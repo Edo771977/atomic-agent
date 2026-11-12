@@ -13,7 +13,7 @@ import {
   ExtractBudget,
   describeSanitizationError,
   entryDiskPath,
-  pruneEscapingSymlinks,
+  pruneIntoReport,
   realDestRoot,
   sanitizeEntryPath,
 } from "./archive-safety.js";
@@ -83,105 +83,103 @@ export class ZipBackend implements ArchiveBackend {
     const destReal = await realDestRoot(options.destDir);
     const createdLinks: Array<{ normalised: string; absolute: string }> = [];
 
-    for (const [rawName, file] of Object.entries(zip.files)) {
-      const kind = classifyZipEntry(rawName, file);
-      const sanitized = sanitizeEntryPath(options.destDir, rawName);
-      if (!sanitized.ok) {
-        report.skippedEntries.push({
-          path: rawName,
-          reason: describeSanitizationError(rawName, sanitized.error),
-        });
-        continue;
-      }
-      if (!includeMatches(sanitized.value.normalised)) continue;
-      // Symlink entries are created at their leaf; every other kind must not
-      // land on an existing symlink either.
-      const onDisk = await entryDiskPath(
-        destReal,
-        options.destDir,
-        sanitized.value.absolute,
-        kind !== "symlink",
-      );
-      if (!onDisk.ok) {
-        report.skippedEntries.push({
-          path: sanitized.value.normalised,
-          reason: onDisk.reason,
-        });
-        continue;
-      }
-      const absolute = onDisk.absolute;
-
-      if (kind === "directory") {
-        await mkdir(absolute, { recursive: true });
-        continue;
-      }
-
-      if (kind === "symlink") {
-        if (!options.followSymlinks) {
+    // Pruned in a `finally`: an extraction that throws midway must not
+    // leave an escaping link behind.
+    try {
+      for (const [rawName, file] of Object.entries(zip.files)) {
+        const kind = classifyZipEntry(rawName, file);
+        const sanitized = sanitizeEntryPath(options.destDir, rawName);
+        if (!sanitized.ok) {
           report.skippedEntries.push({
-            path: sanitized.value.normalised,
-            reason: "symlink entries require followSymlinks=true",
+            path: rawName,
+            reason: describeSanitizationError(rawName, sanitized.error),
           });
           continue;
         }
-        const target = (await file.async("string")).trim();
-        // Re-sanitise the link target relative to the symlink's parent so
-        // the symlink cannot point outside destDir either.
-        const linkParent = dirname(sanitized.value.normalised);
-        const resolvedTarget = sanitizeEntryPath(
+        if (!includeMatches(sanitized.value.normalised)) continue;
+        // Symlink entries are created at their leaf; every other kind must not
+        // land on an existing symlink either.
+        const onDisk = await entryDiskPath(
+          destReal,
           options.destDir,
-          linkParent === "." ? target : `${linkParent}/${target}`,
+          sanitized.value.absolute,
+          kind !== "symlink",
         );
-        if (!resolvedTarget.ok) {
+        if (!onDisk.ok) {
           report.skippedEntries.push({
             path: sanitized.value.normalised,
-            reason: `symlink target escapes destDir: ${target}`,
+            reason: onDisk.reason,
           });
           continue;
         }
-        await mkdir(dirname(absolute), { recursive: true });
-        try {
-          await symlink(target, absolute);
-          createdLinks.push({ normalised: sanitized.value.normalised, absolute });
-          report.extractedEntries++;
-        } catch (err) {
-          report.warnings.push(
-            `failed to create symlink ${sanitized.value.normalised}: ${(err as Error).message}`,
-          );
+        const absolute = onDisk.absolute;
+
+        if (kind === "directory") {
+          await mkdir(absolute, { recursive: true });
+          continue;
         }
-        continue;
+
+        if (kind === "symlink") {
+          if (!options.followSymlinks) {
+            report.skippedEntries.push({
+              path: sanitized.value.normalised,
+              reason: "symlink entries require followSymlinks=true",
+            });
+            continue;
+          }
+          const target = (await file.async("string")).trim();
+          // Re-sanitise the link target relative to the symlink's parent so
+          // the symlink cannot point outside destDir either.
+          const linkParent = dirname(sanitized.value.normalised);
+          const resolvedTarget = sanitizeEntryPath(
+            options.destDir,
+            linkParent === "." ? target : `${linkParent}/${target}`,
+          );
+          if (!resolvedTarget.ok) {
+            report.skippedEntries.push({
+              path: sanitized.value.normalised,
+              reason: `symlink target escapes destDir: ${target}`,
+            });
+            continue;
+          }
+          await mkdir(dirname(absolute), { recursive: true });
+          try {
+            await symlink(target, absolute);
+            createdLinks.push({ normalised: sanitized.value.normalised, absolute });
+            report.extractedEntries++;
+          } catch (err) {
+            report.warnings.push(
+              `failed to create symlink ${sanitized.value.normalised}: ${(err as Error).message}`,
+            );
+          }
+          continue;
+        }
+
+        const nodeBuf = await file.async("nodebuffer");
+        const decision = budget.chargeEntry(nodeBuf.length);
+        if (!decision.ok) {
+          report.skippedEntries.push({
+            path: sanitized.value.normalised,
+            reason: decision.reason,
+          });
+          continue;
+        }
+
+        if (!options.overwrite && (await pathExists(absolute))) {
+          report.skippedEntries.push({
+            path: sanitized.value.normalised,
+            reason: "destination exists and overwrite=false",
+          });
+          continue;
+        }
+
+        await mkdir(dirname(absolute), { recursive: true });
+        await writeFile(absolute, nodeBuf);
+        report.extractedEntries++;
+        report.totalBytesWritten += nodeBuf.length;
       }
-
-      const nodeBuf = await file.async("nodebuffer");
-      const decision = budget.chargeEntry(nodeBuf.length);
-      if (!decision.ok) {
-        report.skippedEntries.push({
-          path: sanitized.value.normalised,
-          reason: decision.reason,
-        });
-        continue;
-      }
-
-      if (!options.overwrite && (await pathExists(absolute))) {
-        report.skippedEntries.push({
-          path: sanitized.value.normalised,
-          reason: "destination exists and overwrite=false",
-        });
-        continue;
-      }
-
-      await mkdir(dirname(absolute), { recursive: true });
-      await writeFile(absolute, nodeBuf);
-      report.extractedEntries++;
-      report.totalBytesWritten += nodeBuf.length;
-    }
-
-    for (const path of await pruneEscapingSymlinks(destReal, createdLinks)) {
-      report.extractedEntries--;
-      report.skippedEntries.push({
-        path,
-        reason: "symlink target does not resolve inside destDir",
-      });
+    } finally {
+      await pruneIntoReport(report, destReal, createdLinks);
     }
     return report;
   }

@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   existsSync,
+  lstatSync,
   mkdtempSync,
   rmSync,
   readFileSync,
@@ -201,6 +202,23 @@ describe("TarBackend symlink containment", () => {
       const report = await extractWithLinks(data, dest);
       expect(existsSync(join(dest, "a"))).toBe(false);
       expect(report.skippedEntries.some((s) => s.path === "a")).toBe(true);
+      expect(existsSync(join(dest, "d", "b"))).toBe(true);
+    });
+  });
+
+  it("removes an escaping chained link even when extraction fails later", async () => {
+    await withTmp(async (root) => {
+      const dest = join(root, "out");
+      const data = await buildTar([
+        { name: "d/", type: "directory" },
+        { name: "d/b", type: "symlink", linkname: ".." },
+        { name: "a", type: "symlink", linkname: "d/b/.." },
+        // A file over an existing directory: the write throws (EISDIR).
+        { name: "z/", type: "directory" },
+        { name: "z", body: "boom" },
+      ]);
+      await expect(extractWithLinks(data, dest)).rejects.toThrow();
+      expect(() => lstatSync(join(dest, "a"))).toThrow();
       expect(existsSync(join(dest, "d", "b"))).toBe(true);
     });
   });

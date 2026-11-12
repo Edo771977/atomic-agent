@@ -152,6 +152,25 @@ export async function pruneEscapingSymlinks(
   return removed;
 }
 
+/**
+ * `pruneEscapingSymlinks`, with each removed link moved from extracted to
+ * skipped in `report`. Backends call it in a `finally`: an extraction
+ * that throws midway must not leave an escaping link behind.
+ */
+export async function pruneIntoReport(
+  report: { extractedEntries: number; skippedEntries: Array<{ path: string; reason: string }> },
+  destReal: string,
+  created: Array<{ normalised: string; absolute: string }>,
+): Promise<void> {
+  for (const path of await pruneEscapingSymlinks(destReal, created)) {
+    report.extractedEntries--;
+    report.skippedEntries.push({
+      path,
+      reason: "symlink target does not resolve inside destDir",
+    });
+  }
+}
+
 function isInsideDir(dir: string, candidate: string): boolean {
   return candidate === dir || candidate.startsWith(dir + sep);
 }

@@ -17,7 +17,7 @@ import {
   ExtractBudget,
   describeSanitizationError,
   entryDiskPath,
-  pruneEscapingSymlinks,
+  pruneIntoReport,
   realDestRoot,
   sanitizeEntryPath,
 } from "./archive-safety.js";
@@ -97,6 +97,8 @@ export class TarBackend implements ArchiveBackend {
     const destReal = await realDestRoot(options.destDir);
     const createdLinks: Array<{ normalised: string; absolute: string }> = [];
 
+    // Pruned in a `finally`: a walk that throws midway (a write that
+    // fails, a corrupt stream) must not leave an escaping link behind.
     await this.walk(data, async (header, stream) => {
       const rawName = normaliseTarName(header.name);
       const kind = mapTarType(header.type);
@@ -256,15 +258,7 @@ export class TarBackend implements ArchiveBackend {
       await writeFile(absolute, body);
       report.extractedEntries++;
       report.totalBytesWritten += body.length;
-    });
-
-    for (const path of await pruneEscapingSymlinks(destReal, createdLinks)) {
-      report.extractedEntries--;
-      report.skippedEntries.push({
-        path,
-        reason: "symlink target does not resolve inside destDir",
-      });
-    }
+    }).finally(() => pruneIntoReport(report, destReal, createdLinks));
     return report;
   }
 
