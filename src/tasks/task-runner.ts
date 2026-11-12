@@ -203,6 +203,15 @@ export interface DrainOutcome {
   blocked: number;
   cancelled: number;
   retried: number;
+  /**
+   * Tasks the drain left `pending` waiting out a retry backoff (failed
+   * retryably in this drain, or already waiting when it began). No drain
+   * sleeps through a backoff, so these are not finished: they run when
+   * due (`nextRetryAt`) on the scheduler's tick or a later drain.
+   */
+  retryPending: number;
+  /** When the earliest of `retryPending` is due (epoch ms); `null` when none. */
+  nextRetryAt: number | null;
 }
 
 /**
@@ -970,7 +979,12 @@ export class TaskRunner {
         // A retry still waiting out its backoff (`markRetry` set its
         // `scheduled_for`) is not run early by any drain, this one
         // included: it is due again later.
-        if (awaitingRetry(current, Date.now())) break;
+        if (awaitingRetry(current, Date.now())) {
+          outcome.retryPending += 1;
+          const due = current.scheduledFor!;
+          if (outcome.nextRetryAt === null || due < outcome.nextRetryAt) outcome.nextRetryAt = due;
+          break;
+        }
         const attempted: TaskRecord = current;
         try {
           current = await this.runOne(attempted.id, signal);
@@ -1352,6 +1366,8 @@ function emptyOutcome(): DrainOutcome {
     blocked: 0,
     cancelled: 0,
     retried: 0,
+    retryPending: 0,
+    nextRetryAt: null,
   };
 }
 

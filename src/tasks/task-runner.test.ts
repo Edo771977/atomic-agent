@@ -248,19 +248,27 @@ describe("TaskRunner", () => {
     try {
       const failedAt = Date.now();
       const first = await runner.drainPending();
-      expect(first).toMatchObject({ drained: 1, completed: 0, retried: 1, failed: 0 });
+      // The drain ends with the retry still pending and says so.
+      expect(first).toMatchObject({
+        drained: 1,
+        completed: 0,
+        retried: 1,
+        failed: 0,
+        retryPending: 1,
+        nextRetryAt: failedAt + 1,
+      });
       // Due again only once its backoff (1 ms after attempt 1) is over.
       const waiting = store.get(t.id)!;
       expect(waiting.status).toBe("pending");
       expect(waiting.scheduledFor).toBe(failedAt + 1);
       expect(store.listDue(failedAt, 10)).toEqual([]);
       // No other drainer runs it early.
-      expect(await runner.drainPending()).toMatchObject({ drained: 0 });
+      expect(await runner.drainPending()).toMatchObject({ drained: 0, retryPending: 1, nextRetryAt: failedAt + 1 });
       expect(await runner.runDue(failedAt, 10)).toMatchObject({ drained: 0 });
       expect(calls).toHaveLength(1);
       vi.setSystemTime(failedAt + 1);
       const second = await runner.drainPending();
-      expect(second).toMatchObject({ drained: 1, completed: 1, retried: 0, failed: 0 });
+      expect(second).toMatchObject({ drained: 1, completed: 1, retried: 0, failed: 0, retryPending: 0, nextRetryAt: null });
     } finally {
       vi.useRealTimers();
     }

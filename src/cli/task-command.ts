@@ -3,6 +3,7 @@ import {
   TaskStore,
   TaskValidationError,
   resolveScheduledFor,
+  type DrainOutcome,
   type TaskRecord,
   type TaskSchedule,
   type TaskStatus,
@@ -52,6 +53,10 @@ const HELP =
     "                            (optionally scoped to one session)",
     "  tick [--limit N]          One-shot scheduler pump: drain every due task (based on",
     "                            scheduled_for) without starting the long-lived ticker",
+    "                            Neither waits out a retry's backoff: a task that failed",
+    "                            retryably stays pending (retryPending and nextRetryAt in",
+    "                            the JSON, 'N retries pending, next at T' on stderr) and",
+    "                            runs once due. That alone still exits 0.",
     "",
     "Examples:",
     "  atomic-agent task list --status pending",
@@ -421,6 +426,11 @@ async function handleRun(args: string[]): Promise<number> {
       sessionId ? { sessionId } : {},
     );
     process.stdout.write(`${JSON.stringify(outcome, null, 2)}\n`);
+    // A retry is never slept through: the drain ends with it still
+    // pending. Say so, so "failed: 0" is not read as "all done"; the exit
+    // code stays 0 because nothing has failed yet.
+    const retryNote = describeRetryPending(outcome);
+    if (retryNote !== null) process.stderr.write(`${retryNote}\n`);
     return outcome.failed > 0 || outcome.blocked > 0 ? 1 : 0;
   } finally {
     await runtime.shutdown();
@@ -459,6 +469,11 @@ async function handleTick(args: string[]): Promise<number> {
   try {
     const outcome = await runtime.taskRunner.runDue(Date.now(), limit);
     process.stdout.write(`${JSON.stringify(outcome, null, 2)}\n`);
+    // A retry is never slept through: the drain ends with it still
+    // pending. Say so, so "failed: 0" is not read as "all done"; the exit
+    // code stays 0 because nothing has failed yet.
+    const retryNote = describeRetryPending(outcome);
+    if (retryNote !== null) process.stderr.write(`${retryNote}\n`);
     return outcome.failed > 0 || outcome.blocked > 0 ? 1 : 0;
   } finally {
     await runtime.shutdown();
@@ -546,4 +561,20 @@ function formatScheduleLabel(task: TaskRecord): string {
   if (!task.schedule) return "-";
   if (task.recurring) return `${task.schedule.kind}*`;
   return task.schedule.kind;
+}
+
+/**
+ * The line a drain prints when it left retries waiting out their backoff
+ * (`null` when none): "2 retries pending, next at <iso>".
+ */
+export function describeRetryPending(
+  outcome: Pick<DrainOutcome, "retryPending" | "nextRetryAt">,
+): string | null {
+  if (outcome.retryPending === 0) return null;
+  const noun = outcome.retryPending === 1 ? "retry" : "retries";
+  const next =
+    outcome.nextRetryAt === null
+      ? ""
+      : `, next at ${new Date(outcome.nextRetryAt).toISOString()}`;
+  return `${outcome.retryPending} ${noun} pending${next}; they run once due (scheduler tick or another drain)`;
 }

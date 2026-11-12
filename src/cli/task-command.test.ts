@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { resetConfigCache, getConfig } from "../config/index.js";
 import { TaskStore } from "../tasks/index.js";
 
-import { taskCommand } from "./task-command.js";
+import { describeRetryPending, taskCommand } from "./task-command.js";
 
 /**
  * The `run` subcommand is exercised end-to-end by `route-tasks.test.ts`
@@ -373,5 +373,19 @@ describe("taskCommand", () => {
     const code = await taskCommand(["list", "--status", "weird"]);
     expect(code).toBe(1);
     expect(stderr()).toMatch(/unknown task status/);
+  });
+});
+
+describe("describeRetryPending", () => {
+  it("says nothing when no retry is waiting", () => {
+    expect(describeRetryPending({ retryPending: 0, nextRetryAt: null })).toBeNull();
+  });
+
+  it("names how many retries wait and when the next is due", () => {
+    const at = Date.UTC(2026, 10, 12, 9, 30, 0);
+    expect(describeRetryPending({ retryPending: 1, nextRetryAt: at })).toBe(
+      "1 retry pending, next at 2026-11-12T09:30:00.000Z; they run once due (scheduler tick or another drain)",
+    );
+    expect(describeRetryPending({ retryPending: 3, nextRetryAt: at })).toMatch(/^3 retries pending, next at 2026-11-12T09:30:00\.000Z/);
   });
 });
