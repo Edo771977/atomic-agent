@@ -157,8 +157,9 @@ export interface TaskRunnerOptions {
   approvalLevel?: () => number;
   metrics?: AgentMetrics;
   /**
-   * Test seam for the inter-attempt sleep. Production uses the real
-   * `setTimeout`; tests substitute a fake to keep the suite fast.
+   * Test seam for the crash-resume backoff wait (`backOffResume`; a
+   * retry waits as durable `scheduled_for` instead). Production uses the
+   * real `setTimeout`; tests substitute a fake to keep the suite fast.
    */
   sleep?: (ms: number) => Promise<void>;
   /**
@@ -861,9 +862,10 @@ export class TaskRunner {
 
   /**
    * Pull every `pending` task (optionally filtered by `sessionId`),
-   * group by session, and drain each group sequentially. Per-session
-   * tasks see their backoff applied between attempts on the *same*
-   * task. Cross-session groups run in parallel; `TurnController`
+   * group by session, and drain each group sequentially. A task still
+   * waiting out a retry backoff is skipped (it is due later), and a
+   * task that fails retryably in this drain is not run again in it
+   * unless no backoff applies. Cross-session groups run in parallel; `TurnController`
    * enforces at most one concurrent `runTurn` per session, which
    * naturally serialises this loop with any user-facing turn that lands
    * mid-drain.
@@ -919,7 +921,10 @@ export class TaskRunner {
       let current: TaskRecord | null = task;
       while (current && current.status === "pending") {
         if (signal?.aborted || this.stopping) return;
-        const before = current;
+        // A retry still waiting out its backoff (`markRetry` set its
+        // `scheduled_for`) is not run early by any drain, this one
+        // included: it is due again later.
+        if (awaitingRetry(current, Date.now())) break;
         current = await this.runOne(current.id, signal);
         outcome.drained += 1;
         if (!current) break;
@@ -948,10 +953,10 @@ export class TaskRunner {
             outcome.completed += 1;
             break;
           }
+          // A retry: run again in this drain only when its backoff is
+          // already over (none configured); otherwise it is left due
+          // later, without holding the drain (or the scheduler's tick).
           outcome.retried += 1;
-          const delay = nextDelayMs(current.attempts, this.options.backoff);
-          if (delay > 0) await this.sleep(delay);
-          void before;
         }
       }
     }
@@ -981,7 +986,13 @@ export class TaskRunner {
       });
       return terminal;
     }
-    const retried = this.options.store.markRetry(task.id, failure);
+    // The backoff is durable state, not a sleep: the row is due again
+    // only at `retryAt`, so no drainer (the next tick, the auto-drain
+    // after a create, an HTTP or CLI drain) runs it early, and no drain
+    // holds the scheduler's tick while it waits.
+    const now = Date.now();
+    const retryAt = now + nextDelayMs(task.attempts, this.options.backoff);
+    const retried = this.options.store.markRetry(task.id, failure, now, retryAt);
     this.options.metrics?.recordTaskRetry({
       taskId: retried.id,
       sessionId: retried.sessionId ?? "<unassigned>",
@@ -994,6 +1005,7 @@ export class TaskRunner {
       category,
       attempt: retried.attempts,
       maxAttempts: retried.maxAttempts,
+      retryAt,
     });
     return retried;
   }
@@ -1253,6 +1265,21 @@ function groupBySession(tasks: TaskRecord[]): Map<string, TaskRecord[]> {
  */
 function isPermanent(category: LlmFailureCategory): boolean {
   return category === "grammar" || category === "tool";
+}
+
+/**
+ * A row put back by `markRetry` whose backoff has not passed yet: an
+ * attempt already ran and its `scheduled_for` is still ahead. A fresh
+ * one-shot scheduled for later (no attempt yet) is not one.
+ */
+function awaitingRetry(task: TaskRecord, now: number): boolean {
+  return (
+    task.status === "pending" &&
+    task.attempts > 0 &&
+    task.lastErrorCategory !== null &&
+    task.scheduledFor !== null &&
+    task.scheduledFor > now
+  );
 }
 
 function defaultSleep(ms: number): Promise<void> {

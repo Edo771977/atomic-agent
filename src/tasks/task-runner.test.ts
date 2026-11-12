@@ -62,6 +62,23 @@ function fakeSessionLoader(session: SessionState | null) {
   };
 }
 
+/**
+ * Drain until nothing is left waiting out a retry backoff, moving the
+ * clock past each backoff in turn: a retry is due later, not run again
+ * inside the drain that failed it.
+ */
+async function drainThroughBackoff(runner: TaskRunner, rounds = 5): Promise<void> {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  try {
+    for (let i = 0; i < rounds; i++) {
+      await runner.drainPending();
+      vi.setSystemTime(Date.now() + 60_000);
+    }
+  } finally {
+    vi.useRealTimers();
+  }
+}
+
 describe("TaskRunner", () => {
   let tmp: string;
   let store: TaskStore;
@@ -217,7 +234,9 @@ describe("TaskRunner", () => {
       backoff: { initialMs: 1, maxMs: 10 },
       enabled: true,
       runOnCreate: false,
-      sleep: async () => undefined,
+      sleep: async () => {
+        throw new Error("a retry must not sleep inline");
+      },
     });
     const t = store.create({
       sessionId: session.id,
@@ -225,13 +244,26 @@ describe("TaskRunner", () => {
       origin: "cli",
       maxAttempts: 3,
     });
-    const outcome = await runner.drainPending();
-    expect(outcome).toMatchObject({
-      drained: 2,
-      completed: 1,
-      retried: 1,
-      failed: 0,
-    });
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const failedAt = Date.now();
+      const first = await runner.drainPending();
+      expect(first).toMatchObject({ drained: 1, completed: 0, retried: 1, failed: 0 });
+      // Due again only once its backoff (1 ms after attempt 1) is over.
+      const waiting = store.get(t.id)!;
+      expect(waiting.status).toBe("pending");
+      expect(waiting.scheduledFor).toBe(failedAt + 1);
+      expect(store.listDue(failedAt, 10)).toEqual([]);
+      // No other drainer runs it early.
+      expect(await runner.drainPending()).toMatchObject({ drained: 0 });
+      expect(await runner.runDue(failedAt, 10)).toMatchObject({ drained: 0 });
+      expect(calls).toHaveLength(1);
+      vi.setSystemTime(failedAt + 1);
+      const second = await runner.drainPending();
+      expect(second).toMatchObject({ drained: 1, completed: 1, retried: 0, failed: 0 });
+    } finally {
+      vi.useRealTimers();
+    }
     expect(store.get(t.id)?.status).toBe("completed");
     expect(calls).toHaveLength(2);
   });
@@ -263,7 +295,7 @@ describe("TaskRunner", () => {
       origin: "cli",
       maxAttempts: 2,
     });
-    await runner.drainPending();
+    await drainThroughBackoff(runner);
     const final = store.get(t.id);
     expect(final?.status).toBe("failed");
     expect(final?.attempts).toBe(2);
@@ -600,7 +632,7 @@ describe("TaskRunner", () => {
       origin: "cli",
       maxAttempts: 3,
     });
-    await runner.drainPending();
+    await drainThroughBackoff(runner);
     expect(store.get(t.id)?.status).toBe("completed");
     expect(calls).toBe(2);
   });
@@ -946,7 +978,7 @@ describe("TaskRunner", () => {
         maxAttempts: 2,
         notify: "telegram",
       });
-      await runner.drainPending();
+      await drainThroughBackoff(runner);
       expect(calls).toBe(2);
       expect(store.get(t.id)?.status).toBe("failed");
       // exactly one report — for the terminal attempt, not the retry
