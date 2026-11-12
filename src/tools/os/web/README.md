@@ -17,6 +17,7 @@ This area owns `os.web.fetch` page retrieval and `os.http.request` raw GET/POST 
 
 - "Allow for this session" on an `os.http.request` prompt covers the target's origin (scheme, host, port) only: the request carries `grantKey` and the gate keys the grant by it. A POST to another host asks again.
 - A redirect that would carry the method and body to another origin (a 307/308 after a POST) is not followed. The result names the `Location` (`details.redirectNotFollowed`) and the model has to make a new request there, which is gated like any other. Same-origin redirects and bodyless GET hops are still followed.
+- `http.hostAllowlist` applies to every redirect hop, not only the first URL: a `Location` on a host outside it is not followed and the request fails with an error naming that host.
 - Any hop on another origin is sent without credential headers (`Authorization`, `Proxy-Authorization`, `Cookie`, `X-Api-Key` and any name containing token, secret, key, auth, password, session, cookie, credential or signature).
 - The approval preview masks the values of those headers (`Authorization: Bearer ****`), since it is shown in the terminal, the desktop app and Telegram.
 - Known limitation: with the default `http.approvalMode: "writes"` a GET runs without a prompt, and a GET can still carry data out in its URL (query string, path) and headers. Use `approvalMode: "always"` or `http.hostAllowlist` where that matters.
