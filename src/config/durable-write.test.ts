@@ -8,7 +8,11 @@ import { join } from "node:path";
 // the real implementation so the writes still happen on disk.
 const calls = vi.hoisted(() => [] as string[]);
 // Errno codes the next calls throw, consumed one per call.
-const faults = vi.hoisted(() => ({ rename: [] as string[] }));
+const faults = vi.hoisted(() => ({
+  rename: [] as string[],
+  fsyncFile: [] as string[],
+  write: [] as string[],
+}));
 function errno(code: string): NodeJS.ErrnoException {
   return Object.assign(new Error(`${code}: injected`), { code });
 }
@@ -17,9 +21,17 @@ vi.mock("node:fs", async (importOriginal) => {
   return {
     ...actual,
     fsyncSync: (fd: number) => {
-      calls.push(actual.fstatSync(fd).isDirectory() ? "fsync:dir" : "fsync:file");
+      const isDir = actual.fstatSync(fd).isDirectory();
+      calls.push(isDir ? "fsync:dir" : "fsync:file");
+      const code = isDir ? undefined : faults.fsyncFile.shift();
+      if (code) throw errno(code);
       return actual.fsyncSync(fd);
     },
+    writeSync: ((...args: Parameters<typeof actual.writeSync>) => {
+      const code = faults.write.shift();
+      if (code) throw errno(code);
+      return (actual.writeSync as (...a: unknown[]) => number)(...args);
+    }) as typeof actual.writeSync,
     renameSync: (from: fs.PathLike, to: fs.PathLike) => {
       calls.push("rename");
       const code = faults.rename.shift();
@@ -121,5 +133,61 @@ describe("atomic writes flush before and after the rename", () => {
     if (process.platform !== "win32") {
       expect(fs.statSync(join(dir, ".env")).mode & 0o777).toBe(0o600);
     }
+  });
+});
+
+describe("a failed tmp write never leaves the tmp file (it can hold secrets)", () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "atomic-durable-fail-"));
+    calls.length = 0;
+    faults.fsyncFile = [];
+    faults.write = [];
+    faults.rename = [];
+  });
+
+  afterEach(() => {
+    faults.fsyncFile = [];
+    faults.write = [];
+    faults.rename = [];
+    rmSync(dir, { recursive: true, force: true });
+    delete process.env.ATOMIC_DURABLE_TEST_KEY;
+  });
+
+  it.each(["EIO", "ENOSPC"])("setDotenvKey: a file fsync %s fails the write and removes .env.tmp-<pid>", (code) => {
+    faults.fsyncFile = [code];
+    expect(() => setDotenvKey(dir, "ATOMIC_DURABLE_TEST_KEY", "secret")).toThrow(code);
+    expect(fs.readdirSync(dir)).toEqual([]);
+    expect(calls).not.toContain("rename");
+  });
+
+  it("writeOwnerOnlyFileAtomicSync: a file fsync EIO keeps the old file and removes the tmp", () => {
+    const path = join(dir, "config.json");
+    fs.writeFileSync(path, "old\n");
+    faults.fsyncFile = ["EIO"];
+    expect(() => writeOwnerOnlyFileAtomicSync(path, "new\n", () => {})).toThrow("EIO");
+    expect(fs.readdirSync(dir)).toEqual(["config.json"]);
+    expect(readFileSync(path, "utf8")).toBe("old\n");
+  });
+
+  it("a write error removes the tmp file too", () => {
+    faults.write = ["ENOSPC"];
+    expect(() => setDotenvKey(dir, "ATOMIC_DURABLE_TEST_KEY", "secret")).toThrow("ENOSPC");
+    expect(fs.readdirSync(dir)).toEqual([]);
+  });
+
+  it("a rename error removes the tmp file", () => {
+    const path = join(dir, "config.json");
+    faults.rename = ["EXDEV"];
+    expect(() => writeOwnerOnlyFileAtomicSync(path, "new\n", () => {})).toThrow("EXDEV");
+    expect(fs.readdirSync(dir)).toEqual([]);
+  });
+
+  it.each(["EINVAL", "ENOTSUP", "EOPNOTSUPP"])("a file fsync %s (not supported) is best effort: the write goes ahead", (code) => {
+    faults.fsyncFile = [code];
+    setDotenvKey(dir, "ATOMIC_DURABLE_TEST_KEY", "value");
+    expect(readFileSync(join(dir, ".env"), "utf8")).toBe("ATOMIC_DURABLE_TEST_KEY=value\n");
+    expect(fs.readdirSync(dir)).toEqual([".env"]);
   });
 });

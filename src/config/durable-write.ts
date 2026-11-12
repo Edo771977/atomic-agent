@@ -1,4 +1,11 @@
-import { closeSync, fsyncSync, openSync, renameSync, writeSync } from "node:fs";
+import {
+  closeSync,
+  fsyncSync,
+  openSync,
+  renameSync,
+  unlinkSync,
+  writeSync,
+} from "node:fs";
 
 /**
  * Durability halves of a tmp-file-then-rename write. A rename is atomic,
@@ -9,8 +16,21 @@ import { closeSync, fsyncSync, openSync, renameSync, writeSync } from "node:fs";
  */
 
 /**
+ * fsync answers for a file system that cannot flush (some network, FUSE
+ * and virtual file systems). The data is written; durability is just not
+ * on offer there, so the write goes ahead rather than failing every save.
+ */
+const FSYNC_UNSUPPORTED_CODES = new Set(["EINVAL", "ENOTSUP", "EOPNOTSUPP"]);
+
+/**
  * Create `path` with `payload` and flush it to disk before returning.
  * `flag` is the open flag (`"w"` or `"wx"`); `mode` applies on creation.
+ *
+ * `path` is a tmp file the caller owns. If anything fails once it has
+ * been created (a write, an fsync error other than "not supported", the
+ * close), it is closed and unlinked before the error is rethrown: the
+ * payload is often secrets (`.env`, `config.json`), and a stray
+ * `.tmp-<pid>` file would keep them on disk.
  */
 export function writeFileSyncedSync(
   path: string,
@@ -18,15 +38,35 @@ export function writeFileSyncedSync(
   options: { mode: number; flag?: "w" | "wx" },
 ): void {
   const fd = openSync(path, options.flag ?? "w", options.mode);
+  let open = true;
   try {
     const data = Buffer.from(payload, "utf8");
     let offset = 0;
     while (offset < data.length) {
       offset += writeSync(fd, data, offset, data.length - offset);
     }
-    fsyncSync(fd);
-  } finally {
+    try {
+      fsyncSync(fd);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (!code || !FSYNC_UNSUPPORTED_CODES.has(code)) throw err;
+    }
+    open = false;
     closeSync(fd);
+  } catch (err) {
+    if (open) {
+      try {
+        closeSync(fd);
+      } catch {
+        // already failing; the unlink below matters more
+      }
+    }
+    try {
+      unlinkSync(path);
+    } catch {
+      // best effort: nothing more to do with a tmp file we cannot remove
+    }
+    throw err;
   }
 }
 
