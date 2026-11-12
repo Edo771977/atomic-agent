@@ -74,10 +74,26 @@ export function normaliseOpenAiUsage(
     details !== null && typeof details === "object"
       ? (details as Record<string, unknown>).cache_write_tokens
       : undefined;
+  const promptTokens = Number(usage.prompt_tokens ?? 0);
+  const reportedCompletion = Number(usage.completion_tokens ?? 0);
+  const totalTokens = Number(usage.total_tokens ?? 0);
+  // Some services leave hidden thinking tokens out of `completion_tokens`
+  // while counting them in `total_tokens`; they are billed as output, so
+  // the excess is. Where reasoning is already inside `completion_tokens`
+  // (total = prompt + completion) this changes nothing. Skipped when cache
+  // reads arrive outside `prompt_tokens` (`cache_read_input_tokens`), where
+  // the excess may be those reads rather than output.
+  const unreported = totalTokens - promptTokens - reportedCompletion;
+  const completionTokens =
+    Number.isFinite(unreported) &&
+    unreported > 0 &&
+    usage.cache_read_input_tokens === undefined
+      ? reportedCompletion + unreported
+      : reportedCompletion;
   return {
-    promptTokens: Number(usage.prompt_tokens ?? 0),
-    completionTokens: Number(usage.completion_tokens ?? 0),
-    totalTokens: Number(usage.total_tokens ?? 0),
+    promptTokens,
+    completionTokens,
+    totalTokens,
     ...(typeof cached === "number" && Number.isFinite(cached) && cached >= 0
       ? { cachedTokens: cached }
       : {}),
