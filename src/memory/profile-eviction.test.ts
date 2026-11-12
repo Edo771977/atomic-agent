@@ -12,7 +12,7 @@ import { ProfileStore } from "./profile-store.js";
 /**
  * Issue #407. `memory.profile.maxEntries` caps active unpinned facts;
  * pinned facts are never counted or evicted; eviction happens inside
- * the write transaction and deletes like `remove()` does.
+ * the write transaction and forgets the key (history too) like `remove()`.
  */
 describe("ProfileStore maxEntries", () => {
   let dir: string;
@@ -159,7 +159,7 @@ describe("ProfileStore maxEntries", () => {
     expect(evictions).toEqual([]);
   });
 
-  it("does not count a supersession twice, and keeps history coherent after an eviction", () => {
+  it("does not count a supersession twice, and forgets the evicted key's history like remove()", () => {
     const store = open(2);
     store.set("editor", "vim", contextual, 1_000);
     store.set("editor", "emacs", contextual, 2_000);
@@ -168,19 +168,18 @@ describe("ProfileStore maxEntries", () => {
 
     store.set("term", "kitty", contextual, 4_000);
 
-    // The active `editor` row went, as with `remove()`; its superseded
-    // predecessor stays readable.
+    // The active `editor` row went and so did its superseded
+    // predecessor, exactly as `remove()` does.
     expect(store.get("editor")).toBeNull();
-    const chain = store.history("editor");
-    expect(chain.map((f) => f.value)).toEqual(["vim"]);
-    expect(chain[0]!.supersededBy).not.toBeNull();
+    expect(store.history("editor")).toEqual([]);
+    expect(store.history("shell").map((f) => f.value)).toEqual(["zsh"]);
 
-    // A later write starts a fresh active row at the end of the chain.
+    // A later write starts a fresh chain.
     store.set("editor", "helix", contextual, 5_000);
     const after = store.history("editor");
-    expect(after.map((f) => f.value)).toEqual(["vim", "helix"]);
-    expect(after[1]!.supersedes).toBeNull();
-    expect(after[1]!.supersededBy).toBeNull();
+    expect(after.map((f) => f.value)).toEqual(["helix"]);
+    expect(after[0]!.supersedes).toBeNull();
+    expect(after[0]!.supersededBy).toBeNull();
     expect(keys(store)).toEqual(["editor", "term"]);
   });
 

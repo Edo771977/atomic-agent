@@ -14,6 +14,7 @@ import {
 } from "./profile-name-keys.js";
 import {
   assertProfileMaxEntries,
+  prepareProfileKeyForget,
   ProfileEvictor,
   type ProfileEviction,
 } from "./profile-eviction.js";
@@ -203,8 +204,7 @@ export class ProfileStore {
   private readonly selectActiveByIdStmt: Database.Statement;
   private readonly selectAllActiveStmt: Database.Statement;
   private readonly historyByKeyStmt: Database.Statement;
-  private readonly deleteKeyStmt: Database.Statement;
-  private readonly clearSupersedesIntoKeyStmt: Database.Statement;
+  private readonly forgetKey: (key: string) => number;
   private readonly markNameGroundingStmt: Database.Statement;
   private readonly markUnconfirmedNameGroundingStmt: Database.Statement;
 
@@ -285,17 +285,7 @@ export class ProfileStore {
         WHERE key = ?
         ORDER BY valid_from ASC, id ASC`,
     );
-    this.deleteKeyStmt = this.db.prepare(
-      `DELETE FROM profile_facts WHERE key = ?`,
-    );
-    // Another key's row that cross-key superseded a removed row keeps
-    // its own value but must not point at a row that no longer exists.
-    this.clearSupersedesIntoKeyStmt = this.db.prepare(
-      `UPDATE profile_facts
-          SET supersedes = NULL
-        WHERE key <> @key
-          AND supersedes IN (SELECT id FROM profile_facts WHERE key = @key)`,
-    );
+    this.forgetKey = prepareProfileKeyForget(this.db);
     // Metadata only: `updated_at` is left alone — it orders eviction,
     // and a check is not a write of the fact.
     this.markNameGroundingStmt = this.db.prepare(
@@ -468,13 +458,9 @@ export class ProfileStore {
    */
   remove(key: string): boolean {
     const normalisedKey = validateKey(key);
-    const changes = this.db.transaction((): number => {
-      this.clearSupersedesIntoKeyStmt.run({ key: normalisedKey });
-      const result = this.deleteKeyStmt.run(normalisedKey) as {
-        changes: number;
-      };
-      return result.changes;
-    })();
+    const changes = this.db.transaction((): number =>
+      this.forgetKey(normalisedKey),
+    )();
     return changes > 0;
   }
 

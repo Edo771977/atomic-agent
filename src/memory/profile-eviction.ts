@@ -14,6 +14,32 @@ export interface ProfileEviction {
   activeUnpinned: number;
 }
 
+/**
+ * Prepare "forget this key": delete every row for it, active and
+ * superseded. A row of another key that cross-key superseded one of them
+ * keeps its own value with its `supersedes` pointer cleared (it must not
+ * point at a row that no longer exists); an older row of another key
+ * that one of them superseded stays superseded. Shared by
+ * `ProfileStore.remove` and eviction so the two cannot drift. The
+ * returned function must run inside the caller's transaction and
+ * returns the number of rows deleted.
+ */
+export function prepareProfileKeyForget(
+  db: Database.Database,
+): (key: string) => number {
+  const deleteKeyStmt = db.prepare(`DELETE FROM profile_facts WHERE key = ?`);
+  const clearSupersedesIntoKeyStmt = db.prepare(
+    `UPDATE profile_facts
+        SET supersedes = NULL
+      WHERE key <> @key
+        AND supersedes IN (SELECT id FROM profile_facts WHERE key = @key)`,
+  );
+  return (key) => {
+    clearSupersedesIntoKeyStmt.run({ key });
+    return (deleteKeyStmt.run(key) as { changes: number }).changes;
+  };
+}
+
 /** Throws unless `maxEntries` is a positive integer. */
 export function assertProfileMaxEntries(maxEntries: number): void {
   if (!Number.isInteger(maxEntries) || maxEntries <= 0) {
@@ -40,11 +66,13 @@ export function assertProfileMaxEntries(maxEntries: number): void {
  * to weigh. The row being written is never a candidate: a `set()` that
  * succeeds and then evicts its own write would be a silent no-op.
  *
- * **What eviction does.** It deletes the active row, exactly like
- * `ProfileStore.remove(key)` — notes evict by delete too. Superseded
- * rows for the key stay on disk, so `history(key)` still shows the
- * chain, just with no active row at the end; the soft `supersedes` /
- * `superseded_by` pointers never cascade.
+ * **What eviction does.** It forgets the key exactly like
+ * `ProfileStore.remove(key)` (both use `prepareProfileKeyForget`): the
+ * active row and every superseded version go, so `history(key)` is
+ * empty afterwards — notes evict by delete too. Eviction is the budget
+ * deciding a fact is expendable; keeping its invisible history would
+ * let rows the cap never counts grow without bound. A later write of
+ * the key starts a fresh chain.
  *
  * **When.** Inside the `set()` transaction, after the insert, so the
  * table is never observed over the cap and a failed write evicts
@@ -54,12 +82,14 @@ export class ProfileEvictor {
   private readonly countStmt: Database.Statement;
   private readonly pickStmt: Database.Statement;
   private readonly deleteStmt: Database.Statement;
+  private readonly forgetKey: (key: string) => number;
 
   constructor(
     db: Database.Database,
     private readonly maxEntries: number,
   ) {
     assertProfileMaxEntries(maxEntries);
+    this.forgetKey = prepareProfileKeyForget(db);
     this.countStmt = db.prepare(
       `SELECT COUNT(*) AS count FROM profile_facts
         WHERE superseded_by IS NULL AND pinned = 0`,
@@ -92,7 +122,11 @@ export class ProfileEvictor {
     const evicted: EvictedProfileFact[] = [];
     for (const row of picked) {
       const result = this.deleteStmt.run(row.id) as { changes: number };
-      if (result.changes > 0) evicted.push({ id: row.id, key: row.key });
+      if (result.changes > 0) {
+        // The active row is gone; drop the rest of the key's history.
+        this.forgetKey(row.key);
+        evicted.push({ id: row.id, key: row.key });
+      }
     }
     if (evicted.length === 0) return null;
     return {
