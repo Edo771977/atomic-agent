@@ -55,6 +55,8 @@ import { DEFAULT_TOOL_DESCRIPTORS } from "../../prompt/tool-descriptors.js";
 import type { McpServerConfig } from "../../mcp/mcp-types.js";
 import { loadPluginMcpServers } from "../../plugins/plugin-mcp.js";
 import { createPluginMcpLiveStop } from "../../plugins/plugin-mcp-live.js";
+import { listPluginSubagents } from "../../plugins/plugin-subagents.js";
+import { loadAgentProfiles, normaliseProfileName, type AgentProfile } from "../../agent-profiles/index.js";
 import type { ToolDescriptor } from "../../prompt/stable-prefix.js";
 import { filterToolDescriptorsByConfig } from "../filter-disabled-tools.js";
 import { readAtomicMailApiKey } from "../../atomic-mail/index.js";
@@ -122,6 +124,28 @@ function runtimeReadConfinement(
       files: getStateSecretPaths(config.paths),
     },
   };
+}
+
+/**
+ * Enabled plugins' `agents/*.md` as subagent profiles, named
+ * `plugin:agent`; a name that does not normalise is skipped.
+ */
+function pluginAgentProfiles(stateDir: string): AgentProfile[] {
+  const out: AgentProfile[] = [];
+  for (const p of listPluginSubagents(stateDir).profiles) {
+    const [plugin, agent] = [normaliseProfileName(p.plugin), normaliseProfileName(p.name.slice(p.plugin.length + 1))];
+    if (plugin === null || agent === null || p.prompt.trim().length === 0) continue;
+    out.push({
+      name: `${plugin}:${agent}`,
+      description: p.description,
+      prompt: p.prompt.trim(),
+      ...(p.model === undefined ? {} : { model: p.model }),
+      ...(p.tools.length === 0 ? {} : { tools: p.tools }),
+      source: "plugin",
+      file: p.file,
+    });
+  }
+  return out;
 }
 
 export function createRuntimeToolRegistry(
@@ -942,6 +966,17 @@ export function registerRuntimeFusionAndReadScope(input: {
       workingDir,
       // Fan-outs never write in the agent's own state directory (ATO-1267).
       agentStateDir: config.paths.stateDir,
+      // Subagent profiles a task may name (ATO-566), read per fan-out so a
+      // new file or a trust answer applies without a restart. Project
+      // files load only once the folder trusted them.
+      resolveAgentProfiles: (dir) =>
+        loadAgentProfiles({
+          workingDir: dir,
+          stateDir: config.paths.stateDir,
+          configFile: config.paths.userConfigFile,
+          startupTrust: config.skills.projectTrust,
+          pluginProfiles: () => pluginAgentProfiles(config.paths.stateDir),
+        }),
       outputCharCap: config.agent.batchToolResultCharCap,
       // A contract's declared `checks` run through the verify family,
       // each on a throwaway copy of the workspace, so a fan-out is judged

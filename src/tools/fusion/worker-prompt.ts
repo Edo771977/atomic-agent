@@ -10,7 +10,7 @@ import {
   neutraliseRequestMarkers,
   quotedRequestTruncationNote,
 } from "../../prompt/request-section.js";
-import type { DelegateTask } from "./delegate-args.js";
+import type { AppliedAgentProfile, DelegateTask } from "./delegate-args.js";
 import { WORKER_QUESTION_RULE } from "./worker-question.js";
 import {
   renderContractBlock,
@@ -173,6 +173,21 @@ function quoteContract(contract: DelegateContract, taskId: string): string[] {
 }
 
 /**
+ * A subagent profile's instructions (ATO-566): how this worker works, set
+ * apart from the TASK, which says what it does. A profile that narrowed
+ * the tools says so, so a worker that misses a tool does not hunt for it.
+ */
+function quoteProfile(profile: AppliedAgentProfile): string[] {
+  return [
+    `PROFILE ${profile.name} — how to work on this task; the TASK above says what to do, and the RULES below still apply.`,
+    profile.prompt,
+    ...(profile.tools === undefined
+      ? []
+      : [`This profile limits your tools to: ${profile.tools.join(", ")}. If the task needs another tool, say so in your reply instead of working around it.`]),
+  ];
+}
+
+/**
  * Workers of one fan-out run side by side, so a file a sibling writes
  * may not exist yet when this worker looks for it. Measured (ATO-919): a
  * worker re-read a neighbour's not-yet-written file until the loop
@@ -213,7 +228,7 @@ export const WORKER_REPLY_RULE = [
 
 /**
  * The brief, in reading order: the frame, this worker's TASK with its
- * FILES, DELIVERABLE and contract part, the RULES, then the quoted
+ * FILES, DELIVERABLE and contract part, its subagent PROFILE, the RULES, then the quoted
  * ORIGINAL REQUEST, then one line naming the task again.
  *
  * Task first because a brief is cut from the end. The request used to
@@ -252,6 +267,9 @@ export function renderWorkerBrief(
   }
   if (options.contract) {
     lines.push(``, ...quoteContract(options.contract, task.id));
+  }
+  if (task.agentProfile) {
+    lines.push(``, ...quoteProfile(task.agentProfile));
   }
   lines.push(
     ``,
