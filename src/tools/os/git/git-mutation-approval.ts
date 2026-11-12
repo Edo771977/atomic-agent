@@ -77,6 +77,7 @@ export async function requireGitMutationApproval(
       reason: request.reason,
       preview: request.preview,
       affectedResources: [request.repoRoot],
+      grantDirs: [request.repoRoot],
       workingDir: request.workingDir,
       trustConfigPaths: trustPaths,
     },
