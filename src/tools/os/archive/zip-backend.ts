@@ -12,6 +12,9 @@ import type {
 import {
   ExtractBudget,
   describeSanitizationError,
+  entryDiskPath,
+  pruneEscapingSymlinks,
+  realDestRoot,
   sanitizeEntryPath,
 } from "./archive-safety.js";
 
@@ -77,6 +80,8 @@ export class ZipBackend implements ArchiveBackend {
         : options.include.some(
             (prefix) => p === prefix || p.startsWith(prefix + "/"),
           );
+    const destReal = await realDestRoot(options.destDir);
+    const createdLinks: Array<{ normalised: string; absolute: string }> = [];
 
     for (const [rawName, file] of Object.entries(zip.files)) {
       const kind = classifyZipEntry(rawName, file);
@@ -89,9 +94,25 @@ export class ZipBackend implements ArchiveBackend {
         continue;
       }
       if (!includeMatches(sanitized.value.normalised)) continue;
+      // Symlink entries are created at their leaf; every other kind must not
+      // land on an existing symlink either.
+      const onDisk = await entryDiskPath(
+        destReal,
+        options.destDir,
+        sanitized.value.absolute,
+        kind !== "symlink",
+      );
+      if (!onDisk.ok) {
+        report.skippedEntries.push({
+          path: sanitized.value.normalised,
+          reason: onDisk.reason,
+        });
+        continue;
+      }
+      const absolute = onDisk.absolute;
 
       if (kind === "directory") {
-        await mkdir(sanitized.value.absolute, { recursive: true });
+        await mkdir(absolute, { recursive: true });
         continue;
       }
 
@@ -118,9 +139,10 @@ export class ZipBackend implements ArchiveBackend {
           });
           continue;
         }
-        await mkdir(dirname(sanitized.value.absolute), { recursive: true });
+        await mkdir(dirname(absolute), { recursive: true });
         try {
-          await symlink(target, sanitized.value.absolute);
+          await symlink(target, absolute);
+          createdLinks.push({ normalised: sanitized.value.normalised, absolute });
           report.extractedEntries++;
         } catch (err) {
           report.warnings.push(
@@ -140,7 +162,7 @@ export class ZipBackend implements ArchiveBackend {
         continue;
       }
 
-      if (!options.overwrite && (await pathExists(sanitized.value.absolute))) {
+      if (!options.overwrite && (await pathExists(absolute))) {
         report.skippedEntries.push({
           path: sanitized.value.normalised,
           reason: "destination exists and overwrite=false",
@@ -148,12 +170,19 @@ export class ZipBackend implements ArchiveBackend {
         continue;
       }
 
-      await mkdir(dirname(sanitized.value.absolute), { recursive: true });
-      await writeFile(sanitized.value.absolute, nodeBuf);
+      await mkdir(dirname(absolute), { recursive: true });
+      await writeFile(absolute, nodeBuf);
       report.extractedEntries++;
       report.totalBytesWritten += nodeBuf.length;
     }
 
+    for (const path of await pruneEscapingSymlinks(destReal, createdLinks)) {
+      report.extractedEntries--;
+      report.skippedEntries.push({
+        path,
+        reason: "symlink target does not resolve inside destDir",
+      });
+    }
     return report;
   }
 }

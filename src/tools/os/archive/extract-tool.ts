@@ -42,7 +42,8 @@ export interface ExtractArchiveToolOptions extends FsDangerousToolOptions {
  *   - Per-entry / total-size / entry-count caps to blunt decompression
  *     bombs.
  *   - Symlinks skipped by default; opt in via `followSymlinks=true`, and
- *     even then the link target must resolve inside destDir.
+ *     even then the link target must resolve inside destDir (checked on
+ *     disk with realpath) and no entry is ever written through a symlink.
  *
  * The tool itself routes every call through the approval gate — it is a
  * write operation by definition and should never surprise the user.

@@ -1,4 +1,5 @@
-import { resolve, sep } from "node:path";
+import { lstat, mkdir, realpath, unlink } from "node:fs/promises";
+import { join, relative, resolve, sep } from "node:path";
 import type { ExtractLimits } from "./archive-types.js";
 
 /**
@@ -77,6 +78,82 @@ export function sanitizeEntryPath(
     ok: true,
     value: { normalised, absolute: candidate },
   };
+}
+
+/**
+ * On-disk containment. `sanitizeEntryPath` only vets names; a symlink the
+ * archive created earlier (`x/up -> ..`) would let a later entry
+ * (`x/up/e/pwned.txt`) be written outside destDir by a plain writeFile.
+ * Backends therefore resolve destDir once with `realDestRoot` and, before
+ * touching the filesystem for an entry, call `entryDiskPath`, which refuses
+ * any entry whose path passes through (or, with `includeLeaf`, ends at) an
+ * existing symlink. Nothing is ever written through a symlink.
+ */
+export async function realDestRoot(destDir: string): Promise<string> {
+  await mkdir(destDir, { recursive: true });
+  return realpath(destDir);
+}
+
+export type DiskPathResult =
+  { ok: true; absolute: string } | { ok: false; reason: string };
+
+export async function entryDiskPath(
+  destReal: string,
+  destDir: string,
+  sanitizedAbsolute: string,
+  includeLeaf: boolean,
+): Promise<DiskPathResult> {
+  const rel = relative(resolve(destDir), sanitizedAbsolute);
+  const parts = rel.split(sep).filter((p) => p.length > 0);
+  const last = includeLeaf ? parts.length : parts.length - 1;
+  let current = destReal;
+  for (let i = 0; i < last; i++) {
+    current = join(current, parts[i]!);
+    let isLink: boolean;
+    try {
+      isLink = (await lstat(current)).isSymbolicLink();
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") break;
+      throw err;
+    }
+    if (isLink) {
+      return {
+        ok: false,
+        reason: `path passes through a symlink (${parts.slice(0, i + 1).join("/")}); writing through symlinks is refused`,
+      };
+    }
+  }
+  return { ok: true, absolute: join(destReal, ...parts) };
+}
+
+/**
+ * After extraction, remove every symlink the archive created whose real
+ * target is outside destDir (or does not resolve at all). A name-level
+ * check cannot see chains such as `a -> b/..` with `b -> ..`.
+ * Returns the normalised paths that were removed.
+ */
+export async function pruneEscapingSymlinks(
+  destReal: string,
+  created: Array<{ normalised: string; absolute: string }>,
+): Promise<string[]> {
+  const removed: string[] = [];
+  for (const link of created) {
+    let inside = false;
+    try {
+      inside = isInsideDir(destReal, await realpath(link.absolute));
+    } catch {
+      inside = false;
+    }
+    if (!inside) {
+      await unlink(link.absolute).catch(() => undefined);
+      removed.push(link.normalised);
+    }
+  }
+  return removed;
+}
+
+function isInsideDir(dir: string, candidate: string): boolean {
+  return candidate === dir || candidate.startsWith(dir + sep);
 }
 
 /**
