@@ -212,6 +212,25 @@ function secretNameStrength(name: string): NameStrength {
   return STRONG_NAME.test(normalised) ? "strong" : "weak";
 }
 
+/**
+ * Last name parts that say the value *is* the credential (`openai_api_key`,
+ * `github_token`, `db_password`), as opposed to a name that only mentions
+ * one (`password_manager`, `token_budget`).
+ */
+const SECRET_HOLDER_SUFFIX =
+  /(?:^|_)(?:API_?KEY|SECRET(?:_KEY)?|TOKEN|PASSWORD|PASSWD|PASSPHRASE|CREDENTIALS?|PRIVATE_KEY|ACCESS_KEY|AUTH_KEY|PAT)$/;
+
+/**
+ * Whether `name` (any case or separator style) names a value that holds a
+ * credential: the detector's secret-name test, ending in a credential part.
+ * Used to refuse durable memory keys such as `openai_api_key`.
+ */
+export function isSecretHoldingName(name: string): boolean {
+  const normalised = normaliseName(name);
+  if (NOT_SECRET_NAME.test(normalised)) return false;
+  return isSecretEnvName(normalised) && SECRET_HOLDER_SUFFIX.test(normalised);
+}
+
 const LITERAL_WORDS =
   /^(?:true|false|null|none|nil|undefined|yes|no|on|off|enabled|disabled|required|optional|string|number|boolean|redacted|hidden|secret|password|changeme)$/i;
 

@@ -6,6 +6,7 @@ import { dirname } from "node:path";
 import type { AgentMetrics } from "../tracing/agent-metrics.js";
 
 import { applyMigrations } from "./memory-schema.js";
+import { containsSecret, SECRET_REFUSAL } from "./memory-secret-guard.js";
 import type { EmbeddingStore } from "./embeddings/embedding-store.js";
 import type { EmbeddingWriter } from "./embeddings/embedding-writer.js";
 import {
@@ -1249,6 +1250,9 @@ function validateContent(raw: unknown): string {
       "content",
       `memory content must be at most ${MEMORY_CONTENT_MAX_LENGTH} chars`,
     );
+  }
+  if (containsSecret(trimmed)) {
+    throw new MemoryValidationError("content", `memory content ${SECRET_REFUSAL}`);
   }
   return trimmed;
 }

@@ -4,6 +4,7 @@ import {
   REFLECTION_KNOWN_PROFILE_MAX_FACTS,
   REFLECTION_MESSAGE_CHAR_CAP,
   REFLECTION_STABLE_PREFIX,
+  REFLECTION_STABLE_PREFIX_ANY_SPEAKER,
   REFLECTION_STABLE_PREFIX_TYPED,
   buildReflectionPrompt,
 } from "./reflection-prompt.js";
@@ -68,7 +69,7 @@ describe("buildReflectionPrompt", () => {
 
       SET has two flavours:
       - Default (pinned) — the fact is always rendered into \`### profile\`. Use for truly identity-level facts that apply to most turns (name, primary language, timezone).
-      - Contextual — the fact is ONLY rendered when a keyword hits the current user message. Use for rare/large context (deploy commands, per-feature preferences, per-project env snippets). Emit as: SET key=value [pinned=false; keywords=a,b,c]. The [...] marker MUST be on the same line, keywords comma-separated, lowercase, 1–8 entries.
+      - Contextual — the fact is ONLY rendered when a keyword hits the current user message. Use for rare/large context (deploy commands, per-feature preferences, per-project build commands). Emit as: SET key=value [pinned=false; keywords=a,b,c]. The [...] marker MUST be on the same line, keywords comma-separated, lowercase, 1–8 entries.
 
       Bi-temporal versioning:
       - Every SET preserves history automatically — re-writing the same key never erases the previous version. The earlier value is still available via the \`memory.profile.history\` tool.
@@ -80,6 +81,7 @@ describe("buildReflectionPrompt", () => {
       - Never invent identity details (name, nickname, role, age, location); record a name only if the USER typed it.
       - A one-off instruction for the current reply ("reply exactly X", "don't use tools for this", test or ping messages) is not a preference.
       - Never copy wording or example values from these instructions into the output.
+      - Never store API keys, tokens, passwords or other credentials, in a SET or a NOTE.
       - Write NOTE bodies about the user in the third person ("The user prefers ..."), never as "I ..." or "you ...".
       - When unsure, output NONE.
       - Skip trivia, chit-chat, weather, transient moods, facts about the AI itself.
@@ -137,6 +139,21 @@ describe("buildReflectionPrompt", () => {
     expect(REFLECTION_STABLE_PREFIX_TYPED).toContain(
       "NEVER use for events or behaviors",
     );
+  });
+
+  // Root contract: secrets never become durable prompt facts. No prefix
+  // may invite env snippets, and every prefix forbids credentials.
+  it("every reflection prefix forbids storing credentials", () => {
+    for (const prefix of [
+      REFLECTION_STABLE_PREFIX,
+      REFLECTION_STABLE_PREFIX_TYPED,
+      REFLECTION_STABLE_PREFIX_ANY_SPEAKER,
+    ]) {
+      expect(prefix).not.toContain("env snippets");
+      expect(prefix).toContain(
+        "Never store API keys, tokens, passwords or other credentials",
+      );
+    }
   });
 
   // B09: a small local model copied the prompt's own example name

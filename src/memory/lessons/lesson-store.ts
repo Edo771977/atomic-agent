@@ -6,6 +6,7 @@ import { dirname } from "node:path";
 import type { AgentMetrics } from "../../tracing/agent-metrics.js";
 
 import { applyMigrations } from "../memory-schema.js";
+import { containsSecret, SECRET_REFUSAL } from "../memory-secret-guard.js";
 
 /**
  * Memory-v2 phase 5. A lesson is a distilled summary produced by the
@@ -670,6 +671,9 @@ function validateActivation(raw: unknown): string {
       `activation must be at most ${LESSON_ACTIVATION_MAX_LENGTH} chars`,
     );
   }
+  if (containsSecret(trimmed)) {
+    throw new LessonValidationError("activation", `activation ${SECRET_REFUSAL}`);
+  }
   return trimmed;
 }
 
@@ -686,6 +690,9 @@ function validatePrinciple(raw: unknown): string {
       "principle",
       `principle must be at most ${LESSON_PRINCIPLE_MAX_LENGTH} chars`,
     );
+  }
+  if (containsSecret(trimmed)) {
+    throw new LessonValidationError("principle", `principle ${SECRET_REFUSAL}`);
   }
   return trimmed;
 }

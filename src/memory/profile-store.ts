@@ -17,6 +17,11 @@ import {
   ProfileEvictor,
   type ProfileEviction,
 } from "./profile-eviction.js";
+import {
+  containsSecret,
+  isSecretKey,
+  SECRET_REFUSAL,
+} from "./memory-secret-guard.js";
 
 // TODO(memory-v2 phase 7a): add `vote_score REAL` column (clamped to
 // `±memory.voting.maxVotePerItem`); expose `applyVote(key, delta)`,
@@ -322,6 +327,9 @@ export class ProfileStore {
     nowArg?: number,
   ): ProfileFact {
     const normalisedKey = validateKey(key);
+    if (isSecretKey(normalisedKey)) {
+      throw new ProfileValidationError("key", `profile key ${SECRET_REFUSAL}`);
+    }
     const normalisedValue = validateValue(value);
     const options: ProfileSetOptions =
       typeof optionsOrNow === "object" && optionsOrNow !== null
@@ -656,6 +664,9 @@ function validateValue(raw: unknown): string {
       "value",
       `profile value must be at most ${PROFILE_VALUE_MAX_LENGTH} chars`,
     );
+  }
+  if (containsSecret(raw)) {
+    throw new ProfileValidationError("value", `profile value ${SECRET_REFUSAL}`);
   }
   return raw;
 }

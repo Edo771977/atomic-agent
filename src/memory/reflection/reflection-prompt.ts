@@ -55,7 +55,7 @@ Two output channels:
 
 SET has two flavours:
 - Default (pinned) — the fact is always rendered into \`### profile\`. Use for truly identity-level facts that apply to most turns (name, primary language, timezone).
-- Contextual — the fact is ONLY rendered when a keyword hits the current user message. Use for rare/large context (deploy commands, per-feature preferences, per-project env snippets). Emit as: SET key=value [pinned=false; keywords=a,b,c]. The [...] marker MUST be on the same line, keywords comma-separated, lowercase, 1–8 entries.
+- Contextual — the fact is ONLY rendered when a keyword hits the current user message. Use for rare/large context (deploy commands, per-feature preferences, per-project build commands). Emit as: SET key=value [pinned=false; keywords=a,b,c]. The [...] marker MUST be on the same line, keywords comma-separated, lowercase, 1–8 entries.
 
 Bi-temporal versioning:
 - Every SET preserves history automatically — re-writing the same key never erases the previous version. The earlier value is still available via the \`memory.profile.history\` tool.
@@ -78,6 +78,7 @@ Rules:
 - Never invent identity details (name, nickname, role, age, location); record a name only if the USER typed it.
 - A one-off instruction for the current reply ("reply exactly X", "don't use tools for this", test or ping messages) is not a preference.
 - Never copy wording or example values from these instructions into the output.
+- Never store API keys, tokens, passwords or other credentials, in a SET or a NOTE.
 - Write NOTE bodies about the user in the third person ("The user prefers ..."), never as "I ..." or "you ...".
 - When unsure, output NONE.
 - Use SET for anything that looks like a stable attribute of the user. Prefer short snake_case keys (e.g. name, timezone, trip_lisbon_plan). Keep each SET value under 200 characters.
@@ -144,6 +145,7 @@ Rules:
 - Use SET for atomic single-valued facts. Use NOTE for narrative episodes, decisions, or multi-attribute context.
 - Keep each SET value under 200 characters and each NOTE body under 500 characters.
 - Skip pure pleasantries, weather, transient moods.
+- Never store API keys, tokens, passwords or other credentials, in a SET or a NOTE.
 - If a SET already captures the fact, do not also emit a NOTE repeating it.
 - If there is truly nothing concrete worth remembering, output exactly: NONE
 - Otherwise output up to six lines total.
@@ -163,7 +165,7 @@ Two output channels:
 
 SET has two flavours:
 - Default (pinned) — the fact is always rendered into \`### profile\`. Use for truly identity-level facts that apply to most turns (name, primary language, timezone).
-- Contextual — the fact is ONLY rendered when a keyword hits the current user message. Use for rare/large context (deploy commands, per-feature preferences, per-project env snippets). Emit as: SET key=value [pinned=false; keywords=a,b,c]. The [...] marker MUST be on the same line, keywords comma-separated, lowercase, 1–8 entries.
+- Contextual — the fact is ONLY rendered when a keyword hits the current user message. Use for rare/large context (deploy commands, per-feature preferences, per-project build commands). Emit as: SET key=value [pinned=false; keywords=a,b,c]. The [...] marker MUST be on the same line, keywords comma-separated, lowercase, 1–8 entries.
 
 Bi-temporal versioning:
 - Every SET preserves history automatically — re-writing the same key never erases the previous version. The earlier value is still available via the \`memory.profile.history\` tool.
@@ -175,6 +177,7 @@ Rules:
 - Never invent identity details (name, nickname, role, age, location); record a name only if the USER typed it.
 - A one-off instruction for the current reply ("reply exactly X", "don't use tools for this", test or ping messages) is not a preference.
 - Never copy wording or example values from these instructions into the output.
+- Never store API keys, tokens, passwords or other credentials, in a SET or a NOTE.
 - Write NOTE bodies about the user in the third person ("The user prefers ..."), never as "I ..." or "you ...".
 - When unsure, output NONE.
 - Skip trivia, chit-chat, weather, transient moods, facts about the AI itself.
