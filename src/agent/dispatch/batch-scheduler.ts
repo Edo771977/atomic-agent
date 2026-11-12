@@ -455,16 +455,20 @@ export async function executeBatch(
     );
   }
 
+  // Every group settles before the batch returns: a cancellation in one
+  // group must not hand the step back while another is still running,
+  // or that group's result would land in `slots` and its
+  // `onCallFinished` fire after the step moved on (possibly into the
+  // next turn's hook). The other groups see the aborted signal at their
+  // next call and stop there.
   let cancelled = false;
-  try {
-    await Promise.all(groupTasks);
-  } catch (err) {
-    if (err instanceof CancelledError) {
-      cancelled = true;
-    } else {
-      throw err;
-    }
+  let failure: { error: unknown } | null = null;
+  for (const settled of await Promise.allSettled(groupTasks)) {
+    if (settled.status === "fulfilled") continue;
+    if (settled.reason instanceof CancelledError) cancelled = true;
+    else failure ??= { error: settled.reason };
   }
+  if (failure !== null) throw failure.error;
 
   // Tail-terminal barrier: now that every non-terminal call has
   // settled (success, error, or cancelled), run the terminal call
