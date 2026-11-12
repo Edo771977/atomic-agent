@@ -169,12 +169,21 @@ export class ProviderFallbackChain {
     );
 
     const idx = chain.indexOf(fromId);
-    // Next healthy link after `fromId`. When `fromId` is not in the chain
-    // (raced config edit) start from the top.
+    // Next healthy link after `fromId`: one whose cooldown has elapsed, so
+    // a probe of the primary does not walk back through a middle link that
+    // just failed. When every remaining link is cooling, the first of them
+    // is still tried as a last resort rather than failing the turn. When
+    // `fromId` is not in the chain (raced config edit) start from the top.
     const startFrom = idx < 0 ? 0 : idx + 1;
-    for (let i = startFrom; i < chain.length; i += 1) {
-      const candidate = chain[i]!;
-      if (candidate === fromId) continue;
+    const now = this.now();
+    const remaining = chain
+      .slice(startFrom)
+      .filter((candidate) => candidate !== fromId);
+    const candidate =
+      remaining.find(
+        (id) => now >= (p.breakers.get(id)?.cooldownUntil ?? 0),
+      ) ?? remaining[0];
+    if (candidate !== undefined) {
       logFallbackAdvance(this.logger, {
         from: fromId,
         to: candidate,

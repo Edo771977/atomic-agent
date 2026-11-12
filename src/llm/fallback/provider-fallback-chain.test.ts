@@ -302,6 +302,41 @@ describe("ProviderFallbackChain", () => {
     expect(chain.advanceFrom("c", http(500))).toBeNull();
   });
 
+  it("skips a middle link still in cooldown when a probe of the primary fails", () => {
+    const clock = makeClock();
+    const chain = new ProviderFallbackChain({
+      resolve: () => chainOf(["a", "b", "c"]),
+      now: clock.now,
+    });
+    // Turn 1: a 503s (30s cooldown); b is tried 10s later and 503s too
+    // (cooling until +40s); c serves and becomes the override.
+    expect(chain.pickProvider()).toEqual({ providerId: "a", isProbe: false });
+    expect(chain.advanceFrom("a", http(503))).toBe("b");
+    clock.advance(10_000);
+    expect(chain.advanceFrom("b", http(503))).toBe("c");
+    chain.recordSuccess("c", false);
+    expect(chain.activeOverride).toBe("c");
+
+    // a's cooldown has elapsed, b's has not: the probe of a fails and the
+    // chain goes straight to c, leaving the override on c.
+    clock.advance(21_000);
+    expect(chain.pickProvider()).toEqual({ providerId: "a", isProbe: true });
+    expect(chain.advanceFrom("a", http(503))).toBe("c");
+    expect(chain.activeOverride).toBe("c");
+  });
+
+  it("still tries a cooling link when every remaining link is cooling", () => {
+    const clock = makeClock();
+    const chain = new ProviderFallbackChain({
+      resolve: () => chainOf(["a", "b", "c"]),
+      now: clock.now,
+    });
+    // b and c are both in cooldown; a fails: b is the last resort.
+    chain.advanceFrom("b", http(503));
+    chain.advanceFrom("c", http(503));
+    expect(chain.advanceFrom("a", http(503))).toBe("b");
+  });
+
   it("emits exactly one 'away' notice across a multi-hop exhaustion in one turn", () => {
     const notices: ProviderSwitchNotice[] = [];
     const chain = new ProviderFallbackChain({
