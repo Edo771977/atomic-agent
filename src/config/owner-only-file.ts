@@ -1,5 +1,7 @@
-import { chmodSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, renameSync, unlinkSync } from "node:fs";
+import { dirname } from "node:path";
 
+import { syncDirectoryBestEffort, writeFileSyncedSync } from "./durable-write.js";
 import { restrictWindowsAcl } from "./windows-acl.js";
 
 /** Owner read/write only: the mode `config.json` and `.env` are kept at. */
@@ -20,7 +22,9 @@ export const OWNER_ONLY_FILE_MODE = 0o600;
  * The tmp file is created exclusively, after removing one a crash may
  * have left: a leftover keeps the mode it was created with, and writing
  * into it would put the new content on disk at that mode until the
- * rename.
+ * rename. It is fsynced before the rename and the directory after it
+ * (best effort), so a power loss leaves the old file or the new one,
+ * never an empty one.
  *
  * Windows has no POSIX modes, so the chmod is a no-op there. Instead the
  * tmp file's ACL is narrowed to the current user (`restrictWindowsAcl`,
@@ -41,8 +45,7 @@ export function writeOwnerOnlyFileAtomicSync(
   } catch {
     // none left behind — the usual case
   }
-  writeFileSync(tmp, payload, {
-    encoding: "utf8",
+  writeFileSyncedSync(tmp, payload, {
     mode: OWNER_ONLY_FILE_MODE,
     flag: "wx",
   });
@@ -61,6 +64,7 @@ export function writeOwnerOnlyFileAtomicSync(
     }
     throw err;
   }
+  syncDirectoryBestEffort(dirname(path));
   // Creation masks the mode with the umask, which only ever removes bits;
   // chmod again so the result does not depend on the platform keeping it.
   try {

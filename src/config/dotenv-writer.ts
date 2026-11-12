@@ -5,10 +5,10 @@ import {
   readFileSync,
   renameSync,
   unlinkSync,
-  writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
 
+import { syncDirectoryBestEffort, writeFileSyncedSync } from "./durable-write.js";
 import { restrictWindowsAcl } from "./windows-acl.js";
 
 /**
@@ -95,7 +95,9 @@ export function setDotenvKey(
 
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.tmp-${process.pid}`;
-  writeFileSync(tmp, updated, { encoding: "utf8", mode: SECRET_FILE_MODE });
+  // Flushed before the rename, the directory after it: a power loss
+  // leaves the old `.env` or the new one, never an empty file.
+  writeFileSyncedSync(tmp, updated, { mode: SECRET_FILE_MODE });
   try {
     renameSync(tmp, path);
   } catch (err) {
@@ -106,6 +108,7 @@ export function setDotenvKey(
     }
     throw err;
   }
+  syncDirectoryBestEffort(dirname(path));
   // `rename` preserves the source-mode on most platforms but a few do
   // not; chmod again to be defensive. Cheap and idempotent.
   try {
