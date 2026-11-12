@@ -471,6 +471,16 @@ describe("openai stream consumer chunk boundaries", () => {
     expect(crCut.result.terminalObserved).toBe(true);
   });
 
+  it("yields nothing for a keep-alive comment event", async () => {
+    const iterator = createOpenAiStreamConsumer("delta_reasoning").consume(
+      bodyOf(": OPENROUTER PROCESSING\n\n" + TWO_FRAMES),
+      undefined,
+    );
+    const first = await iterator.next();
+    expect(first.done).toBe(false);
+    expect(first.value).toMatchObject({ delta: "hello ", done: false });
+  });
+
   it("keeps tool-call arguments split across reads", async () => {
     const body =
       toolCallFrame([

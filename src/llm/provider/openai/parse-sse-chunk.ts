@@ -56,6 +56,12 @@ export function parseOpenAiSseEvent(
    * The consumer throws on it; a chunk carrying one has no delta.
    */
   error: { status: number | null; message: string } | null;
+  /**
+   * The event carried no `data:` line: a keep-alive comment
+   * (`: OPENROUTER PROCESSING`) or a bare `event:`/`id:` frame. It is
+   * not provider output, so the consumer does not yield it.
+   */
+  noData?: true;
 } {
   const dataLines: string[] = [];
   for (const line of rawEvent.split(SSE_LINE_BREAK)) {
@@ -78,6 +84,7 @@ export function parseOpenAiSseEvent(
       toolCallDeltas: [],
       id: null,
       error: null,
+      noData: true,
     };
   }
   const joined = dataLines.join("\n");

@@ -173,6 +173,14 @@ export function createOpenAiStreamConsumer(
               reasoning,
               toolArgsBuffer,
             );
+            if (chunk.noData === true) {
+              // A keep-alive comment is not output: yielding it would
+              // commit the stream, and a socket that died before any real
+              // delta could then no longer be reopened. The transport's
+              // body deadline still re-arms on its bytes.
+              boundary = buffer.indexOf("\n\n");
+              continue;
+            }
             generationId = chunk.id ?? generationId;
             if (chunk.error !== null) {
               // Whatever streamed before this is billed under the id;

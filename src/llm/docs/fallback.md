@@ -13,7 +13,7 @@ The fallback breaker reads live chain configuration and partitions mutable state
 
 ## Streams and transport
 
-Opening/priming a stream can fail over before committed output. Once output is committed, restarting risks duplicating visible text or side effects. Cancellation must propagate as cancellation rather than advancing the provider chain.
+Opening/priming a stream can fail over before committed output; an SSE keep-alive comment is not output and does not commit the stream. Once output is committed, restarting risks duplicating visible text or side effects. Cancellation must propagate as cancellation rather than advancing the provider chain.
 
 Fallback completions and chunks carry servedTransport. Parsing and live reasoning detection use the actual serving link, including when a native-tools primary falls back to grammar. The primary's capabilities are not proof of what the fallback served. Cross-provider strict/parallel capability handling and grammar-primary/native-tail payload limitations remain explicit implementation constraints.
 
