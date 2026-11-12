@@ -50,7 +50,7 @@ export function checkShellCommandGuardWithRules(
   for (const rule of rules) {
     try {
       const verdict = rule.match(normalised.command, input);
-      if (verdict !== null) return verdict;
+      if (verdict !== null) return confineAllowToSingleCommand(verdict, rule, input);
     } catch {
       return {
         action: "approval_required",
@@ -64,6 +64,36 @@ export function checkShellCommandGuardWithRules(
     action: "approval_required",
     rule: "default",
     reason: "no shell guard rule matched; approval required",
+  };
+}
+
+/**
+ * Shell syntax that ends one command and starts another, or runs one
+ * inside another: newlines, `;`, `&`, `|`, backticks, `$(`, process
+ * substitution and grouping, plus redirects (a write the rule never
+ * judged). Quoted occurrences count too: the check errs towards asking.
+ */
+const COMPOUND_SHELL_SYNTAX = /[\n\r;&|`<>()]/;
+
+/**
+ * The safe-allow and trusted rules judge one command by its first word.
+ * On a subshell line that also chains, pipes or substitutes another
+ * command, their allow would cover commands they never read, so it
+ * becomes an approval instead. Refusals and approvals pass through.
+ */
+function confineAllowToSingleCommand(
+  verdict: GuardVerdict,
+  rule: Rule,
+  input: GuardInput,
+): GuardVerdict {
+  if (verdict.action !== "allow") return verdict;
+  if (rule.layer !== "safe-allow" && rule.layer !== "trusted") return verdict;
+  if (input.shellLine === undefined) return verdict;
+  if (!COMPOUND_SHELL_SYNTAX.test(input.shellLine)) return verdict;
+  return {
+    action: "approval_required",
+    rule: "guard.compound_line",
+    reason: `${verdict.rule} covers one command; the line chains or substitutes others`,
   };
 }
 

@@ -66,7 +66,7 @@ export function guardVerifyCommand(
   const tokens = useShell ? commandLine.split(/\s+/).filter((t) => t.length > 0) : null;
   const input =
     tokens !== null && tokens.length > 0
-      ? { cmd: tokens[0]!, rawArgs: tokens.slice(1), cwd }
+      ? { cmd: tokens[0]!, rawArgs: tokens.slice(1), cwd, shellLine: commandLine }
       : { cmd, rawArgs: execArgs, cwd };
   return (
     (useShell

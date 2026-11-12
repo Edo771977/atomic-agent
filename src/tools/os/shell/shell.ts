@@ -193,7 +193,12 @@ export function buildOsShellTool(options: OsShellToolOptions): ToolDefinition {
       : null;
     const guardInput =
       useShell && guardTokens && guardTokens.length > 0
-        ? { cmd: guardTokens[0]!, rawArgs: guardTokens.slice(1), cwd }
+        ? {
+            cmd: guardTokens[0]!,
+            rawArgs: guardTokens.slice(1),
+            cwd,
+            shellLine: commandLine,
+          }
         : { cmd, rawArgs: execArgs, cwd };
     const gogProbe = guardInput.cmd;
 

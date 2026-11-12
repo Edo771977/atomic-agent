@@ -381,3 +381,47 @@ describe("git remote-sync policy layer", () => {
     expect(guardWith(off, "rm", ["-rf", "/"]).rule).toMatch(/^hardline\./);
   });
 });
+
+describe("checkShellCommandGuard on a subshell line", () => {
+  function guardLine(line: string) {
+    const tokens = line.split(/\s+/).filter((t) => t.length > 0);
+    return checkShellCommandGuard({
+      cmd: tokens[0]!,
+      rawArgs: tokens.slice(1),
+      cwd: "/tmp",
+      shellLine: line,
+    });
+  }
+
+  it.each([
+    "echo hi\ntouch pwned.txt",
+    "gh pr list ; touch pwned.txt",
+    "gh pr list && touch pwned.txt",
+    "gh pr list | sh",
+    "gh pr view `touch pwned.txt`",
+    "gh pr view $(touch pwned.txt)",
+    "gh pr list > out.txt",
+    "icalBuddy eventsToday & touch pwned.txt",
+  ])("does not let a first-word allow cover %j", (line) => {
+    expect(guardLine(line)).toMatchObject({
+      action: "approval_required",
+      rule: "guard.compound_line",
+    });
+  });
+
+  it("keeps a single safe or trusted command allowed", () => {
+    expect(guardLine("echo hi there").action).toBe("allow");
+    expect(guardLine("gh pr list --limit 5").action).toBe("allow");
+    expect(guardLine("icalBuddy eventsToday").action).toBe("allow");
+  });
+
+  it("leaves refusals on a compound line untouched", () => {
+    expect(guardLine("echo hi ; rm -rf /").action).toBe("block");
+  });
+
+  it("rejects a newline in an echo argument even without the line", () => {
+    expect(guard("echo", ["hi\ntouch", "pwned.txt"]).action).toBe(
+      "approval_required",
+    );
+  });
+});
