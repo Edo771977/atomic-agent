@@ -155,8 +155,69 @@ export function buildCommandEnv(
   const env: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(base)) {
     if (typeof value !== "string") continue;
+    if (GIT_CONFIG_ENV_NAME.test(key)) continue;
     if (isSecretEnvName(key) && !allowed.has(key.toUpperCase())) continue;
     env[key] = value;
   }
+  Object.assign(env, filterGitConfigEnv(base, allowed));
+  return env;
+}
+
+/**
+ * Git's environment config (git >= 2.31): `GIT_CONFIG_COUNT=n` plus
+ * `GIT_CONFIG_KEY_i` / `GIT_CONFIG_VALUE_i` for each `i < n`. The set is
+ * all-or-nothing for git: a count whose key is missing makes every git
+ * command fail with "missing config key GIT_CONFIG_KEY_0". The name
+ * filter above would drop each `GIT_CONFIG_KEY_i` (a `KEY` segment) and
+ * keep the count, so it is handled here as a unit instead.
+ */
+const GIT_CONFIG_ENV_NAME = /^GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+)$/i;
+
+/**
+ * Git config entries that carry a credential in their value: an
+ * `http[.<url>].extraHeader` (an `Authorization:` header), a
+ * `credential[.<url>].helper` (an inline helper can print a password),
+ * or a URL with a password (`https://user:pass@host`) in the value or
+ * in the key (`url.<base>.insteadOf` names its URL in the key).
+ */
+const GIT_SECRET_CONFIG_KEY = /^(?:http\..*extraheader|credential\..*helper)$/i;
+const URL_WITH_PASSWORD = /:\/\/[^/\s:@]*:[^/\s@]+@/;
+
+/**
+ * The `GIT_CONFIG_*` set from `base` for the child: the same entries,
+ * minus those whose value carries a credential (unless their
+ * `GIT_CONFIG_VALUE_i` is in `passthrough`), renumbered from 0 with a
+ * matching count. A count that is not a number, or an entry without its
+ * key, is a set git would refuse anyway, and nothing of it is passed on.
+ */
+function filterGitConfigEnv(
+  base: NodeJS.ProcessEnv,
+  allowed: ReadonlySet<string>,
+): NodeJS.ProcessEnv {
+  const read = (name: string): string | undefined => {
+    if (typeof base[name] === "string") return base[name];
+    const match = Object.keys(base).find((key) => key.toUpperCase() === name);
+    return match === undefined ? undefined : base[match];
+  };
+  const countText = read("GIT_CONFIG_COUNT");
+  if (countText === undefined || !/^\d+$/.test(countText.trim())) return {};
+  const count = Number(countText.trim());
+  const entries: Array<[string, string]> = [];
+  for (let i = 0; i < count; i++) {
+    const key = read(`GIT_CONFIG_KEY_${i}`);
+    if (key === undefined) return {};
+    const value = read(`GIT_CONFIG_VALUE_${i}`) ?? "";
+    const secret =
+      GIT_SECRET_CONFIG_KEY.test(key.trim()) ||
+      URL_WITH_PASSWORD.test(key) ||
+      URL_WITH_PASSWORD.test(value);
+    if (secret && !allowed.has(`GIT_CONFIG_VALUE_${i}`)) continue;
+    entries.push([key, value]);
+  }
+  const env: NodeJS.ProcessEnv = { GIT_CONFIG_COUNT: String(entries.length) };
+  entries.forEach(([key, value], i) => {
+    env[`GIT_CONFIG_KEY_${i}`] = key;
+    env[`GIT_CONFIG_VALUE_${i}`] = value;
+  });
   return env;
 }
