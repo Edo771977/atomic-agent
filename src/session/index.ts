@@ -23,6 +23,7 @@ export type {
   PruneSessionsResult,
 } from "./session-retention.js";
 export {
+  describeSessionPinsFix,
   readSessionPins,
   readTaskPinnedSessionIds,
   readWebhookPinnedSessionIds,

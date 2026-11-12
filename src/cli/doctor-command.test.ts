@@ -91,6 +91,22 @@ describe("atag doctor (ATO-577)", () => {
     expect(statSync(cfgPath()).mode & 0o777).toBe(0o600);
   });
 
+  it("an unreadable session pin file is reported with the file and its fix", async () => {
+    save(USER_CONFIG_DEFAULTS);
+    writeFileSync(join(dir, "webhook-sessions.json"), "{ half");
+    expect(await run([])).toBe(0);
+    expect(out).toMatch(/warn {2}session-pins: could not read webhooks session pins from .*webhook-sessions\.json \(parse\)/);
+    expect(out).toContain("session retention skips its prune every start");
+    expect(out).toContain("is not valid JSON");
+  });
+
+  it("readable or missing session pin files are not reported", async () => {
+    save(USER_CONFIG_DEFAULTS);
+    writeFileSync(join(dir, "webhook-sessions.json"), '{"deploy":"s1"}');
+    await run([]);
+    expect(out).not.toContain("session-pins");
+  });
+
   it("an unknown option is a usage error", async () => {
     expect(await run(["--fxi"])).toBe(2);
   });

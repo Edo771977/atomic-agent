@@ -15,7 +15,7 @@ This area owns http and openai-compatible ingress. Read [AGENTS.md](AGENTS.md) b
 
 ## Ownership and dependencies
 
-The HTTP server owns request handling and connection cancellation; route modules translate transport payloads into runtime operations. Session routes use the existing turn/steering contract, and webhook routes materialize durable tasks. Runtime owns session execution, task storage and approval policy; routes must retain authentication and error mapping. MCP routes use [shared server-config commands](../config/mcp-server-commands.ts) and manager operations, independently of TUI.
+The HTTP server owns request handling and connection cancellation; route modules translate transport payloads into runtime operations. Session routes use the existing turn/steering contract, and webhook routes materialize durable tasks; the persistent-webhook session map moves a corrupt file aside to `.corrupt-<time>` instead of silently overwriting it. Runtime owns session execution, task storage and approval policy; routes must retain authentication and error mapping. MCP routes use [shared server-config commands](../config/mcp-server-commands.ts) and manager operations, independently of TUI.
 
 ## Task-specific reading
 

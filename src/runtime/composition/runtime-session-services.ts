@@ -1,7 +1,7 @@
 import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { AtomicAgentConfig } from "../../config/index.js";
-import { SessionPinsReadError, SessionStore, createEmptySessionState, createFusionWorkerSession, pruneSessions, readSessionPins, type FusionWorkerMeta, type SessionState } from "../../session/index.js";
+import { describeSessionPinsFix, SessionPinsReadError, SessionStore, createEmptySessionState, createFusionWorkerSession, pruneSessions, readSessionPins, type FusionWorkerMeta, type SessionState } from "../../session/index.js";
 import { WEBHOOK_SESSIONS_FILENAME } from "../../http/webhook-session-store.js";
 import type { StructuredLogger } from "../../tracing/structured-logger.js";
 import type { ShellJobRegistry } from "../../tools/os/shell/shell-jobs.js";
@@ -75,10 +75,13 @@ export function prepareRuntimeSessionStore(
         });
       } catch (err) {
         if (!(err instanceof SessionPinsReadError)) throw err;
+        // Every boot skips again until the file reads, so the warning
+        // carries the fix; `atomic-agent doctor` reports the same.
         logger.warn("session retention skipped: could not read session pins", {
           source: err.source,
           path: err.path,
           reason: err.reason,
+          fix: describeSessionPinsFix(err),
         });
         return sessionStore;
       }

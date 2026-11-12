@@ -45,6 +45,29 @@ export class SessionPinsReadError extends Error {
   }
 }
 
+/**
+ * What the operator should do about an unreadable pin file. Retention
+ * keeps skipping its pass until the file reads again (pruning blind
+ * could take a pinned session), so this is shown wherever the skip is
+ * reported: the boot warning and `atomic-agent doctor`.
+ */
+export function describeSessionPinsFix(err: SessionPinsReadError): string {
+  const { path, reason } = err;
+  if (reason === "EACCES" || reason === "EPERM") {
+    return `make ${path} readable by the user that runs atomic-agent (check ls -l "${path}", then chmod 600 "${path}")`;
+  }
+  if (err.source === "webhooks" && reason === "parse") {
+    return `${path} is not valid JSON; repair it by hand, or move it aside (its persistent webhook bindings are lost either way; the webhook store moves it to ${path}.corrupt-<time> the next time it starts)`;
+  }
+  if (err.source === "tasks" && (reason === "SQLITE_BUSY" || reason === "SQLITE_LOCKED")) {
+    return `another process held a lock on ${path}; this usually clears by the next start`;
+  }
+  if (err.source === "tasks") {
+    return `check ${path} with sqlite3 "${path}" "PRAGMA integrity_check"; restore it from a backup or move it aside (the scheduled tasks in it are lost if moved)`;
+  }
+  return `check that ${path} is readable, or move it aside`;
+}
+
 function failureReason(err: unknown, fallback: string): string {
   const code = (err as { code?: unknown } | null)?.code;
   return typeof code === "string" && code.length > 0 ? code : fallback;

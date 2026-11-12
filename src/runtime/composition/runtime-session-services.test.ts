@@ -72,6 +72,7 @@ describe("runtime session phases", () => {
     const warn = records.find(record => record.message === "session retention skipped: could not read session pins");
     expect(warn?.level).toBe("warn");
     expect(warn?.context).toMatchObject({ source: "webhooks", reason: "parse" });
+    expect(String(warn?.context?.fix)).toContain("/state/webhook-sessions.json.corrupt-");
   });
 
   it("an unreadable pin file on disk keeps every pinned session", async () => {

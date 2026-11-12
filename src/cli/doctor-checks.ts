@@ -3,6 +3,8 @@ import { delimiter, isAbsolute, join } from "node:path";
 
 import { ConfigValidationError, parseUserConfigFile } from "../config/index.js";
 import { readRawConfigTree } from "../config/config-paths.js";
+import { describeSessionPinsFix, readSessionPins, SessionPinsReadError } from "../session/index.js";
+import { WEBHOOK_SESSIONS_FILENAME } from "../http/webhook-session-store.js";
 import { checkCoreLocks } from "./doctor-core-lock.js";
 
 /**
@@ -140,11 +142,33 @@ function checkMcpCommands(ctx: DoctorContext): DoctorFinding[] {
   return out;
 }
 
+/**
+ * Session retention skips its prune on every boot while a pin file exists
+ * but cannot be read; only a log line says so. Reported here with the fix.
+ */
+function checkSessionPins(ctx: DoctorContext): DoctorFinding[] {
+  try {
+    readSessionPins({
+      tasksDbFile: join(ctx.stateDir, "tasks.sqlite"),
+      webhookSessionsFile: join(ctx.stateDir, WEBHOOK_SESSIONS_FILENAME),
+    });
+    return [];
+  } catch (err) {
+    if (!(err instanceof SessionPinsReadError)) throw err;
+    return [{
+      check: "session-pins",
+      status: "warn",
+      message: `${err.message}; session retention skips its prune every start until this is fixed. Fix: ${describeSessionPinsFix(err)}`,
+    }];
+  }
+}
+
 export const DOCTOR_CHECKS: ReadonlyArray<(ctx: DoctorContext) => DoctorFinding[]> = [
   checkConfig,
   checkConfigMode,
   checkMcpCommands,
   checkCoreLocks,
+  checkSessionPins,
 ];
 
 export function runDoctorChecks(ctx: DoctorContext): DoctorFinding[] {
