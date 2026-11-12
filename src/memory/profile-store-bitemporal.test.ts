@@ -20,8 +20,8 @@ import { ProfileStore } from "./profile-store.js";
  *   - Partial unique index `idx_profile_active_key` enforces "at
  *     most one active row per key" — pinned by inspecting the
  *     intermediate state via `db.prepare`.
- *   - `remove()` deletes only the active row; historical chain is
- *     preserved.
+ *   - `remove()` deletes the key's whole chain, superseded versions
+ *     included: a forgotten fact is not readable through `history`.
  *   - Legacy v6 → v7 migration produces one v7 row per legacy row
  *     with `valid_from = updated_at`, `superseded_by = NULL`.
  *   - The `agent.memory.profile.superseded` counter fires on every
@@ -62,6 +62,16 @@ function makeHarness(): Harness {
       rmSync(dir, { recursive: true, force: true });
     },
   };
+}
+
+/** Run SQL on the store's file through a second handle (simulates an older build). */
+function rawDelete(h: Harness, sql: string): void {
+  const db = new DatabaseCtor(join(h.dir, "memory.sqlite"));
+  try {
+    db.prepare(sql).run();
+  } finally {
+    db.close();
+  }
 }
 
 describe("ProfileStore (bi-temporal phase 4)", () => {
@@ -130,15 +140,35 @@ describe("ProfileStore (bi-temporal phase 4)", () => {
     }
   });
 
-  it("remove() deletes only the active row, history chain intact", () => {
+  it("remove() deletes the whole chain, superseded versions included", () => {
     h.store.set("language", "ru", 1_000);
     h.store.set("language", "en", 2_000);
     expect(h.store.remove("language")).toBe(true);
     expect(h.store.get("language")).toBeNull();
-    // Historical chain still walks the old `ru` row.
-    const chain = h.store.history("language");
-    expect(chain.length).toBe(1);
-    expect(chain[0]?.value).toBe("ru");
+    // A forgotten fact must not stay readable through its history.
+    expect(h.store.history("language")).toEqual([]);
+    expect(h.store.remove("language")).toBe(false);
+  });
+
+  it("remove() purges history left behind by an earlier active-only delete", () => {
+    h.store.set("deploy_cmd", "make old", 1_000);
+    h.store.set("deploy_cmd", "make new", 2_000);
+    // The previous remove() deleted only the active row.
+    rawDelete(h, "DELETE FROM profile_facts WHERE key = 'deploy_cmd' AND superseded_by IS NULL");
+    expect(h.store.history("deploy_cmd").map((f) => f.value)).toEqual(["make old"]);
+    expect(h.store.remove("deploy_cmd")).toBe(true);
+    expect(h.store.history("deploy_cmd")).toEqual([]);
+  });
+
+  it("remove() keeps another key's chain and clears its pointer into the removed one", () => {
+    h.store.set("editor", "vim", 1_000);
+    const next = h.store.set("ide", "vscode", { supersedesKey: "editor" }, 2_000);
+    expect(next.supersedes).not.toBeNull();
+    expect(h.store.remove("editor")).toBe(true);
+    expect(h.store.history("editor")).toEqual([]);
+    const ide = h.store.get("ide");
+    expect(ide?.value).toBe("vscode");
+    expect(ide?.supersedes).toBeNull();
   });
 
   it("history() returns empty when key has never been written", () => {

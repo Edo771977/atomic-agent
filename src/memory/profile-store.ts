@@ -203,7 +203,8 @@ export class ProfileStore {
   private readonly selectActiveByIdStmt: Database.Statement;
   private readonly selectAllActiveStmt: Database.Statement;
   private readonly historyByKeyStmt: Database.Statement;
-  private readonly deleteActiveStmt: Database.Statement;
+  private readonly deleteKeyStmt: Database.Statement;
+  private readonly clearSupersedesIntoKeyStmt: Database.Statement;
   private readonly markNameGroundingStmt: Database.Statement;
   private readonly markUnconfirmedNameGroundingStmt: Database.Statement;
 
@@ -284,9 +285,16 @@ export class ProfileStore {
         WHERE key = ?
         ORDER BY valid_from ASC, id ASC`,
     );
-    this.deleteActiveStmt = this.db.prepare(
-      `DELETE FROM profile_facts
-        WHERE key = ? AND superseded_by IS NULL`,
+    this.deleteKeyStmt = this.db.prepare(
+      `DELETE FROM profile_facts WHERE key = ?`,
+    );
+    // Another key's row that cross-key superseded a removed row keeps
+    // its own value but must not point at a row that no longer exists.
+    this.clearSupersedesIntoKeyStmt = this.db.prepare(
+      `UPDATE profile_facts
+          SET supersedes = NULL
+        WHERE key <> @key
+          AND supersedes IN (SELECT id FROM profile_facts WHERE key = @key)`,
     );
     // Metadata only: `updated_at` is left alone — it orders eviction,
     // and a check is not a write of the fact.
@@ -451,16 +459,23 @@ export class ProfileStore {
   }
 
   /**
-   * Delete the **active** row for `key`. Historical (superseded)
-   * rows are kept on disk — direct chain walks via `history(key)`
-   * still work. Returns `true` when a row was deleted.
+   * Forget `key`: delete every row for it, the active one and all
+   * superseded versions, so `history(key)` is empty afterwards. A row of
+   * another key that cross-key superseded one of them stays, with its
+   * `supersedes` pointer cleared; an older row of another key that one
+   * of them superseded stays superseded. Returns `true` when any row was
+   * deleted.
    */
   remove(key: string): boolean {
     const normalisedKey = validateKey(key);
-    const result = this.deleteActiveStmt.run(normalisedKey) as {
-      changes: number;
-    };
-    return result.changes > 0;
+    const changes = this.db.transaction((): number => {
+      this.clearSupersedesIntoKeyStmt.run({ key: normalisedKey });
+      const result = this.deleteKeyStmt.run(normalisedKey) as {
+        changes: number;
+      };
+      return result.changes;
+    })();
+    return changes > 0;
   }
 
   /**

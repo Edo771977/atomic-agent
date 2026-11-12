@@ -387,8 +387,8 @@ describe("importAtomicDesktop", () => {
         1_000,
       );
       target.profileStore.set("editor", "emacs", {}, 2_000);
-      // Changed and then removed here: its history says the key is the
-      // target's, so the desktop's value does not come back.
+      // Changed and then removed here: remove() forgets the whole
+      // history, so like any removed key the desktop's value is imported.
       target.profileStore.set("city", "Porto", {}, 2_000);
       target.profileStore.set("city", "Braga", {}, 3_000);
       target.profileStore.remove("city");
@@ -397,9 +397,9 @@ describe("importAtomicDesktop", () => {
       const result = await run();
 
       expect(result.ok).toBe(true);
-      expect(result.profileFacts).toEqual({ imported: 2, skipped: 2 });
+      expect(result.profileFacts).toEqual({ imported: 3, skipped: 1 });
       expect(target.profileStore.get("editor")?.value).toBe("emacs");
-      expect(target.profileStore.get("city")).toBeNull();
+      expect(target.profileStore.get("city")?.value).toBe("Lisbon");
       expect(target.profileStore.get("name")?.value).toBe("Desk");
       expect(target.profileStore.get("coffee")).toMatchObject({
         value: "flat white",
