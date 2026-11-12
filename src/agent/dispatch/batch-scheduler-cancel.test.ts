@@ -137,4 +137,44 @@ describe("cancellation across resource groups", () => {
     expect(out.results[0]!.compressed).toBeUndefined();
     expect(out.results[0]!.cancelled).toBe(true);
   });
+
+  it("reports cancelled rather than another group's failure once the turn is aborted", async () => {
+    const abort = new AbortController();
+    const reg = new ToolRegistry();
+    reg.register({
+      name: "browser.click",
+      description: "click",
+      readonly: false,
+      run: async () => {
+        abort.abort();
+        throw new CancelledError("cancelled by the operator");
+      },
+    });
+    reg.register({
+      name: "vision.describe",
+      description: "describe",
+      readonly: true,
+      run: async () => compressToolResult({ tool: "vision.describe", status: "ok", output: "a cat" }),
+    });
+    const out = await executeBatch(
+      toBatchInputs([
+        { tool: "vision.describe", args: {} },
+        { tool: "browser.click", args: { ref: "e1" } },
+      ]),
+      reg,
+      {
+        workingDir: "/tmp",
+        sessionId: "s1",
+        stepIndex: 0,
+        signal: abort.signal,
+        toolHooks: null,
+        // A broken observer makes the vision group reject with an
+        // ordinary error while the browser group is cancelled.
+        onCallFinished: () => {
+          throw new Error("observer failed");
+        },
+      },
+    );
+    expect(out.cancelled).toBe(true);
+  });
 });

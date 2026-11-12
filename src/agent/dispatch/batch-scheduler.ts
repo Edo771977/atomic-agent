@@ -489,7 +489,9 @@ export async function executeBatch(
     if (settled.reason instanceof CancelledError) cancelled = true;
     else failure ??= { error: settled.reason };
   }
-  if (failure !== null) {
+  // A cancelled turn surfaces as cancelled: once the turn's signal is
+  // aborted, another group's failure does not outrank the cancellation.
+  if (failure !== null && !ctx.signal.aborted) {
     closed = true;
     throw failure.error;
   }
