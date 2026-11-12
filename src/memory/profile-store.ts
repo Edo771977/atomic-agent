@@ -19,6 +19,7 @@ import {
 } from "./profile-eviction.js";
 import {
   containsSecret,
+  containsSecretPair,
   isSecretKey,
   SECRET_REFUSAL,
 } from "./memory-secret-guard.js";
@@ -331,6 +332,10 @@ export class ProfileStore {
       throw new ProfileValidationError("key", `profile key ${SECRET_REFUSAL}`);
     }
     const normalisedValue = validateValue(value);
+    // Apart, `pin` and `4821` say nothing; together they are a credential.
+    if (containsSecretPair(normalisedKey, normalisedValue)) {
+      throw new ProfileValidationError("value", `profile value ${SECRET_REFUSAL}`);
+    }
     const options: ProfileSetOptions =
       typeof optionsOrNow === "object" && optionsOrNow !== null
         ? optionsOrNow

@@ -22,6 +22,9 @@ const SLACK_USER = "xox" + "p-" + "123456789012-1234567890123-Ab12Cd34Ef56Gh78";
 const AWS = "AKIA" + "IOSFODNN7EXAMPLE";
 const GOOGLE = "AIza" + "SyA-0123456789abcdefghijklmnopqrstu";
 const HF = "hf_" + "Ab12Cd34Ef56Gh78Ij90Kl12Mn34Op56";
+const STRIPE_LIVE = "sk_" + "live_" + "51Ab12Cd34Ef56Gh78Ij90Kl";
+const STRIPE_RESTRICTED = "rk_" + "live_" + "51Ab12Cd34Ef56Gh78Ij90Kl";
+const TELEGRAM = "123456789" + ":" + "AAH" + "x9Kd2Lm8Pq4Rs7Tu1Vw5Xy3Za6Bc0Def";
 const JWT =
   "eyJ" + "hbGciOiJIUzI1NiJ9" + ".eyJ" + "zdWIiOiIxMjM0NTY3ODkwIn0" + ".dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U";
 const PEM_BODY = "MIIEpAIBAAKCAQEA1234567890abcdefABCDEF+/xyz\nQWERTYuiop0987654321asdfghjklZXCVBNM==";
@@ -40,6 +43,9 @@ describe("maskSecrets: vendor key shapes", () => {
     ["AWS access key id", AWS, "aws-access-key"],
     ["Google API key", GOOGLE, "google-key"],
     ["Hugging Face token", HF, "hf-token"],
+    ["Stripe secret key", STRIPE_LIVE, "stripe-key"],
+    ["Stripe restricted key", STRIPE_RESTRICTED, "stripe-key"],
+    ["Telegram bot token", TELEGRAM, "telegram-bot-token"],
     ["JWT", JWT, "jwt"],
   ])("replaces a %s with a labelled marker", (_name, secret, label) => {
     const out = maskSecrets(`found ${secret} in the log`);
@@ -223,6 +229,8 @@ describe("maskSecrets: ordinary output is left alone", () => {
     ["prose with bearer and basic", "Bearer of bad news. The bearer tokenization-strategies doc. Basic authentication-explained."],
     ["a URL with a port and no password", "http://localhost:8080/v1/chat ssh://git@github.com/o/r.git"],
     ["clock times and versions", "12:30:45 version: 1.2.3 key: value"],
+    ["a Stripe publishable key", "pk_live_51Ab12Cd34Ef56Gh78Ij90Kl"],
+    ["an id and a slug after a colon", "build 202611120:release-candidate-branch-for-arm-os"],
   ])("leaves %s unchanged", (_name, text) => {
     expect(maskSecrets(text)).toBe(text);
   });

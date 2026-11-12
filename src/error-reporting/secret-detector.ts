@@ -126,6 +126,26 @@ const SHAPE_RULES: readonly Rule[] = [
   shape(/(?<![A-Za-z0-9+/])(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Za-z0-9+/=])/g, ["AKIA", "ASIA"], "aws-access-key"),
   shape(/(?<![A-Za-z0-9+/_-])AIza[A-Za-z0-9_-]{35}(?![A-Za-z0-9_-])/g, "AIza", "google-key"),
   shape(/(?<![A-Za-z0-9_])hf_[A-Za-z0-9]{30,}(?![A-Za-z0-9_])/g, "hf_", "hf-token"),
+  // Stripe secret and restricted keys; `pk_…` publishable keys are public.
+  shape(
+    /(?<![A-Za-z0-9_])[sr]k_(?:live|test)_[A-Za-z0-9]{16,}(?![A-Za-z0-9_])/g,
+    ["sk_live_", "sk_test_", "rk_live_", "rk_test_"],
+    "stripe-key",
+  ),
+  {
+    // Telegram bot token: `<8-10 digit bot id>:<35-char secret>`. The
+    // secret part must mix letters with digits or case, so a `line:col`
+    // or an id followed by a word is not taken for one.
+    applies: (text) => /\d{8}:/.test(text),
+    apply: (text) =>
+      text.replace(
+        /(?<![A-Za-z0-9_:-])\d{8,10}:([A-Za-z0-9_-]{35})(?![A-Za-z0-9_-])/g,
+        (match, secret: string) =>
+          /[A-Za-z]/.test(secret) && (hasDigit(secret) || (/[a-z]/.test(secret) && /[A-Z]/.test(secret)))
+            ? redactedMarker("telegram-bot-token")
+            : match,
+      ),
+  },
   shape(
     /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g,
     "eyJ",
@@ -215,10 +235,12 @@ function secretNameStrength(name: string): NameStrength {
 /**
  * Last name parts that say the value *is* the credential (`openai_api_key`,
  * `github_token`, `db_password`), as opposed to a name that only mentions
- * one (`password_manager`, `token_budget`).
+ * one (`password_manager`, `token_budget`). `PAT` counts only after a
+ * service that issues personal access tokens (`github_pat`): alone it is
+ * a name (`favorite_pat`) as often as a token.
  */
 const SECRET_HOLDER_SUFFIX =
-  /(?:^|_)(?:API_?KEY|SECRET(?:_KEY)?|TOKEN|PASSWORD|PASSWD|PASSPHRASE|CREDENTIALS?|PRIVATE_KEY|ACCESS_KEY|AUTH_KEY|PAT)$/;
+  /(?:^|_)(?:API_?KEY|SECRET(?:_KEY)?|TOKEN|PASSWORD|PASSWD|PASSPHRASE|CREDENTIALS?|PRIVATE_KEY|ACCESS_KEY|AUTH_KEY|(?:GITHUB|GH|GITLAB|GL|AZURE|ADO|AZDO|DEVOPS|BITBUCKET|ATLASSIAN|JIRA|NPM|DOCKER|DOCKERHUB|HF|HUGGINGFACE)_PAT)$/;
 
 /**
  * Whether `name` (any case or separator style) names a value that holds a
