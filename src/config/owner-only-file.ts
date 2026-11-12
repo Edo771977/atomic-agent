@@ -1,7 +1,11 @@
-import { chmodSync, renameSync, unlinkSync } from "node:fs";
+import { chmodSync, unlinkSync } from "node:fs";
 import { dirname } from "node:path";
 
-import { syncDirectoryBestEffort, writeFileSyncedSync } from "./durable-write.js";
+import {
+  renameWithRetrySync,
+  syncDirectoryBestEffort,
+  writeFileSyncedSync,
+} from "./durable-write.js";
 import { restrictWindowsAcl } from "./windows-acl.js";
 
 /** Owner read/write only: the mode `config.json` and `.env` are kept at. */
@@ -55,7 +59,7 @@ export function writeOwnerOnlyFileAtomicSync(
     // Never fail a config write over permissions; see above.
   }
   try {
-    renameSync(tmp, path);
+    renameWithRetrySync(tmp, path);
   } catch (err) {
     try {
       unlinkSync(tmp);

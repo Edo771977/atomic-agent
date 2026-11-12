@@ -1,4 +1,4 @@
-import { closeSync, fsyncSync, openSync, writeSync } from "node:fs";
+import { closeSync, fsyncSync, openSync, renameSync, writeSync } from "node:fs";
 
 /**
  * Durability halves of a tmp-file-then-rename write. A rename is atomic,
@@ -27,6 +27,55 @@ export function writeFileSyncedSync(
     fsyncSync(fd);
   } finally {
     closeSync(fd);
+  }
+}
+
+/**
+ * Windows: replacing a file another process holds open (antivirus, a
+ * sync client, an editor, another reader of the map) fails with
+ * EPERM/EBUSY/EACCES for a few milliseconds. Elsewhere these codes are
+ * real errors and fail at once.
+ */
+const RENAME_RETRY_CODES = new Set(["EPERM", "EBUSY", "EACCES"]);
+const RENAME_BACKOFF_MS: readonly number[] = [10, 30, 60, 90];
+
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+export interface RenameRetryDeps {
+  platform?: NodeJS.Platform;
+  sleep?: (ms: number) => void;
+}
+
+/**
+ * `renameSync`, retried on win32 for transient sharing locks: up to
+ * five attempts, ~190ms of backoff in total. Throws the last error.
+ */
+export function renameWithRetrySync(
+  from: string,
+  to: string,
+  deps: RenameRetryDeps = {},
+): void {
+  const platform = deps.platform ?? process.platform;
+  const sleep = deps.sleep ?? sleepSync;
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      renameSync(from, to);
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      const delay = RENAME_BACKOFF_MS[attempt];
+      if (
+        platform !== "win32" ||
+        !code ||
+        !RENAME_RETRY_CODES.has(code) ||
+        delay === undefined
+      ) {
+        throw err;
+      }
+      sleep(delay);
+    }
   }
 }
 

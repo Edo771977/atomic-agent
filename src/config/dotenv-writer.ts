@@ -3,12 +3,15 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
-  renameSync,
   unlinkSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
 
-import { syncDirectoryBestEffort, writeFileSyncedSync } from "./durable-write.js";
+import {
+  renameWithRetrySync,
+  syncDirectoryBestEffort,
+  writeFileSyncedSync,
+} from "./durable-write.js";
 import { restrictWindowsAcl } from "./windows-acl.js";
 
 /**
@@ -99,7 +102,7 @@ export function setDotenvKey(
   // leaves the old `.env` or the new one, never an empty file.
   writeFileSyncedSync(tmp, updated, { mode: SECRET_FILE_MODE });
   try {
-    renameSync(tmp, path);
+    renameWithRetrySync(tmp, path);
   } catch (err) {
     try {
       unlinkSync(tmp);
