@@ -1,5 +1,7 @@
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+
+import { writeOwnerOnlyFileAtomicSync } from "../config/owner-only-file.js";
 
 /**
  * Flat-file store mapping webhook names to the session id they
@@ -11,7 +13,9 @@ import { dirname } from "node:path";
  * Concurrency: all writes are synchronous through the single HTTP
  * server process, and we reread on every get so operators can hot-swap
  * entries by editing the file. A corrupt/missing file resets to an
- * empty map rather than failing the whole webhook pipeline.
+ * empty map rather than failing the whole webhook pipeline. Writes go
+ * to a tmp file renamed over the map (owner-only, like `config.json`),
+ * so a crash or a reader mid-write never sees a truncated map.
  */
 
 /**
@@ -77,6 +81,9 @@ export class WebhookSessionStore {
 
   private writeMap(map: Record<string, string>): void {
     mkdirSync(dirname(this.path), { recursive: true });
-    writeFileSync(this.path, `${JSON.stringify(map, null, 2)}\n`, "utf8");
+    writeOwnerOnlyFileAtomicSync(
+      this.path,
+      `${JSON.stringify(map, null, 2)}\n`,
+    );
   }
 }
