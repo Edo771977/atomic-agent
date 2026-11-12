@@ -13,7 +13,8 @@ import {
   type BrowserDomainPolicy,
 } from "./browser-domain-policy.js";
 import { gateBrowserUrl, recheckLandedPage } from "./gate-browser-url.js";
-import { dirname } from "node:path";
+import { statSync } from "node:fs";
+import { dirname, sep } from "node:path";
 import { localFileOfUrl } from "../read-scope/read-scope-targets.js";
 
 const SAFE_SCHEMES = new Set(["http:", "https:"]);
@@ -36,11 +37,26 @@ export function isSafeUrl(url: string): boolean {
  * What a `browser_nonweb` session grant on `url` covers. A local page is
  * granted per directory (`file:<dir>`), so "allow in this chat" on one
  * HTML report never covers every file:// URL on the machine. Other
- * non-web URLs keep the whole-category grant.
+ * non-web URLs keep the whole-category grant. A directory URL (a
+ * `file://` listing, `…/dir/` or a path that is a directory) keys to that
+ * directory itself, never to its parent.
  */
 export function nonWebGrantKey(url: string): string | undefined {
   const file = localFileOfUrl(url);
-  return file === null ? undefined : `file:${dirname(file)}`;
+  if (file === null) return undefined;
+  if (/[\\/]$/.test(file)) {
+    const trimmed = file.replace(/[\\/]+$/, "");
+    return `file:${trimmed === "" ? sep : trimmed}`;
+  }
+  return `file:${isDirectory(file) ? file : dirname(file)}`;
+}
+
+function isDirectory(path: string): boolean {
+  try {
+    return statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 const SCRIPT_SCHEMES = new Set(["javascript:", "vbscript:"]);

@@ -98,6 +98,15 @@ describe("browser file:// navigation", () => {
     expect(backend.navigations).toHaveLength(3);
   });
 
+  it("a grant on a directory listing covers that directory, not its parent", async () => {
+    const listing = `${url(join(root, "a"))}/`;
+    await navigate(listing);
+    await navigate(url(join(root, "a", "page.html")));
+    expect(prompts.map((p) => p.category)).toEqual(["browser_nonweb"]);
+    await navigate(url(join(root, "sibling.html")));
+    expect(prompts.map((p) => p.category)).toEqual(["browser_nonweb", "browser_nonweb"]);
+  });
+
   it("a file:// URL to the agent's own secrets asks as state_secret despite a grant", async () => {
     await navigate(url(join(stateDir, "notes.html")));
     expect(prompts.map((p) => p.category)).toEqual(["browser_nonweb"]);
