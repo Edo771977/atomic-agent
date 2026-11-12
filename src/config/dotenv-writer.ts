@@ -179,10 +179,9 @@ function matchesKey(line: string, key: string): boolean {
 function formatValue(value: string): string {
   if (value.length === 0) return "";
   if (/[\s"'#\\]/.test(value)) {
-    // Escape backslashes and double quotes; the reader strips a
-    // single matching outer quote pair without honouring escapes, so
-    // keep this conservative — values with embedded `"` round-trip
-    // by being wrapped in `'...'` instead.
+    // Values with embedded `"` (and no `'`) are wrapped in `'...'`,
+    // which the reader takes verbatim. Otherwise escape backslashes and
+    // double quotes inside `"..."`; the reader decodes exactly these two.
     if (value.includes('"') && !value.includes("'")) {
       return `'${value}'`;
     }

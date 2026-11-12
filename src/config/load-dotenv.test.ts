@@ -113,6 +113,27 @@ describe("loadDotenvFromStateDir", () => {
     expect(process.env.ATOMIC_DOTENV_TEST_SINGLE).toBe("value with spaces");
   });
 
+  it("unescapes \\\\ and \\\" in double quotes; single quotes and bare values stay literal", () => {
+    writeFileSync(
+      join(dir, ".env"),
+      [
+        'ATOMIC_DOTENV_TEST_QUOTED="pa\\\\ss \\"q\\" C:\\dir\\n"',
+        "ATOMIC_DOTENV_TEST_SINGLE='pa\\\\ss \\n'",
+        "ATOMIC_DOTENV_TEST_FOO=pa\\\\ss",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+
+    loadDotenvFromStateDir(dir);
+
+    // Only the two escapes the writer produces are decoded; any other
+    // backslash (a hand-written Windows path) is kept as written.
+    expect(process.env.ATOMIC_DOTENV_TEST_QUOTED).toBe('pa\\ss "q" C:\\dir\\n');
+    expect(process.env.ATOMIC_DOTENV_TEST_SINGLE).toBe("pa\\\\ss \\n");
+    expect(process.env.ATOMIC_DOTENV_TEST_FOO).toBe("pa\\\\ss");
+  });
+
   it("ignores blank lines and # comments without warning", () => {
     writeFileSync(
       join(dir, ".env"),

@@ -167,6 +167,20 @@ describe("setDotenvKey", () => {
     expect(process.env.SOME_OTHER_KEY).toBe('has "quotes" inside');
   });
 
+  it.each([
+    ["a backslash", "pa\\ss"],
+    ["a backslash and whitespace", "C:\\Program Files\\app"],
+    ["a trailing backslash", "ends with \\"],
+    ["both quote kinds", `it's "quoted"`],
+    ["an escaped-looking sequence", 'x\\"y \\\\ z'],
+    ["a single quote only", "it's here"],
+  ])("round-trips a value with %s through the loader", (_label, value) => {
+    setDotenvKey(stateDir, "SOME_OTHER_KEY", value);
+    const result = loadDotenvFromStateDir(stateDir);
+    expect(result.loaded).toContain("SOME_OTHER_KEY");
+    expect(process.env.SOME_OTHER_KEY).toBe(value);
+  });
+
   it("does not log or expose the value through the result object", () => {
     const result = setDotenvKey(stateDir, "TELEGRAM_BOT_TOKEN", "secret-value");
     // Result keys should be exactly { path, preexisting, changed }.
