@@ -113,13 +113,17 @@ describe("loadDotenvFromStateDir", () => {
     expect(process.env.ATOMIC_DOTENV_TEST_SINGLE).toBe("value with spaces");
   });
 
-  it("unescapes \\\\ and \\\" in double quotes; single quotes and bare values stay literal", () => {
+  it("keeps backslashes and inner quotes literal in hand-written values", () => {
+    // Hand-written files must keep the meaning they had before the
+    // writer changed (and the one npm dotenv gives): no escape decoding.
     writeFileSync(
       join(dir, ".env"),
       [
-        'ATOMIC_DOTENV_TEST_QUOTED="pa\\\\ss \\"q\\" C:\\dir\\n"',
-        "ATOMIC_DOTENV_TEST_SINGLE='pa\\\\ss \\n'",
-        "ATOMIC_DOTENV_TEST_FOO=pa\\\\ss",
+        String.raw`ATOMIC_DOTENV_TEST_QUOTED="\\server\share"`,
+        String.raw`ATOMIC_DOTENV_TEST_SINGLE='ab\\cd \n'`,
+        String.raw`ATOMIC_DOTENV_TEST_FOO=ab\\cd`,
+        String.raw`ATOMIC_DOTENV_TEST_BAR="C:\dir\"x"`,
+        String.raw`ATOMIC_DOTENV_TEST_BAZ="say "hi""`,
         "",
       ].join("\n"),
       "utf8",
@@ -127,11 +131,11 @@ describe("loadDotenvFromStateDir", () => {
 
     loadDotenvFromStateDir(dir);
 
-    // Only the two escapes the writer produces are decoded; any other
-    // backslash (a hand-written Windows path) is kept as written.
-    expect(process.env.ATOMIC_DOTENV_TEST_QUOTED).toBe('pa\\ss "q" C:\\dir\\n');
-    expect(process.env.ATOMIC_DOTENV_TEST_SINGLE).toBe("pa\\\\ss \\n");
-    expect(process.env.ATOMIC_DOTENV_TEST_FOO).toBe("pa\\\\ss");
+    expect(process.env.ATOMIC_DOTENV_TEST_QUOTED).toBe(String.raw`\\server\share`);
+    expect(process.env.ATOMIC_DOTENV_TEST_SINGLE).toBe(String.raw`ab\\cd \n`);
+    expect(process.env.ATOMIC_DOTENV_TEST_FOO).toBe(String.raw`ab\\cd`);
+    expect(process.env.ATOMIC_DOTENV_TEST_BAR).toBe(String.raw`C:\dir\"x`);
+    expect(process.env.ATOMIC_DOTENV_TEST_BAZ).toBe('say "hi"');
   });
 
   it("ignores blank lines and # comments without warning", () => {

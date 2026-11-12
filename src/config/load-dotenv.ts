@@ -71,21 +71,19 @@ function sleepSync(ms: number): void {
 
 /**
  * Strip a single matching pair of surrounding quotes (`"..."` or `'...'`).
- * Inside double quotes the two escapes `setDotenvKey` writes are decoded
- * (`\\` → `\`, `\"` → `"`); any other backslash is kept as written, so
- * a hand-written `"C:\dir"` still reads literally. Single-quoted and bare
- * values are verbatim. No other escape sequences, no `${VAR}`
- * interpolation. Mismatched quotes are left as-is so the user sees their
- * literal value (and can debug from it).
+ * Inner content is taken verbatim: no escape sequences (a backslash is
+ * always literal, so a hand-written `"\\server\share"` keeps both
+ * leading backslashes, as npm dotenv does), no `${VAR}` interpolation.
+ * Only the first and last characters are inspected, so inner quotes of
+ * either kind are literal as well; `setDotenvKey` relies on that rather
+ * than writing escapes. Mismatched quotes are left as-is so the user
+ * sees their literal value (and can debug from it).
  */
 function stripQuotes(value: string): string {
   if (value.length < 2) return value;
   const first = value[0];
   const last = value[value.length - 1];
-  if (first === '"' && last === '"') {
-    return value.slice(1, -1).replace(/\\(["\\])/g, "$1");
-  }
-  if (first === "'" && last === "'") {
+  if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
     return value.slice(1, -1);
   }
   return value;
@@ -200,8 +198,8 @@ export function formatDotenvReadWarning(
  *
  * The loader has no external dependency and supports a deliberately tiny
  * subset of dotenv syntax: `KEY=VALUE` per line, optional surrounding
- * quotes (`\\` and `\"` decoded inside double quotes), `#` line
- * comments, blank lines. No interpolation, no `export`
+ * quotes (contents verbatim, no escapes), `#` line comments, blank
+ * lines. No interpolation, no `export`
  * prefix, no multiline values. Add later if a real use case demands it.
  *
  * Returned `loaded` / `skipped` lists carry variable **names only** — values
