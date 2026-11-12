@@ -38,6 +38,15 @@ import {
  * groups concurrently. Inside each group, calls remain in
  * batch-index order; the group entry preserves that order.
  */
+/**
+ * How long a cancelled batch waits for groups still running once the
+ * cancellation is seen. A tool that ignores the abort signal (a hung
+ * read, CPU-bound work, a plugin) must not hold the step and the
+ * session lock for ever: after this grace the batch returns with the
+ * unsettled calls marked cancelled, and their late results are dropped.
+ */
+export const BATCH_CANCEL_GRACE_MS = 3_000;
+
 export function planBatch(
   inputs: readonly BatchCallInput[],
 ): Map<ResourceClass, BatchCallInput[]> {
@@ -93,6 +102,10 @@ export async function executeBatch(
     cancelled: false,
   }));
   const loopSignals: BatchLoopSignal[] = [];
+  // Set once the batch has returned (or given up waiting on groups after
+  // a cancellation). A call that settles after that writes no slot and
+  // fires no callback: the step has moved on.
+  let closed = false;
 
   // Split off any tail terminal call so the non-terminal portion runs
   // first as a normal grouped batch and the terminal runs strictly
@@ -315,6 +328,7 @@ export async function executeBatch(
         );
 
   const invokeOne = async (input: BatchCallInput): Promise<void> => {
+    if (closed) return;
     if (ctx.signal.aborted) {
       slots[input.batchIndex] = {
         ...slots[input.batchIndex]!,
@@ -344,6 +358,9 @@ export async function executeBatch(
     if (approvals.length > 0) {
       compressed = { ...compressed, approvals: [...approvals] };
     }
+    // Settled after the batch gave up on it: the slot already reads
+    // cancelled, and nothing else may observe this late result.
+    if (closed) return;
     const durationMs = Date.now() - startedAt;
     slots[input.batchIndex] = {
       ...slots[input.batchIndex]!,
@@ -416,6 +433,7 @@ export async function executeBatch(
       (async (): Promise<void> => {
         let deniedBy: BatchCallInput | null = null;
         for (const call of calls) {
+          if (closed) return;
           if (ctx.signal.aborted) {
             slots[call.batchIndex] = {
               ...slots[call.batchIndex]!,
@@ -455,20 +473,26 @@ export async function executeBatch(
     );
   }
 
-  // Every group settles before the batch returns: a cancellation in one
-  // group must not hand the step back while another is still running,
-  // or that group's result would land in `slots` and its
-  // `onCallFinished` fire after the step moved on (possibly into the
-  // next turn's hook). The other groups see the aborted signal at their
-  // next call and stop there.
+  // Groups settle before the batch returns: a cancellation in one group
+  // must not hand the step back while another is still running, or that
+  // group's result would land in `slots` and its `onCallFinished` fire
+  // after the step moved on (possibly into the next turn's hook). The
+  // other groups see the aborted signal at their next call and stop
+  // there. A tool that ignores the signal is waited for only up to
+  // `BATCH_CANCEL_GRACE_MS`; the batch then closes without it.
+  const outcomes = await settleGroups(groupTasks, ctx.signal);
+  if (outcomes.some((outcome) => outcome === undefined)) closed = true;
   let cancelled = false;
   let failure: { error: unknown } | null = null;
-  for (const settled of await Promise.allSettled(groupTasks)) {
-    if (settled.status === "fulfilled") continue;
+  for (const settled of outcomes) {
+    if (settled === undefined || settled.status === "fulfilled") continue;
     if (settled.reason instanceof CancelledError) cancelled = true;
     else failure ??= { error: settled.reason };
   }
-  if (failure !== null) throw failure.error;
+  if (failure !== null) {
+    closed = true;
+    throw failure.error;
+  }
 
   // Tail-terminal barrier: now that every non-terminal call has
   // settled (success, error, or cancelled), run the terminal call
@@ -497,6 +521,7 @@ export async function executeBatch(
 
   // Final pass: any slot still without `compressed` and not flagged as
   // started belongs to a cancellation tail that we never reached.
+  closed = true;
   for (const slot of slots) {
     if (!slot.compressed && !slot.cancelled) {
       slot.cancelled = true;
@@ -507,6 +532,48 @@ export async function executeBatch(
     cancelled: cancelled || ctx.signal.aborted,
     loopSignals,
   };
+}
+
+/**
+ * Wait for every group, or — once a cancellation is seen (the signal
+ * aborts, or a group throws `CancelledError`) — for at most
+ * `BATCH_CANCEL_GRACE_MS` more. A group still running then reads
+ * `undefined`; its eventual outcome is swallowed here.
+ */
+async function settleGroups(
+  groupTasks: readonly Promise<void>[],
+  signal: AbortSignal,
+): Promise<Array<PromiseSettledResult<void> | undefined>> {
+  const outcomes: Array<PromiseSettledResult<void> | undefined> = groupTasks.map(() => undefined);
+  let onCancelSeen!: () => void;
+  const cancelSeen = new Promise<void>((resolve) => { onCancelSeen = resolve; });
+  const tracked = groupTasks.map((task, i) =>
+    task.then(
+      () => { outcomes[i] = { status: "fulfilled", value: undefined }; },
+      (reason: unknown) => {
+        outcomes[i] = { status: "rejected", reason };
+        if (reason instanceof CancelledError) onCancelSeen();
+      },
+    ),
+  );
+  if (signal.aborted) onCancelSeen();
+  signal.addEventListener("abort", onCancelSeen, { once: true });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let done = false;
+  const grace = cancelSeen.then(
+    () => new Promise<void>((resolve) => {
+      if (done) return resolve();
+      timer = setTimeout(resolve, BATCH_CANCEL_GRACE_MS);
+    }),
+  );
+  try {
+    await Promise.race([Promise.all(tracked), grace]);
+  } finally {
+    done = true;
+    if (timer !== undefined) clearTimeout(timer);
+    signal.removeEventListener("abort", onCancelSeen);
+  }
+  return [...outcomes];
 }
 
 /**
