@@ -91,6 +91,7 @@ import {
   delegateOutcome,
   fanoutSpend,
   formatDelegateOutput,
+  taskSpendUsd,
   type WorkerPricing,
   type WorkerTaskResult,
 } from "./worker-result.js";
@@ -790,10 +791,8 @@ export function buildFusionDelegateTool(
               onWorkerTool: (taskId: string, tool: string): void =>
                 run.noteTool(taskId, tool),
               onTaskFinished: (result: WorkerTaskResult): void => {
-                const costUsd =
-                  result.usage !== undefined
-                    ? estimateUsageCostUsd(result.usage, pricing)
-                    : 0;
+                // Per call, as the turn budget was charged.
+                const costUsd = taskSpendUsd(result, pricing);
                 // A proposal is not an answer: its row is written once the
                 // split closed (`expandWave`), its spend now. Under isolation
                 // nothing has reached the folder yet: `runTasks` writes the

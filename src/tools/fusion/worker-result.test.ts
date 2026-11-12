@@ -20,6 +20,8 @@ import {
   queuedWorkerHint,
   readSlotOccupancy,
   resultCarriesApprovalRefusal,
+  sumWorkerBilling,
+  taskSpendUsd,
   unservedWorkerHint,
   workerFailureHint,
   workerHintNoFirstToken,
@@ -56,7 +58,7 @@ function reply(text: string): AgentLoopEvent {
 
 function completed(
   usage:
-    | { promptTokens: number; completionTokens: number; totalTokens: number }
+    | { promptTokens: number; completionTokens: number; totalTokens: number; costUsd?: number }
     | undefined,
 ): AgentLoopEvent {
   return {
@@ -116,6 +118,42 @@ describe("WorkerRunCollector", () => {
       },
       usage: { promptTokens: 15, completionTokens: 5, totalTokens: 20 },
     });
+  });
+
+  it("prices a partly billed worker per call, as the turn budget counts it", () => {
+    const c = new WorkerRunCollector();
+    // Billed by the service: $0.5, whatever the price table says.
+    c.observe(completed({ promptTokens: 1_000_000, completionTokens: 0, totalTokens: 1_000_000, costUsd: 0.5 }));
+    // No bill: estimated at $2 per million input tokens.
+    c.observe(completed({ promptTokens: 1_000_000, completionTokens: 0, totalTokens: 1_000_000 }));
+    const result = c.finish({ id: "t", title: "T", reason: "reply", stepCount: 2, durationMs: 1 });
+    expect(result.usage).toEqual({ promptTokens: 2_000_000, completionTokens: 0, totalTokens: 2_000_000 });
+    expect(result.billing).toEqual({
+      billedUsd: 0.5,
+      unbilled: { promptTokens: 1_000_000, completionTokens: 0, totalTokens: 1_000_000 },
+    });
+    const pricing = { input: 2, output: 8 };
+    expect(taskSpendUsd(result, pricing)).toBeCloseTo(2.5);
+    // An unpriced worker still counts what the service billed.
+    expect(taskSpendUsd(result, undefined)).toBeCloseTo(0.5);
+    // A split parent sums its rows the same way.
+    const fullyBilled = { usage: { promptTokens: 10, completionTokens: 0, totalTokens: 10, costUsd: 0.25 } };
+    const summed = sumWorkerBilling([result, fullyBilled]);
+    expect(summed?.billedUsd).toBeCloseTo(0.75);
+    expect(summed?.unbilled.promptTokens).toBe(1_000_000);
+    expect(sumWorkerBilling([fullyBilled, fullyBilled])).toBeUndefined();
+  });
+
+  it("leaves a fully billed or fully unbilled worker without a billing split", () => {
+    const billed = new WorkerRunCollector();
+    billed.observe(completed({ promptTokens: 10, completionTokens: 1, totalTokens: 11, costUsd: 0.1 }));
+    billed.observe(completed({ promptTokens: 10, completionTokens: 1, totalTokens: 11, costUsd: 0.2 }));
+    const b = billed.finish({ id: "b", title: "B", reason: "reply", stepCount: 2, durationMs: 1 });
+    expect(b).not.toHaveProperty("billing");
+    expect(b.usage?.costUsd).toBeCloseTo(0.3);
+    const plain = new WorkerRunCollector();
+    plain.observe(completed({ promptTokens: 10, completionTokens: 1, totalTokens: 11 }));
+    expect(plain.finish({ id: "p", title: "P", reason: "reply", stepCount: 1, durationMs: 1 })).not.toHaveProperty("billing");
   });
 
   it("counts only the write, edit and patch calls that succeeded", () => {
