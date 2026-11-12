@@ -1353,13 +1353,17 @@ function isPermanent(category: LlmFailureCategory): boolean {
 /**
  * A row put back by `markRetry` whose backoff has not passed yet: an
  * attempt already ran and its `scheduled_for` is still ahead. A fresh
- * one-shot scheduled for later (no attempt yet) is not one.
+ * one-shot scheduled for later (no attempt yet) is not one, and neither
+ * is a run put back as interrupted (`markInterrupted`, category
+ * `cancelled`): it keeps whatever `scheduled_for` it had, but nothing
+ * failed, so the next drain runs it as it would a fresh task.
  */
 function awaitingRetry(task: TaskRecord, now: number): boolean {
   return (
     task.status === "pending" &&
     task.attempts > 0 &&
     task.lastErrorCategory !== null &&
+    task.lastErrorCategory !== "cancelled" &&
     task.scheduledFor !== null &&
     task.scheduledFor > now
   );

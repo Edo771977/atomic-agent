@@ -276,6 +276,99 @@ describe("TaskRunner", () => {
     expect(calls).toHaveLength(2);
   });
 
+  it("a recurring task that fails retryably waits out its backoff, then rearms for its next firing", async () => {
+    const { runtime, calls } = fakeRuntime({
+      scripts: [
+        () => {
+          throw new TransportError("boom", 503, "http://llama");
+        },
+      ],
+    });
+    const runner = new TaskRunner({
+      store,
+      runtime,
+      sessionLoader: fakeSessionLoader(session),
+      defaultMaxSteps: 5,
+      backoff: { initialMs: 1_000, maxMs: 1_000 },
+      enabled: true,
+      runOnCreate: false,
+      sleep: async () => undefined,
+    });
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const t = store.create({
+        sessionId: session.id,
+        userMessage: "poll every 5m",
+        origin: "cli",
+        maxAttempts: 3,
+        schedule: { kind: "interval", everyMs: 300_000 },
+        scheduledFor: Date.now() - 1,
+      });
+      const failedAt = Date.now();
+      const first = await runner.runDue(failedAt, 10);
+      expect(first).toMatchObject({ drained: 1, retried: 1, retryPending: 1, nextRetryAt: failedAt + 1_000 });
+      // The backoff, not the next firing, decides when it is due again.
+      expect(store.get(t.id)).toMatchObject({
+        status: "pending",
+        attempts: 1,
+        scheduledFor: failedAt + 1_000,
+        lastErrorCategory: "transport",
+      });
+      vi.setSystemTime(failedAt + 999);
+      expect(await runner.runDue(Date.now(), 10)).toMatchObject({ drained: 0 });
+      expect(calls).toHaveLength(1);
+      vi.setSystemTime(failedAt + 1_000);
+      const second = await runner.runDue(Date.now(), 10);
+      expect(second).toMatchObject({ drained: 1, completed: 1, retryPending: 0, nextRetryAt: null });
+      // Completed: rearmed for its next firing with the firing's
+      // bookkeeping reset, so its next failure starts the curve afresh.
+      const rearmed = store.get(t.id)!;
+      expect(rearmed).toMatchObject({ status: "pending", attempts: 0, lastErrorCategory: null });
+      expect(rearmed.scheduledFor).toBeGreaterThanOrEqual(failedAt + 1_000 + 300_000);
+      expect(calls).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("an interrupted row is not waiting on a retry, even with its scheduled_for still ahead", async () => {
+    const { runtime, calls } = fakeRuntime();
+    const runner = new TaskRunner({
+      store,
+      runtime,
+      sessionLoader: fakeSessionLoader(session),
+      defaultMaxSteps: 5,
+      backoff: { initialMs: 1_000, maxMs: 1_000 },
+      enabled: true,
+      runOnCreate: false,
+      sleep: async () => undefined,
+    });
+    // Run once early (an explicit `task run <id>` does that) and cut off:
+    // put back as interrupted, keeping the scheduled_for it had.
+    const later = Date.now() + 3_600_000;
+    const t = store.create({
+      sessionId: session.id,
+      userMessage: "later",
+      origin: "cli",
+      maxAttempts: 3,
+      scheduledFor: later,
+    });
+    expect(store.markRunning(t.id)).not.toBeNull();
+    const interrupted = store.markInterrupted(t.id, { nextScheduledFor: null })!;
+    expect(interrupted).toMatchObject({
+      status: "pending",
+      attempts: 1,
+      scheduledFor: later,
+      lastErrorCategory: "cancelled",
+    });
+    // Not reported as a pending retry, and run by the next drain like a
+    // fresh task instead of being held to its old time.
+    const outcome = await runner.drainPending();
+    expect(outcome).toMatchObject({ drained: 1, completed: 1, retryPending: 0, nextRetryAt: null });
+    expect(calls).toHaveLength(1);
+    expect(store.get(t.id)?.status).toBe("completed");
+  });
+
   it("marks failed once maxAttempts reached on retryable failures", async () => {
     const { runtime } = fakeRuntime({
       scripts: [
