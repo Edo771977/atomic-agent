@@ -446,6 +446,31 @@ describe("openai stream consumer chunk boundaries", () => {
     expect(result.content).toBe(text);
   });
 
+  it("reads a stream framed with CRLF line endings", async () => {
+    const crlf = TWO_FRAMES.replace(/\n/g, "\r\n");
+    const { result, deltas } = await drainSlices(crlf, []);
+    expect(result.content).toBe("hello world");
+    expect(deltas).toEqual(["hello ", "world"]);
+    expect(result.finishReason).toBe("tool_calls");
+    expect(result.terminalObserved).toBe(true);
+  });
+
+  it("reads CRLF and bare-CR frames whose boundary is split across reads", async () => {
+    const crlf = TWO_FRAMES.replace(/\n/g, "\r\n");
+    const firstBoundary = crlf.indexOf("\r\n\r\n");
+    // Cut between the "\r" and the "\n" of each half of the boundary.
+    const { result, deltas } = await drainSlices(crlf, [
+      firstBoundary + 1,
+      firstBoundary + 3,
+    ]);
+    expect(result.content).toBe("hello world");
+    expect(deltas).toEqual(["hello ", "world"]);
+    const cr = TWO_FRAMES.replace(/\n/g, "\r");
+    const crCut = await drainSlices(cr, [cr.indexOf("\r\r") + 1]);
+    expect(crCut.result.content).toBe("hello world");
+    expect(crCut.result.terminalObserved).toBe(true);
+  });
+
   it("keeps tool-call arguments split across reads", async () => {
     const body =
       toolCallFrame([

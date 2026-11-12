@@ -10,6 +10,7 @@ import { readContextOverflowCounts, type ContextOverflowCounts } from "./reliabi
 import { createStreamRepetitionWatcher } from "./reliability/stream-repetition-watcher.js";
 import { drySamplerFields } from "./dry-sampler.js";
 import { takePromptProgress } from "./llama-prompt-progress.js";
+import { createSseLineNormaliser, SSE_LINE_BREAK } from "./sse-line-endings.js";
 import type { StructuredLogger } from "../tracing/structured-logger.js";
 import type {
   CompletionRequest,
@@ -1124,6 +1125,7 @@ export class LlamaServerClient {
       // this slot, session and process forever.
       startStreamDeadline();
       let buffer = "";
+      const lineEndings = createSseLineNormaliser();
       let accumulated = "";
       let accumulatedReasoning = "";
       // A small local model that falls into a loop spends the whole cap
@@ -1159,7 +1161,8 @@ export class LlamaServerClient {
           alive = true;
           keepAlive("idle");
         };
-        buffer += value;
+        // CRLF / CR framing becomes LF before events are split on "\n\n".
+        buffer += lineEndings.push(value);
         let eventEnd = buffer.indexOf("\n\n");
         // Bytes that complete no event yet are still a live server —
         // unless progress was asked for and no real event has come: then
@@ -1921,7 +1924,7 @@ export class LlamaServerClient {
 export function parseSseErrorEvent(
   rawEvent: string,
 ): { status: number; detail: string; type?: string } | null {
-  for (const line of rawEvent.split("\n")) {
+  for (const line of rawEvent.split(SSE_LINE_BREAK)) {
     let payload: unknown;
     if (line.startsWith("error:")) {
       const text = line.slice(6).trim();
@@ -1962,7 +1965,7 @@ function tryParseJson(text: string): unknown {
 }
 
 function parseSseEvent(rawEvent: string): Record<string, unknown> | null {
-  const lines = rawEvent.split("\n");
+  const lines = rawEvent.split(SSE_LINE_BREAK);
   const dataLines: string[] = [];
   for (const line of lines) {
     if (line.startsWith("data:")) {

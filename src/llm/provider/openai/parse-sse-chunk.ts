@@ -1,5 +1,6 @@
 import type { ReasoningExtractor } from "./reasoning-extractor.js";
 import { extractPartialReplyTextFromToolArguments } from "./tool-arguments-stream-parser.js";
+import { SSE_LINE_BREAK } from "../../sse-line-endings.js";
 
 export interface OpenAiToolCallDelta {
   /**
@@ -57,7 +58,7 @@ export function parseOpenAiSseEvent(
   error: { status: number | null; message: string } | null;
 } {
   const dataLines: string[] = [];
-  for (const line of rawEvent.split("\n")) {
+  for (const line of rawEvent.split(SSE_LINE_BREAK)) {
     if (line.startsWith("data:")) {
       dataLines.push(line.slice(5).trimStart());
     }

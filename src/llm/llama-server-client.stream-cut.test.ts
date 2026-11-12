@@ -56,6 +56,39 @@ describe("parseSseErrorEvent", () => {
   });
 });
 
+describe("LlamaServerClient.completeStream: CRLF framing", () => {
+  it("reads events separated by CRLF, including a boundary split across reads", async () => {
+    const client = new LlamaServerClient({
+      baseUrl: "http://127.0.0.1:9999",
+      progressWatch: false,
+      fetchImpl: fetchReturning(() =>
+        streamOf([
+          'data: {"content":"hel","stop":false}\r\n\r',
+          '\ndata: {"content":"lo","stop":false}\r\n\r\n',
+          'data: {"content":"","stop":true}\r\n\r\n',
+        ]),
+      ),
+    });
+    const iterator = client.completeStream({ prompt: "hi" });
+    const deltas: string[] = [];
+    for (;;) {
+      const step = await iterator.next();
+      if (step.done) {
+        expect(step.value.content).toBe("hello");
+        break;
+      }
+      if (step.value.delta.length > 0) deltas.push(step.value.delta);
+    }
+    expect(deltas).toEqual(["hel", "lo"]);
+  });
+
+  it("reads an error event whose lines end in a bare CR", () => {
+    expect(
+      parseSseErrorEvent('event: x\rerror: {"code":503,"message":"busy"}'),
+    ).toEqual({ status: 503, detail: "busy" });
+  });
+});
+
 describe("LlamaServerClient.completeStream: a cut stream (ATO-1279)", () => {
   it("throws a mid-stream 500 for an error event inside the stream instead of ending empty", async () => {
     const client = new LlamaServerClient({
