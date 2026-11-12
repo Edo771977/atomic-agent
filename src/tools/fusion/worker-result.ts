@@ -337,6 +337,11 @@ export class WorkerRunCollector {
                     cachedTokens:
                       (prev.cachedTokens ?? 0) + (next.cachedTokens ?? 0),
                   }),
+              // The service's bill sums only while every call reported one;
+              // a partial sum would undercount, so the estimate takes over.
+              ...(prev.costUsd !== undefined && next.costUsd !== undefined
+                ? { costUsd: prev.costUsd + next.costUsd }
+                : {}),
             };
     }
   }

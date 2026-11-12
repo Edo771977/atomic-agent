@@ -740,6 +740,10 @@ function sumUsage(rows: readonly WorkerTaskResult[]): CompletionUsage | undefine
                   cachedTokens:
                     (usage.cachedTokens ?? 0) + (r.usage.cachedTokens ?? 0),
                 }),
+            // Summed only while every row carries the service's bill.
+            ...(usage.costUsd !== undefined && r.usage.costUsd !== undefined
+              ? { costUsd: usage.costUsd + r.usage.costUsd }
+              : {}),
           };
   }
   return usage;

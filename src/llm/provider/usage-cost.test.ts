@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { estimateUsageCostUsd } from "./usage-cost.js";
+import { completionCostUsd, estimateUsageCostUsd } from "./usage-cost.js";
 
 describe("estimateUsageCostUsd", () => {
   it("prices cached prompt tokens at the cacheRead rate", () => {
@@ -72,5 +72,39 @@ describe("estimateUsageCostUsd", () => {
       { input: 1_000_000, output: 0, cacheRead: 0 },
     );
     expect(usd).toBe(0);
+  });
+
+  it("prefers the service-billed cost over the estimate", () => {
+    const usd = estimateUsageCostUsd(
+      { promptTokens: 1_000_000, completionTokens: 0, totalTokens: 1_000_000, costUsd: 0.75 },
+      { input: 3, output: 15 },
+    );
+    expect(usd).toBe(0.75);
+  });
+
+  it("counts the service-billed cost for an unpriced model, and 0 without one", () => {
+    const billed = { promptTokens: 10, completionTokens: 10, totalTokens: 20, costUsd: 0.75 };
+    expect(estimateUsageCostUsd(billed, undefined)).toBe(0.75);
+    expect(estimateUsageCostUsd({ ...billed, costUsd: undefined }, undefined)).toBe(0);
+  });
+
+  it("ignores a negative or non-finite billed cost", () => {
+    const base = { promptTokens: 1_000_000, completionTokens: 0, totalTokens: 1_000_000 };
+    expect(estimateUsageCostUsd({ ...base, costUsd: -1 }, { input: 3, output: 15 })).toBeCloseTo(3, 9);
+    expect(estimateUsageCostUsd({ ...base, costUsd: Number.NaN }, { input: 3, output: 15 })).toBeCloseTo(3, 9);
+  });
+});
+
+describe("completionCostUsd", () => {
+  const base = { promptTokens: 1_000_000, completionTokens: 0, totalTokens: 1_000_000 };
+
+  it("is the billed cost when reported, priced or not", () => {
+    expect(completionCostUsd({ ...base, costUsd: 0.75 }, undefined)).toBe(0.75);
+    expect(completionCostUsd({ ...base, costUsd: 0.75 }, { input: 3, output: 15 })).toBe(0.75);
+  });
+
+  it("falls back to the estimate, and is undefined for an unpriced, unbilled call", () => {
+    expect(completionCostUsd(base, { input: 3, output: 15 })).toBeCloseTo(3, 9);
+    expect(completionCostUsd(base, undefined)).toBeUndefined();
   });
 });

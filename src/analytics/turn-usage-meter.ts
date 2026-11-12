@@ -1,6 +1,6 @@
 import type { CompletionTiming, CompletionUsage } from "../llm/provider/completion-types.js";
 import type { ResolvedModel } from "../llm/provider/model-resolver.js";
-import { estimateUsageCostUsd } from "../llm/provider/usage-cost.js";
+import { completionCostUsd } from "../llm/provider/usage-cost.js";
 
 /**
  * Token + spend totals accumulated for a single turn.
@@ -11,8 +11,9 @@ import { estimateUsageCostUsd } from "../llm/provider/usage-cost.js";
  * read this at the end of the turn to attach non-content shape metrics
  * to `message_sent`.
  *
- * `costUsd` is only meaningful when the model carries pricing. Local
- * runners (llama.cpp) have none, so their turns accumulate tokens with
+ * `costUsd` is only meaningful when the service billed the call or the
+ * model carries pricing. Local runners (llama.cpp) have neither, so
+ * their turns accumulate tokens with
  * a zero cost — which is why `snapshot()` reports `costUsd` as
  * undefined rather than 0 unless at least one priced call landed.
  */
@@ -137,10 +138,11 @@ export class TurnUsageMeter {
       bucket.cachedTokens += usage.cachedTokens;
     }
 
-    const pricing = params.model?.pricing;
-    if (!pricing) return;
+    // The service's own bill counts even for a model the table does not price.
+    const usd = completionCostUsd(usage, params.model?.pricing);
+    if (usd === undefined) return;
     bucket.sawPricedUsage = true;
-    bucket.costUsd += estimateUsageCostUsd(usage, pricing);
+    bucket.costUsd += usd;
   }
 
   /**

@@ -131,6 +131,23 @@ describe("TurnUsageMeter", () => {
     expect(snap.costUsd).toBeCloseTo(18, 10);
   });
 
+  it("counts the service-billed cost even for an unpriced model, and prefers it over the estimate", () => {
+    const meter = new TurnUsageMeter();
+    meter.begin(S);
+    meter.record({
+      sessionId: S,
+      usage: { ...usage(200, 100), costUsd: 0.75 },
+      model: unpricedModel(),
+    });
+    expect(meter.peekCostUsd(S)).toBeCloseTo(0.75, 10);
+    meter.record({
+      sessionId: S,
+      usage: { ...usage(1_000_000, 1_000_000), costUsd: 0.5 },
+      model: pricedModel(3, 15),
+    });
+    expect(meter.snapshot(S).costUsd).toBeCloseTo(1.25, 10);
+  });
+
   it("snapshot() closes the turn — calling it twice returns {} the second time", () => {
     const meter = new TurnUsageMeter();
     meter.begin(S);

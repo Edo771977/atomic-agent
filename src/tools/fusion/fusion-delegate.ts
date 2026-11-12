@@ -70,7 +70,7 @@ import {
 import type { DelegateTask } from "./delegate-args.js";
 import { resolveTaskLegs, unknownModels, type TaskLeg } from "./role-models.js";
 import type { DelegateContract } from "./contract.js";
-import { estimateUsageCostUsd } from "../../llm/provider/usage-cost.js";
+import { completionCostUsd, estimateUsageCostUsd } from "../../llm/provider/usage-cost.js";
 import {
   FusionTurnBudget,
   TURN_BUDGET_INSTRUCTION,
@@ -693,11 +693,10 @@ export function buildFusionDelegateTool(
                 _taskId: string,
                 usage: Parameters<typeof estimateUsageCostUsd>[0],
               ): void => {
-                if (pricing !== undefined) {
-                  turnBudget.addWorkerSpend(
-                    ctx.sessionId,
-                    estimateUsageCostUsd(usage, pricing),
-                  );
+                // The service's own bill counts even for an unpriced worker.
+                const usd = completionCostUsd(usage, pricing);
+                if (usd !== undefined) {
+                  turnBudget.addWorkerSpend(ctx.sessionId, usd);
                 }
                 const stop = budgetStop();
                 if (stop !== undefined) stopForBudget(stop);
@@ -792,7 +791,7 @@ export function buildFusionDelegateTool(
                 run.noteTool(taskId, tool),
               onTaskFinished: (result: WorkerTaskResult): void => {
                 const costUsd =
-                  pricing !== undefined && result.usage !== undefined
+                  result.usage !== undefined
                     ? estimateUsageCostUsd(result.usage, pricing)
                     : 0;
                 // A proposal is not an answer: its row is written once the
