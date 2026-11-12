@@ -13,6 +13,8 @@ import {
   type BrowserDomainPolicy,
 } from "./browser-domain-policy.js";
 import { gateBrowserUrl, recheckLandedPage } from "./gate-browser-url.js";
+import { dirname } from "node:path";
+import { localFileOfUrl } from "../read-scope/read-scope-targets.js";
 
 const SAFE_SCHEMES = new Set(["http:", "https:"]);
 
@@ -28,6 +30,17 @@ export function isSafeUrl(url: string): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * What a `browser_nonweb` session grant on `url` covers. A local page is
+ * granted per directory (`file:<dir>`), so "allow in this chat" on one
+ * HTML report never covers every file:// URL on the machine. Other
+ * non-web URLs keep the whole-category grant.
+ */
+export function nonWebGrantKey(url: string): string | undefined {
+  const file = localFileOfUrl(url);
+  return file === null ? undefined : `file:${dirname(file)}`;
 }
 
 const SCRIPT_SCHEMES = new Set(["javascript:", "vbscript:"]);
@@ -74,12 +87,14 @@ export function buildBrowserNavigateTool(
       const refused = await gateBrowserUrl(options, policy, "browser.navigate", url, ctx);
       if (refused) return refused;
       if (!isSafeUrl(url)) {
+        const grantKey = nonWebGrantKey(url);
         await requireApproval(
           options,
           {
             sessionId: ctx.sessionId,
             tool: "browser.navigate",
             category: "browser_nonweb",
+            ...(grantKey !== undefined ? { grantKey } : {}),
             reason: "non-http(s) URL requested",
             preview: url,
             affectedResources: [url],

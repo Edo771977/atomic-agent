@@ -5,6 +5,7 @@
  */
 
 import { isAbsolute } from "node:path";
+import { fileURLToPath } from "node:url";
 
 export type ReadTargetsOf = (args: Record<string, unknown>) => string[];
 
@@ -15,6 +16,40 @@ function nonEmpty(value: unknown): string | undefined {
 const pathArg: ReadTargetsOf = (args) => {
   const path = nonEmpty(args.path);
   return path === undefined ? [] : [path];
+};
+
+/**
+ * The local file a browser URL opens (`file:///…`, also behind
+ * `view-source:`), or `null` for any other URL. A browser page on a
+ * local file is a read like `os.fs.read`.
+ */
+export function localFileOfUrl(url: string): string | null {
+  let rest = url.trim();
+  while (/^view-source:/i.test(rest)) rest = rest.slice("view-source:".length).trim();
+  let parsed: URL;
+  try {
+    parsed = new URL(rest);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "file:") return null;
+  try {
+    return fileURLToPath(parsed);
+  } catch {
+    // A host the platform cannot map (`file://server/…` on POSIX): the
+    // path part is still what a browser would try to open.
+    try {
+      return decodeURIComponent(parsed.pathname);
+    } catch {
+      return parsed.pathname;
+    }
+  }
+}
+
+const browserUrlArg: ReadTargetsOf = (args) => {
+  const url = nonEmpty(args.url);
+  const file = url === undefined ? null : localFileOfUrl(url);
+  return file === null ? [] : [file];
 };
 
 function gitRepoArg(pathKey?: "path" | "paths"): ReadTargetsOf {
@@ -108,6 +143,13 @@ export const READ_TOOL_TARGETS: ReadonlyMap<string, ReadTargetsOf> = new Map<
   ["os.git.log", gitRepoArg("path")],
   ["os.git.blame", gitRepoArg("path")],
   ["os.git.diff", gitRepoArg("paths")],
+  // A file:// page (or its view-source:) reads that file into the
+  // browser, and the page text comes back to the model.
+  ["browser.navigate", browserUrlArg],
+  [
+    "browser.tabs",
+    (args) => (args.action === "new" ? browserUrlArg(args) : []),
+  ],
   [
     // A syntax check reads every file it is handed.
     "verify.syntax",
