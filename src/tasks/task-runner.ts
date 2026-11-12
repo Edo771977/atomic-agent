@@ -363,6 +363,48 @@ export class TaskRunner {
 
     const claimed = this.options.store.markRunning(resolvedTask.id);
     if (!claimed) return this.options.store.get(resolvedTask.id);
+    // Anything that throws after the claim (saving the wake reason or a
+    // recreated session, starting the snapshot sink) must not leave the
+    // row `running` with nobody on it: it ends like a failed run.
+    try {
+      return await this.runClaimed(task, claimed, runtimeSignal);
+    } catch (err) {
+      return this.failAfterClaim(claimed, err);
+    }
+  }
+
+  /**
+   * A throw out of a claimed attempt outside its turn: failed or retried
+   * on the usual curve, unless the row already ended elsewhere. When the
+   * store cannot record even that, the error is logged and the row is
+   * left for the boot sweep, rather than rejecting the whole drain.
+   */
+  private failAfterClaim(claimed: TaskRecord, err: unknown): TaskRecord | null {
+    this.options.logger?.warn("task run threw outside its turn", {
+      taskId: claimed.id,
+      sessionId: claimed.sessionId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    try {
+      if (this.endedElsewhere(claimed)) return this.options.store.get(claimed.id);
+      // Infrastructure around the turn, not the task's own request: retried
+      // on the usual curve, failed once its attempts run out.
+      return this.handleFailure(claimed, "transport", err);
+    } catch (storeErr) {
+      this.options.logger?.warn("task failure could not be recorded", {
+        taskId: claimed.id,
+        error: storeErr instanceof Error ? storeErr.message : String(storeErr),
+      });
+      return null;
+    }
+  }
+
+  /** One claimed attempt of `task` (`claimed` is its row after the claim). */
+  private async runClaimed(
+    task: TaskRecord,
+    claimed: TaskRecord,
+    runtimeSignal: AbortSignal | undefined,
+  ): Promise<TaskRecord | null> {
 
     this.options.metrics?.recordTaskStarted({
       taskId: claimed.id,
@@ -460,7 +502,10 @@ export class TaskRunner {
       userMessage: claimed.userMessage,
       startedAt: claimed.startedAt ?? Date.now(),
     };
-    const snapshots =
+    // Started inside the run's try below, so its `finally` stops the
+    // timer whatever ends the run.
+    let snapshots: ReturnType<typeof startTaskSnapshots> | null = null;
+    const startSnapshots = (): ReturnType<typeof startTaskSnapshots> | null =>
       collector && this.options.snapshotSink
         ? startTaskSnapshots({
             sink: this.options.snapshotSink,
@@ -544,6 +589,7 @@ export class TaskRunner {
       this.live.set(claimed.id, { ...liveInfo, collector });
     }
     try {
+      snapshots = startSnapshots();
       let result: RunTurnResult;
       try {
         await this.backOffResume(plan, run.signal);
@@ -925,7 +971,19 @@ export class TaskRunner {
         // `scheduled_for`) is not run early by any drain, this one
         // included: it is due again later.
         if (awaitingRetry(current, Date.now())) break;
-        current = await this.runOne(current.id, signal);
+        const attempted: TaskRecord = current;
+        try {
+          current = await this.runOne(attempted.id, signal);
+        } catch (err) {
+          // One task's throw (before its claim, e.g. the store) must not
+          // reject the whole drain and strand the other sessions' groups.
+          this.options.logger?.warn("task drain skipped a task that threw", {
+            taskId: attempted.id,
+            sessionId: attempted.sessionId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          break;
+        }
         outcome.drained += 1;
         if (!current) break;
         if (current.status === "completed") outcome.completed += 1;

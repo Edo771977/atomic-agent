@@ -3,7 +3,7 @@
 Status: current
 Owner: src/tasks/
 
-TaskStore owns durable pending/running/terminal rows. TaskRunner claims due work, invokes runtime.runTurn and records the actual outcome. Recovering an orphan or retrying eligible work returns running to pending; a recurring completion requeues while preserving its session. A retry waits out its backoff as durable state: `markRetry` sets `scheduled_for` to now plus the backoff, so `listDue` and every drain (scheduler tick, auto-drain after create, HTTP/CLI drain) skip it until then, and no drain sleeps holding the scheduler tick.
+TaskStore owns durable pending/running/terminal rows. TaskRunner claims due work, invokes runtime.runTurn and records the actual outcome. Recovering an orphan or retrying eligible work returns running to pending; a recurring completion requeues while preserving its session. A retry waits out its backoff as durable state: `markRetry` sets `scheduled_for` to now plus the backoff, so `listDue` and every drain (scheduler tick, auto-drain after create, HTTP/CLI drain) skip it until then, and no drain sleeps holding the scheduler tick. A throw after the claim but outside the turn (saving the wake reason or a recreated session) retries or fails the row like a failed run instead of leaving it `running`, and one task's throw does not reject the rest of the drain.
 
 Scheduler owns due polling and avoids re-entry. Stop/drain must settle in-flight work before store closure. Schedule math, webhook wake reasons, session metadata and notification destinations are explicit records; UI is not the scheduling engine.
 

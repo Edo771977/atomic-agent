@@ -568,6 +568,43 @@ describe("TaskRunner", () => {
     expect(saved.length).toBeGreaterThan(0);
   });
 
+  it("a throw after the claim retries or fails the task instead of leaving it running, and the drain goes on", async () => {
+    const other = createEmptySessionState({ id: "s-2", workingDir: "/tmp/work" });
+    const { runtime, calls } = fakeRuntime();
+    const runner = new TaskRunner({
+      store,
+      runtime,
+      sessionLoader: { load: (id: string) => (id === other.id ? other : session) },
+      sessionFactory: {
+        create: () => session,
+        save: (state) => {
+          if (state.id === session.id) throw new Error("disk full");
+        },
+      },
+      defaultMaxSteps: 5,
+      backoff: { initialMs: 1_000, maxMs: 1_000 },
+      enabled: true,
+      runOnCreate: false,
+      sleep: async () => undefined,
+    });
+    const broken = store.create({ sessionId: session.id, userMessage: "a", origin: "cli", maxAttempts: 2 });
+    const fine = store.create({ sessionId: other.id, userMessage: "b", origin: "cli", maxAttempts: 1 });
+    const outcome = await runner.drainPending();
+    expect(outcome).toMatchObject({ retried: 1, completed: 1 });
+    expect(store.get(broken.id)).toMatchObject({ status: "pending", lastError: "disk full" });
+    expect(store.get(fine.id)?.status).toBe("completed");
+    expect(calls.map((c) => c.sessionId)).toEqual([other.id]);
+    // Its last attempt fails it rather than leaving it running.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(Date.now() + 1_000);
+      await runner.drainPending();
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(store.get(broken.id)?.status).toBe("failed");
+  });
+
   it("carries webhookName from session metadata into wakeReason", async () => {
     session.metadata = { ...session.metadata, webhookName: "slack-ping" };
     let observed: unknown = undefined;
