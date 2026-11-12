@@ -16,6 +16,9 @@ import type { ResolvedModel } from "./model-resolver.js";
  * known; otherwise they stay in the plain-input share, as before. A
  * service that reports no write count is billed exactly as it was
  * (ATO-912).
+ *
+ * Output tokens the service left out of `completion_tokens` but counted
+ * in its total (`unreportedOutputTokens`) are billed at the output rate.
  */
 export function estimateUsageCostUsd(
   usage: CompletionUsage,
@@ -38,7 +41,9 @@ export function estimateUsageCostUsd(
     (uncached / 1_000_000) * pricing.input +
     (cached / 1_000_000) * cacheReadRate +
     (written / 1_000_000) * cacheWriteRate +
-    (usage.completionTokens / 1_000_000) * pricing.output
+    ((usage.completionTokens + Math.max(0, usage.unreportedOutputTokens ?? 0)) /
+      1_000_000) *
+      pricing.output
   );
 }
 

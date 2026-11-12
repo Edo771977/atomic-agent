@@ -35,6 +35,15 @@ export interface CompletionUsage {
    */
   cacheWriteTokens?: number;
   /**
+   * Output tokens the service counted in `total_tokens` but left out of
+   * `completion_tokens` (hidden thinking, on some OpenAI-compatible
+   * services). An inference from the total, so it is not part of
+   * `completionTokens` (the predicted token count and truncation
+   * recovery read only what was reported); `estimateUsageCostUsd` bills
+   * it at the output rate. Absent when there is no such excess.
+   */
+  unreportedOutputTokens?: number;
+  /**
    * What the service itself says the call cost, in USD (OpenRouter's
    * `usage.cost`). Preferred over any price-table estimate because it
    * is the bill, not a guess at it. Absent when the service said

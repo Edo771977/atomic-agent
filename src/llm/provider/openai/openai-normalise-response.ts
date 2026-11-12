@@ -77,23 +77,12 @@ export function normaliseOpenAiUsage(
   const promptTokens = Number(usage.prompt_tokens ?? 0);
   const reportedCompletion = Number(usage.completion_tokens ?? 0);
   const totalTokens = Number(usage.total_tokens ?? 0);
-  // Some services leave hidden thinking tokens out of `completion_tokens`
-  // while counting them in `total_tokens`; they are billed as output, so
-  // the excess is. Where reasoning is already inside `completion_tokens`
-  // (total = prompt + completion) this changes nothing. Skipped when cache
-  // reads arrive outside `prompt_tokens` (`cache_read_input_tokens`), where
-  // the excess may be those reads rather than output.
-  const unreported = totalTokens - promptTokens - reportedCompletion;
-  const completionTokens =
-    Number.isFinite(unreported) &&
-    unreported > 0 &&
-    usage.cache_read_input_tokens === undefined
-      ? reportedCompletion + unreported
-      : reportedCompletion;
+  const output = readOutputTokens(usage, promptTokens, reportedCompletion, totalTokens);
   return {
     promptTokens,
-    completionTokens,
+    completionTokens: output.completionTokens,
     totalTokens,
+    ...(output.unreported > 0 ? { unreportedOutputTokens: output.unreported } : {}),
     ...(typeof cached === "number" && Number.isFinite(cached) && cached >= 0
       ? { cachedTokens: cached }
       : {}),
@@ -106,6 +95,76 @@ export function normaliseOpenAiUsage(
       ? { costUsd: usage.cost }
       : {}),
   };
+}
+
+/**
+ * Usage keys that say `total_tokens` counts something besides prompt and
+ * completion: cache reads or writes billed outside `prompt_tokens`
+ * (`cache_read_input_tokens`, `cache_creation_input_tokens`), and audio,
+ * image, citation or search tokens. Beside any of them an excess of the
+ * total is not evidence of hidden output.
+ */
+const NON_OUTPUT_USAGE_KEY = /cache|_input_tokens|audio|image|citation|search/;
+
+function hasNonOutputUsageKey(usage: Record<string, unknown>): boolean {
+  for (const [key, value] of Object.entries(usage)) {
+    if (NON_OUTPUT_USAGE_KEY.test(key)) return true;
+    if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+      if (Object.keys(value).some((k) => NON_OUTPUT_USAGE_KEY.test(k))) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * The output side of an OpenAI-shaped `usage` block.
+ *
+ * `completion_tokens_details.reasoning_tokens` is read first. On OpenAI
+ * it is a subset of `completion_tokens`, so it is added only when it is
+ * evidently outside: larger than `completion_tokens`, or the only way
+ * `total_tokens` adds up (prompt + completion + reasoning). Either way it
+ * settles the question, and the total is not read further.
+ *
+ * Without it, some services still leave hidden thinking out of
+ * `completion_tokens` while counting it in `total_tokens`. That excess is
+ * an inference, so it is used only when both `prompt_tokens` and
+ * `completion_tokens` are reported and no usage key says the total counts
+ * something else (`NON_OUTPUT_USAGE_KEY`). It comes back as `unreported`
+ * (`CompletionUsage.unreportedOutputTokens`): billed at the output rate,
+ * but kept out of `completionTokens`, which feeds the predicted token
+ * count (tok/s) and the truncation-recovery cap, both of which should
+ * read what the service reported rather than a guess.
+ */
+function readOutputTokens(
+  usage: Record<string, unknown>,
+  promptTokens: number,
+  reportedCompletion: number,
+  totalTokens: number,
+): { completionTokens: number; unreported: number } {
+  const details = usage.completion_tokens_details;
+  const reasoning =
+    details !== null && typeof details === "object"
+      ? Number((details as Record<string, unknown>).reasoning_tokens)
+      : Number.NaN;
+  if (Number.isFinite(reasoning) && reasoning > 0) {
+    const outside =
+      reasoning > reportedCompletion ||
+      (totalTokens > promptTokens + reportedCompletion &&
+        totalTokens === promptTokens + reportedCompletion + reasoning);
+    return {
+      completionTokens: outside ? reportedCompletion + reasoning : reportedCompletion,
+      unreported: 0,
+    };
+  }
+  const bothReported =
+    typeof usage.prompt_tokens === "number" &&
+    typeof usage.completion_tokens === "number";
+  const excess = totalTokens - promptTokens - reportedCompletion;
+  const unreported =
+    bothReported && Number.isFinite(excess) && excess > 0 && !hasNonOutputUsageKey(usage)
+      ? excess
+      : 0;
+  return { completionTokens: reportedCompletion, unreported };
 }
 
 /**
