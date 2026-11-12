@@ -398,6 +398,7 @@ describe("approval gating", () => {
       sessionId: "s-test",
       tool: "mcp.windows.app_launch",
       category: "other",
+      grantKey: "mcp.windows.app_launch",
       affectedResources: ["windows"],
     });
     expect(requests[0]!.preview).toContain('"calc.exe"');

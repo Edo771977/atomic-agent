@@ -169,6 +169,9 @@ export function createMcpToolDefinition(
               sessionId: ctx.sessionId,
               tool: meta.qualifiedName,
               category: "other",
+              // "Allow in this chat" covers this one server tool, never
+              // another request that also asks as `other`.
+              grantKey: meta.qualifiedName,
               reason: `call MCP tool ${meta.rawName} on server ${meta.server}`,
               preview: buildApprovalPreview(args),
               affectedResources: [meta.server],
