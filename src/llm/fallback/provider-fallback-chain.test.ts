@@ -1,5 +1,8 @@
 import { describe, it, expect, vi } from "vitest";
-import { ProviderFallbackChain } from "./provider-fallback-chain.js";
+import {
+  newAdvanceTurn,
+  ProviderFallbackChain,
+} from "./provider-fallback-chain.js";
 import type { ProviderSwitchNotice } from "./provider-fallback-chain.js";
 import type { ResolvedFallbackChain } from "./fallback-config.js";
 import { DEFAULT_FALLBACK_TIMING } from "./fallback-config.js";
@@ -323,6 +326,42 @@ describe("ProviderFallbackChain", () => {
     expect(chain.pickProvider()).toEqual({ providerId: "a", isProbe: true });
     expect(chain.advanceFrom("a", http(503))).toBe("c");
     expect(chain.activeOverride).toBe("c");
+  });
+
+  it("falls back to a link skipped for cooldown once the links after it are exhausted", () => {
+    const clock = makeClock();
+    const chain = new ProviderFallbackChain({
+      resolve: () => chainOf(["a", "b", "c"]),
+      now: clock.now,
+    });
+    // b is cooling; a probe-style turn on a fails and skips b for c.
+    chain.advanceFrom("b", http(503));
+    const turn = newAdvanceTurn();
+    expect(chain.advanceFrom("a", http(503), undefined, turn)).toBe("c");
+    expect([...turn.skipped]).toEqual(["b"]);
+    // c fails too: b, skipped earlier this turn, is the last resort.
+    expect(chain.advanceFrom("c", http(503), undefined, turn)).toBe("b");
+    expect(turn.skipped.size).toBe(0);
+    // b fails as well: now the turn is really out of links.
+    expect(chain.advanceFrom("b", http(503), undefined, turn)).toBeNull();
+  });
+
+  it("prefers the skipped link whose cooldown ends soonest", () => {
+    const clock = makeClock();
+    const timing = { ...DEFAULT_FALLBACK_TIMING, cooldownMs: [30_000, 120_000] };
+    const chain = new ProviderFallbackChain({
+      resolve: () => chainOf(["a", "b", "c", "d"], timing),
+      now: clock.now,
+    });
+    // b cools for the longer step (second trip), c for the shorter one.
+    chain.advanceFrom("b", http(503));
+    clock.advance(31_000);
+    chain.advanceFrom("b", http(503));
+    chain.advanceFrom("c", http(503));
+    const turn = newAdvanceTurn();
+    expect(chain.advanceFrom("a", http(503), undefined, turn)).toBe("d");
+    expect(chain.advanceFrom("d", http(503), undefined, turn)).toBe("c");
+    expect(chain.advanceFrom("c", http(503), undefined, turn)).toBe("b");
   });
 
   it("still tries a cooling link when every remaining link is cooling", () => {
