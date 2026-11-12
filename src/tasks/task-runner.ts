@@ -378,7 +378,7 @@ export class TaskRunner {
     try {
       return await this.runClaimed(task, claimed, runtimeSignal);
     } catch (err) {
-      return this.failAfterClaim(claimed, err);
+      return this.failAfterClaim(claimed, err, runtimeSignal);
     }
   }
 
@@ -388,7 +388,11 @@ export class TaskRunner {
    * store cannot record even that, the error is logged and the row is
    * left for the boot sweep, rather than rejecting the whole drain.
    */
-  private failAfterClaim(claimed: TaskRecord, err: unknown): TaskRecord | null {
+  private failAfterClaim(
+    claimed: TaskRecord,
+    err: unknown,
+    runtimeSignal: AbortSignal | undefined,
+  ): TaskRecord | null {
     this.options.logger?.warn("task run threw outside its turn", {
       taskId: claimed.id,
       sessionId: claimed.sessionId,
@@ -396,6 +400,13 @@ export class TaskRunner {
     });
     try {
       if (this.endedElsewhere(claimed)) return this.options.store.get(claimed.id);
+      // The agent stopping or the drain aborted is what ended it, not the
+      // task: put back like any interrupted run (`handleCancelled`), not
+      // filed as a transport retry; a recurring task is rearmed for its
+      // next firing.
+      if (this.interrupted(runtimeSignal)) {
+        return this.handleCancelled(claimed, err, true);
+      }
       // Infrastructure around the turn, not the task's own request: retried
       // on the usual curve, failed once its attempts run out.
       return this.handleFailure(claimed, "transport", err);

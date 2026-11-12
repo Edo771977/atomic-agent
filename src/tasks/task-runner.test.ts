@@ -1308,6 +1308,51 @@ describe("TaskRunner", () => {
       expect(turn.entered()).toBe(1);
     });
 
+    /** A runner whose save (after the claim) aborts the drain, then throws. */
+    function runnerThatThrowsWhileAborting(controller: AbortController): TaskRunner {
+      return new TaskRunner({
+        store,
+        runtime: fakeRuntime().runtime,
+        sessionLoader: fakeSessionLoader(session),
+        sessionFactory: {
+          create: () => session,
+          save: () => {
+            controller.abort();
+            throw new Error("database is closing");
+          },
+        },
+        defaultMaxSteps: 5,
+        backoff: { initialMs: 1_000, maxMs: 1_000 },
+        enabled: true,
+        runOnCreate: false,
+        sleep: async () => undefined,
+      });
+    }
+
+    it("a throw after the claim while the drain is aborted puts a one-shot back as interrupted, not as a retry", async () => {
+      const controller = new AbortController();
+      const runner = runnerThatThrowsWhileAborting(controller);
+      const id = oneShotTask();
+      const outcome = await runner.drainPending({ signal: controller.signal });
+      expect(outcome).toMatchObject({ retried: 0, failed: 0, cancelled: 1, retryPending: 0 });
+      expect(store.get(id)).toMatchObject({
+        status: "pending",
+        scheduledFor: null,
+        lastErrorCategory: "cancelled",
+      });
+    });
+
+    it("a throw after the claim while the drain is aborted rearms a recurring task", async () => {
+      const controller = new AbortController();
+      const runner = runnerThatThrowsWhileAborting(controller);
+      const id = recurringTask();
+      const before = Date.now();
+      await runner.drainPending({ signal: controller.signal });
+      const after = store.get(id)!;
+      expect(after).toMatchObject({ status: "pending", attempts: 0, lastErrorCategory: "cancelled" });
+      expect(after.scheduledFor).toBeGreaterThanOrEqual(before + 300_000);
+    });
+
     it("a recurring task whose own turn was stopped is rearmed, not cancelled for good", async () => {
       const { runtime } = fakeRuntime({
         scripts: [
