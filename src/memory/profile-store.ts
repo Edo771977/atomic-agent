@@ -453,15 +453,19 @@ export class ProfileStore {
    * superseded versions, so `history(key)` is empty afterwards. A row of
    * another key that cross-key superseded one of them stays, with its
    * `supersedes` pointer cleared; an older row of another key that one
-   * of them superseded stays superseded. Returns `true` when any row was
-   * deleted.
+   * of them superseded stays superseded. Returns `true` only when the key
+   * had an active row (one `get(key)` could see), so
+   * `memory.profile.remove` never reports success for a key that was not
+   * there; leftover history alone is still purged, but reads as `false`.
    */
   remove(key: string): boolean {
     const normalisedKey = validateKey(key);
-    const changes = this.db.transaction((): number =>
-      this.forgetKey(normalisedKey),
-    )();
-    return changes > 0;
+    return this.db.transaction((): boolean => {
+      const hadActive =
+        this.selectActiveByKeyStmt.get(normalisedKey) !== undefined;
+      this.forgetKey(normalisedKey);
+      return hadActive;
+    })();
   }
 
   /**

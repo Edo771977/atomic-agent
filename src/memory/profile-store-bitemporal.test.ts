@@ -156,7 +156,8 @@ describe("ProfileStore (bi-temporal phase 4)", () => {
     // The previous remove() deleted only the active row.
     rawDelete(h, "DELETE FROM profile_facts WHERE key = 'deploy_cmd' AND superseded_by IS NULL");
     expect(h.store.history("deploy_cmd").map((f) => f.value)).toEqual(["make old"]);
-    expect(h.store.remove("deploy_cmd")).toBe(true);
+    // Purged, but there was no active fact to remove: not a success.
+    expect(h.store.remove("deploy_cmd")).toBe(false);
     expect(h.store.history("deploy_cmd")).toEqual([]);
   });
 
@@ -164,7 +165,8 @@ describe("ProfileStore (bi-temporal phase 4)", () => {
     h.store.set("editor", "vim", 1_000);
     const next = h.store.set("ide", "vscode", { supersedesKey: "editor" }, 2_000);
     expect(next.supersedes).not.toBeNull();
-    expect(h.store.remove("editor")).toBe(true);
+    // `editor` has no active row (ide superseded it): purged, reported false.
+    expect(h.store.remove("editor")).toBe(false);
     expect(h.store.history("editor")).toEqual([]);
     const ide = h.store.get("ide");
     expect(ide?.value).toBe("vscode");
