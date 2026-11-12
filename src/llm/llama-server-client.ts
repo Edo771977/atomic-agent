@@ -1137,8 +1137,16 @@ export class LlamaServerClient {
       let replyStarted = false;
       while (looped === null) {
         const { value, done } = await reader.read();
-        if (done) break;
-        if (phase !== "streaming") {
+        if (done) {
+          // EOF: release a `\r` the normaliser held back (with CR-only
+          // framing it ends every event), and read what is left as the
+          // last event even without its trailing blank line, as the
+          // OpenAI-compatible consumer does. Otherwise the stop event,
+          // and with it the timings and token counts, is lost.
+          buffer += lineEndings.push("", true);
+          if (buffer.trim().length === 0) break;
+          buffer += "\n\n";
+        } else if (phase !== "streaming") {
           phase = "streaming";
           this.logger?.debug("llama stream: first byte", {
             ...trace,
@@ -1147,22 +1155,23 @@ export class LlamaServerClient {
         }
         // A byte arrived: the server is alive, so start the clock over —
         // and from now on a silence really is a mid-reply stall.
-        // Deliberately not called on `done` — that breaks straight out of
-        // the loop into `finally { cleanup() }` with nothing awaited in
-        // between, so there is no window left for the timer to fire.
+        // Deliberately not re-armed on `done` (`alive` starts true): the
+        // body has ended, and the tail events read off it lead straight
+        // out of the loop into `finally { cleanup() }`.
         // Except a prompt-progress event (ATO-1027): that is the server
         // still reading the prompt, not the reply starting, so it keeps
         // the first-token budget and the `/slots` watch running. Marked
         // before the first yield of this read, as the call always was.
-        let alive = false;
+        let alive = done === true;
         const markAlive = (): void => {
           replyStarted = true;
           if (alive) return;
           alive = true;
           keepAlive("idle");
         };
-        // CRLF / CR framing becomes LF before events are split on "\n\n".
-        buffer += lineEndings.push(value);
+        // CRLF / CR framing becomes LF before events are split on "\n\n"
+        // (at EOF the tail was flushed above).
+        if (!done) buffer += lineEndings.push(value);
         let eventEnd = buffer.indexOf("\n\n");
         // Bytes that complete no event yet are still a live server —
         // unless progress was asked for and no real event has come: then
@@ -1236,6 +1245,7 @@ export class LlamaServerClient {
           }
           eventEnd = buffer.indexOf("\n\n");
         }
+        if (done) break;
       }
       if (looped !== null) {
         // Close the connection now, not when the consumer gets round to
