@@ -608,6 +608,12 @@ export interface TuiAppCallbacks {
   prepareFusionResume?(sessionId: string, runId: string | undefined): string | null;
   /** `/fusion report [flags]`: the outcome report's text (or a usage line). */
   renderFusionReport?(args: readonly string[]): string;
+  /**
+   * `/resume` (ATO-448): the message that continues `sessionId`'s last
+   * turn when a restart cut it off, sent as the person's turn; `null`
+   * when there is none. Taking it records the turn as resumed.
+   */
+  prepareInterruptedTurnResume?(sessionId: string): string | null;
   /** Providers tab / LLM panel: select an exact chat model for a provider. */
   onProvidersSelectChatModel?(providerId: string, modelId: string): void;
   /**
