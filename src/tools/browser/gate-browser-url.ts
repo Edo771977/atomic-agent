@@ -8,6 +8,11 @@ import {
 } from "../../approval/dangerous-tool.js";
 import type { ToolContext } from "../tool-registry.js";
 import { requireUserSite } from "./user-profile-sites.js";
+import {
+  localPageMessage,
+  localPageRefusal,
+  type LocalPageRead,
+} from "./gate-page-read.js";
 import type { BrowserBackend } from "./browser-backend.js";
 import {
   blockedDomainMessage,
@@ -93,15 +98,24 @@ export async function gateBrowserUrl(
  * later than the click itself returns is caught by the next read
  * (`browser.read_aria`), which refuses a blocked page too.
  *
- * Skipped while `blockedDomains` is empty, so it costs nothing then.
+ * With `local` and `policy.localPages`, a landed `file://` page is
+ * checked like a read too: a meta refresh to `file:///…/.env`, or a click
+ * on a `file://` listing's parent link, ends on a file nobody was asked
+ * about. Such a page is cleared and refused the same way (never asked
+ * about mid-action; the question belongs to a navigation naming it).
+ *
+ * Skipped while `blockedDomains` is empty and no local check is wired,
+ * so it costs nothing then.
  */
 export async function recheckLandedPage(
   backend: Pick<BrowserBackend, "currentUrl" | "navigate">,
   policy: BrowserDomainPolicy,
   tool: string,
   landedUrl?: string,
+  local?: LocalPageRead,
 ): Promise<CompressedToolResult | null> {
-  if (policy.blockedDomains.length === 0) return null;
+  const checkLocal = policy.localPages !== undefined && local !== undefined;
+  if (policy.blockedDomains.length === 0 && !checkLocal) return null;
   let url = landedUrl;
   if (url === undefined) {
     try {
@@ -109,6 +123,16 @@ export async function recheckLandedPage(
     } catch {
       return null;
     }
+  }
+  const localFile = localPageRefusal([url], policy, local);
+  if (localFile !== null) {
+    await backend.navigate({ url: "about:blank" }).catch(() => undefined);
+    return compressToolResult({
+      tool,
+      status: "error",
+      output: `${localPageMessage(tool, localFile.path, localFile.why)} The action ended on that file, so the tab was cleared.`,
+      details: { url, path: localFile.path, reason: "local_file_refused" },
+    });
   }
   const verdict = checkBrowserUrl(url, policy);
   if (verdict.kind !== "blocked") return null;

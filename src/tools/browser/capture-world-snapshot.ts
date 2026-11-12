@@ -27,17 +27,24 @@ export interface CapturedWorldSnapshot {
  * captured: its content must not reach the model. In the user's own
  * Chrome a site not cleared this session (a redirect went elsewhere) is
  * not captured either; browser.read_aria asks for it (`gate-page-read.ts`).
+ * Nor is a local file the read scope does not cover, except `allowUrl`,
+ * the file the calling navigation itself named and had approved.
  */
 export async function captureWorldSnapshot(
   backend: BrowserBackend,
-  ctx: Pick<ToolContext, "modelMode" | "contextWindowTokens" | "sessionId">,
+  ctx: Pick<
+    ToolContext,
+    "modelMode" | "contextWindowTokens" | "sessionId" | "workingDir" | "readRoots"
+  >,
   policy: BrowserDomainPolicy = EMPTY_DOMAIN_POLICY,
   store?: AriaSnapshotStore,
+  allowUrl?: string,
 ): Promise<CapturedWorldSnapshot | undefined> {
   const view: AriaViewContext = {
     ...(ctx.modelMode ? { modelMode: ctx.modelMode } : {}),
     ...(ctx.contextWindowTokens !== undefined ? { contextWindowTokens: ctx.contextWindowTokens } : {}),
     sessionId: ctx.sessionId,
+    local: { reader: ctx, ...(allowUrl !== undefined ? { allowUrl } : {}) },
   };
   try {
     const result = await readAriaView(backend, {}, view, policy, store);

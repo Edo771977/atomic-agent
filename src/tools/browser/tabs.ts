@@ -89,7 +89,10 @@ export function buildBrowserTabsTool(
       await backend.ensureReady();
       const result = await backend.tabs(input);
       if (action === "new" && input.url !== undefined) {
-        const landed = await recheckLandedPage(backend, policy, "browser.tabs");
+        const landed = await recheckLandedPage(backend, policy, "browser.tabs", undefined, {
+          reader: ctx,
+          allowUrl: input.url,
+        });
         if (landed) return landed;
       }
       const rendered = result.tabs

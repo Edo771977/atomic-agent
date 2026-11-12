@@ -39,7 +39,11 @@ import { registerVideoTools, VIDEO_GENERATE_TOOL } from "../../tools/video/index
 import { captureImageGenerated, captureVideoGenerated } from "../../analytics/analytics-events.js";
 import type { AnalyticsClient } from "../../analytics/analytics-client.js";
 import { buildFusionDelegateTool, readSlotOccupancy, type FusionDelegateDeps } from "../../tools/fusion/index.js";
-import { confineReads } from "../../tools/read-scope/index.js";
+import {
+  confineReads,
+  localPageCheck,
+  type ConfineReadsOptions,
+} from "../../tools/read-scope/index.js";
 import { McpManager, buildMcpPromptGetTool, buildMcpPromptListTool, buildMcpResourceListTool, buildMcpResourceReadTool, buildMcpToolDescriptors, createMcpSamplingHandler, mergeMcpDescriptors, applyMcpToolNameRule, buildMcpToolNameRule } from "../../mcp/index.js";
 import { DEFAULT_TOOL_DESCRIPTORS } from "../../prompt/tool-descriptors.js";
 import type { McpServerConfig } from "../../mcp/mcp-types.js";
@@ -94,6 +98,26 @@ export function runtimeKnownSecrets(
   return out;
 }
 
+/**
+ * The read confinement every session gets (`confineReads`), shared with
+ * the browser's landed-page check (`localPageCheck`) so a page that ends
+ * on a local file sees the same scope, secret files and grants.
+ */
+function runtimeReadConfinement(
+  config: AtomicAgentConfig,
+  dangerous: DangerousToolOptions,
+): ConfineReadsOptions {
+  return {
+    grantedDirs: (sessionId) => dangerous.approvals.fanoutScopes.scopeFor(sessionId),
+    readScope: () => getConfig().agent.readScope,
+    approvals: dangerous,
+    stateSecrets: {
+      stateDir: config.paths.stateDir,
+      files: getStateSecretPaths(config.paths),
+    },
+  };
+}
+
 export function createRuntimeToolRegistry(
   config: AtomicAgentConfig,
   browserBackend: BrowserBackend,
@@ -114,6 +138,7 @@ export function createRuntimeToolRegistry(
       allowedDomains: config.browser.allowedDomains,
       userProfile: config.browser.connect === "user-chrome",
       ...(config.browser.connect === "user-chrome" ? { userSites: new UserSiteApprovals() } : {}),
+      localPages: localPageCheck(runtimeReadConfinement(config, dangerous)),
     };
     for (const tool of buildBrowserTools(browserBackend, dangerous, domainPolicy)) {
       toolRegistry.register(tool);
@@ -835,15 +860,7 @@ export function registerRuntimeFusionAndReadScope(input: {
   // The agent's own secret files (`.env`, `config.json`, local server
   // keys) ask as `state_secret` on any read or shell command naming
   // them, whatever the scope and below full trust (ATO-877).
-  confineReads(toolRegistry, {
-    grantedDirs: (sessionId) => approvals.fanoutScopes.scopeFor(sessionId),
-    readScope: () => getConfig().agent.readScope,
-    approvals: dangerous,
-    stateSecrets: {
-      stateDir: config.paths.stateDir,
-      files: getStateSecretPaths(config.paths),
-    },
-  });
+  confineReads(toolRegistry, runtimeReadConfinement(config, dangerous));
 }
 
 function safePluginMcpServers(

@@ -43,7 +43,9 @@ export function buildBrowserSearchTool(
         ...(engine !== undefined ? { engine } : {}),
       };
       const result = await backend.search(payload);
-      const landed = await recheckLandedPage(backend, policy, "browser.search");
+      const landed = await recheckLandedPage(backend, policy, "browser.search", undefined, {
+        reader: ctx,
+      });
       if (landed) return landed;
       const worldSnapshot = await captureWorldSnapshot(backend, ctx, policy, store);
       return compressToolResult({

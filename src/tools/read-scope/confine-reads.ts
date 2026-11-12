@@ -2,10 +2,11 @@ import type { DangerousToolOptions } from "../../approval/dangerous-tool.js";
 import type { CompressedToolResult } from "../../compressor/result-compressor.js";
 import type { ReadScope } from "../../config/index.js";
 import { isFusionWorkerSessionId } from "../../session/fusion-worker-session.js";
-import type { ToolDefinition, ToolRegistry } from "../tool-registry.js";
+import type { ToolContext, ToolDefinition, ToolRegistry } from "../tool-registry.js";
 import {
   checkWorkerRead,
   findSessionReadOutside,
+  sessionReadRoots,
   workerReadRefusal,
 } from "./read-scope.js";
 import {
@@ -228,6 +229,42 @@ export function confineReads(
     }
   }
   return confined;
+}
+
+/** The browser tool whose `url` names a local page as a read target. */
+const LOCAL_PAGE_TOOL = "browser.navigate";
+
+/**
+ * The read-scope check for a browser page that LANDED on a local file
+ * (`BrowserDomainPolicy.localPages`): a redirect or a click the requested
+ * URL never named. Built from the same options as `confineReads`, so it
+ * sees the same worker scope, secret files, `agent.readScope` and the
+ * directories approved so far. It never asks — mid-click there is no
+ * call left to put the question to — and the browser refuses the page.
+ */
+export function localPageCheck(
+  options: ConfineReadsOptions,
+): (url: string, ctx: Pick<ToolContext, "sessionId" | "workingDir" | "readRoots">) => string | null {
+  return (url, ctx) => {
+    const args = { url };
+    if (checkWorkerRead(LOCAL_PAGE_TOOL, args, ctx, options.grantedDirs(ctx.sessionId)) !== null) {
+      return "is outside this worker's directories";
+    }
+    if (
+      options.stateSecrets !== undefined &&
+      findStateSecretReads(LOCAL_PAGE_TOOL, args, ctx, options.stateSecrets).length > 0
+    ) {
+      return "is one of the agent's own secret files";
+    }
+    if (options.readScope?.() !== "working-dir" || options.approvals === undefined) return null;
+    const roots = [
+      ...sessionReadRoots(ctx),
+      ...options.approvals.approvals.readScopeGrants.rootsFor(ctx.sessionId),
+    ];
+    return findSessionReadOutside(LOCAL_PAGE_TOOL, args, ctx, roots) === null
+      ? null
+      : `is outside the read scope (the working directory ${ctx.workingDir} and the paths approved this session)`;
+  };
 }
 
 /**

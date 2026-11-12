@@ -110,9 +110,12 @@ export function buildBrowserNavigateTool(
         ...(waitUntil !== undefined ? { waitUntil } : {}),
         ...(timeoutMs !== undefined ? { timeoutMs } : {}),
       });
-      const landed = await recheckLandedPage(backend, policy, "browser.navigate", result.url);
+      const landed = await recheckLandedPage(backend, policy, "browser.navigate", result.url, {
+        reader: ctx,
+        allowUrl: url,
+      });
       if (landed) return landed;
-      const worldSnapshot = await captureWorldSnapshot(backend, ctx, policy, store);
+      const worldSnapshot = await captureWorldSnapshot(backend, ctx, policy, store, url);
       return compressToolResult({
         tool: "browser.navigate",
         status: "ok",

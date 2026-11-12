@@ -5,6 +5,7 @@
  * asks first (`browser_offsite`). Matching is by host: an entry matches
  * itself and every subdomain, case-insensitively.
  */
+import type { ToolContext } from "../tool-registry.js";
 import type { UserSiteApprovals } from "./user-profile-sites.js";
 
 export interface BrowserDomainPolicy {
@@ -24,7 +25,25 @@ export interface BrowserDomainPolicy {
    * in `allowedDomains` excepted. Absent ⇒ every site asks.
    */
   readonly userSites?: UserSiteApprovals;
+  /**
+   * The read-scope check for a page on a local file (`localPageCheck`,
+   * `../read-scope/confine-reads.ts`), applied where a page landed and
+   * before its content is read: a redirect or a link can reach a file the
+   * requested URL never named. Absent ⇒ landed file:// pages are not
+   * checked (embedders, tests).
+   */
+  readonly localPages?: LocalPageCheck;
 }
+
+/** Enough of the tool context to place a local page in the read scope. */
+export type LocalPageReader = Pick<ToolContext, "sessionId" | "workingDir" | "readRoots">;
+
+/**
+ * Why a page URL may not be read without asking (`"is one of the agent's
+ * own secret files"`), or `null`: not a local file, or one inside the
+ * session's read scope.
+ */
+export type LocalPageCheck = (url: string, reader: LocalPageReader) => string | null;
 
 export const EMPTY_DOMAIN_POLICY: BrowserDomainPolicy = {
   blockedDomains: [],

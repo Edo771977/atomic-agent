@@ -7,9 +7,13 @@ import { pathToFileURL } from "node:url";
 import { ApprovalGate, type ApprovalLevel, type ApprovalRequest } from "../../approval/index.js";
 import type { ReadScope } from "../../config/index.js";
 import { ToolRegistry, type ToolContext } from "../tool-registry.js";
-import { confineReads } from "../read-scope/confine-reads.js";
+import {
+  confineReads,
+  localPageCheck,
+  type ConfineReadsOptions,
+} from "../read-scope/confine-reads.js";
 import { GateBackend } from "./browser-gate-test-helpers.js";
-import { buildBrowserNavigateTool, buildBrowserTabsTool } from "./index.js";
+import { buildBrowserTools } from "./index.js";
 
 /**
  * A file:// page is a local read: it goes through the agent's secret-file
@@ -61,9 +65,9 @@ describe("browser file:// navigation", () => {
     const options = { approvals: gate, approvalRequired: true };
     backend = new GateBackend();
     registry = new ToolRegistry();
-    registry.register(buildBrowserNavigateTool(backend, options));
-    registry.register(buildBrowserTabsTool(backend, options));
-    confineReads(registry, {
+    // The runtime's wiring: one set of confinement options for the
+    // dispatch-time read checks and the browser's landed-page check.
+    const confinement: ConfineReadsOptions = {
       grantedDirs: () => [],
       readScope: () => readScope,
       approvals: options,
@@ -71,7 +75,14 @@ describe("browser file:// navigation", () => {
         stateDir,
         files: [join(stateDir, "config.json"), join(stateDir, ".env")],
       },
-    });
+    };
+    const policy = {
+      blockedDomains: [],
+      allowedDomains: [],
+      localPages: localPageCheck(confinement),
+    };
+    for (const tool of buildBrowserTools(backend, options, policy)) registry.register(tool);
+    confineReads(registry, confinement);
   });
 
   afterEach(() => {
@@ -117,6 +128,67 @@ describe("browser file:// navigation", () => {
     ).rejects.toMatchObject({ name: "ApprovalDeniedError" });
     expect(prompts.map((p) => p.category)).toEqual(["state_secret"]);
     expect(backend.tabCalls).toBe(0);
+  });
+
+  it("an approved secret page opens, and its world snapshot is captured", async () => {
+    const result = await navigate(url(join(stateDir, ".env")));
+    expect(result.status).toBe("ok");
+    expect(prompts.map((p) => p.category)).toEqual(["state_secret", "browser_nonweb"]);
+    expect(result.details.worldSnapshot).toBeDefined();
+  });
+
+  it("a page that redirects to a secret file is cleared and refused", async () => {
+    // An in-scope report whose meta refresh goes to the agent's `.env`.
+    const report = url(join(work, "report.html"));
+    backend.redirects.set(report, url(join(stateDir, ".env")));
+    const result = await navigate(report);
+    expect(result.status).toBe("error");
+    expect(result.details.reason).toBe("local_file_refused");
+    expect(result.summary).toContain(join(stateDir, ".env"));
+    expect(backend.url).toBe("about:blank");
+    expect(backend.snapshots).toBe(0);
+    expect(prompts.map((p) => p.category)).toEqual(["browser_nonweb"]);
+  });
+
+  it("a click that lands outside the read scope is cleared and refused", async () => {
+    readScope = "working-dir";
+    backend.url = url(join(work, "index.html"));
+    // A file:// directory listing's parent link, off the temp directory.
+    backend.landAfterAction = "file:///srv/elsewhere/";
+    const result = await registry.invoke("browser.click", { ref: "e1" }, ctx());
+    expect(result.status).toBe("error");
+    expect(result.details.reason).toBe("local_file_refused");
+    expect(backend.url).toBe("about:blank");
+    expect(prompts).toEqual([]);
+  });
+
+  it("a click that lands on a secret file is cleared and refused at any scope", async () => {
+    backend.url = url(join(work, "index.html"));
+    backend.landAfterAction = url(join(stateDir, "config.json"));
+    const result = await registry.invoke("browser.click", { ref: "e1" }, ctx());
+    expect(result.status).toBe("error");
+    expect(result.details.reason).toBe("local_file_refused");
+    expect(backend.url).toBe("about:blank");
+  });
+
+  it("read_aria and screenshot refuse a page sitting on a secret file", async () => {
+    // However the tab got there (a navigation that started after a click
+    // returned), the page text never reaches the model.
+    backend.url = url(join(stateDir, ".env"));
+    const read = await registry.invoke("browser.read_aria", {}, ctx());
+    expect(read.status).toBe("error");
+    expect(read.details.reason).toBe("local_file_refused");
+    const shot = await registry.invoke("browser.screenshot", {}, ctx());
+    expect(shot.status).toBe("error");
+    expect(shot.details.reason).toBe("local_file_refused");
+    expect(backend.shots).toHaveLength(0);
+  });
+
+  it("read_aria on a local page inside the scope still reads", async () => {
+    readScope = "working-dir";
+    backend.url = url(join(work, "index.html"));
+    const read = await registry.invoke("browser.read_aria", {}, ctx());
+    expect(read.status).toBe("ok");
   });
 
   it("under the working-dir scope a local page outside it asks as a read", async () => {

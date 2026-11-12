@@ -10,7 +10,7 @@ import {
   EMPTY_DOMAIN_POLICY,
   type BrowserDomainPolicy,
 } from "./browser-domain-policy.js";
-import { gatePageRead } from "./gate-page-read.js";
+import { gatePageRead, localPageMessage } from "./gate-page-read.js";
 import { BROWSER_SHOT_MAX_BYTES, SHOT_ATTEMPTS } from "./screenshot-geometry.js";
 
 export const BROWSER_SCREENSHOT_TOOL = "browser.screenshot";
@@ -96,7 +96,15 @@ export function buildBrowserScreenshotTool(
         policy,
         ctx.sessionId,
         dangerous ? { dangerous, tool: BROWSER_SCREENSHOT_TOOL, signal: ctx.signal } : undefined,
+        { reader: ctx },
       );
+      if (gateBefore.kind === "local_file_refused") {
+        return errorResult(localPageMessage(BROWSER_SCREENSHOT_TOOL, gateBefore.path, gateBefore.why), {
+          url: before,
+          path: gateBefore.path,
+          reason: "local_file_refused",
+        });
+      }
       if (gateBefore.kind === "blocked") {
         return errorResult(blockedDomainMessage(BROWSER_SCREENSHOT_TOOL, gateBefore.host), {
           url: before,
@@ -125,7 +133,13 @@ export function buildBrowserScreenshotTool(
           maxSide: attempt.maxSide,
           quality: attempt.quality,
         });
-        const gate = await gatePageRead(taken, policy, ctx.sessionId);
+        const gate = await gatePageRead(taken, policy, ctx.sessionId, undefined, { reader: ctx });
+        if (gate.kind === "local_file_refused") {
+          return errorResult(
+            `${localPageMessage(BROWSER_SCREENSHOT_TOOL, gate.path, gate.why)} The page moved there, so the screenshot was discarded.`,
+            { url: taken.url, path: gate.path, reason: "local_file_refused" },
+          );
+        }
         if (gate.kind === "blocked") {
           return errorResult(
             `${blockedDomainMessage(BROWSER_SCREENSHOT_TOOL, gate.host)} The page showed that site, so the screenshot was discarded.`,
