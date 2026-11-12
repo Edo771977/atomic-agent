@@ -32,6 +32,21 @@ export interface GitRunOptions {
   env?: NodeJS.ProcessEnv;
 }
 
+/**
+ * A revision, range or ref the model handed a git read tool, refused
+ * when git would read it as an option. These arguments sit before `--`,
+ * so `--no-index`, `--contents=<file>` or `--output=<file>` would turn a
+ * read of history into a read (or write) of any file on disk.
+ */
+export function revisionArg(tool: string, field: string, value: string): string {
+  if (value.startsWith("-")) {
+    throw new Error(
+      `${tool}: \`${field}\` must not start with "-" (got ${JSON.stringify(value)}); pass a revision, not an option`,
+    );
+  }
+  return value;
+}
+
 const DEFAULT_TIMEOUT_MS = 15_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 512 * 1024;
 

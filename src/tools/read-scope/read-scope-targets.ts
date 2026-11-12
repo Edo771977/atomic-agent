@@ -4,7 +4,7 @@
  * the narrower fusion-worker one (`read-scope.ts`).
  */
 
-import { isAbsolute } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export type ReadTargetsOf = (args: Record<string, unknown>) => string[];
@@ -60,8 +60,11 @@ function gitRepoArg(pathKey?: "path" | "paths"): ReadTargetsOf {
     if (pathKey !== undefined) {
       const raw = args[pathKey];
       const paths = Array.isArray(raw) ? raw.map(nonEmpty) : [nonEmpty(raw)];
+      // git runs in `repo` (or the working directory), so a relative
+      // pathspec names a file under it: `../` climbs out like any read.
       for (const path of paths) {
-        if (path !== undefined && isAbsolute(path)) targets.push(path);
+        if (path === undefined) continue;
+        targets.push(isAbsolute(path) || repo === undefined ? path : join(repo, path));
       }
     }
     return targets;
@@ -136,7 +139,9 @@ export const READ_TOOL_TARGETS: ReadonlyMap<string, ReadTargetsOf> = new Map<
   ],
   // The git read tools print file contents and history of whatever
   // repository `repo` names (omitted = the working directory). Pathspecs
-  // are relative to that repository; an absolute one is checked as is.
+  // are resolved against that repository; an absolute one is checked as
+  // is. A revision cannot smuggle in a path: the tools refuse one that
+  // starts with `-` (`revisionArg` in git-runner.ts).
   ["os.git.status", gitRepoArg()],
   ["os.git.branch", gitRepoArg()],
   ["os.git.show", gitRepoArg()],

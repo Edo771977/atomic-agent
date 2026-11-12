@@ -117,6 +117,24 @@ describe("worker read scope", () => {
     ).toBeNull();
   });
 
+  it("resolves relative git pathspecs against the repository", () => {
+    // `../` in a pathspec climbs out of the repo the call names.
+    expect(
+      checkWorkerRead(
+        "os.git.diff",
+        { paths: ["../../01-cloud-flash/work/js/main.js", "js"] },
+        worker(),
+        [],
+      ),
+    ).not.toBeNull();
+    expect(
+      checkWorkerRead("os.git.blame", { repo: "js", path: "../../x" }, worker(), []),
+    ).not.toBeNull();
+    expect(
+      checkWorkerRead("os.git.blame", { repo: "js", path: "main.js" }, worker(), []),
+    ).toBeNull();
+  });
+
   it("leaves every non-worker session alone", () => {
     expect(
       checkWorkerRead(
