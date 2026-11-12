@@ -4,6 +4,8 @@
  * the narrower fusion-worker one (`read-scope.ts`).
  */
 
+import { isAbsolute } from "node:path";
+
 export type ReadTargetsOf = (args: Record<string, unknown>) => string[];
 
 function nonEmpty(value: unknown): string | undefined {
@@ -14,6 +16,22 @@ const pathArg: ReadTargetsOf = (args) => {
   const path = nonEmpty(args.path);
   return path === undefined ? [] : [path];
 };
+
+function gitRepoArg(pathKey?: "path" | "paths"): ReadTargetsOf {
+  return (args) => {
+    const targets: string[] = [];
+    const repo = nonEmpty(args.repo);
+    if (repo !== undefined) targets.push(repo);
+    if (pathKey !== undefined) {
+      const raw = args[pathKey];
+      const paths = Array.isArray(raw) ? raw.map(nonEmpty) : [nonEmpty(raw)];
+      for (const path of paths) {
+        if (path !== undefined && isAbsolute(path)) targets.push(path);
+      }
+    }
+    return targets;
+  };
+}
 
 /**
  * The read-class filesystem tools and the argument(s) naming what they
@@ -81,6 +99,15 @@ export const READ_TOOL_TARGETS: ReadonlyMap<string, ReadTargetsOf> = new Map<
         )
         .filter((path): path is string => path !== undefined),
   ],
+  // The git read tools print file contents and history of whatever
+  // repository `repo` names (omitted = the working directory). Pathspecs
+  // are relative to that repository; an absolute one is checked as is.
+  ["os.git.status", gitRepoArg()],
+  ["os.git.branch", gitRepoArg()],
+  ["os.git.show", gitRepoArg()],
+  ["os.git.log", gitRepoArg("path")],
+  ["os.git.blame", gitRepoArg("path")],
+  ["os.git.diff", gitRepoArg("paths")],
   [
     // A syntax check reads every file it is handed.
     "verify.syntax",

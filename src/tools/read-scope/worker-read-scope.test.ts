@@ -90,6 +90,33 @@ describe("worker read scope", () => {
     }
   });
 
+  it("confines the git read tools' repo and absolute paths", () => {
+    for (const tool of [
+      "os.git.status",
+      "os.git.branch",
+      "os.git.show",
+      "os.git.log",
+      "os.git.blame",
+      "os.git.diff",
+    ]) {
+      expect(
+        checkWorkerRead(tool, { repo: sibling, path: "main.js" }, worker(), []),
+        tool,
+      ).not.toBeNull();
+      expect(checkWorkerRead(tool, { repo: "js" }, worker(), []), tool).toBeNull();
+      expect(checkWorkerRead(tool, {}, worker(), []), tool).toBeNull();
+    }
+    expect(
+      checkWorkerRead("os.git.blame", { path: join(sibling, "main.js") }, worker(), []),
+    ).not.toBeNull();
+    expect(
+      checkWorkerRead("os.git.diff", { paths: ["js", join(sibling, "main.js")] }, worker(), []),
+    ).not.toBeNull();
+    expect(
+      checkWorkerRead("os.git.log", { path: "js/main.js" }, worker(), []),
+    ).toBeNull();
+  });
+
   it("leaves every non-worker session alone", () => {
     expect(
       checkWorkerRead(
