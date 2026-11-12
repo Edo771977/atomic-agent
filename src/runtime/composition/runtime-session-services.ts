@@ -1,7 +1,7 @@
 import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { AtomicAgentConfig } from "../../config/index.js";
-import { SessionStore, createEmptySessionState, createFusionWorkerSession, pruneSessions, readSessionPins, type FusionWorkerMeta, type SessionState } from "../../session/index.js";
+import { SessionPinsReadError, SessionStore, createEmptySessionState, createFusionWorkerSession, pruneSessions, readSessionPins, type FusionWorkerMeta, type SessionState } from "../../session/index.js";
 import { WEBHOOK_SESSIONS_FILENAME } from "../../http/webhook-session-store.js";
 import type { StructuredLogger } from "../../tracing/structured-logger.js";
 import type { ShellJobRegistry } from "../../tools/os/shell/shell-jobs.js";
@@ -58,22 +58,36 @@ export function prepareRuntimeSessionStore(
   // operator nothing but disk.
   if (config.sessions.retention.enabled) {
     try {
-      const pruned = pruneSessions({
-        db: sessionStore.getDatabaseHandleForRetention(),
-        maxAgeDays: config.sessions.retention.maxAgeDays,
-        maxRows: config.sessions.retention.maxRows,
-        tracesDir: config.paths.tracesDir,
-        // Read here, not inside the prune: what points at a session is
-        // this runtime's knowledge, and both files are read before the
-        // stores that own them exist (the task queue and the webhook
-        // map are both built hundreds of lines below).
-        keepSessionIds: readSessionPins({
+      // Read here, not inside the prune: what points at a session is
+      // this runtime's knowledge, and both files are read before the
+      // stores that own them exist (the task queue and the webhook
+      // map are both built hundreds of lines below). A pin file that
+      // exists but cannot be read skips this pass: pruning with an
+      // empty keep-list could take a session a binding still uses.
+      let keepSessionIds: string[];
+      try {
+        keepSessionIds = readSessionPins({
           tasksDbFile: config.paths.tasksDbFile,
           webhookSessionsFile: resolve(
             config.paths.stateDir,
             WEBHOOK_SESSIONS_FILENAME,
           ),
-        }),
+        });
+      } catch (err) {
+        if (!(err instanceof SessionPinsReadError)) throw err;
+        logger.warn("session retention skipped: could not read session pins", {
+          source: err.source,
+          path: err.path,
+          reason: err.reason,
+        });
+        return sessionStore;
+      }
+      const pruned = pruneSessions({
+        db: sessionStore.getDatabaseHandleForRetention(),
+        maxAgeDays: config.sessions.retention.maxAgeDays,
+        maxRows: config.sessions.retention.maxRows,
+        tracesDir: config.paths.tracesDir,
+        keepSessionIds,
       });
       // Nothing on a no-op: an install inside its retention window would
       // otherwise log a line every boot saying it did nothing.

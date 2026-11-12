@@ -15,6 +15,7 @@ import {
   readSessionPins,
   readTaskPinnedSessionIds,
   readWebhookPinnedSessionIds,
+  SessionPinsReadError,
 } from "./session-pins.js";
 import { pruneSessions } from "./session-retention.js";
 import { SessionStore } from "./session-store.js";
@@ -267,18 +268,34 @@ describe("pruneSessions", () => {
       expect(remaining()).toEqual([]);
     });
 
-    it("reads no pins from files that are absent, corrupt or the wrong shape", () => {
+    it("reads no pins from files that are absent or the wrong shape", () => {
       const webhookPins = (map: Record<string, unknown> | string): string[] =>
         readWebhookPinnedSessionIds(seedWebhooks(map));
 
       expect(readSessionPins({})).toEqual([]);
       expect(readTaskPinnedSessionIds(join(tmp, "no-such.sqlite"))).toEqual([]);
       expect(readWebhookPinnedSessionIds(join(tmp, "no-such.json"))).toEqual([]);
-      // Half-written JSON, a JSON array, and entries that are not ids:
-      // `WebhookSessionStore` reads each of these as an empty map too.
-      expect(webhookPins('{"deploy": "s1')).toEqual([]);
+      // A JSON array and entries that are not ids pin nothing.
       expect(webhookPins('["s1"]')).toEqual([]);
       expect(webhookPins({ a: "", b: 7, c: null })).toEqual([]);
+    });
+
+    // A pin file that exists but cannot be read may still name live
+    // bindings: an empty keep-list there would let the prune take them.
+    it("throws SessionPinsReadError for a pin file that exists but cannot be read", () => {
+      const halfWritten = seedWebhooks('{"deploy": "s1');
+      expect(() => readWebhookPinnedSessionIds(halfWritten)).toThrow(
+        SessionPinsReadError,
+      );
+      expect(() => readSessionPins({ webhookSessionsFile: halfWritten })).toThrow(
+        SessionPinsReadError,
+      );
+      // A directory where the file should be: EISDIR, not "missing".
+      expect(() => readWebhookPinnedSessionIds(tmp)).toThrow(SessionPinsReadError);
+
+      const corruptDb = join(tmp, "corrupt-tasks.sqlite");
+      writeFileSync(corruptDb, "this is not a sqlite database, just text. ".repeat(40));
+      expect(() => readTaskPinnedSessionIds(corruptDb)).toThrow(SessionPinsReadError);
     });
 
     it("reads no pins from a tasks.sqlite with no tasks table", () => {
