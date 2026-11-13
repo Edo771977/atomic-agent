@@ -959,6 +959,9 @@ export function buildFusionDelegateTool(
         }
         const verdict = await judgeTask({
           ...input,
+          ...(deps.knownSecrets === undefined
+            ? {}
+            : { knownSecrets: deps.knownSecrets() }),
           target: judgeTarget!,
           pricing: judgePricing,
           complete: sideComplete!,
@@ -1545,6 +1548,7 @@ export function buildFusionDelegateTool(
                 reply: row.reply,
                 contract: parsed.contract,
                 workingDir: ctx.workingDir,
+                // No snapshot of the folder before the wave: file heads.
                 changes: [],
               }),
             );

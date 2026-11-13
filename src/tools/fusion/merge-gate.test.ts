@@ -275,6 +275,42 @@ describe("merge only green tasks (isolation)", () => {
   });
 });
 
+describe("the judge reads the task's diff (isolation)", () => {
+  it("sees an edit past the first 6,000 chars and lists a touched file nobody declared", async () => {
+    const big = Array.from({ length: 400 }, (_, i) => `line ${i + 1} of the original text`).join("\n") + "\n";
+    expect(big.length).toBeGreaterThan(6_000);
+    const repo = await gitRepo({ "big.txt": big });
+    const prompts: string[] = [];
+    const complete: EscalationComplete = async (call) => {
+      prompts.push(call.prompt);
+      return { content: JSON.stringify({ items: [{ id: "a2", pass: true, why: "ok" }] }) };
+    };
+    const d = deps(
+      repo,
+      async (_id, _n, dir) => {
+        await writeFile(join(dir, "big.txt"), big.replace("line 399 of", "line 399 FIXED of"));
+        await writeFile(join(dir, "extra.txt"), "helper\n");
+      },
+      { escalationComplete: complete },
+      { judge: { providerId: "cloud", model: "judge" } },
+    );
+    const result = await buildFusionDelegateTool(d).run(
+      { tasks: [{ id: "one", title: "One", instructions: "fix line 399", files: ["big.txt"] }] },
+      ctx(repo),
+    );
+    expect(prompts).toHaveLength(1);
+    const prompt = prompts[0]!;
+    expect(prompt).toContain("Touched files: big.txt (modified), extra.txt (added)");
+    expect(prompt).toContain("-line 399 of the original text");
+    expect(prompt).toContain("+line 399 FIXED of the original text");
+    expect(prompt).toContain("### extra.txt (new file)\nhelper");
+    // A diff, not the file's head.
+    expect(prompt).not.toContain("line 1 of the original text");
+    expect((result.details.tasks as WorkerTaskResult[])[0]!.status).toBe("ok");
+    expect(await readFile(join(repo, "big.txt"), "utf8")).toContain("line 399 FIXED");
+  });
+});
+
 describe("gatedChecks / applyPostMergeChecks", () => {
   it("leaves a check naming a concurrent task's path to the pass after the merge", () => {
     const contract = {

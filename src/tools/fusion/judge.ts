@@ -10,6 +10,12 @@ import type {
 import { CHECK_OUTPUT_CHARS, tailClip } from "./contract-checks.js";
 import type { EscalationComplete } from "./escalation.js";
 import type { WorkerPricing, WorkerTaskResult } from "./worker-result.js";
+import type { WorkspaceChange } from "./branch-diff.js";
+import {
+  knownSecretsFromEnv,
+  maskSecrets,
+  type KnownSecret,
+} from "../../error-reporting/secret-detector.js";
 
 /**
  * The trimmed judge (ATO-944): a node is closed by its acceptance list,
@@ -28,8 +34,13 @@ import type { WorkerPricing, WorkerTaskResult } from "./worker-result.js";
  *     failed or did not run, a provide that is missing, a declared file
  *     that is absent or empty are red, whatever any model says. Then a
  *     judge in a fresh context — no worker transcript, no worker claims
- *     about files — reads the files themselves and rules on the items no
+ *     about files — reads the work itself and rules on the items no
  *     script can (the deliverable, a provide's shape, the instructions).
+ *     Under isolation the work is the task's unified diff against the
+ *     snapshot its workspace started from, every touched file listed
+ *     (declared or not), a new file shown as its head; elsewhere there
+ *     is no snapshot of the folder before the wave, so it is the head
+ *     of each declared file. Evidence is masked before it is sent.
  *     The judge can only add red: it never turns a failed fact green.
  *     An item it gives no verdict for is red. An answer that cannot be
  *     read leaves the node unverified, never green.
@@ -62,6 +73,10 @@ const INSTRUCTIONS_ITEM_CHARS = 300;
 /** How much of each file, and of all files, the judge reads. */
 export const JUDGE_FILE_CHARS = 6_000;
 export const JUDGE_EVIDENCE_CHARS = 24_000;
+/** How much of one file's diff the judge reads. */
+export const JUDGE_DIFF_FILE_CHARS = 12_000;
+/** Touched paths listed by name; the rest are counted. */
+export const JUDGE_TOUCHED_PATHS = 40;
 /** Room for one short verdict per item. */
 export const JUDGE_MAX_OUTPUT_TOKENS = 1_200;
 
@@ -214,12 +229,103 @@ function absolute(path: string, workingDir: string): string {
   return isAbsolute(path) ? path : resolve(workingDir, path);
 }
 
-/** The files the judge reads, clipped; the worker's reply only when there are none. */
+function clipped(body: string, cap: number, what: string): string {
+  return body.length > cap
+    ? `${body.slice(0, cap)}\n[… ${body.length - cap} more chars ${what}clipped]`
+    : body;
+}
+
+function normalised(path: string): string {
+  return path.trim().replace(/^(?:\.\/)+/, "");
+}
+
+/**
+ * The task's changes as the judge reads them: the touched files listed,
+ * each diff (a new file as its head), then the declared files it left
+ * as they were, as heads, within what is left of the budget.
+ */
+async function diffEvidence(
+  declared: readonly string[],
+  changes: readonly WorkspaceChange[],
+  workingDir: string,
+): Promise<string> {
+  const listed = changes
+    .slice(0, JUDGE_TOUCHED_PATHS)
+    .map((c) => `${c.path} (${c.kind})`);
+  const more = changes.length - listed.length;
+  const touched = new Set(changes.map((c) => c.path));
+  const untouched = declared.filter(
+    (p) =>
+      !touched.has(normalised(p)) &&
+      ![...touched].some((t) => isAbsolute(p) && p.endsWith(`/${t}`)),
+  );
+  const parts: string[] = [
+    "The task's changes, as a unified diff against the files as they were before it ran: lines not shown are unchanged; a new file is shown as its content.",
+    `Touched files: ${listed.join(", ")}${more > 0 ? `, and ${more} more` : ""}`,
+  ];
+  if (untouched.length > 0) {
+    parts.push(`Declared but not changed: ${untouched.join(", ")}`);
+  }
+  let budget = JUDGE_EVIDENCE_CHARS;
+  for (const change of changes) {
+    if (budget <= 0) {
+      parts.push(`### ${change.path} (${change.kind})\n[not shown: evidence budget spent]`);
+      continue;
+    }
+    const shown =
+      change.kind === "added" && change.content !== undefined
+        ? clipped(change.content, Math.min(JUDGE_FILE_CHARS, budget), "")
+        : clipped(change.patch, Math.min(JUDGE_DIFF_FILE_CHARS, budget), "of diff ");
+    budget -= shown.length;
+    parts.push(
+      `### ${change.path} (${change.kind === "added" ? "new file" : change.kind === "modified" ? "diff" : change.kind})\n${shown}`,
+    );
+  }
+  for (const path of untouched) {
+    if (budget <= 0) {
+      parts.push(`### ${path} (unchanged)\n[not shown: evidence budget spent]`);
+      continue;
+    }
+    let body: string;
+    try {
+      body = await readFile(absolute(path, workingDir), "utf8");
+    } catch {
+      parts.push(`### ${path}\n[missing]`);
+      continue;
+    }
+    const shown = clipped(body, Math.min(JUDGE_FILE_CHARS, budget), "");
+    budget -= shown.length;
+    parts.push(`### ${path} (unchanged)\n${shown}`);
+  }
+  return parts.join("\n\n");
+}
+
+/**
+ * What the judge reads, masked: the task's diff when its changes are
+ * known (isolation), else the declared files' heads; the worker's reply
+ * only when it declared and changed nothing.
+ */
 export async function gatherEvidence(
   task: DelegateTask,
   contract: DelegateContract | undefined,
   reply: string,
   workingDir: string,
+  changes?: readonly WorkspaceChange[],
+  knownSecrets?: readonly KnownSecret[],
+): Promise<string> {
+  const known = knownSecrets ?? knownSecretsFromEnv();
+  return maskSecrets(
+    await rawEvidence(task, contract, reply, workingDir, changes),
+    known,
+  );
+}
+
+async function rawEvidence(
+  task: DelegateTask,
+  contract: DelegateContract | undefined,
+  reply: string,
+  workingDir: string,
+  changes: readonly WorkspaceChange[] | undefined,
 ): Promise<string> {
   const paths = [
     ...(task.files ?? []),
@@ -227,6 +333,9 @@ export async function gatherEvidence(
       .filter((p) => p.task === task.id && p.in !== undefined)
       .map((p) => p.in!),
   ].filter((p, i, all) => all.indexOf(p) === i);
+  if (changes !== undefined && changes.length > 0) {
+    return diffEvidence(paths, changes, workingDir);
+  }
   if (paths.length === 0) {
     return [
       "This task declared no files, so its reply is the deliverable. Judge what the reply contains, not what it says it did elsewhere.",
@@ -331,6 +440,10 @@ export async function judgeTask(input: {
   reply: string;
   contract: DelegateContract | undefined;
   workingDir: string;
+  /** What the task changed (isolation): the judge reads the diff. */
+  changes?: readonly WorkspaceChange[];
+  /** The agent's own keys, for masking the evidence. */
+  knownSecrets?: readonly KnownSecret[];
   target: JudgeTarget;
   pricing: WorkerPricing | undefined;
   complete: EscalationComplete;
@@ -368,6 +481,8 @@ export async function judgeTask(input: {
     input.contract,
     input.reply,
     input.workingDir,
+    input.changes,
+    input.knownSecrets,
   );
   let content: string;
   let costUsd: number | null = null;

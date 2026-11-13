@@ -10,6 +10,8 @@ import { FUSION_WORKER_ID_PREFIX } from "../../session/fusion-worker-session.js"
 import { StructuredLogger } from "../../tracing/structured-logger.js";
 import {
   buildAcceptanceChecklist,
+  gatherEvidence,
+  JUDGE_FILE_CHARS,
   judgeTask,
   parseJudgeAnswer,
   renderRetryFindings,
@@ -429,6 +431,45 @@ describe("the retry brief carries a failing check's output", () => {
     expect(retry).toBeDefined();
     expect(retry).toContain("Error: auth failed for [redacted:stripe-key] at db.js:3:9");
     expect(retry).not.toContain("sk_live_abcdefghijklmnop1234");
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe("judge evidence", () => {
+  const task: DelegateTask = { id: "t", title: "T", instructions: "edit a.txt", files: ["a.txt"] };
+
+  it("without a diff (no isolation) reads each declared file's head, as before", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "judge-ev-"));
+    writeFileSync(join(dir, "a.txt"), "x".repeat(JUDGE_FILE_CHARS + 50));
+    const evidence = await gatherEvidence(task, undefined, "", dir);
+    expect(evidence.startsWith("### a.txt\n")).toBe(true);
+    expect(evidence).toContain("[… 50 more chars clipped]");
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("reads the diff when the changes are known, shows an unchanged declared file's head, and masks", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "judge-ev-"));
+    writeFileSync(join(dir, "a.txt"), "kept\n");
+    const secret = "sk-test-" + "Z".repeat(32);
+    const evidence = await gatherEvidence(
+      { ...task, files: ["a.txt", "b.txt"] },
+      undefined,
+      "",
+      dir,
+      [
+        {
+          path: "b.txt",
+          kind: "modified",
+          patch: `--- a/b.txt\n+++ b/b.txt\n@@ -1 +1 @@\n-old\n+key=${secret}\n`,
+        },
+      ],
+      [{ label: "TEST_KEY", value: secret }],
+    );
+    expect(evidence).toContain("Touched files: b.txt (modified)");
+    expect(evidence).toContain("Declared but not changed: a.txt");
+    expect(evidence).toContain("### a.txt (unchanged)\nkept");
+    expect(evidence).toContain("-old");
+    expect(evidence).not.toContain(secret);
     rmSync(dir, { recursive: true, force: true });
   });
 });
