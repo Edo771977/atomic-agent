@@ -12,11 +12,11 @@ const model = { id: "m", contextWindow: 200_000, source: "user", pricing: { inpu
 const provider = { id: "cloud", supportsRequestBudget: true } as LlmProvider;
 const entry = { id: "cloud", kind: "openai-compatible" } as LlmProviderConfigEntry;
 
-function setup(usd: number, request: Partial<CompletionRequest> = {}) {
+function setup(usd: number, request: Partial<CompletionRequest> = {}, providerEntry: LlmProviderConfigEntry = entry) {
   const budget = new FusionTurnBudget();
   budget.begin("p", 0, { usd });
   const req = { sessionId: "p", prompt: "hi", maxOutputTokens: 4096, ...request } as CompletionRequest;
-  const scope = () => createRequestBudgetScope(budget, req, provider, entry, model)!;
+  const scope = () => createRequestBudgetScope(budget, req, provider, providerEntry, model)!;
   return { budget, scope };
 }
 
@@ -120,11 +120,26 @@ describe("request budget scope", () => {
   }, 30_000);
 
   it("writes the model profile's cap field when the body carries none", () => {
-    const { scope } = setup(10, { maxOutputTokens: undefined });
+    const { scope } = setup(10, { maxOutputTokens: undefined }, { ...entry, maxOutputTokens: 8192 });
     const body: Record<string, unknown> = { model: "openai/gpt-5.1", messages: [] };
     scope().beforeSend(body);
-    expect(body).toMatchObject({ max_completion_tokens: 200_000 });
+    expect(body).toMatchObject({ max_completion_tokens: 8192 });
     expect(body).not.toHaveProperty("max_tokens");
+  });
+
+  it("refuses a paid send without any explicit output ceiling instead of reserving the context window", () => {
+    const { budget, scope } = setup(10, { maxOutputTokens: undefined });
+    const body: Record<string, unknown> = { model: "openai/gpt-5.1", messages: [] };
+    expect(() => scope().beforeSend(body)).toThrow(/set `maxOutputTokens` on provider entry cloud/);
+    expect(body).not.toHaveProperty("max_completion_tokens");
+    expect(spent(budget)).toBe(0);
+  });
+
+  it("accepts a cap field already in the body as the explicit ceiling", () => {
+    const { scope } = setup(10, { maxOutputTokens: undefined });
+    const body: Record<string, unknown> = { model: "m", messages: [], max_tokens: 2048 };
+    scope().beforeSend(body);
+    expect(body).toEqual({ model: "m", messages: [], max_tokens: 2048 });
   });
 
   it("clamps an existing max_completion_tokens without adding max_tokens", () => {
@@ -145,6 +160,7 @@ describe("request budget scope", () => {
     const budget = new FusionTurnBudget();
     budget.begin("p", 0, { usd: 10 });
     const req = { sessionId: "p", prompt: "hi" } as CompletionRequest;
-    expect(() => createRequestBudgetScope(budget, req, provider, entry, { ...model, source: "default" })).toThrow(/output ceiling/);
+    const s = createRequestBudgetScope(budget, req, provider, entry, { ...model, source: "default" })!;
+    expect(() => s.beforeSend({ model: "m", messages: [] })).toThrow(/output ceiling/);
   });
 });

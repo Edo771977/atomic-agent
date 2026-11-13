@@ -60,8 +60,9 @@ export function createRequestBudgetScope(
   }
   if (priceRequired && provider.supportsRequestBudget !== true) throw new Error(`turn budget cannot authorize physical requests for provider ${provider.id}`);
   const caps = [request.maxTokens, request.maxOutputTokens, entry?.maxOutputTokens].filter((value): value is number => typeof value === "number" && Number.isFinite(value) && value > 0);
-  const outputCap = caps.length > 0 ? Math.min(...caps) : model?.source !== "default" ? model?.contextWindow : undefined;
-  if (priceRequired && (outputCap === undefined || !Number.isFinite(outputCap) || outputCap <= 0)) throw new Error("turn budget needs a verified output ceiling before sending");
+  // No context-window fallback: providers reject a window-sized output
+  // limit, and reserving one would hold dollars per request.
+  const outputCap = caps.length > 0 ? Math.min(...caps) : undefined;
   const timeLeft = budget.requestTimeLeftMs(sessionId);
   if (timeLeft !== undefined && timeLeft <= 0) throw new Error("the turn time cap has been reached before this request");
   let held = !priceRequired && limits.usd !== undefined ? budget.reserveRequest(sessionId, 0) : undefined;
@@ -81,7 +82,11 @@ export function createRequestBudgetScope(
       held = undefined;
       if (request.signal?.aborted) throw request.signal.reason;
       const wireCaps = [body.max_tokens, body.max_completion_tokens].filter((value): value is number => typeof value === "number" && Number.isFinite(value) && value > 0);
-      const ceiling = Math.floor(Math.min(outputCap!, ...wireCaps));
+      const explicitCaps = outputCap === undefined ? wireCaps : [outputCap, ...wireCaps];
+      if (explicitCaps.length === 0) {
+        throw new Error(`turn budget needs a verified output ceiling before sending; set \`maxOutputTokens\` on provider entry ${entry?.id ?? provider.id}`);
+      }
+      const ceiling = Math.floor(Math.min(...explicitCaps));
       // Runs after extraBody/model-parameter conversion, immediately before
       // serialization. Those overrides cannot raise this enforced ceiling.
       // Clamp the field(s) the body already uses. With neither, write the
