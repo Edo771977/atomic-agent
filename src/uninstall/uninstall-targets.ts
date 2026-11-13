@@ -191,15 +191,20 @@ export function isSafeToRemove(
   const insideHome = !path.isAbsolute(fromHome) && fromHome !== ".." && !fromHome.startsWith(`..${path.sep}`);
   if (segments.length < 2 && !insideHome) return false;
   // An 8.3 short name (`OPERAT~1`) cannot be resolved lexically: at or above
-  // home's depth it might be home or one of its ancestors, so refuse it.
-  if (platform === "win32" && segments.length <= homeDepth(home) && segments.some((part) => SHORT_NAME.test(part))) return false;
+  // home's depth it might be home or one of its ancestors, so refuse it, in
+  // the target or in home itself (a short-named home's long name is home).
+  if (platform === "win32" && segments.length <= homeDepth(home) && [...segments, ...homeSegments(home)].some((part) => SHORT_NAME.test(part))) return false;
   return true;
 }
 
 const SHORT_NAME = /~\d+(?:\.[^.]{0,3})?$/;
 
+function homeSegments(home: string): string[] {
+  return pathWin32.relative(pathWin32.parse(home).root, home).split(pathWin32.sep).filter((part) => part.length > 0);
+}
+
 function homeDepth(home: string): number {
-  return pathWin32.relative(pathWin32.parse(home).root, home).split(pathWin32.sep).filter((part) => part.length > 0).length;
+  return homeSegments(home).length;
 }
 
 /**
