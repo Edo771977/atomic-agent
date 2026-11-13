@@ -198,6 +198,32 @@ describe("atomic-agent setup fusion", () => {
     expect(again.out()).toMatch(/judge\s+\(unset\) → "on"/);
   });
 
+  it("an invalid config.json names the file and exits 1 without writing", async () => {
+    const path = getUserConfigPath(stateDir);
+    writeFileSync(path, JSON.stringify({ version: 1, llm: { activeTextProvider: 5 } }));
+    const before = raw();
+    const h = harness();
+    expect(await setupCommand(["fusion", "--yes"], h.deps)).toBe(1);
+    expect(h.out()).toContain(path);
+    expect(h.out()).toMatch(new RegExp(`Fix or move ${path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+    expect(raw()).toBe(before);
+  });
+
+  it("broken JSON in config.json is reported the same way", async () => {
+    writeFileSync(getUserConfigPath(stateDir), "{ not json");
+    const h = harness();
+    expect(await setupCommand(["fusion", "--dry-run"], h.deps)).toBe(1);
+    expect(h.out()).toMatch(/is not valid JSON/);
+    expect(h.out()).toContain(`Fix or move ${getUserConfigPath(stateDir)}`);
+  });
+
+  it("names the file it wrote", async () => {
+    seed();
+    const h = harness();
+    expect(await setupCommand(["fusion", "--yes"], h.deps)).toBe(0);
+    expect(h.out()).toContain(`Fusion is on, in ${getConfig().paths.userConfigFile}.`);
+  });
+
   it("usage errors exit 2", async () => {
     expect(await setupCommand([], harness().deps)).toBe(2);
     expect(await setupCommand(["nope"], harness().deps)).toBe(2);

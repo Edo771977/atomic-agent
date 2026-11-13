@@ -1,10 +1,9 @@
 import { join, resolve } from "node:path";
 
 import {
-  USER_CONFIG_DEFAULTS,
   getUserConfigPath,
   loadDotenvFromStateDir,
-  readUserConfigFileSync,
+  readUserConfigSnapshotSync,
   type UserConfigFile,
 } from "../config/index.js";
 import { SUBSCRIPTION_CLIS, type SubscriptionCliName } from "../config/llm-config.js";
@@ -97,7 +96,9 @@ export async function detectFusionSetup(
   deps: FusionDetectDeps = {},
 ): Promise<FusionSetupFacts> {
   (deps.loadDotenv ?? ((dir) => { loadDotenvFromStateDir(dir); }))(stateDir);
-  const file = readUserConfigFileSync(getUserConfigPath(stateDir)) ?? USER_CONFIG_DEFAULTS;
+  // The snapshot read names the file in a validation error (a missing
+  // file reads as the defaults); the caller prints it and stops.
+  const file = readUserConfigSnapshotSync(getUserConfigPath(stateDir)).config;
   setCustomLocalModels(file.localModels.customModels);
   const llm = readLlmBlockOrDefault(file);
 

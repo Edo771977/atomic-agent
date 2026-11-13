@@ -1,6 +1,6 @@
 import { createInterface } from "node:readline/promises";
 
-import { resolveStateDir } from "../config/index.js";
+import { ConfigValidationError, getUserConfigPath, resolveStateDir } from "../config/index.js";
 import { applyFusionSetupInConfig } from "../config/fusion-setup-commands.js";
 import {
   planFusionSetup,
@@ -109,7 +109,15 @@ async function setupFusion(args: readonly string[], deps: SetupCommandDeps): Pro
     else { write(`unknown option "${a}"\n\n${HELP}\n`); return 2; }
   }
   const stateDir = deps.stateDir ?? resolveStateDir();
-  const facts: FusionSetupFacts = await detectFusionSetup(stateDir, deps.detect);
+  const configPath = getUserConfigPath(stateDir);
+  let facts: FusionSetupFacts;
+  try {
+    facts = await detectFusionSetup(stateDir, deps.detect);
+  } catch (err) {
+    if (!(err instanceof ConfigValidationError)) throw err;
+    write(`${err.message}\n\nFix or move ${configPath}, then run this again. Nothing was written.\n`);
+    return 1;
+  }
   const plan = planFusionSetup(facts, { judge, isolation });
   write(renderFusionPlan(plan));
   if (!plan.ok) return 1;
@@ -133,7 +141,7 @@ async function setupFusion(args: readonly string[], deps: SetupCommandDeps): Pro
     }
   }
   (deps.apply ?? applyFusionSetupInConfig)(plan.write);
-  write(`Fusion is on, in ${stateDir}/config.json. Start it with: atomic-agent tui\n`);
+  write(`Fusion is on, in ${configPath}. Start it with: atomic-agent tui\n`);
   return 0;
 }
 
