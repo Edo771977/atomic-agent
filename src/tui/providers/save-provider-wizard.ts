@@ -10,6 +10,10 @@ import {
 import { findProviderPreset } from "./provider-presets.js";
 import { wizardKeyIsOptional } from "./providers-wizard-target.js";
 import {
+  storedEntryAtBaseUrl,
+  storedProviderFileEntry,
+} from "./stored-provider-entry.js";
+import {
   AIMLAPI_DEFAULT_CHAT_MODEL,
   GEMINI_DEFAULT_CHAT_MODEL,
   LOCAL_EMBEDDING_CHOICE_ID,
@@ -73,7 +77,7 @@ export function saveProviderWizardToConfig(
   // subscription-cli entry can carry a hand-set binPath / extraArgs /
   // streaming flag / spend ceiling, and any entry a request timeout.
   // `upsertLlmProvider` preserves model policy but replaces other fields,
-  // so carry them over the same way the stored apiKey is carried below.
+  // so carry them over; the key is handled below, from config.json itself.
   if (existing?.subscriptionCli && entry.subscriptionCli) {
     entry = {
       ...entry,
@@ -100,11 +104,19 @@ export function saveProviderWizardToConfig(
   // ATO-1066: a server on another computer on this network never reads
   // the shared compat variables (they usually hold a real cloud key), so
   // a key typed for it lives under a variable of its own.
+  // The entry as written in config.json, moved to its new address. Never
+  // `existing` for keys: getConfig() has already filled its apiKey from
+  // the environment, and copying that wrote a shared cloud key into
+  // config.json in clear (ATO-1066).
+  const storedFile = existing ? storedProviderFileEntry(existing.id) : undefined;
+  const stored = storedFile
+    ? storedEntryAtBaseUrl(storedFile, entry.baseUrl)
+    : undefined;
   const networkKeyEnvVar =
     !preset &&
     entry.kind === "openai-compatible" &&
     isOtherComputerOnNetworkUrl(entry.baseUrl)
-      ? (existing?.apiKeyEnvVar ?? networkComputerKeyEnvVar(entry.id))
+      ? (stored?.apiKeyEnvVar ?? networkComputerKeyEnvVar(entry.id))
       : undefined;
   if (wizard.apiKeyBuffer.trim().length > 0) {
     // Validate the value that is actually persisted: the dotenv writer
@@ -125,14 +137,16 @@ export function saveProviderWizardToConfig(
       preset?.envVar ?? networkKeyEnvVar,
     );
     if (networkKeyEnvVar) entry = { ...entry, apiKeyEnvVar: networkKeyEnvVar };
-  } else if (existing?.apiKey) {
-    entry = { ...entry, apiKey: existing.apiKey };
-  } else if (networkKeyEnvVar && existing?.apiKeyEnvVar) {
-    entry = { ...entry, apiKeyEnvVar: existing.apiKeyEnvVar };
+  } else if (stored?.apiKey) {
+    entry = { ...entry, apiKey: stored.apiKey };
+  } else if (stored?.apiKeyEnvVar && !entry.apiKeyEnvVar) {
+    // Still a variable: the key stays in .env, under the name the
+    // operator gave it.
+    entry = { ...entry, apiKeyEnvVar: stored.apiKeyEnvVar };
   } else if (
     !keyOptional &&
     !resolveLlmProviderApiKey(entry) &&
-    !(existing && resolveLlmProviderApiKey(existing))
+    !(stored && resolveLlmProviderApiKey(stored))
   ) {
     throw new Error("API key is empty — paste a key or set it in .env first");
   }

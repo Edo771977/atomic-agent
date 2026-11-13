@@ -17,7 +17,7 @@ This feature owns provider rows, configuration wizard state, input and presentat
 
 The shared provider writer automatically saves a [model behavior default](../../llm/docs/model-mode.md) for new connections: `cloud` for recognized cloud services and subscription CLIs, `local` for local or unknown endpoints. The v75 config migration also enables cloud policy for existing recognized cloud connections without a saved flag. The wizard returns the saved entry and preserves existing settings on reconfiguration after migration. Switching policy currently uses `/llm model-mode`, whose submit handler persists settings through config commands; it does not hot-swap the provider or change a running turn's snapshot.
 
-Keys follow the address (ATO-1066). The wizard resolves a key with the entry's new base URL, so a server on another computer on the network never receives the shared compat variables; a reconfigure reads the entry's saved key from `config.json` itself ([stored entry](stored-provider-entry.ts)), never from the env-filled runtime config, and a key saved for a different server does not follow the entry to another computer.
+Keys follow the address (ATO-1066). The wizard resolves a key with the entry's new base URL, so a server on another computer on the network never receives the shared compat variables; a reconfigure reads and saves back only the key literally written in `config.json` (an `apiKeyEnvVar` stays a variable) ([stored entry](stored-provider-entry.ts)), never from the env-filled runtime config, and a key saved for a different server does not follow the entry to another computer.
 
 ## Checks
 
