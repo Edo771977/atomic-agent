@@ -189,6 +189,9 @@ export async function runVerify(
       result = failed(`verification not started: ${workspace.error ?? "a private workspace copy is unavailable"}`, "workspace-unavailable");
     } else {
       result = await runInWorkspace(args, workspace.dir, true, ctx, started);
+      // Executors may settle normally after an abort (a page can skip
+      // remaining script steps). Such an incomplete run cannot pass.
+      if (ctx.signal?.aborted) result = failed("verification cancelled during execution", "cancelled", true);
     }
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);

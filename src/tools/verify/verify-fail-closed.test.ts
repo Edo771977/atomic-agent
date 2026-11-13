@@ -2,6 +2,7 @@ import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { Browser } from "playwright-core";
 
 import type { AtomicAgentConfig } from "../../config/index.js";
 import type { ApprovalGate } from "../../approval/approval-gate.js";
@@ -118,5 +119,55 @@ describe("verify refuses to execute without a private workspace", () => {
     expect(result.error).toContain("cleanup denied");
     expect(cleanup).toHaveBeenCalledOnce();
     expect(runner).not.toHaveBeenCalled();
+  });
+
+  it("the public page tool reports cancellation when a loaded page skips its required script", async () => {
+    const controller = new AbortController();
+    const click = vi.fn(async () => {});
+    const close = vi.fn(async () => {});
+    const page = { on() {}, async addInitScript() {}, async goto() { controller.abort(); }, click, async evaluate() { return []; } };
+    const browser = { async newContext() { return { async route() {}, async newPage() { return page; } }; }, close } as unknown as Browser;
+    let copy = "";
+    const cleanup = vi.fn(async () => {});
+    const tool = buildVerifyRunTool({ config, approvals: {} as ApprovalGate, approvalRequired: false,
+      launchBrowser: async () => browser,
+      workspace: async (cwd) => {
+        const workspace = await createVerifyWorkspace(cwd);
+        copy = workspace.dir;
+        cleanup.mockImplementation(() => workspace.cleanup());
+        return { ...workspace, cleanup };
+      },
+    });
+    const result = await tool.run({ kind: "page", url: "http://localhost", script: [{ action: "click", selector: "#must-run" }], checks: ["no errors"] },
+      { workingDir: dir, sessionId: "verify-test", stepIndex: 0, signal: controller.signal });
+    expect(controller.signal.aborted).toBe(true);
+    expect(click).not.toHaveBeenCalled();
+    expect(result.status).toBe("error");
+    expect(result.details).toMatchObject({ ok: false, errorCode: "cancelled", checks: [{ ok: false }] });
+    expect(result.summary).toContain("cancelled");
+    expect(close).toHaveBeenCalledOnce();
+    expect(cleanup).toHaveBeenCalledOnce();
+    await expect(readdir(copy)).rejects.toThrow();
+    expect(await readFile(join(dir, "original.txt"), "utf8")).toBe("original");
+  });
+
+  it.each(["command", "service", "page"])("returns typed cancellation when the %s executor returns normally after abort", async (kind) => {
+    const controller = new AbortController();
+    vi.spyOn(commands, "runCommandKind").mockImplementation(async () => {
+      controller.abort();
+      return { commandLine: "test", exitCode: 0, signal: null, timedOut: false, aborted: true, stdout: "", stderr: "", stdoutTail: "", stderrTail: "", durationMs: 0 };
+    });
+    vi.spyOn(services, "runServiceKind").mockImplementation(async () => {
+      controller.abort();
+      return { commandLine: "test", ready: true, readyMs: 0, requests: [], exitCode: 0, timedOut: false, stdout: "", stderr: "", stdoutTail: "", stderrTail: "", durationMs: 0 };
+    });
+    vi.spyOn(pages, "runPageKind").mockImplementation(async () => {
+      controller.abort();
+      return { target: "test", launched: true, loaded: true, errors: [], consoleErrors: [], consoleWarnings: [], requestFailures: [], missingSelectors: [], probes: {}, durationMs: 0 };
+    });
+    const args = kind === "command" ? { kind, cmd: process.execPath } : kind === "service" ? { kind, start: { cmd: process.execPath }, ready: { port: 12345 } } : { kind, url: "http://localhost" };
+    const result = await runVerify(args, { workingDir: dir, config, signal: controller.signal });
+    expect(result).toMatchObject({ ok: false, errorCode: "cancelled" });
+    expect(result.error).toContain("cancelled");
   });
 });
