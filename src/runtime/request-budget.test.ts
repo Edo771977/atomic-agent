@@ -93,4 +93,33 @@ describe("request budget scope", () => {
     expect(String(error)).toMatch(/network error/);
     expect(spent(budget)).toBe(0);
   }, 30_000);
+
+  it("writes the model profile's cap field when the body carries none", () => {
+    const { scope } = setup(10, { maxOutputTokens: undefined });
+    const body: Record<string, unknown> = { model: "openai/gpt-5.1", messages: [] };
+    scope().beforeSend(body);
+    expect(body).toMatchObject({ max_completion_tokens: 200_000 });
+    expect(body).not.toHaveProperty("max_tokens");
+  });
+
+  it("clamps an existing max_completion_tokens without adding max_tokens", () => {
+    const { scope } = setup(10);
+    const body: Record<string, unknown> = { model: "custom-model", messages: [], max_completion_tokens: 9000 };
+    scope().beforeSend(body);
+    expect(body).toEqual({ model: "custom-model", messages: [], max_completion_tokens: 4096 });
+  });
+
+  it("keeps max_tokens for models whose profile uses it", () => {
+    const { scope } = setup(10);
+    const body: Record<string, unknown> = { model: "claude-sonnet-4.5", messages: [] };
+    scope().beforeSend(body);
+    expect(body).toEqual({ model: "claude-sonnet-4.5", messages: [], max_tokens: 4096 });
+  });
+
+  it("refuses a paid request with no verified output ceiling", () => {
+    const budget = new FusionTurnBudget();
+    budget.begin("p", 0, { usd: 10 });
+    const req = { sessionId: "p", prompt: "hi" } as CompletionRequest;
+    expect(() => createRequestBudgetScope(budget, req, provider, entry, { ...model, source: "default" })).toThrow(/output ceiling/);
+  });
 });

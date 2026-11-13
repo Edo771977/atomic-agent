@@ -4,6 +4,7 @@ import type { LlmProviderConfigEntry } from "../llm/provider/registry/provider-t
 import type { ResolvedModel } from "../llm/provider/model-resolver.js";
 import { completionCostUsd, reportedCostUsd } from "../llm/provider/usage-cost.js";
 import { readErrnoCode } from "../llm/errno-code.js";
+import { modelParamProfile } from "../llm/provider/openai/model-params.js";
 import type { FusionTurnBudget } from "../tools/fusion/turn-budget.js";
 
 // Explicit rejections before generation. 503/529 are overload answers
@@ -66,8 +67,12 @@ export function createRequestBudgetScope(
       const ceiling = Math.floor(Math.min(outputCap!, ...wireCaps));
       // Runs after extraBody/model-parameter conversion, immediately before
       // serialization. Those overrides cannot raise this enforced ceiling.
-      if (body.max_completion_tokens !== undefined) body.max_completion_tokens = ceiling;
-      if (body.max_tokens !== undefined || body.max_completion_tokens === undefined) body.max_tokens = ceiling;
+      // Clamp the field(s) the body already uses. With neither, write the
+      // field the wire model's profile expects: OpenAI reasoning models
+      // reject `max_tokens`.
+      const present = (["max_tokens", "max_completion_tokens"] as const).filter(field => body[field] !== undefined);
+      const fields = present.length > 0 ? present : [typeof body.model === "string" ? modelParamProfile(body.model).capField : "max_tokens"];
+      for (const field of fields) body[field] = ceiling;
       // Every tokenizer emits at most one token per UTF-8 byte of text, so
       // the serialized body bounds the prompt; JSON keys/escaping and a fixed
       // framing allowance deliberately overestimate the server's template.
