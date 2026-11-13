@@ -5,15 +5,19 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
+import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 
 import {
   FusionOutcomeLog,
   failureCategory,
   judgeOutcome,
+  outcomeLogFiles,
   outcomeLogPath,
   rowCostUsd,
   sessionTag,
@@ -196,4 +200,86 @@ describe("FusionOutcomeLog", () => {
     expect(lines[0]).toBe('{"type":"task"');
     expect((JSON.parse(lines[1]!) as TaskOutcomeRecord).steps).toBe(1);
   });
+
+  it("appends without rotating, and at once, while another live writer holds the lock", () => {
+    const path = outcomeLogPath(dir);
+    const one = `${JSON.stringify(record(1))}\n`;
+    mkdirSync(join(dir, "fusion"), { recursive: true });
+    // The other writer: this very (live) process, a fresh lock.
+    writeFileSync(`${path}.lock`, `${process.pid} other-writer`);
+    const warn = vi.fn();
+    const log = new FusionOutcomeLog({ path, maxBytes: one.length, keep: 2, warn });
+    const started = Date.now();
+    for (let i = 0; i < 4; i += 1) log.append([record(i)]);
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(warn).not.toHaveBeenCalled();
+    expect(existsSync(`${path}.1`)).toBe(false);
+    expect(readFileSync(path, "utf8").trim().split("\n")).toHaveLength(4);
+    // Not this writer's lock to release.
+    expect(readFileSync(`${path}.lock`, "utf8")).toBe(`${process.pid} other-writer`);
+  });
+
+  it("breaks a lock whose owner is gone or that is too old, then rotates and releases it", () => {
+    const path = outcomeLogPath(dir);
+    const one = `${JSON.stringify(record(1))}\n`;
+    mkdirSync(join(dir, "fusion"), { recursive: true });
+    const log = new FusionOutcomeLog({ path, maxBytes: one.length, keep: 2 });
+    log.append([record(0)]);
+    // An owner pid no process has.
+    writeFileSync(`${path}.lock`, "2147483646 dead-writer");
+    log.append([record(1)]);
+    expect(existsSync(`${path}.1`)).toBe(true);
+    expect(existsSync(`${path}.lock`)).toBe(false);
+    // A live owner, but abandoned long ago.
+    writeFileSync(`${path}.lock`, `${process.pid} old-writer`);
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(`${path}.lock`, old, old);
+    log.append([record(2)]);
+    expect(readFileSync(`${path}.2`, "utf8")).toContain('"steps":0');
+    expect(readFileSync(`${path}.1`, "utf8")).toContain('"steps":1');
+    expect(readFileSync(path, "utf8")).toContain('"steps":2');
+    expect(existsSync(`${path}.lock`)).toBe(false);
+  });
+
+  it("loses no line when two processes append and rotate the same file", async () => {
+    const path = outcomeLogPath(dir);
+    const perWriter = 150;
+    // Generations enough that rotation itself never ages a line out.
+    const keep = 200;
+    const script = join(dir, "writer.mts");
+    const logModule = pathToFileURL(join(import.meta.dirname, "outcome-log.ts")).href;
+    writeFileSync(
+      script,
+      [
+        `import { FusionOutcomeLog } from ${JSON.stringify(logModule)};`,
+        `const [path, tag, count, keep] = process.argv.slice(2);`,
+        `const log = new FusionOutcomeLog({ path, maxBytes: 1500, keep: Number(keep), warn: (m, f) => { console.error(m, JSON.stringify(f)); process.exitCode = 3; } });`,
+        `for (let i = 0; i < Number(count); i += 1) log.append([{ v: 1, type: "task", writer: tag, i, pad: "x".repeat(200) }]);`,
+      ].join("\n"),
+    );
+    const run = (tag: string) =>
+      new Promise<{ code: number | null; stderr: string }>((resolve) => {
+        const child = spawn(
+          process.execPath,
+          ["--import", "tsx", script, path, tag, String(perWriter), String(keep)],
+          { cwd: process.cwd(), stdio: ["ignore", "ignore", "pipe"] },
+        );
+        let stderr = "";
+        child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
+        child.on("close", (code) => resolve({ code, stderr }));
+      });
+    const results = await Promise.all([run("a"), run("b")]);
+    for (const result of results) expect(result).toEqual({ code: 0, stderr: "" });
+    const seen = new Set<string>();
+    for (const file of outcomeLogFiles(path, keep)) {
+      if (!existsSync(file)) continue;
+      for (const line of readFileSync(file, "utf8").split("\n")) {
+        if (line === "") continue;
+        const parsed = JSON.parse(line) as { writer: string; i: number };
+        seen.add(`${parsed.writer}:${parsed.i}`);
+      }
+    }
+    expect(seen.size).toBe(perWriter * 2);
+    expect(existsSync(`${path}.lock`)).toBe(false);
+  }, 60_000);
 });

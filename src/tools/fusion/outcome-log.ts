@@ -13,6 +13,7 @@ import { dirname, join } from "node:path";
 
 import { reportedCostUsd } from "../../llm/provider/usage-cost.js";
 import { classifyWorkerFailure } from "./failure-breaker.js";
+import { tryAcquireOutcomeLock } from "./outcome-log-lock.js";
 import {
   taskSpendUsd,
   type WorkerPricing,
@@ -261,7 +262,8 @@ export function outcomeLogFiles(path: string, keep = OUTCOME_LOG_KEEP): string[]
 /**
  * Appends whole lines, rotating before an append would pass the size
  * bound: `.N` is dropped, each `.i` becomes `.i+1`, the live file `.1`.
- * Synchronous, so lines from concurrent fan-outs never interleave.
+ * Synchronous, so lines from concurrent fan-outs never interleave; across
+ * processes, rotation happens only under `<log>.lock` (`outcome-log-lock.ts`).
  */
 export class FusionOutcomeLog implements FusionOutcomeSink {
   private readonly path: string;
@@ -284,10 +286,23 @@ export class FusionOutcomeLog implements FusionOutcomeSink {
       if (!this.enabled()) return;
       const text = records.map((r) => `${JSON.stringify(r)}\n`).join("");
       mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
-      this.rotateFor(Buffer.byteLength(text));
-      // A crash mid-append leaves a torn last line: start on a fresh one,
-      // so only the torn line is lost to a reader.
-      appendFileSync(this.path, this.endsTorn() ? `\n${text}` : text, { mode: 0o600 });
+      // Other processes (TUI, sidecar, scheduler) append to the same file:
+      // only the lock's holder rotates, checking the size once it holds it.
+      // Without the lock in a short wait, the line goes in unrotated.
+      let release: (() => void) | undefined;
+      try {
+        release = tryAcquireOutcomeLock(`${this.path}.lock`);
+      } catch {
+        release = undefined;
+      }
+      try {
+        if (release !== undefined) this.rotateFor(Buffer.byteLength(text));
+        // A crash mid-append leaves a torn last line: start on a fresh one,
+        // so only the torn line is lost to a reader.
+        appendFileSync(this.path, this.endsTorn() ? `\n${text}` : text, { mode: 0o600 });
+      } finally {
+        release?.();
+      }
     } catch (err) {
       // Never the fan-out's problem: the line is dropped and said once here.
       this.warn?.("fusion: the outcome log could not be written", {
@@ -332,6 +347,11 @@ export class FusionOutcomeLog implements FusionOutcomeSink {
         // A gap in the chain is fine: that file did not exist.
       }
     }
-    renameSync(this.path, `${this.path}.1`);
+    try {
+      renameSync(this.path, `${this.path}.1`);
+    } catch {
+      // Gone already (a writer outside the lock's rules): the append
+      // starts a fresh live file.
+    }
   }
 }
