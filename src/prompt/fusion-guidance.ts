@@ -88,9 +88,13 @@ const DEFAULT_TASK_SIZING = "a big one per worker, small ones shared.";
  * context. Sized by what one of its answers can hold
  * (`workerMaxNewLines`): a whole-file rewrite or three files in one task
  * is what such a worker runs out of cap, context or steps on.
+ *
+ * `maxNewLines` comes from the configured cap, which the runner can
+ * lower on a slow machine (`fitReplyCapToTime`), so it is stated as a
+ * ceiling that may be lower, never as a target.
  */
 export function localTaskSizing(maxNewLines: number): string {
-  return `one file or one function per task, at most ~${maxNewLines} new lines; edit large files, never rewrite them.`;
+  return `one file or one function per task, at most ~${maxNewLines} new lines (fewer on a slow machine); edit large files, never rewrite them.`;
 }
 
 /** What a worker sees, when nothing says its brief quotes less. */

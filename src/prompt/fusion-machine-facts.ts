@@ -301,7 +301,13 @@ export function resolveFusionMachineFacts(
     : null;
   // The cap a local worker is actually sent (`fusion-delegate.ts`): the
   // operator's `workerMaxOutputTokens`, else the reply allowance the
-  // pool was divided by. Config only, so stable for the prefix.
+  // pool was divided by. Config only, so stable for the prefix — and so
+  // it can overestimate on a slow machine: the runner lowers a local
+  // worker's real cap to what its time limit lets it write
+  // (`fitReplyCapToTime` in worker-runner.ts), which the prefix cannot
+  // follow without changing per measurement. The guidance therefore
+  // states it as a ceiling ("at most ~N", `localTaskSizing`), not a
+  // target.
   const newLines = workersAreLocal
     ? workerMaxNewLines(
         fusion?.workerMaxOutputTokens ??

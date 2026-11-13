@@ -280,7 +280,7 @@ describe("task sizing per worker leg", () => {
     // is what it runs out of cap, context or steps on.
     const block = buildFusionGuidance({ ...FACTS, workerMaxNewLines: 300 });
     expect(block).toContain(
-      "list the independent parts, one file or one function per task, at most ~300 new lines; edit large files, never rewrite them.",
+      "list the independent parts, one file or one function per task, at most ~300 new lines (fewer on a slow machine); edit large files, never rewrite them.",
     );
     expect(block).not.toContain("a big one per worker");
     expect(localTaskSizing(650)).toContain("at most ~650 new lines");
