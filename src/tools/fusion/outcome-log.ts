@@ -86,7 +86,7 @@ export interface TaskOutcomeRecord {
   role: string | null;
   status: WorkerTaskStatus;
   failure: FailureCategory | null;
-  /** This turn's attempt at the task (1 = first); counted when autoReplan is on. */
+  /** This turn's attempt at the task (1 = first), replans and re-delegations alike. */
   attempt: number;
   /** The judge re-ran the task once with its findings. */
   judgeRetried: boolean;

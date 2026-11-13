@@ -1507,23 +1507,25 @@ export function buildFusionDelegateTool(
         }
         // Each task this call actually started is one attempt at it this
         // turn; the replan bound (ATO-941) is counted against these. A task
-        // held or kept from starting has not been tried.
-      const ranNow = new Set<string>();
-        if (autoReplan > 0) {
-          // Rows carried from before a restart (ATO-617) were not run now.
-          const carried = new Set(resume?.carried.map((r) => r.id) ?? []);
+        // held or kept from starting has not been tried. Counted with
+        // autoReplan off too: the outcome log's `attempt` must see the
+        // orchestrator's own re-delegation of a failed task.
+        const ranNow = new Set<string>();
+        // Rows carried from before a restart (ATO-617) were not run now.
+        const carried = new Set(resume?.carried.map((r) => r.id) ?? []);
         for (const r of results) {
           if (!(r.error ?? "").startsWith("not started:") && !carried.has(r.id)) {
             ranNow.add(r.id);
           }
         }
-          // One round per family: a split's continuations (`t3.a`, `t3.b`)
-          // count once, on the task they continue.
+        // One round per family: a split's continuations (`t3.a`, `t3.b`)
+        // count once, on the task they continue.
         turnBudget.noteRoundAttempts(ctx.sessionId, [...ranNow]);
-        // Across rounds: a task that ran there once is not steered back.
-        turnBudget.noteOrchestratorRuns(
+        if (autoReplan > 0) {
+          // Across rounds: a task that ran there once is not steered back.
+          turnBudget.noteOrchestratorRuns(
             ctx.sessionId,
-          [...ranNow].filter((id) => taskLegs.get(id)?.orchestrator === true),
+            [...ranNow].filter((id) => taskLegs.get(id)?.orchestrator === true),
           );
         }
         // What the failure breakers saw (ATO-1406): remembered for the
@@ -1958,7 +1960,7 @@ export function buildFusionDelegateTool(
                   model: leg?.model ?? workerModel,
                   leg: legKind,
                   role: leg?.orchestrator === true ? "orchestrator" : (leg?.role ?? null),
-                  attempt: autoReplan > 0 ? turnBudget.attempts(ctx.sessionId, r.id) : 1,
+                  attempt: turnBudget.attempts(ctx.sessionId, r.id),
                   pricing,
                   merge:
                     mode.isolation === "worktree" ? (mergeOutcomes.get(r.id) ?? null) : null,
