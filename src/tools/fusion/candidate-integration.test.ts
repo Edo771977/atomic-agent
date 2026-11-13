@@ -612,3 +612,19 @@ it("refuses to delete a directory that still holds ignored or disposable origina
   expect(await readFile(join(repo, "old", "x.ts"), "utf8")).toBe("x\n");
   expect(await readFile(join(repo, "old", "debug.log"), "utf8")).toBe("log\n");
 });
+
+it("accepted trade-off: a concurrent write to an unrelated path during delivery is neither detected nor overwritten", async () => {
+  const root = await project();
+  const candidate = await createCandidateIntegration(root, { beforeCommit: async path => {
+    if (path === "api.json") { await writeFile(join(root, "unrelated.txt"), "user write mid-delivery"); await writeFile(join(root, "dirty.txt"), "user edit of an untouched path"); }
+  } });
+  try {
+    await writeFile(join(candidate.dir, "api.json"), "promoted api");
+    const report = await candidate.finish({ rows, contract, signal, runChecks: pass });
+    // Only touched paths are re-verified during delivery: the promotion stands.
+    expect(report.status).toBe("promoted"); expect(report.changes).toEqual(["api.json"]);
+  } finally { await candidate.cleanup(); }
+  expect(await readFile(join(root, "api.json"), "utf8")).toBe("promoted api");
+  expect(await readFile(join(root, "unrelated.txt"), "utf8")).toBe("user write mid-delivery");
+  expect(await readFile(join(root, "dirty.txt"), "utf8")).toBe("user edit of an untouched path");
+});
