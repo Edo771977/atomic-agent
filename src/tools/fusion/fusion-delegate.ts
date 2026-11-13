@@ -1109,7 +1109,11 @@ export function buildFusionDelegateTool(
             writeScope,
             signal: runSignal,
             ...guardOptionsFor(leg.providerId, pricing),
-            ...(escalationTarget?.providerId === leg.providerId
+            // An orchestrator task already runs on the strongest model
+            // the session holds: whichever escalation provider is
+            // configured, it can only be the same or a weaker one.
+            ...(escalationTarget?.providerId === leg.providerId ||
+            leg.orchestrator === true
               ? {}
               : escalationOptions),
             ...(briefSuffix === undefined ? {} : { briefSuffix }),

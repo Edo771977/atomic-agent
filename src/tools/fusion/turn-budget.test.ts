@@ -552,6 +552,57 @@ describe("the per-turn cap on model: \"orchestrator\" tasks", () => {
     expect(peak).toBe(2);
   });
 
+  it("never escalates an orchestrator task, even to another provider", async () => {
+    const asked: string[] = [];
+    const d = deps({
+      resolveRunMode: () =>
+        mode({
+          escalation: {
+            providerId: "third",
+            model: "other",
+            auto: true,
+            replace: false,
+            maxUsd: 1,
+          },
+        }),
+      escalationComplete: async ({ providerId }) => {
+        asked.push(providerId);
+        return {
+          content: "write the file",
+          usage: { promptTokens: 10, completionTokens: 10, totalTokens: 20 },
+        };
+      },
+      steerWorker: () => true,
+    });
+    d.runTurn = (async (_session, _message, options) => {
+      d.turns += 1;
+      // Six identical failing reads: a stall the advisor would answer.
+      for (let i = 0; i < 6; i += 1) {
+        options.eventHook?.({
+          type: "llm_event",
+          event: {
+            type: "tool_call_executed",
+            result: { tool: "os.fs.read", status: "error", summary: "not found: a.txt", details: {} },
+          },
+        } as never);
+        options.eventHook?.({ type: "step_finished", stepIndex: i, summary: "", durationMs: 1 } as never);
+      }
+      await new Promise((r) => setTimeout(r, 0));
+      return {
+        session: createEmptySessionState({ id: "s-w", workingDir: "/repo" }),
+        reason: "reply",
+        stepCount: 6,
+      } as RunTurnResult;
+    }) as FusionDelegateDeps["runTurn"];
+    await buildFusionDelegateTool(d).run(
+      { tasks: [hard(1), { id: "w", instructions: "bulk" }] },
+      ctx(),
+    );
+    expect(d.turns).toBe(2);
+    // Only the worker-leg task asked the advisor.
+    expect(asked).toEqual(["third"]);
+  });
+
   it("parses the cap, 0 included, and resolves the default", async () => {
     const { parseLlmRunModeConfig } = await import("../../config/llm-run-mode-config.js");
     const { resolveRunMode } = await import("../../llm/run-mode/resolve-run-mode.js");
