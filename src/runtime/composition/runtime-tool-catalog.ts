@@ -13,6 +13,8 @@ import { resolveLlmConfig } from "../../llm/provider/index.js";
 import type { ResolvedRunMode } from "../../llm/run-mode/index.js";
 import { visionCapableAlternatives } from "../../llm/provider/model-vision.js";
 import { resolveModelPricingFor } from "../resolve-model-pricing.js";
+import type { ModelProfile } from "../../llm/model-profile.js";
+import { createFusionFormatProbeFor } from "./fusion-format-check.js";
 import type { SessionUsageLedger } from "../../session/usage-meter.js";
 import { isLocalServerUrl } from "../../llm/provider/openai/local-server-url.js";
 import { ToolRegistry } from "../../tools/tool-registry.js";
@@ -705,12 +707,22 @@ export function registerRuntimeFusionAndReadScope(input: {
   runCheckpoints?: FusionDelegateDeps["runCheckpoints"];
   outcomeLog?: FusionDelegateDeps["outcomeLog"];
   turnLedger?: FusionDelegateDeps["turnLedger"];
+  /**
+   * What the local legs' format check sends with (`fusion-format-check.ts`):
+   * the step's live base grammar and the main local server's live profile
+   * and model id. Absent, no leg is checked.
+   */
+  localFormatCheck?: {
+    getGrammar: () => string;
+    getProfile: () => ModelProfile;
+    getModelId: () => string | null;
+  };
 }): void {
   const { config, toolRegistry, runTurn, createEphemeralSession, resolveOriginalRequest, declaredInputs,
     prepareLocalLink, emitAgentLoopEventFor, resolveCurrentRunMode, providerRegistry,
     llama, approvals, dangerous, slotManager, workingDir, logger, turnBudget,
     orchestratorTurnSpendUsd, liveWorkers, steerWorker, runCheckpoints, sessionUsage,
-    outcomeLog, turnLedger } = input;
+    outcomeLog, turnLedger, localFormatCheck } = input;
 
 
   // The orchestrator's fan-out. Registered UNCONDITIONALLY: the tool
@@ -775,6 +787,24 @@ export function registerRuntimeFusionAndReadScope(input: {
           ? () => llama.probeHealth()
           : undefined;
       },
+      // One short completion under the workers' grammar before the first
+      // fan-out on the main local server's leg; never a cloud leg.
+      ...(localFormatCheck === undefined
+        ? {}
+        : {
+            localGrammarProbeFor: createFusionFormatProbeFor({
+              getConfig,
+              providers: () => resolveLlmConfig(getConfig()).providers,
+              complete: async (providerId, request) => {
+                const provider = providerRegistry.getProvider(providerId);
+                if (provider === undefined) {
+                  throw new Error(`format check: provider ${providerId} is not configured`);
+                }
+                return provider.complete(request);
+              },
+              ...localFormatCheck,
+            }),
+          }),
       // The turn's $ / time caps (ATO-947), reset at each fusion turn's
       // start by the loop; read only when a cap is configured.
       ...(turnBudget === undefined ? {} : { turnBudget }),

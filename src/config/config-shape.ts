@@ -161,6 +161,7 @@ const LLM_FUSION_KEYS: Record<keyof UserLlmFusionConfig, true> = {
   roles: true,
   mixLocalModels: true,
   outcomeLog: true,
+  localFormatCheck: true,
   isolation: true,
   taskTree: true,
 };

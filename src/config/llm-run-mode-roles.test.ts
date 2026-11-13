@@ -37,6 +37,17 @@ describe("llm.runMode.fusion.roles (ATO-943)", () => {
     });
   });
 
+  it("parses localFormatCheck as a boolean, absent by default", () => {
+    const parse = (fusion: unknown) =>
+      parseLlmRunModeConfig({ fusion }, providers, "llm.runMode").fusion;
+    expect(parse({})?.localFormatCheck).toBeUndefined();
+    expect(parse({ localFormatCheck: false })).toEqual({ localFormatCheck: false });
+    expect(parse({ localFormatCheck: true })).toEqual({ localFormatCheck: true });
+    expect(() => parse({ localFormatCheck: "off" })).toThrow(
+      /llm\.runMode\.fusion\.localFormatCheck/,
+    );
+  });
+
   it("skips a role a newer build added", () => {
     expect(
       parseLlmRunModeConfig({ fusion: { roles: { coder: "or-coder", build: "openrouter" } } }, providers, "llm.runMode").fusion?.roles,

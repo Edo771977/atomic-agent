@@ -83,14 +83,19 @@ const NOT_SIGNED_IN =
 const OUT_OF_CREDIT =
   /(?:HTTP|status|code)\s*402\b|^402\b|402 Payment|payment required|insufficient (?:credits?|funds|balance|quota)|out of (?:credits?|funds)|quota (?:exceeded|exhausted)|exceeded (?:your|the) (?:current )?quota|usage limit|(?:subscription|plan|weekly|daily|hourly|5-hour) limit|is out of credit/i;
 
+/** The tool-protocol blocker's signature, shared with the pre-dispatch format check. */
+export const TOOL_PROTOCOL_SIGNATURE = "blocker:tool-protocol";
+/** The tool-protocol blocker's words, shared with the pre-dispatch format check. */
+export const TOOL_PROTOCOL_LABEL =
+  "the worker model's replies do not fit the agent's tool-call protocol, so its tools never run";
+
 // The protocol check first: its messages carry positions and counts
 // ("at position 401") that the other patterns must not claim.
 const BLOCKERS: ReadonlyArray<{ re: RegExp; signature: string; label: string }> = [
   {
     re: TOOL_PROTOCOL,
-    signature: "blocker:tool-protocol",
-    label:
-      "the worker model's replies do not fit the agent's tool-call protocol, so its tools never run",
+    signature: TOOL_PROTOCOL_SIGNATURE,
+    label: TOOL_PROTOCOL_LABEL,
   },
   {
     re: CLI_MISSING,

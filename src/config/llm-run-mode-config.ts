@@ -220,6 +220,13 @@ export type UserLlmFusionConfig = {
    */
   outcomeLog?: boolean;
   /**
+   * The one-call format check before the first fan-out on a local worker
+   * leg: a few dozen tokens under the workers' own grammar, and a reply
+   * that does not parse refuses the fan-out before a worker spends its
+   * time. Default `true`; `false` sends workers unchecked, as before.
+   */
+  localFormatCheck?: boolean;
+  /**
    * Branch isolation (ATO-946). `"worktree"`: every task of a fan-out
    * works in a workspace of its own (a detached git worktree inside a
    * git repo, a folder copy elsewhere); after its wave the changes are
@@ -664,6 +671,15 @@ function parseFusion(
       throw new ConfigValidationError(`${field}.outcomeLog`, "expected boolean");
     }
     out.outcomeLog = obj.outcomeLog;
+  }
+  if (obj.localFormatCheck !== undefined) {
+    if (typeof obj.localFormatCheck !== "boolean") {
+      throw new ConfigValidationError(
+        `${field}.localFormatCheck`,
+        "expected boolean",
+      );
+    }
+    out.localFormatCheck = obj.localFormatCheck;
   }
   if (obj.taskTree !== undefined) {
     out.taskTree = parseTaskTree(obj.taskTree, `${field}.taskTree`);

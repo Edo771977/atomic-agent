@@ -1,0 +1,323 @@
+import { describe, expect, it, vi } from "vitest";
+
+import type { RunTurnResult } from "../../agent/agent-loop.js";
+import { FanoutScopeRegistry } from "../../approval/fanout-scope.js";
+import type { GrammarSmokeVerdict } from "../../llm/grammar/grammar-smoke.js";
+import type { ResolvedRunMode } from "../../llm/run-mode/index.js";
+import { FUSION_WORKER_ID_PREFIX } from "../../session/fusion-worker-session.js";
+import { createEmptySessionState } from "../../session/session-state.js";
+import { StructuredLogger } from "../../tracing/structured-logger.js";
+import type { ToolContext } from "../tool-registry.js";
+import {
+  FAILURE_BREAKER_INSTRUCTION,
+  TOOL_PROTOCOL_LABEL,
+  TOOL_PROTOCOL_SIGNATURE,
+  classifyWorkerFailure,
+} from "./failure-breaker.js";
+import { buildFusionDelegateTool, type FusionDelegateDeps } from "./fusion-delegate.js";
+import {
+  LocalGrammarSmoke,
+  describeFormatCheckRefusal,
+  formatCheckTrip,
+  type LocalGrammarProbe,
+} from "./local-grammar-smoke.js";
+import { FusionTurnBudget } from "./turn-budget.js";
+
+const FAIL: GrammarSmokeVerdict = {
+  kind: "fail",
+  error: 'tool-call protocol mismatch: invalid tool-call JSON (reply began "Sure")',
+};
+
+function probe(verdicts: GrammarSmokeVerdict[], key = "srv\u0000model\u0000qwen-think") {
+  const run = vi.fn(async (_signal?: AbortSignal) => verdicts.shift() ?? { kind: "pass" as const });
+  const p: LocalGrammarProbe = { key, run };
+  return { probe: p, run };
+}
+
+describe("LocalGrammarSmoke", () => {
+  it("keeps a pass and a failure per (server, model, profile) for the process", async () => {
+    const smoke = new LocalGrammarSmoke();
+    const passing = probe([{ kind: "pass" }], "a");
+    const at = { sessionId: "s1", leg: "local-llama" };
+    expect(await smoke.check(passing.probe, at)).toEqual({ kind: "pass", cached: false });
+    expect(await smoke.check(passing.probe, { ...at, sessionId: "s2" })).toEqual({
+      kind: "pass",
+      cached: true,
+    });
+    expect(passing.run).toHaveBeenCalledOnce();
+
+    const failing = probe([FAIL], "b");
+    expect(await smoke.check(failing.probe, at)).toMatchObject({ kind: "fail", cached: false });
+    expect(await smoke.check(failing.probe, at)).toMatchObject({ kind: "fail", cached: true });
+    expect(failing.run).toHaveBeenCalledOnce();
+
+    // Another model or profile on the same server is asked afresh.
+    const other = probe([{ kind: "pass" }], "a-other-model");
+    await smoke.check(other.probe, at);
+    expect(other.run).toHaveBeenCalledOnce();
+  });
+
+  it("keeps nothing from a timeout, so the next fan-out asks again", async () => {
+    const smoke = new LocalGrammarSmoke();
+    const flaky = probe([
+      { kind: "inconclusive", reason: "timeout", detail: "no answer within 30 s" },
+      { kind: "pass" },
+    ]);
+    const at = { sessionId: "s1", leg: "local-llama" };
+    expect(await smoke.check(flaky.probe, at)).toMatchObject({ kind: "inconclusive", reason: "timeout" });
+    expect(await smoke.check(flaky.probe, at)).toEqual({ kind: "pass", cached: false });
+    expect(flaky.run).toHaveBeenCalledTimes(2);
+  });
+
+  it("asks once for two checks in flight", async () => {
+    const smoke = new LocalGrammarSmoke();
+    let release!: (v: GrammarSmokeVerdict) => void;
+    const run = vi.fn(() => new Promise<GrammarSmokeVerdict>((resolve) => (release = resolve)));
+    const p = { key: "k", run };
+    const at = { sessionId: "s1", leg: "local-llama" };
+    const first = smoke.check(p, at);
+    const second = smoke.check(p, at);
+    release({ kind: "pass" });
+    expect(await first).toEqual({ kind: "pass", cached: false });
+    expect(await second).toEqual({ kind: "pass", cached: true });
+    expect(run).toHaveBeenCalledOnce();
+  });
+
+  it("skips a leg a worker already succeeded on this session, and a cancelled call", async () => {
+    const smoke = new LocalGrammarSmoke();
+    const p = probe([FAIL]);
+    smoke.noteWorkerSucceeded("s1", "local-llama");
+    expect(await smoke.check(p.probe, { sessionId: "s1", leg: "local-llama" })).toEqual({
+      kind: "skipped",
+      why: "worker-succeeded",
+    });
+    const aborted = new AbortController();
+    aborted.abort();
+    expect(
+      await smoke.check(p.probe, { sessionId: "s2", leg: "local-llama", signal: aborted.signal }),
+    ).toEqual({ kind: "skipped", why: "cancelled" });
+    expect(p.run).not.toHaveBeenCalled();
+  });
+
+  it("passes the caller's signal to the probe and turns a throw into no verdict", async () => {
+    const smoke = new LocalGrammarSmoke();
+    const controller = new AbortController();
+    const run = vi.fn(async () => {
+      throw new Error("socket hang up");
+    });
+    const verdict = await smoke.check(
+      { key: "k", run },
+      { sessionId: "s", leg: "l", signal: controller.signal },
+    );
+    expect(run).toHaveBeenCalledWith(controller.signal);
+    expect(verdict).toMatchObject({ kind: "inconclusive", reason: "unreachable" });
+  });
+
+  it("refuses in the breaker's own protocol-mismatch words", () => {
+    const trip = formatCheckTrip("local-llama");
+    expect(trip).toMatchObject({ signature: TOOL_PROTOCOL_SIGNATURE, blocker: true, label: TOOL_PROTOCOL_LABEL });
+    const message = describeFormatCheckRefusal(trip, FAIL.kind === "fail" ? FAIL.error : "", "small");
+    expect(message).toContain(TOOL_PROTOCOL_LABEL);
+    expect(message).toContain("another worker on this leg would fail the same way");
+    expect(message).toContain(FAILURE_BREAKER_INSTRUCTION);
+    // A row with the check's error would be classified the same way.
+    expect(
+      classifyWorkerFailure({ status: "failed", error: FAIL.kind === "fail" ? FAIL.error : "" }),
+    ).toMatchObject({ blocker: true, signature: TOOL_PROTOCOL_SIGNATURE });
+  });
+});
+
+const logger = new StructuredLogger({ level: "error", sinks: [] });
+
+function fusionMode(over: Partial<ResolvedRunMode> = {}): ResolvedRunMode {
+  return {
+    stored: "fusion",
+    effective: "fusion",
+    orchestratorProviderId: "openrouter",
+    orchestratorModel: "big",
+    workerProviderId: "local-llama",
+    workerModel: "small",
+    workers: 2,
+    workersPinned: true,
+    workerMaxSteps: 7,
+    workerTimeoutMs: 60_000,
+    primaryProviderId: "openrouter",
+    degraded: null,
+    ...over,
+  };
+}
+
+function ctx(over: Partial<ToolContext> = {}): ToolContext {
+  return {
+    workingDir: "/repo",
+    sessionId: "s-parent",
+    stepIndex: 0,
+    signal: new AbortController().signal,
+    ...over,
+  };
+}
+
+const workerTurn: FusionDelegateDeps["runTurn"] = async (_session, _message, options) => {
+  options.eventHook?.({
+    type: "llm_event",
+    event: {
+      type: "tool_call_executed",
+      result: { tool: "os.fs.read", status: "ok", summary: "read", details: {}, truncated: false },
+      batchIndex: 0,
+      batchSize: 1,
+    },
+  });
+  options.eventHook?.({ type: "llm_event", event: { type: "assistant_reply", text: "done" } });
+  const result: RunTurnResult = {
+    session: createEmptySessionState({ id: "s-w", workingDir: "/repo" }),
+    reason: "reply",
+    stepCount: 2,
+  };
+  return result;
+};
+
+function deps(over: Partial<FusionDelegateDeps> = {}): FusionDelegateDeps {
+  let minted = 0;
+  return {
+    runTurn: vi.fn(workerTurn),
+    createEphemeralSession: (meta) => {
+      minted += 1;
+      return createEmptySessionState({
+        id: `${FUSION_WORKER_ID_PREFIX}${minted}`,
+        workingDir: "/repo",
+        metadata: { fusionWorker: { ...meta } },
+      });
+    },
+    approvals: {
+      setSessionPolicy: () => {},
+      clearSessionPolicy: () => {},
+      fanoutScopes: new FanoutScopeRegistry(),
+    },
+    approvalRequired: false,
+    emitEvent: () => {},
+    workingDir: "/repo",
+    slotManager: { poolSize: () => 2 },
+    resolveRunMode: () => fusionMode(),
+    workerSupportsSlotAffinity: () => true,
+    warmWorkerBackend: async () => {},
+    outputCharCap: 4000,
+    logger,
+    ...over,
+  };
+}
+
+const TASKS = [
+  { id: "t1", title: "One", instructions: "Do one" },
+  { id: "t2", title: "Two", instructions: "Do two" },
+];
+
+describe("fusion.delegate with the local format check", () => {
+  it("refuses the fan-out up front when the check fails, and notes the blocker on the turn", async () => {
+    const failing = probe([FAIL]);
+    const turnBudget = new FusionTurnBudget();
+    const d = deps({ localGrammarProbeFor: () => failing.probe, turnBudget });
+    const tool = buildFusionDelegateTool(d);
+    const result = await tool.run({ tasks: TASKS }, ctx());
+    expect(result.status).toBe("error");
+    const output = result.fullOutput ?? "";
+    expect(output).toMatch(/^fusion\.delegate did not run: the fan-out was stopped because /);
+    expect(output).toContain(TOOL_PROTOCOL_LABEL);
+    expect(output).toContain("format check on small");
+    expect(output).toContain("tool-call protocol mismatch: invalid tool-call JSON");
+    expect(output).toContain(FAILURE_BREAKER_INSTRUCTION);
+    expect(result.details).toMatchObject({ reason: "failure-breaker", blocker: true, formatCheck: true });
+    expect(d.runTurn).not.toHaveBeenCalled();
+    expect(turnBudget.trips("s-parent")).toEqual([formatCheckTrip("local-llama")]);
+
+    // The trip refuses the next delegation this turn, as any blocker does.
+    const sameTurn = await tool.run({ tasks: TASKS }, ctx());
+    expect(sameTurn.fullOutput).toMatch(/did not run: earlier this turn/);
+    expect(failing.run).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the failure for the process: a later turn is refused without asking again", async () => {
+    const failing = probe([FAIL]);
+    const d = deps({ localGrammarProbeFor: () => failing.probe });
+    const tool = buildFusionDelegateTool(d);
+    expect((await tool.run({ tasks: TASKS }, ctx())).status).toBe("error");
+    const later = await tool.run({ tasks: TASKS }, ctx());
+    expect(later.status).toBe("error");
+    expect(later.fullOutput).toContain("format check on small");
+    expect(failing.run).toHaveBeenCalledOnce();
+    expect(d.runTurn).not.toHaveBeenCalled();
+  });
+
+  it("runs the workers after a pass, and does not ask again for the next fan-out", async () => {
+    const passing = probe([{ kind: "pass" }]);
+    const d = deps({ localGrammarProbeFor: vi.fn(() => passing.probe) });
+    const tool = buildFusionDelegateTool(d);
+    expect((await tool.run({ tasks: TASKS }, ctx())).status).toBe("ok");
+    expect(d.runTurn).toHaveBeenCalledTimes(2);
+    expect((await tool.run({ tasks: TASKS }, ctx())).status).toBe("ok");
+    expect(passing.run).toHaveBeenCalledOnce();
+  });
+
+  it("skips the check on a leg whose worker already ran tools this session", async () => {
+    const smoke = new LocalGrammarSmoke();
+    const first = probe([{ kind: "pass" }], "first");
+    const tool = buildFusionDelegateTool(
+      deps({ localGrammarSmoke: smoke, localGrammarProbeFor: () => first.probe }),
+    );
+    expect((await tool.run({ tasks: TASKS }, ctx())).status).toBe("ok");
+    // A model switch changes the key; the leg already proved itself here.
+    const second = probe([FAIL], "second");
+    const after = buildFusionDelegateTool(
+      deps({ localGrammarSmoke: smoke, localGrammarProbeFor: () => second.probe }),
+    );
+    expect((await after.run({ tasks: TASKS }, ctx())).status).toBe("ok");
+    expect(second.run).not.toHaveBeenCalled();
+    // Another session has proved nothing yet.
+    expect((await after.run({ tasks: TASKS }, ctx({ sessionId: "s-other" }))).status).toBe("error");
+  });
+
+  it("never asks a cloud leg", async () => {
+    const probeFor = vi.fn(() => probe([FAIL]).probe);
+    const d = deps({
+      workerSupportsSlotAffinity: () => false,
+      localGrammarProbeFor: probeFor,
+    });
+    expect((await buildFusionDelegateTool(d).run({ tasks: TASKS }, ctx())).status).toBe("ok");
+    expect(probeFor).not.toHaveBeenCalled();
+  });
+
+  it("sends workers unchecked when localFormatCheck is off, or no probe answers for the leg", async () => {
+    const failing = probe([FAIL]);
+    const off = deps({
+      resolveRunMode: () => fusionMode({ localFormatCheck: false }),
+      localGrammarProbeFor: () => failing.probe,
+    });
+    expect((await buildFusionDelegateTool(off).run({ tasks: TASKS }, ctx())).status).toBe("ok");
+    const noProbe = deps({ localGrammarProbeFor: () => undefined });
+    expect((await buildFusionDelegateTool(noProbe).run({ tasks: TASKS }, ctx())).status).toBe("ok");
+    expect(failing.run).not.toHaveBeenCalled();
+  });
+
+  it("dispatches as before when the check has no verdict", async () => {
+    const silent = probe([{ kind: "inconclusive", reason: "timeout", detail: "no answer within 30 s" }]);
+    const d = deps({ localGrammarProbeFor: () => silent.probe });
+    expect((await buildFusionDelegateTool(d).run({ tasks: TASKS }, ctx())).status).toBe("ok");
+    expect(d.runTurn).toHaveBeenCalledTimes(2);
+  });
+
+  it("hands the tool call's cancellation to the check", async () => {
+    const controller = new AbortController();
+    const seen: Array<AbortSignal | undefined> = [];
+    const watching: LocalGrammarProbe = {
+      key: "k",
+      run: async (signal) => {
+        seen.push(signal);
+        return { kind: "pass" };
+      },
+    };
+    await buildFusionDelegateTool(deps({ localGrammarProbeFor: () => watching })).run(
+      { tasks: TASKS },
+      ctx({ signal: controller.signal }),
+    );
+    expect(seen).toEqual([controller.signal]);
+  });
+});

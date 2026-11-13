@@ -1106,6 +1106,10 @@ export interface UserConfigFile {
 // Unversioned, additive: `llm.runMode.fusion.roles` (`plan|build|review|
 // explore|utility` → provider id) and `mixLocalModels` (default false),
 // ATO-943. An older file has neither and runs every task on the worker leg.
+// Unversioned, additive: `llm.runMode.fusion.localFormatCheck` (boolean,
+// default true): one short completion under the workers' grammar before
+// the first fan-out on a local worker leg. An older file has no field and
+// gets the check; `false` turns it off.
 // Unversioned, additive: `llm.runMode.fusion.isolation` (`off|worktree`,
 // default `off`), ATO-946. An older file has none and workers write in
 // place, as before.

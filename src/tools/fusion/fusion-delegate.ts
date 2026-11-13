@@ -49,6 +49,12 @@ import {
 import { describeReplan, isOpenResult, renderReplanBlock } from "./replan.js";
 import { LocalLegHealth } from "./local-leg-health.js";
 import {
+  LocalGrammarSmoke,
+  describeFormatCheckRefusal,
+  formatCheckTrip,
+  type LocalGrammarProbe,
+} from "./local-grammar-smoke.js";
+import {
   renderMergeBlock,
   runIsolatedWave,
   type KeptBranch,
@@ -219,6 +225,15 @@ export interface FusionDelegateDeps extends WorkerRunnerDeps {
   outcomeLog?: FusionOutcomeSink;
   /** The turn receipt's per-turn tally (`turn-receipt.ts`). */
   turnLedger?: Pick<FusionTurnLedger, "noteFanout">;
+  /**
+   * The format check for one local leg (`local-grammar-smoke.ts`): one
+   * short completion under the workers' grammar on that leg's server, or
+   * `undefined` when nothing can ask it (a cloud leg, a second local
+   * server). Absent: no leg is checked.
+   */
+  localGrammarProbeFor?: (providerId: string) => LocalGrammarProbe | undefined;
+  /** Its verdicts across fan-outs; one per tool unless injected. */
+  localGrammarSmoke?: LocalGrammarSmoke;
 }
 
 /**
@@ -324,6 +339,8 @@ export function buildFusionDelegateTool(
     ...input,
     localLegHealth: input.localLegHealth ?? new LocalLegHealth(),
   };
+  // Also per runtime: a leg's format verdict holds for every fan-out.
+  const formatCheck = input.localGrammarSmoke ?? new LocalGrammarSmoke();
   const turnBudget = deps.turnBudget ?? new FusionTurnBudget();
   return {
     name: FUSION_DELEGATE_TOOL,
@@ -659,6 +676,43 @@ export function buildFusionDelegateTool(
           { reason: "agent-state-dir", scope: intoState },
         );
       }
+      // A local leg that cannot produce the tool-call format is found out
+      // here, with one short completion, before the person is asked and
+      // before a worker spends its time on it (local-grammar-smoke.ts).
+      // Never a cloud leg: only a slot-affine leg with a probe is asked.
+      if (mode.localFormatCheck !== false && deps.localGrammarProbeFor !== undefined) {
+        const localLegs = new Map<string, string>();
+        if (slotAffine && legTaskCount > 0) localLegs.set(workerProviderId, workerModel);
+        for (const [providerId, leg] of roleLegs) {
+          if (deps.workerSupportsSlotAffinity(providerId)) localLegs.set(providerId, leg.model);
+        }
+        for (const [providerId, model] of localLegs) {
+          const probe = deps.localGrammarProbeFor(providerId);
+          if (probe === undefined) continue;
+          const checked = await formatCheck.check(probe, {
+            sessionId: ctx.sessionId,
+            leg: providerId,
+            signal: ctx.signal,
+          });
+          deps.logger.info("fusion: local format check", {
+            providerId,
+            verdict: checked.kind,
+            ...("cached" in checked ? { cached: checked.cached } : {}),
+            ...(checked.kind === "inconclusive" ? { reason: checked.reason } : {}),
+          });
+          if (checked.kind === "fail") {
+            const trip = formatCheckTrip(providerId);
+            if (tracksTurn) turnBudget.noteTrip(ctx.sessionId, trip);
+            return error(describeFormatCheckRefusal(trip, checked.error, model), {
+              reason: "failure-breaker",
+              blocker: true,
+              signature: trip.signature,
+              formatCheck: true,
+            });
+          }
+        }
+      }
+
       // A turn is one job. An orchestrator that reviews and re-delegates
       // runs five fan-outs to build one library, and asking the same
       // question five times is attrition, not consent. The operator's
@@ -983,6 +1037,13 @@ export function buildFusionDelegateTool(
           shouldStartTask: () => breaker.stopReason(),
           onTaskFinished: (result: WorkerTaskResult): void => {
             breaker.observe(result);
+            // A finished worker that ran tools answers the format check.
+            if (
+              (result.status === "ok" || result.status === "no_changes") &&
+              result.tools.calls > 0
+            ) {
+              formatCheck.noteWorkerSucceeded(ctx.sessionId, providerId);
+            }
             checkpoint.onTaskFinished?.(result);
           },
         };

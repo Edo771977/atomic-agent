@@ -55,6 +55,16 @@ describe("resolveRunMode roles (ATO-943)", () => {
     expect(rm.orchestratorProviderId).toBe("openrouter");
   });
 
+  it("carries localFormatCheck only when it is turned off", () => {
+    expect(resolveRunMode(llm({ mode: "fusion" }))).not.toHaveProperty("localFormatCheck");
+    expect(
+      resolveRunMode(llm({ mode: "fusion", fusion: { localFormatCheck: true } })),
+    ).not.toHaveProperty("localFormatCheck");
+    expect(
+      resolveRunMode(llm({ mode: "fusion", fusion: { localFormatCheck: false } })).localFormatCheck,
+    ).toBe(false);
+  });
+
   it("carries mixLocalModels", () => {
     const rm = resolveRunMode(
       llm({ mode: "fusion", fusion: { roles: { utility: "small-llama" }, mixLocalModels: true } }),

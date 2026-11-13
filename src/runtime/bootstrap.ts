@@ -812,6 +812,11 @@ export async function createAgentRuntime(
     turnLedger: fusionOutcomes.ledger,
     steerWorker: (sessionId, text) => steeringInbox.push(sessionId, text),
     orchestratorTurnSpendUsd: (sessionId) => turnUsageMeter.peekCostUsd(sessionId),
+    localFormatCheck: {
+      getGrammar,
+      getProfile: connectedLocal.getLiveProfile,
+      getModelId: connectedLocal.getLiveModelId,
+    },
   });
 
   const scheduler = createRuntimeScheduler({

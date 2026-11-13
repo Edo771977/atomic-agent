@@ -96,6 +96,12 @@ export type ResolvedRunMode = {
    */
   isolation?: "worktree";
   /**
+   * `llm.runMode.fusion.localFormatCheck`, present only when turned off
+   * (`false`): no one-call format check before a fan-out on a local
+   * worker leg (`tools/fusion/local-grammar-smoke.ts`).
+   */
+  localFormatCheck?: false;
+  /**
    * `llm.runMode.fusion.taskTree` (ATO-940), present only when enabled
    * with a depth above 1 — a tree of depth 1 is the flat fan-out.
    * `maxDepth` is already clamped to `FUSION_TASK_TREE_MAX_DEPTH`.
@@ -370,6 +376,7 @@ export function resolveRunMode(
       ? { autoReplan: fusion.autoReplan }
       : {}),
     ...(fusion?.isolation === "worktree" ? { isolation: "worktree" as const } : {}),
+    ...(fusion?.localFormatCheck === false ? { localFormatCheck: false as const } : {}),
     ...resolveTaskTree(fusion?.taskTree),
     ...(fusion?.turnBudgetUsd !== undefined && fusion.turnBudgetUsd > 0
       ? { turnBudgetUsd: fusion.turnBudgetUsd }
