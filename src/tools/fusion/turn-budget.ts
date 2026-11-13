@@ -44,6 +44,12 @@ interface TurnState {
   attempts: Map<string, number>;
   /** Continuation id → the root it continues (`continuationRoot`). */
   family: Map<string, string>;
+  /**
+   * Roots whose last round closed every member green
+   * (`noteRoundOutcomes`). A dotted id is never a continuation of one:
+   * `parse.dates` after a closed `parse` is new work.
+   */
+  closed: Set<string>;
   /** Delegations started this turn, and the tasks they carried (ATO-1406). */
   rounds: number;
   tasks: number;
@@ -68,12 +74,13 @@ export interface TurnCountStop {
 
 /**
  * The task a continuation id continues: `t3.a` (or `t3.a.x`) is `t3`'s
- * once `t3` ran earlier this turn, else the id is its own root. The
- * longest prefix that ran wins, then its own root, so a split of a
- * split still counts on the first task.
+ * once `t3` ran earlier this turn and is still open (pending a replan
+ * or out of them), else the id is its own root. The longest prefix that
+ * ran wins, then its own root, so a split of a split still counts on
+ * the first task. A prefix whose family closed green continues nothing.
  */
 function continuationRoot(
-  state: Pick<TurnState, "attempts" | "family">,
+  state: Pick<TurnState, "attempts" | "family" | "closed">,
   taskId: string,
 ): string {
   const known = state.family.get(taskId);
@@ -89,7 +96,7 @@ function continuationRoot(
     const root =
       state.family.get(prefix) ??
       (state.attempts.has(prefix) ? prefix : undefined);
-    if (root !== undefined) return root;
+    if (root !== undefined && !state.closed.has(root)) return root;
   }
   return taskId;
 }
@@ -111,6 +118,7 @@ export class FusionTurnBudget {
       orchestratorBaseUsd,
       attempts: new Map(),
       family: new Map(),
+      closed: new Set(),
       rounds: 0,
       tasks: 0,
       trips: [],
@@ -128,6 +136,7 @@ export class FusionTurnBudget {
         orchestratorBaseUsd: 0,
         attempts: new Map(),
         family: new Map(),
+        closed: new Set(),
         rounds: 0,
         tasks: 0,
         trips: [],
@@ -167,6 +176,29 @@ export class FusionTurnBudget {
     }
     for (const root of new Set(roots.values())) {
       state.attempts.set(root, (state.attempts.get(root) ?? 0) + 1);
+    }
+  }
+
+  /**
+   * How this round's runs ended: a family whose members this round all
+   * closed is closed, so a later dotted id (`parse.dates` after `parse`)
+   * starts its own family instead of inheriting `parse`'s attempts. A
+   * family with any member still open stays open; one that reopens (its
+   * own id sent again and failing) is open again.
+   */
+  noteRoundOutcomes(
+    sessionId: string,
+    outcomes: readonly { id: string; open: boolean }[],
+  ): void {
+    const state = this.turn(sessionId);
+    const open = new Map<string, boolean>();
+    for (const { id, open: isOpen } of outcomes) {
+      const root = continuationRoot(state, id);
+      open.set(root, (open.get(root) ?? false) || isOpen);
+    }
+    for (const [root, isOpen] of open) {
+      if (isOpen) state.closed.delete(root);
+      else state.closed.add(root);
     }
   }
 

@@ -43,7 +43,7 @@ import {
   runWorkerTasks,
   type WorkerRunnerDeps,
 } from "./worker-runner.js";
-import { describeReplan, renderReplanBlock } from "./replan.js";
+import { describeReplan, isOpenResult, renderReplanBlock } from "./replan.js";
 import { LocalLegHealth } from "./local-leg-health.js";
 import {
   renderMergeBlock,
@@ -1280,20 +1280,18 @@ export function buildFusionDelegateTool(
       // Each task this call actually started is one attempt at it this
       // turn; the replan bound (ATO-941) is counted against these. A task
       // held or kept from starting has not been tried.
+      const ranNow = new Set<string>();
       if (autoReplan > 0) {
         // Rows carried from before a restart (ATO-617) were not run now.
         const carried = new Set(resume?.carried.map((r) => r.id) ?? []);
+        for (const r of results) {
+          if (!(r.error ?? "").startsWith("not started:") && !carried.has(r.id)) {
+            ranNow.add(r.id);
+          }
+        }
         // One round per family: a split's continuations (`t3.a`, `t3.b`)
         // count once, on the task they continue.
-        turnBudget.noteRoundAttempts(
-          ctx.sessionId,
-          results
-            .filter(
-              (r) =>
-                !(r.error ?? "").startsWith("not started:") && !carried.has(r.id),
-            )
-            .map((r) => r.id),
-        );
+        turnBudget.noteRoundAttempts(ctx.sessionId, [...ranNow]);
       }
       // What the failure breakers saw (ATO-1406): remembered for the
       // rest of the turn, so the next round on a broken leg is refused.
@@ -1531,6 +1529,16 @@ export function buildFusionDelegateTool(
               (id) => taskLegs.get(id)?.orchestrator === true,
             )
           : undefined;
+      // How this round's families ended, judged rows included: a family
+      // that closed green is no longer one a dotted id can continue.
+      if (ranNow.size > 0) {
+        turnBudget.noteRoundOutcomes(
+          ctx.sessionId,
+          results
+            .filter((r) => ranNow.has(r.id))
+            .map((r) => ({ id: r.id, open: isOpenResult(r) })),
+        );
+      }
       const contractLine =
         contract === undefined ? undefined : renderContractLine(contract);
       // The run ended here. Stopped by the person or by a quit, its file

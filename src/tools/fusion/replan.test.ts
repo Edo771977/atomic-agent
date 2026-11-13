@@ -192,6 +192,45 @@ describe("a replan may split a failed task into continuation ids", () => {
     budget.begin("s");
     expect(budget.attempts("s", "parse.dates.iso")).toBe(0);
   });
+
+  it("continues only a task that is still open: a dotted id after a closed one is new work", () => {
+    const budget = new FusionTurnBudget();
+    budget.begin("s");
+    budget.noteRoundAttempts("s", ["parse", "lex"]);
+    budget.noteRoundOutcomes("s", [
+      { id: "parse", open: false },
+      { id: "lex", open: true },
+    ]);
+    budget.noteRoundAttempts("s", ["parse.dates", "lex.a"]);
+    // `parse` closed green: `parse.dates` is its own family, one run.
+    expect(budget.attempts("s", "parse.dates")).toBe(1);
+    expect(budget.attempts("s", "parse")).toBe(1);
+    // `lex` is still open: `lex.a` continues it.
+    expect(budget.attempts("s", "lex.a")).toBe(2);
+    expect(budget.attempts("s", "lex")).toBe(2);
+  });
+
+  it("gives a new dotted id after a closed task its own replans, through the delegate", async () => {
+    const budget = new FusionTurnBudget();
+    budget.begin("s-p");
+    const { d, ran } = deps(new Set(["parse.dates"]), { turnBudget: budget });
+    const tool = buildFusionDelegateTool(d);
+    const first = await tool.run({ tasks: [{ id: "parse", instructions: "the parser" }] }, ctx());
+    expect(first.details.replan).toBeUndefined();
+    const second = await tool.run(
+      { tasks: [{ id: "parse.dates", instructions: "now dates, new work" }] },
+      ctx(),
+    );
+    const report = second.details.replan as Report;
+    // One run, not two: the full replans, and no "failed twice" steer.
+    expect(report.exhausted).toEqual([]);
+    expect(report.pending).toEqual([
+      expect.objectContaining({ id: "parse.dates", replansLeft: 1 }),
+    ]);
+    expect(report.pending[0]!.fix).toBeUndefined();
+    expect(budget.attempts("s-p", "parse.dates")).toBe(1);
+    expect(ran).toEqual(["parse", "parse.dates"]);
+  });
 });
 
 describe("the fix each status calls for", () => {

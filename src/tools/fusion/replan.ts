@@ -17,7 +17,9 @@ import type { WorkerTaskResult, WorkerTaskStatus } from "./worker-result.js";
  * (`t3.a`, `t3.b`: the failed id, a dot, a suffix). Continuations count
  * on the task they continue (`FusionTurnBudget.noteRoundAttempts`): one
  * attempt per round for the whole family, and they share its replans,
- * so a split never buys more than the cap. Each pending task carries
+ * so a split never buys more than the cap. Only an open task has
+ * continuations: once a family closed green (`noteRoundOutcomes`), a
+ * dotted id after it is new work with its own replans. Each pending task carries
  * the fix its status calls for (`replanFix`).
  */
 
@@ -50,7 +52,8 @@ export interface ReplanReport {
   max: number;
 }
 
-function isOpen(result: WorkerTaskResult): boolean {
+/** Whether a row leaves its task open: for the planner to replan or report. */
+export function isOpenResult(result: WorkerTaskResult): boolean {
   if (OPEN_STATUSES.has(result.status)) return true;
   return (
     result.status === "cancelled" &&
@@ -99,7 +102,7 @@ export function describeReplan(
   const pending: ReplanTask[] = [];
   const exhausted: ReplanTask[] = [];
   for (const result of results) {
-    if (!isOpen(result)) continue;
+    if (!isOpenResult(result)) continue;
     const runs = attempts(result.id);
     const used = Math.max(0, runs - 1);
     const left = max - used;
