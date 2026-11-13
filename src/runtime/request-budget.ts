@@ -3,7 +3,17 @@ import type { LlmProvider } from "../llm/provider/llm-provider.js";
 import type { LlmProviderConfigEntry } from "../llm/provider/registry/provider-types.js";
 import type { ResolvedModel } from "../llm/provider/model-resolver.js";
 import { completionCostUsd, reportedCostUsd } from "../llm/provider/usage-cost.js";
+import { readErrnoCode } from "../llm/errno-code.js";
 import type { FusionTurnBudget } from "../tools/fusion/turn-budget.js";
+
+// Explicit rejections before generation. 503/529 are overload answers
+// returned instead of generating, which providers do not bill; other 5xx
+// (500/502/504) can follow partial or proxied generation and stay charged.
+const RELEASED_STATUSES = new Set([400, 401, 402, 403, 404, 405, 413, 415, 422, 429, 503, 529]);
+// Failures before a connection exists: no request byte reached a server.
+// A reset, timeout or TLS/socket error can follow a delivered body and
+// stays charged.
+const UNSENT_ERRNOS = new Set(["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN"]);
 
 export interface RequestBudgetScope extends CompletionRequestBudget {
   signal?: AbortSignal;
@@ -72,9 +82,15 @@ export function createRequestBudgetScope(
       held = budget.reserveRequest(sessionId, upperUsd);
     },
     onResponse(status) {
-      // These statuses explicitly reject the request before generation.
-      // 408/5xx/network deaths remain ambiguous and retain their bound.
-      if ([400, 401, 402, 403, 404, 405, 413, 415, 422, 429].includes(status)) {
+      // 408, other 5xx and network deaths remain ambiguous and retain their bound.
+      if (RELEASED_STATUSES.has(status)) {
+        held?.release();
+        held = undefined;
+      }
+    },
+    onSendFailed(error) {
+      const code = readErrnoCode(error);
+      if (code !== undefined && UNSENT_ERRNOS.has(code)) {
         held?.release();
         held = undefined;
       }

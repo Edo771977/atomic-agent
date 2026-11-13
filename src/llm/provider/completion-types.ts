@@ -129,6 +129,8 @@ export interface ChatPromptParts {
 export interface CompletionRequestBudget {
   beforeSend(body: Record<string, unknown>): void;
   onResponse(status: number): void;
+  /** The physical send threw before any response status arrived. */
+  onSendFailed?(error: unknown): void;
 }
 
 export interface CompletionRequest {

@@ -58,7 +58,7 @@ function fixture(options: { cap?: number; baseUrl?: string; unpriced?: boolean; 
 }
 
 describe("physical completion reservations", () => {
-  it.each([["unary", 400], ["unary", 503], ["stream", 400], ["stream", 503]] as const)("cancels a stalled %s error body after status %s at the turn deadline", async (mode, status) => {
+  it.each([["unary", 400], ["unary", 502], ["stream", 400], ["stream", 502]] as const)("cancels a stalled %s error body after status %s at the turn deadline", async (mode, status) => {
     vi.useFakeTimers();
     let body: ReadableStreamDefaultController<Uint8Array> | undefined;
     const cancel = new AbortController();
@@ -74,7 +74,7 @@ describe("physical completion reservations", () => {
       expect(settled).toBe(true);
       expect(await pending).toBeInstanceOf(Error);
       expect(f.sent).toHaveLength(1);
-      if (status === 503) expect(f.budget.check("parent", { usd: 0.75 })).toMatchObject({ conservativeUsd: 0.75 });
+      if (status === 502) expect(f.budget.check("parent", { usd: 0.75 })).toMatchObject({ conservativeUsd: 0.75 });
     } finally {
       cancel.abort();
       try { body?.close(); } catch { /* already cancelled */ }
@@ -95,7 +95,7 @@ describe("physical completion reservations", () => {
   it("cancels a stalled diagnostic body on an internal retry without losing the first dispatch charge", async () => {
     vi.useFakeTimers();
     let count = 0;
-    const f = fixture({ cap: 3, fetch: async () => ++count === 1 ? new Response("retry", { status: 503 }) : new Response(new ReadableStream(), { status: 400 }) });
+    const f = fixture({ cap: 3, fetch: async () => ++count === 1 ? new Response("retry", { status: 502 }) : new Response(new ReadableStream(), { status: 400 }) });
     f.budget.begin("parent", 0, { usd: 3, timeMs: 1000 });
     const pending = f.wired.llmComplete(f.request).catch(error => error as Error);
     await vi.advanceTimersByTimeAsync(1001);
@@ -193,7 +193,7 @@ describe("physical completion reservations", () => {
 
   it("retains an ambiguous dispatched failure's bound before allowing a retry", async () => {
     vi.useFakeTimers();
-    const f = fixture({ fetch: async () => new Response("provider failed", { status: 503 }) });
+    const f = fixture({ fetch: async () => new Response("provider failed", { status: 502 }) });
     const pending = f.wired.llmComplete(f.request).catch(error => error as Error);
     await vi.runAllTimersAsync();
     expect(await pending).toBeInstanceOf(Error);

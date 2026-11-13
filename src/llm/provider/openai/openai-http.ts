@@ -916,6 +916,7 @@ export async function openAiFetch(
     // fetch threw without an HTTP response: DNS failure, refused
     // connection, TLS error, socket reset. Which of those it was lives
     // in the errno — keep it, and the original error with it.
+    request.requestBudget?.onSendFailed?.(err);
     const detail = err instanceof Error ? err.message : String(err);
     throw new OpenAiHttpError(
       `openai provider network error: ${detail}`,
