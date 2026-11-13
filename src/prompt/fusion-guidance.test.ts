@@ -268,9 +268,7 @@ describe("the machine facts in the ### fusion block", () => {
     // And to check a fan-out before accepting it, but only what the
     // delegate's own contract checks and syntax pass left uncovered:
     // a re-run of `verify.syntax` is a strong step for nothing.
-    expect(FUSION_GUIDANCE).toContain(
-      "Re-verify only what contract checks and the syntax pass did not cover",
-    );
+    expect(FUSION_GUIDANCE).toContain("Checks and syntax run for you");
     expect(FUSION_GUIDANCE).not.toContain("`verify.syntax` on the declared files");
     expect(FUSION_GUIDANCE).toContain("`verify.run` on what the request must do");
     expect(FUSION_GUIDANCE).toMatch(/only makes sense with this conversation/i);

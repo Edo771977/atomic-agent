@@ -72,7 +72,7 @@ function fusionGuidanceLines(sizing: string, sees: string): string {
     "Keep the design and judgement: read every reply against its brief.",
     // The delegate runs the contract checks and syntax-checks every green
     // row's changed files itself (`syntax-pass.ts`); its rows say so.
-    "Re-verify only what contract checks and the syntax pass did not cover: `verify.run` on what the request must do.",
+    "Checks and syntax run for you; add `verify.run` on what the request must do.",
     "Rework goes out: `failed`, `cancelled`, `needs_orchestrator` or weak work is another `fusion.delegate` saying what was wrong and what good looks like.",
     "Hard parts, or one that failed twice, go to `model: \"orchestrator\"` (a worker turn on your model); keep the bulk on workers.",
     // F43: the status table now says `replaced the user's file sales.csv
