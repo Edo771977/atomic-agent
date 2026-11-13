@@ -7,10 +7,11 @@ import { readErrnoCode } from "../llm/errno-code.js";
 import { modelParamProfile } from "../llm/provider/openai/model-params.js";
 import type { FusionTurnBudget } from "../tools/fusion/turn-budget.js";
 
-// Explicit rejections before generation. 503/529 are overload answers
-// returned instead of generating, which providers do not bill; other 5xx
-// (500/502/504) can follow partial or proxied generation and stay charged.
-const RELEASED_STATUSES = new Set([400, 401, 402, 403, 404, 405, 413, 415, 422, 429, 503, 529]);
+// Explicit rejections before generation. 529 is Anthropic's overload answer
+// returned instead of generating. 503 stays charged like 500/502/504:
+// proxies (Envoy "upstream reset before headers", Heroku H12) return it after
+// the request was delivered and generation was billed.
+const RELEASED_STATUSES = new Set([400, 401, 402, 403, 404, 405, 413, 415, 422, 429, 529]);
 // Failures before a connection exists: no request byte reached a server.
 // A reset, timeout or TLS/socket error can follow a delivered body and
 // stays charged.

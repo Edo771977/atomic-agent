@@ -67,7 +67,7 @@ describe("request budget scope", () => {
     expect(spent(budget)).toBeGreaterThan(0.06);
   });
 
-  it.each([[503, 0], [529, 0], [500, 1], [502, 1], [504, 1]])("status %s releases (0) or retains (1) the hold", (status, retained) => {
+  it.each([[529, 0], [429, 0], [500, 1], [502, 1], [503, 1], [504, 1]])("status %s releases (0) or retains (1) the hold", (status, retained) => {
     const { budget, scope } = setup(2);
     const s = scope();
     s.beforeSend({ model: "m", messages: [] });
