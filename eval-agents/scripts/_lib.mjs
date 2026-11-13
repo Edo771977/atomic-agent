@@ -5,6 +5,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { setTimeout as delay } from "node:timers/promises";
 
 const HERE = fileURLToPath(new URL(".", import.meta.url));
 export const REPO_ROOT = resolve(HERE, "..", "..");
@@ -52,28 +53,32 @@ export function parseStatus(stdout) {
   };
 }
 
-export async function probeUrl(url, timeoutMs = 2000) {
+export async function probeUrl(url, timeoutMs = 2000, signal) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), timeoutMs);
-    const r = await fetch(`${url}/health`, { signal: ctrl.signal });
-    clearTimeout(t);
+    const r = await fetch(`${url}/health`, { signal: signal ? AbortSignal.any([ctrl.signal, signal]) : ctrl.signal });
     return r.ok;
   } catch {
+    signal?.throwIfAborted();
     return false;
+  } finally {
+    clearTimeout(t);
   }
 }
 
-export async function waitForHealth(url, timeoutMs) {
+export async function waitForHealth(url, timeoutMs, signal) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (await probeUrl(url, 2000)) return;
-    await new Promise((r) => setTimeout(r, 500));
+    signal?.throwIfAborted();
+    if (await probeUrl(url, 2000, signal)) return;
+    await delay(500, undefined, { signal });
   }
   throw new Error(`llama-server not healthy at ${url} in ${timeoutMs}ms`);
 }
 
-export async function bringUpDaemons(log) {
+export async function bringUpDaemons(log, { signal } = {}) {
+  signal?.throwIfAborted();
   if (process.env.ATOMIC_AGENT_EVAL_LLAMA_URL) {
     log(`ATOMIC_AGENT_EVAL_LLAMA_URL=${process.env.ATOMIC_AGENT_EVAL_LLAMA_URL}`);
     return {
@@ -107,23 +112,28 @@ export async function bringUpDaemons(log) {
     log(`reusing healthy chat daemon at ${chatUrl}`);
   }
 
-  await waitForHealth(chatUrl, 120_000);
+  try {
+    await waitForHealth(chatUrl, 120_000, signal);
 
-  let embedUrl = null;
-  for (const url of [
-    process.env.ATOMIC_AGENT_EVAL_EMBED_URL,
-    "http://127.0.0.1:19092",
-    "http://127.0.0.1:18992",
-  ].filter(Boolean)) {
-    if (await probeUrl(url)) {
-      embedUrl = url;
-      log(`embedding daemon at ${url}`);
-      break;
+    let embedUrl = null;
+    for (const url of [
+      process.env.ATOMIC_AGENT_EVAL_EMBED_URL,
+      "http://127.0.0.1:19092",
+      "http://127.0.0.1:18992",
+    ].filter(Boolean)) {
+      if (await probeUrl(url, 2000, signal)) {
+        embedUrl = url;
+        log(`embedding daemon at ${url}`);
+        break;
+      }
     }
-  }
-  if (!embedUrl) log("no embedding daemon — atomic-agent runs FTS5-only memory");
+    if (!embedUrl) log("no embedding daemon — atomic-agent runs FTS5-only memory");
 
-  return { chatUrl, embedUrl, startedByUs };
+    return { chatUrl, embedUrl, startedByUs };
+  } catch (error) {
+    teardownDaemons(log, startedByUs);
+    throw error;
+  }
 }
 
 export function teardownDaemons(log, startedByUs) {
@@ -139,6 +149,7 @@ export function teardownDaemons(log, startedByUs) {
 export function runVitest({ extraEnv = {}, forwarded = [], signal,
   entryPath = VITEST_ENTRY, cwd = REPO_ROOT,
   requireCampaign = entryPath === VITEST_ENTRY } = {}) {
+  if (signal?.aborted) return Promise.resolve(130);
   const env = { ...process.env, ...extraEnv };
   let campaignPath;
   if (requireCampaign) {
@@ -171,9 +182,12 @@ export function runVitest({ extraEnv = {}, forwarded = [], signal,
     };
     const onInt = () => forward("SIGINT");
     const onTerm = () => forward("SIGTERM");
-    // Run before the orchestrator's daemon teardown/exit handler.
-    process.prependListener("SIGINT", onInt);
-    process.prependListener("SIGTERM", onTerm);
+    // Orchestrators pass the signal from installSignalHandlers. Standalone
+    // callers still forward process signals, without exiting before close.
+    if (!signal) {
+      process.prependListener("SIGINT", onInt);
+      process.prependListener("SIGTERM", onTerm);
+    }
     child.once("error", (error) => {
       launchFailed = true;
       if (!signal?.aborted) console.error(`[eval-agents] could not launch vitest: ${error.message}`);
@@ -199,16 +213,18 @@ export function runVitest({ extraEnv = {}, forwarded = [], signal,
 }
 
 export function installSignalHandlers(log) {
-  let cleaning = false;
+  const controller = new AbortController();
   const onSignal = (signal) => {
-    if (cleaning) return;
-    cleaning = true;
-    log(`received ${signal}, stopping daemons`);
-    try {
-      runCli(["models", "stop"]);
-    } catch { /* noop */ }
-    process.exit(130);
+    if (controller.signal.aborted) return;
+    log(`received ${signal}, cancelling campaign`);
+    controller.abort(new Error(`campaign cancelled by ${signal}`));
   };
-  process.on("SIGINT", () => onSignal("SIGINT"));
-  process.on("SIGTERM", () => onSignal("SIGTERM"));
+  const onInt = () => onSignal("SIGINT");
+  const onTerm = () => onSignal("SIGTERM");
+  process.on("SIGINT", onInt);
+  process.on("SIGTERM", onTerm);
+  return { signal: controller.signal, dispose() {
+    process.removeListener("SIGINT", onInt);
+    process.removeListener("SIGTERM", onTerm);
+  } };
 }

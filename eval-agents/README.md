@@ -91,6 +91,10 @@ Orchestrators launch the installed Vitest JavaScript entry with the current
 Node executable, including on Windows; forwarded arguments stay separate
 argv entries. Spawn errors fail the run, and cancellation waits for the
 test child to close before returning.
+Installed SIGINT/SIGTERM handlers request cancellation through the signal
+passed by smoke/level1; they do not exit or stop daemons inline. The caller
+awaits child close, then its managed-daemon teardown, before exiting 130.
+Health waits honor the same signal, and handlers are removed after teardown.
 
 ## Methodology
 
