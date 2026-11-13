@@ -5,6 +5,7 @@ import type { SessionState } from "../../session/session-state.js";
 import type { FusionWorkerMeta } from "../../session/fusion-worker-session.js";
 import type { TurnOrigin } from "../../runtime/turn-controller.js";
 import type { DelegateTask } from "./delegate-args.js";
+import type { TaskPermit } from "./task-permits.js";
 import type { DelegateContract } from "./contract.js";
 import type { CompletionUsage } from "../../llm/provider/completion-types.js";
 import type { FusionEscalationTarget } from "../../llm/run-mode/index.js";
@@ -576,6 +577,8 @@ export interface RunWorkerTasksOptions {
   concurrentTaskIds?: readonly string[];
   /** Concurrency ceiling, already reconciled against the slot pool. */
   maxWorkers: number;
+  /** Shared call-wide admission, acquired before sessions and task clocks start. */
+  acquireTaskPermit?: (signal: AbortSignal) => Promise<TaskPermit | undefined>;
   /** The local leg every worker turn is pinned to. */
   providerId: string;
   /**
@@ -727,8 +730,8 @@ export function notStartedResult(
  * The pool is an index-claiming loop rather than a library: `next` is
  * mutated synchronously by each of the N runners, so a runner that
  * finishes early immediately claims the next unstarted task and the
- * fan-out stays exactly `maxWorkers` wide without a queue object,
- * a semaphore, or a dependency.
+ * leg stays at most `maxWorkers` wide. An optional call-wide permit
+ * queues these legs together before any task session or clock starts.
  *
  * **Nothing here throws.** Every failure — a rejected turn, a timeout,
  * the operator aborting the orchestrator's turn — lands as a status on
@@ -753,14 +756,46 @@ export async function runWorkerTasks(
       // The cap first (its row must name the cap), then the failure
       // breaker (ATO-1406), then a stopped turn (ATO-1334, #1139):
       // `shouldStart` is only wired when a budget cap is set.
-      const stop =
+      const stopped = (): string | undefined =>
         options.shouldStart?.() ??
         options.shouldStartTask?.() ??
         (options.signal.aborted ? "the turn was stopped" : undefined);
-      results[i] =
-        stop === undefined
-          ? await runOneTask(deps, options, options.tasks[i]!)
-          : notStartedResult(options.tasks[i]!, stop);
+      const task = options.tasks[i]!;
+      let permit: TaskPermit | undefined;
+      let schedulerWaitMs = 0;
+      try {
+        const before = stopped();
+        if (before !== undefined) {
+          results[i] = notStartedResult(task, before);
+        } else {
+          if (options.acquireTaskPermit !== undefined) {
+            const queuedAt = Date.now();
+            permit = await options.acquireTaskPermit(options.signal);
+            // An aborted waiter owns no permit but still spent time queued.
+            schedulerWaitMs = permit?.waitMs ?? Math.max(0, Date.now() - queuedAt);
+          }
+          // A queue wait can outlive a budget or breaker trip. Recheck
+          // before minting a session, arming clocks or taking any action.
+          const after = options.acquireTaskPermit === undefined ? undefined :
+            stopped() ?? (permit === undefined ? "the turn was stopped" : undefined);
+          results[i] = after === undefined
+            ? await runOneTask(deps, options, task)
+            : notStartedResult(task, after);
+        }
+      } catch (err) {
+        results[i] = new WorkerRunCollector().finish({
+          id: task.id, title: task.title, reason: null, stepCount: 0, durationMs: 0,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      } finally {
+        permit?.release();
+      }
+      if (schedulerWaitMs > 0) {
+        const row = results[i]!;
+        results[i] = { ...row, schedulerQueueWaitMs: schedulerWaitMs,
+          notes: [...(row.notes ?? []), `queued ${formatWaitMs(schedulerWaitMs)} for fan-out concurrency before execution`],
+        };
+      }
       try {
         options.onTaskFinished?.(results[i]!);
       } catch {
