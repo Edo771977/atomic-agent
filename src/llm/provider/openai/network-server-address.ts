@@ -1,5 +1,5 @@
 import { isLocalProviderUrl } from "../presets/is-local-provider-url.js";
-import { classifiableHostOf } from "../url-host.js";
+import { isLoopbackUrl } from "../url-host.js";
 import { isLocalServerUrl } from "./local-server-url.js";
 import { normalizeOpenAiBaseUrl } from "./normalize-openai-base-url.js";
 
@@ -35,9 +35,7 @@ const SCHEME = /^[a-z][a-z0-9+.-]*:\/\//i;
  */
 export function isOtherComputerOnNetworkUrl(url: string | undefined): boolean {
   if (!url || !isLocalServerUrl(url) || isLocalProviderUrl(url)) return false;
-  const host = classifiableHostOf(url);
-  if (host === null) return false;
-  return !host.startsWith("127.") && host !== "::1";
+  return !isLoopbackUrl(url);
 }
 
 /**

@@ -73,3 +73,56 @@ describe("resolveLlmProviderApiKey for a server on another computer (ATO-1066)",
     ).toBe("sk-test");
   });
 });
+
+describe("resolveLlmProviderApiKey: the shared OpenAI key goes only over https or to this machine", () => {
+  afterEach(() => vi.unstubAllEnvs());
+
+  function withSharedKey(): void {
+    for (const name of ["OPENAI_COMPAT_API_KEY", "ATOMIC_AGENT_OPENAI_API_KEY"]) {
+      const saved = process.env[name];
+      delete process.env[name];
+      onTestFinished(() => {
+        if (saved !== undefined) process.env[name] = saved;
+      });
+    }
+    vi.stubEnv("OPENAI_API_KEY", "sk-shared");
+  }
+
+  const compat = (baseUrl?: string) => ({
+    id: "custom",
+    kind: "openai-compatible" as const,
+    ...(baseUrl !== undefined ? { baseUrl } : {}),
+  });
+
+  it("keeps the fallback for an https endpoint, even on a public IP", () => {
+    withSharedKey();
+    expect(resolveLlmProviderApiKey(compat("https://8.8.8.8"))).toBe("sk-shared");
+    expect(resolveLlmProviderApiKey(compat("https://api.together.xyz"))).toBe("sk-shared");
+  });
+
+  it("keeps the fallback when no baseUrl is set (the default endpoint is https)", () => {
+    withSharedKey();
+    expect(resolveLlmProviderApiKey(compat())).toBe("sk-shared");
+  });
+
+  it("sends no shared key over plain http to a public host", () => {
+    withSharedKey();
+    for (const url of ["http://8.8.8.8", "http://api.example.com:8080", "http://[2001:db8::1]"]) {
+      expect(resolveLlmProviderApiKey(compat(url)), url).toBeUndefined();
+    }
+    expect(resolveLlmProviderApiKey({ ...compat("http://8.8.8.8"), kind: "qwen-openai-compatible" })).toBeUndefined();
+  });
+
+  it("keeps the fallback over plain http to this machine", () => {
+    withSharedKey();
+    for (const url of ["http://localhost:8080", "http://127.0.0.2:8080", "http://[::1]:8080", "http://0.0.0.0:8080", "http://[::]:8080", "http://localhost.:8080"]) {
+      expect(resolveLlmProviderApiKey(compat(url)), url).toBe("sk-shared");
+    }
+  });
+
+  it("still honours an explicit apiKeyEnvVar naming a shared variable, and a stored key", () => {
+    withSharedKey();
+    expect(resolveLlmProviderApiKey({ ...compat("http://8.8.8.8"), apiKeyEnvVar: "OPENAI_API_KEY" })).toBe("sk-shared");
+    expect(resolveLlmProviderApiKey({ ...compat("http://8.8.8.8"), apiKey: "own" })).toBe("own");
+  });
+});

@@ -37,3 +37,22 @@ function embeddedIpv4(host: string): string | null {
   const low = parseInt(hex[2]!, 16);
   return `${high >> 8}.${high & 0xff}.${low >> 8}.${low & 0xff}`;
 }
+
+/**
+ * `true` when `url` points at this machine: `localhost` and `*.localhost`,
+ * the whole 127/8 block, `::1`, and the unspecified `0.0.0.0` / `::`
+ * (which connect to this machine). Any spelling `classifiableHostOf`
+ * accepts, IPv4-mapped included.
+ */
+export function isLoopbackUrl(url: string | undefined): boolean {
+  const host = classifiableHostOf(url);
+  if (host === null) return false;
+  return (
+    host === "localhost" ||
+    host.endsWith(".localhost") ||
+    host === "::1" ||
+    host === "::" ||
+    host === "0.0.0.0" ||
+    /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host)
+  );
+}
