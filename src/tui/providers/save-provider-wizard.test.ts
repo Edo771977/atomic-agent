@@ -173,6 +173,39 @@ describe("saveProviderWizardToConfig", () => {
     expect(resolveLlmProviderApiKey(built.entry)).toBeUndefined();
   });
 
+  it.each([
+    "http://203.0.113.5:8000",
+    "http://localhost.localdomain:8000",
+  ])(
+    "keeps a key for plain http:// off this machine out of the shared variable: %s",
+    (baseUrlLine) => {
+      // The resolver never sends the shared key over plain http:// to a
+      // host that is not this machine, so a key saved there was never
+      // used (401 forever) and overwrote the operator's cloud key.
+      process.env.OPENAI_COMPAT_API_KEY = "sk-real-cloud-key";
+      const built = saveProviderWizardToConfig({
+        ...lanWizard("vps-key"),
+        baseUrlLine,
+      });
+      const envVar = networkComputerKeyEnvVar(built.entry.id);
+      onTestFinished(() => {
+        delete process.env[envVar];
+      });
+
+      expect(built.entry.apiKeyEnvVar).toBe(envVar);
+      expect(process.env[envVar]).toBe("vps-key");
+      expect(process.env.OPENAI_COMPAT_API_KEY).toBe("sk-real-cloud-key");
+      expect(readFileSync(join(stateDir, ".env"), "utf8")).not.toMatch(
+        /OPENAI_COMPAT_API_KEY=.*vps-key/,
+      );
+      resetConfigCache();
+      const runtime = getConfig().llm?.providers.find(
+        (p) => p.id === built.entry.id,
+      );
+      expect(runtime && resolveLlmProviderApiKey(runtime)).toBe("vps-key");
+    },
+  );
+
   function configureCompat(providerId: string, baseUrl: string) {
     return {
       ...createProvidersWizardState("configure", {

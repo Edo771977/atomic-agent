@@ -98,7 +98,7 @@ function sharedOpenAiKey(): { readonly name: string; readonly value: string } | 
  * either scheme (ATO-1066), get no shared key; an entry that wants one
  * there sets `apiKey` or `apiKeyEnvVar`.
  */
-function maySendSharedOpenAiKey(baseUrl: string | undefined): boolean {
+export function maySendSharedOpenAiKey(baseUrl: string | undefined): boolean {
   if (baseUrl === undefined || baseUrl.trim().length === 0) return true;
   if (isOtherComputerOnNetworkUrl(baseUrl)) return false;
   let protocol: string;

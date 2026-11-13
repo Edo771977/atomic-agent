@@ -295,6 +295,44 @@ describe("envHintForWizard", () => {
   });
 });
 
+describe("envHintForWizard where the shared key is not sent", () => {
+  it.each(["http://203.0.113.5:8000", "http://localhost.localdomain"])(
+    "names the entry's own variable for %s",
+    (baseUrlLine) => {
+      const wizard = {
+        ...wizardFor("openai-compatible"),
+        baseUrlLine,
+        providerId: "my-vps",
+      };
+      expect(envHintForWizard(wizard)).toBe("ATOMIC_AGENT_KEY_MY_VPS");
+      expect(apiKeyPhaseError(wizard)).toContain("ATOMIC_AGENT_KEY_MY_VPS");
+    },
+  );
+
+  it("explains why the shared key is not sent over plain http://", () => {
+    process.env.OPENAI_COMPAT_API_KEY = "sk-SHARED";
+    try {
+      const note = sharedKeyNotSentNote({
+        ...wizardFor("openai-compatible"),
+        baseUrlLine: "http://203.0.113.5:8000",
+      });
+      expect(note).toContain(
+        "OPENAI_COMPAT_API_KEY is not sent over plain http://",
+      );
+    } finally {
+      delete process.env.OPENAI_COMPAT_API_KEY;
+    }
+  });
+
+  it("still names the shared variable for https", () => {
+    const wizard = {
+      ...wizardFor("openai-compatible"),
+      baseUrlLine: "https://api.example.com",
+    };
+    expect(envHintForWizard(wizard)).toBe("OPENAI_COMPAT_API_KEY");
+  });
+});
+
 describe("verifyTargetForWizard", () => {
   beforeEach(() => {
     for (const key of ENV_KEYS) delete process.env[key];

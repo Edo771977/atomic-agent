@@ -1,7 +1,9 @@
 import { getConfig } from "../../config/index.js";
-import { resolveLlmProviderApiKey } from "../../config/resolve-llm-api-key.js";
+import {
+  maySendSharedOpenAiKey,
+  resolveLlmProviderApiKey,
+} from "../../config/resolve-llm-api-key.js";
 import { isAsciiOnly } from "../../llm/provider/openai/ascii-header-guard.js";
-import { isOtherComputerOnNetworkUrl } from "../../llm/provider/openai/network-server-address.js";
 import {
   setActiveTextProviderInConfig,
   upsertLlmProvider,
@@ -101,9 +103,11 @@ export function saveProviderWizardToConfig(
   // an empty key is a valid state for both: nothing is written to .env
   // and requests go out without Authorization.
   const keyOptional = wizardKeyIsOptional(wizard);
-  // ATO-1066: a server on another computer on this network never reads
-  // the shared compat variables (they usually hold a real cloud key), so
-  // a key typed for it lives under a variable of its own.
+  // ATO-1066: an endpoint the shared compat variables are never sent to
+  // (a server on another computer on this network, or plain http:// to a
+  // host that is not this machine) cannot use a key saved there: the
+  // resolver refuses it, and saving it would overwrite the operator's
+  // cloud key. A key typed for it lives under a variable of its own.
   // The entry as written in config.json, moved to its new address. Never
   // `existing` for keys: getConfig() has already filled its apiKey from
   // the environment, and copying that wrote a shared cloud key into
@@ -115,7 +119,7 @@ export function saveProviderWizardToConfig(
   const networkKeyEnvVar =
     !preset &&
     entry.kind === "openai-compatible" &&
-    isOtherComputerOnNetworkUrl(entry.baseUrl)
+    !maySendSharedOpenAiKey(entry.baseUrl)
       ? (stored?.apiKeyEnvVar ?? networkComputerKeyEnvVar(entry.id))
       : undefined;
   if (wizard.apiKeyBuffer.trim().length > 0) {
