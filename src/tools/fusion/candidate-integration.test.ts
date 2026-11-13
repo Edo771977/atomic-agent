@@ -1,6 +1,6 @@
-import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, rename, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, sep } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 import { createBranchSet } from "./branch-workspace.js";
 import { createCandidateIntegration } from "./candidate-integration.js";
@@ -59,8 +59,10 @@ afterEach(() => { delete faults.rm; delete faults.chmod; delete faults.openSync;
 
 const roots: string[] = [];
 afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
-async function project() {
-  const root = await mkdtemp(join(tmpdir(), "atag-candidate-test-")); roots.push(root);
+async function project(prefix = join(tmpdir(), "atag-candidate-test-")) {
+  // Runtime paths use async realpath too; temp paths may contain Windows
+  // drive-case/8.3 aliases that would hide events from the exact-path spies.
+  const root = await realpath(await mkdtemp(prefix)); roots.push(root);
   await writeFile(join(root, "api.json"), '{"name":"before"}');
   await writeFile(join(root, "dirty.txt"), "user's uncommitted bytes\r\n");
   return root;
@@ -68,6 +70,14 @@ async function project() {
 const rows: WorkerTaskResult[] = [{ id: "api", title: "api", status: "ok", reply: "done", stepCount: 1, durationMs: 1, tools: { calls: 1, errors: 0, writes: 1, byTool: {} } }];
 const contract = { checks: [{ kind: "command", command: "integration" }] };
 const signal = new AbortController().signal;
+
+it("canonicalizes fixture path aliases before matching runtime filesystem events", async () => {
+  // Keep the redundant component in the actual mkdtemp prefix. This exposes
+  // the same lexical/canonical mismatch as Windows drive-case or 8.3 aliases
+  // without requiring a particular host or filesystem setting.
+  const root = await project(`${tmpdir()}${sep}.${sep}atag-candidate-alias-`);
+  expect(root).toBe(await realpath(root));
+});
 
 it("rejects individually valid files with incompatible final API and retains a patch", async () => {
   const root = await project(); const candidate = await createCandidateIntegration(root);
