@@ -1591,7 +1591,11 @@ export function buildFusionDelegateTool(
             const original = finished.get(id);
             const noChanges = original?.status === "no_changes";
             if (original === undefined || (original.status !== "ok" && !noChanges)) return;
+            // A candidate promotes only all-ok rows, so a released consumer's
+            // work could never be delivered: hold it instead.
+            if (noChanges && candidate !== undefined) return;
             let row: WorkerTaskResult | undefined = noChanges ? { ...original, status: "ok" } : original;
+            let ranEvidence = false;
             const names = new Set((parsed.contract?.requires ?? []).map((r) => r.name));
             const required = (parsed.contract?.provides ?? []).filter(
               (p) => p.task === id && names.has(p.name),
@@ -1631,6 +1635,7 @@ export function buildFusionDelegateTool(
                 if (outcome !== undefined) dependencyCheckOutcomes.set(c.index, outcome);
               });
               row = applyPostMergeChecks([row], checks.outcomes, previous)[0]!;
+              ranEvidence ||= checks.checksSkipped === undefined && checks.outcomes.length > 0 && checks.outcomes.length === own.length && checks.outcomes.every((o) => o.ok);
               if (checks.checksSkipped !== undefined) {
                 row = { ...row, status: "needs_orchestrator", error: `dependency: ${checks.checksSkipped}` };
               }
@@ -1645,9 +1650,13 @@ export function buildFusionDelegateTool(
                 runner: deps.syntaxCheck, workingDir: ctx.workingDir, roots: syntaxRoots, signal: runSignal,
                 ...(deps.knownSecrets === undefined ? {} : { knownSecrets: deps.knownSecrets() }),
               });
+              const syntax = row!.syntax;
+              ranEvidence ||= syntax !== undefined && syntax.error === undefined && syntax.checked > 0 && syntax.failedFiles.length === 0;
             }
             if (noChanges) {
-              if (row!.status === "ok") releasedNoChanges.add(id);
+              // Artifact presence alone is no evidence: at least one own check
+              // or syntax check must actually have run here and passed.
+              if (row!.status === "ok" && ranEvidence) releasedNoChanges.add(id);
               return;
             }
             if (row!.status !== "ok") gateState.verdicts.delete(id);

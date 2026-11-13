@@ -62,7 +62,7 @@ describe("dependency readiness before a later worker starts", () => {
     expect(dependencyWarnings(["ui"], new Map([["ui", ["core"]]]), new Map([["core", { id: "core", status } as WorkerTaskResult]]))).toEqual([`task ui depends on core, which ended ${status}`]);
   });
 
-  it.each([true, false])("releases a no_changes provider's dependents only when its artifact verifies (present=%s)", async present => {
+  function noChangesProvider(present: boolean, over: Partial<FusionDelegateDeps> = {}, modeOver: Partial<ResolvedRunMode> = {}) {
     const old = new Date(Date.now() - 3_600_000);
     writeFileSync(join(dir, "aux.js"), "export const aux = 1;");
     utimesSync(join(dir, "aux.js"), old, old);
@@ -74,12 +74,41 @@ describe("dependency readiness before a later worker starts", () => {
       const id = (session.metadata as { fusionWorker: { taskId: string } }).fusionWorker.taskId;
       f.ran.push(id);
       return { session, reason: "reply", stepCount: 1 };
-    } });
+    }, ...over }, modeOver);
+    return f;
+  }
+  const passingSyntax = { syntaxCheck: async (files: readonly string[]) => ({ results: files.map(file => ({ file, ok: true as const, checker: "javascript" as const })) }) };
+
+  it.each([true, false])("releases a no_changes provider's dependents only when its artifact verifies (present=%s)", async present => {
+    const f = noChangesProvider(present, passingSyntax);
     const result = await f.run({ tasks: [{ ...tasks[0]!, files: ["aux.js"] }, tasks[1]!], contract: { provides: contract.provides.slice(0, 1), requires: contract.requires.slice(0, 1) } });
     const rows = result.details.tasks as WorkerTaskResult[];
     expect(rows[0]!.status).toBe("no_changes");
     expect(f.ran).toEqual(present ? ["core", "ui"] : ["core"]);
     expect(rows[1]!.status).toBe(present ? "ok" : "cancelled");
+  });
+
+  it("releases a no_changes provider whose own check ran and passed", async () => {
+    const ran: number[] = [];
+    const f = noChangesProvider(true, { runChecks: async specs => { ran.push(specs.length); return { ok: true, results: specs.map(() => ({ ok: true })) }; } });
+    await f.run({ tasks: [{ ...tasks[0]!, files: ["aux.js"] }, tasks[1]!], contract: { provides: contract.provides.slice(0, 1), requires: contract.requires.slice(0, 1), checks: [{ kind: "command", command: "core-check", task: "core" }] } });
+    expect(ran.length).toBeGreaterThan(0);
+    expect(f.ran).toEqual(["core", "ui"]);
+  });
+
+  it("holds a no_changes provider's dependents when no own check or syntax check ran", async () => {
+    const f = noChangesProvider(true);
+    const result = await f.run({ tasks: [{ ...tasks[0]!, files: ["aux.js"] }, tasks[1]!], contract: { provides: contract.provides.slice(0, 1), requires: contract.requires.slice(0, 1) } });
+    const rows = result.details.tasks as WorkerTaskResult[];
+    expect(rows[0]!.status).toBe("no_changes");
+    expect(f.ran).toEqual(["core"]);
+    expect(rows[1]!.status).toBe("cancelled");
+  });
+
+  it("holds a no_changes provider's dependents when its syntax check could not check anything", async () => {
+    const f = noChangesProvider(true, { syntaxCheck: async files => ({ results: files.map(file => ({ file, ok: null, checker: "javascript" as const })) }) });
+    await f.run({ tasks: [{ ...tasks[0]!, files: ["aux.js"] }, tasks[1]!], contract: { provides: contract.provides.slice(0, 1), requires: contract.requires.slice(0, 1) } });
+    expect(f.ran).toEqual(["core"]);
   });
 
   it("holds consumers when an ok provider's required file is absent", async () => {

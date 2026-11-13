@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
@@ -193,4 +193,26 @@ it.each([
     if (mutation === "delete") await expect(readFile(join(f.root, "personal.txt"))).rejects.toThrow();
     else expect(await readFile(join(f.root, "personal.txt"), "utf8")).toBe("updated\n");
   }
+});
+
+it("never releases dependents of a no_changes provider in candidate mode", async () => {
+  const ran: string[] = [];
+  const f = await fixture({
+    runTurn: async session => {
+      ran.push(session.id);
+      // The candidate copy's fresh mtime would read as a change: restore an untouched stamp.
+      const old = new Date(Date.now() - 3_600_000); await utimes(join(session.workingDir, "core.js"), old, old);
+      return { session, reason: "reply", stepCount: 1 };
+    },
+    syntaxCheck: async files => ({ results: files.map(file => ({ file, ok: true, checker: "javascript" as const })) }),
+    runChecks: async specs => ({ ok: true, results: specs.map(() => ({ ok: true })) }),
+  });
+  await writeFile(join(f.root, "core.js"), "export const core = 1;");
+  const result = await buildFusionDelegateTool(f.deps).run({
+    tasks: [{ id: "core", instructions: "provide core", files: ["core.js"] }, { id: "ui", instructions: "use core" }],
+    contract: { ...contract, provides: [{ task: "core", kind: "file", name: "core.js" }], requires: [{ task: "ui", name: "core.js" }], checks: [...contract.checks, { kind: "command", command: "core-check", task: "core" }] },
+  }, f.ctx);
+  expect((result.details.tasks as { id: string; status: string }[])[0]!.status).toBe("no_changes");
+  expect(ran).toEqual([`${FUSION_WORKER_ID_PREFIX}core`]);
+  expect((result.details.candidateIntegration as { status: string }).status).toBe("rejected");
 });
