@@ -16,7 +16,12 @@ import { DEFAULT_FUSION_CLOUD_WORKERS } from "../../config/llm-run-mode-config.j
 import { getConfig } from "../../config/index.js";
 import { workerReplyAllowance } from "../../local-llm/server/worker-slots.js";
 import type { ToolDefinition } from "../tool-registry.js";
-import { localTaskSizeWarnings, parseDelegateArgs } from "./delegate-args.js";
+import {
+  describeOversizedLocalTasks,
+  localTaskSizeWarnings,
+  oversizedLocalTasks,
+  parseDelegateArgs,
+} from "./delegate-args.js";
 import {
   applyCheckOutcomes,
   applyContractFindings,
@@ -334,12 +339,16 @@ export function buildFusionDelegateTool(
       }
       const taskLegs = resolveTaskLegs(parsed.tasks, workerLegRef, mode.roles);
       // Tasks sized past what a small local worker does well: run as
-      // asked, and said so on the result, never refused.
-      const sizeWarnings = localTaskSizeWarnings(parsed.tasks, (t) =>
+      // asked, never refused. Said on the approval line (before any
+      // worker starts, when a person is asked) and on the result (the
+      // orchestrator reads nothing in between).
+      const taskIsLocal = (t: DelegateTask): boolean =>
         deps.workerSupportsSlotAffinity(
           taskLegs.get(t.id)?.providerId ?? workerProviderId,
-        ),
-      );
+        );
+      const declaredInputs = parsed.contract?.inputs ?? [];
+      const oversized = oversizedLocalTasks(parsed.tasks, taskIsLocal, declaredInputs);
+      const sizeWarnings = localTaskSizeWarnings(parsed.tasks, taskIsLocal, declaredInputs);
       // The legs other than the worker leg, one per provider.
       const roleLegs = new Map<string, TaskLeg>();
       for (const leg of taskLegs.values()) {
@@ -577,7 +586,7 @@ export function buildFusionDelegateTool(
                 roleLegs.size === 0
                   ? ""
                   : ` and ${[...roleLegs.values()].map((l) => l.model).join(", ")}`
-              }${tracksTurn ? describeTurnCounts(turnBudget.counts(ctx.sessionId), parsed.tasks.length, mode) : ""}`,
+              }${tracksTurn ? describeTurnCounts(turnBudget.counts(ctx.sessionId), parsed.tasks.length, mode) : ""}${describeOversizedLocalTasks(oversized)}`,
               preview: describeFanoutPreview(parsed.tasks, writeScope),
               affectedResources: [...writeScope],
             },

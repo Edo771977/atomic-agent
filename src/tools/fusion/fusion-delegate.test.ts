@@ -2019,9 +2019,37 @@ describe("fusion.delegate — task size on a local leg", () => {
     );
     expect(result.details.tasks).toHaveLength(2);
     expect(result.details.sizeWarnings).toEqual([
-      'task "big" declares 4 files for a local worker; a small local model does best with one file or one function per task — split it next time if it stalls or comes back half done',
+      'task "big" declares 4 files to write for a local worker (tests, fixtures and snapshots aside); a small local model does best with one file or one function per task — split it next time if it stalls or comes back half done',
     ]);
-    expect(result.summary).toContain('Warning: task "big" declares 4 files for a local worker');
+    expect(result.summary).toContain('Warning: task "big" declares 4 files to write for a local worker');
+  });
+
+  it("names an oversized local task on the fan-out's approval, before any worker starts", async () => {
+    const prompts: ApprovalRequest[] = [];
+    let started = 0;
+    const gate: ApprovalGate = new ApprovalGate({
+      level: 1,
+      emit: (req) => {
+        prompts.push(req);
+        expect(started).toBe(0);
+        queueMicrotask(() => gate.resolve({ approvalId: req.approvalId, approved: true }));
+      },
+    });
+    const result = await buildFusionDelegateTool(
+      deps({
+        approvalRequired: true,
+        approvals: gate,
+        runTurn: async () => {
+          started += 1;
+          return turnResult();
+        },
+      }),
+    ).run({ tasks: [BIG] }, ctx());
+    expect(result.details.sizeWarnings).toHaveLength(1);
+    // Asked once, then the worker ran: the note was in front of the person first.
+    expect(started).toBeGreaterThan(0);
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]?.reason).toContain('task "big" has 4 files to write, a lot for a local worker');
   });
 
   it("says nothing on a cloud leg", async () => {

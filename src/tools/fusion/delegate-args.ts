@@ -161,34 +161,84 @@ export const MAX_TASK_FILES = 32;
 export const MAX_REPORTED_PROBLEMS = 32;
 
 /**
- * Output files past which a task on a local worker draws a warning
+ * Files to write past which a task on a local worker draws a warning
  * (`localTaskSizeWarnings`). A small local model with a small context
- * does one file or one function well; a task declaring four or more is
+ * does one file or one function well; a task writing four or more is
  * where such workers ran out of cap, context or steps halfway through.
- * A warning, never a refusal: the orchestrator may know the files are
+ * Tests, fixtures, snapshots and declared inputs are not counted
+ * (`countsTowardTaskSize`): a module with its test and fixture is one
+ * unit of work, which is why the threshold can stay at three. A
+ * warning, never a refusal: the orchestrator may know the files are
  * tiny, and a refused call costs a whole regeneration.
  */
 export const LOCAL_TASK_FILES_WARN_ABOVE = 3;
 
 /**
- * One line per task that will run on a local worker and declares more
- * than {@link LOCAL_TASK_FILES_WARN_ABOVE} files, for the tool result.
+ * Whether a declared path counts toward a task's size: not a test
+ * (`*.test.*`, `*.spec.*`, under `__tests__/`), a fixture (under
+ * `fixtures/` or `fixture/`), a snapshot (under `__snapshots__/`,
+ * `*.snap`), or one of the contract's inputs (read, not written).
+ * Plain path heuristics: a miss only adds or drops a warning.
+ */
+function countsTowardTaskSize(path: string, inputs: ReadonlySet<string>): boolean {
+  const p = normalizeTaskPath(path);
+  if (inputs.has(p)) return false;
+  const name = p.slice(p.lastIndexOf("/") + 1);
+  if (/\.(test|spec)\.[^.]+$/.test(name) || name.endsWith(".snap")) return false;
+  return !/(^|\/)(__tests__|__snapshots__|fixtures?)\//.test(p);
+}
+
+/** `.\src\a.ts` → `src/a.ts`: just enough to compare a task path with an input. */
+function normalizeTaskPath(path: string): string {
+  return path.replaceAll("\\", "/").replace(/^(\.\/)+/, "");
+}
+
+/**
+ * The tasks that will run on a local worker and write more than
+ * {@link LOCAL_TASK_FILES_WARN_ABOVE} counted files, with that count.
  * `isLocal` says which leg a task runs on (a role model may move it off
  * the worker leg), so the caller decides after resolving the legs.
  */
+export function oversizedLocalTasks(
+  tasks: readonly DelegateTask[],
+  isLocal: (task: DelegateTask) => boolean,
+  inputs: readonly string[] = [],
+): { id: string; files: number }[] {
+  const declared = new Set(inputs.map(normalizeTaskPath));
+  const out: { id: string; files: number }[] = [];
+  for (const task of tasks) {
+    const files = (task.files ?? []).filter((f) =>
+      countsTowardTaskSize(f, declared),
+    ).length;
+    if (files <= LOCAL_TASK_FILES_WARN_ABOVE || !isLocal(task)) continue;
+    out.push({ id: task.id, files });
+  }
+  return out;
+}
+
+/** One line per {@link oversizedLocalTasks} entry, for the tool result. */
 export function localTaskSizeWarnings(
   tasks: readonly DelegateTask[],
   isLocal: (task: DelegateTask) => boolean,
+  inputs: readonly string[] = [],
 ): string[] {
-  const out: string[] = [];
-  for (const task of tasks) {
-    const files = task.files?.length ?? 0;
-    if (files <= LOCAL_TASK_FILES_WARN_ABOVE || !isLocal(task)) continue;
-    out.push(
-      `task "${task.id}" declares ${files} files for a local worker; a small local model does best with one file or one function per task — split it next time if it stalls or comes back half done`,
-    );
-  }
-  return out;
+  return oversizedLocalTasks(tasks, isLocal, inputs).map(
+    ({ id, files }) =>
+      `task "${id}" declares ${files} files to write for a local worker (tests, fixtures and snapshots aside); a small local model does best with one file or one function per task — split it next time if it stalls or comes back half done`,
+  );
+}
+
+/**
+ * The same finding for the fan-out's approval line, which the person
+ * reads before any worker starts; the orchestrator gets it on the
+ * result, the first thing it reads after the call.
+ */
+export function describeOversizedLocalTasks(
+  oversized: readonly { id: string; files: number }[],
+): string {
+  return oversized
+    .map(({ id, files }) => `; task "${id}" has ${files} files to write, a lot for a local worker`)
+    .join("");
 }
 
 /** `8436` → `"8,436"`: the number the orchestrator has to act on, readable. */
