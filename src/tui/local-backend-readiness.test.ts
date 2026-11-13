@@ -267,12 +267,13 @@ describe("isCloudTextProviderReady", () => {
     expect(isCloudTextProviderReady()).toBe(false);
   });
 
-  it("does not treat a keyless LAN openai-compatible entry as ready", () => {
-    // The reachability premise for persistUserRemoteLlmUrls routing chat
-    // at local-llama: a LAN box is not loopback and has no key, so the
-    // startup gate does NOT return early — the wizard is reachable while
-    // an llm block with a non-local active provider exists. (A keyed or
-    // loopback entry short-circuits the gate and the wizard never runs.)
+  it("treats a keyless openai-compatible server on another computer on the network as ready (ATO-1066)", () => {
+    // A server on another computer on this network needs no key of its
+    // own (provider-key.ts `not-needed`), so an operator who made it the
+    // active provider is routed at it and the startup gate returns early,
+    // as it does for a keyed or loopback entry. Before ATO-1066 such an
+    // entry counted as unready, the gate stayed open and the wizard's
+    // "Remote llama.cpp" choice could re-route chat at local-llama.
     const cfg = getConfig();
     const file = ensureUserConfigFileSync(cfg.paths.userConfigFile);
     writeUserConfigFileSync(cfg.paths.userConfigFile, {
@@ -294,7 +295,7 @@ describe("isCloudTextProviderReady", () => {
     });
     resetConfigCache();
 
-    expect(isCloudTextProviderReady()).toBe(false);
+    expect(isCloudTextProviderReady()).toBe(true);
   });
 
   it("does not treat an active cloud text provider without a key as ready", () => {
