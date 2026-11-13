@@ -28,6 +28,22 @@ export interface FileChange {
 /** How many paths a `changed:` line names before "+N more". */
 export const CHANGED_PATHS_SHOWN = 12;
 
+/**
+ * Tools that can write files the file tools never report: a shell
+ * command, an archive extraction, a skill's script, a checkout.
+ * `verify.run` works in a throwaway copy and counts only when its
+ * result says it ran in place (`isolated: false`).
+ */
+export const UNTRACKED_WRITE_TOOLS: ReadonlySet<string> = new Set([
+  "os.shell.run",
+  "os.fs.archive.extract",
+  "skill.run_script",
+  "os.git.checkout",
+]);
+
+/** The `changed:` line's label once a shell command ran. */
+const SHELL_RAN_LABEL = "changed (file tools only; shell commands ran)";
+
 interface Entry {
   kind: FileChange["kind"];
   added: number | undefined;
@@ -39,15 +55,23 @@ interface Entry {
  * Accumulates one worker's file changes, path by path, in first-touch
  * order. Only successful calls count; a patch counts the files it
  * applied. Shell commands can change files too and are not seen here:
- * the line says what the file tools did, and the declared-file check on
- * disk still covers the rest.
+ * the line says what the file tools did, marks itself when such a
+ * command ran (`shellRan`), and the declared-file check on disk and the
+ * syntax pass over the declared files still cover the rest.
  */
 export class FileChangeLog {
   private readonly entries = new Map<string, Entry>();
+  private untracked = false;
 
   constructor(private readonly workingDir?: string) {}
 
+  /** Whether a tool that can write outside the file tools ran. */
+  shellRan(): boolean {
+    return this.untracked;
+  }
+
   observe(result: CompressedToolResult): void {
+    if (ranUntrackedWriter(result)) this.untracked = true;
     if (result.status !== "ok") return;
     const d = result.details;
     switch (result.tool) {
@@ -163,6 +187,20 @@ export class FileChangeLog {
   }
 }
 
+/**
+ * A call that may have written files on its own: one of
+ * `UNTRACKED_WRITE_TOOLS` that ran (a shell command that exited, even
+ * non-zero, or was detached; not one the guard or the parser refused),
+ * or a `verify.run` that ran in place.
+ */
+function ranUntrackedWriter(result: CompressedToolResult): boolean {
+  const d = result.details;
+  if (result.tool === "verify.run") return d.isolated === false;
+  if (!UNTRACKED_WRITE_TOOLS.has(result.tool)) return false;
+  if (result.status === "ok") return true;
+  return result.tool === "os.shell.run" && ("exitCode" in d || d.detached === true);
+}
+
 /** Two rows' changes as one (a split task's parent and its children). */
 export function mergeFileChanges(
   lists: readonly (readonly FileChange[] | undefined)[],
@@ -198,17 +236,22 @@ function describeChange(change: FileChange): string {
 
 /**
  * The row's `changed:` line, written by the runtime from the tool
- * calls: at most `CHANGED_PATHS_SHOWN` paths, then "+N more". `null`
- * when the file tools changed nothing.
+ * calls: at most `CHANGED_PATHS_SHOWN` paths, then "+N more". Labelled
+ * `changed (file tools only; shell commands ran):` when `shellRan`, so
+ * the list does not read as complete. `null` when the file tools
+ * changed nothing and no shell command ran.
  */
 export function describeChanges(
   changes: readonly FileChange[] | undefined,
-  shown = CHANGED_PATHS_SHOWN,
+  options: { shown?: number; shellRan?: boolean } = {},
 ): string | null {
-  if (changes === undefined || changes.length === 0) return null;
-  const listed = changes.slice(0, shown).map(describeChange);
+  const label = options.shellRan === true ? SHELL_RAN_LABEL : "changed";
+  if (changes === undefined || changes.length === 0) {
+    return options.shellRan === true ? `${label}: nothing by the file tools` : null;
+  }
+  const listed = changes.slice(0, options.shown ?? CHANGED_PATHS_SHOWN).map(describeChange);
   const more = changes.length - listed.length;
-  return `changed: ${listed.join(", ")}${more > 0 ? `, +${more} more` : ""}`;
+  return `${label}: ${listed.join(", ")}${more > 0 ? `, +${more} more` : ""}`;
 }
 
 /** The changed paths that should be on disk now (not trashed). */

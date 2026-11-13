@@ -113,6 +113,18 @@ describe("runSyntaxPass", () => {
     expect(runner.mock.calls[0]![0]).toEqual([join(dir, "bad.js")]);
   });
 
+  it("checks the declared files as well as the changed ones (a shell may have written them)", async () => {
+    const runner = vi.fn(realRunner);
+    const [out] = await runSyntaxPass(
+      [row({ shellRan: true, changes: [{ path: "good.js", kind: "modified", addedLines: 1, removedLines: 0 }] })],
+      [{ id: "t1", title: "Task", instructions: "x", files: ["good.js", "bad.js", "missing.js"] }],
+      { runner, workingDir: dir, roots: [dir], signal },
+    );
+    expect(runner.mock.calls[0]![0]).toEqual([join(dir, "good.js"), join(dir, "bad.js")]);
+    expect(out!.status).toBe("failed");
+    expect(out!.syntax).toMatchObject({ checked: 2, failedFiles: ["bad.js"] });
+  });
+
   it("does not read outside the read scope, and counts files with no checker as unchecked", async () => {
     const outside = mkdtempSync(join(tmpdir(), "fusion-syntax-outside-"));
     try {

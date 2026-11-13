@@ -222,8 +222,14 @@ export interface WorkerTaskResult {
    */
   changes?: FileChange[];
   /**
-   * The delegate's own syntax pass over this row's changed (else
-   * declared) files (`syntax-pass.ts`), when it ran. A failure is also
+   * A tool that can write outside the file tools ran (a shell command,
+   * `worker-changes.ts`' `UNTRACKED_WRITE_TOOLS`): `changes` may be
+   * incomplete, and the `changed:` line says so.
+   */
+  shellRan?: true;
+  /**
+   * The delegate's own syntax pass over this row's changed and
+   * declared files (`syntax-pass.ts`), when it ran. A failure is also
    * the row's `error` and made it `failed`.
    */
   syntax?: TaskSyntaxSummary;
@@ -470,6 +476,7 @@ export class WorkerRunCollector {
         ? {}
         : { replacedInputs: [...this.replaced] }),
       ...(changes.length === 0 ? {} : { changes }),
+      ...(this.changes.shellRan() ? { shellRan: true as const } : {}),
     };
   }
 }
@@ -1164,7 +1171,9 @@ function renderBlock(
     (result.error
       ? ` — error: ${oneLine(result.error, ERROR_HEAD_CHARS)}`
       : "");
-  const changed = describeChanges(result.changes);
+  const changed = describeChanges(result.changes, {
+    ...(result.shellRan === true ? { shellRan: true } : {}),
+  });
   const diagnosis = [
     ...(changed === null ? [] : [changed]),
     ...(result.replacedInputs ?? []).map(describeReplacedInput),

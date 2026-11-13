@@ -68,16 +68,19 @@ export const TYPE_OUTPUT_CHARS = 300;
 
 /**
  * The files a row is checked on: what its worker's file tools changed
- * and is still there, else (a shell wrote them, or nothing recorded)
- * the task's declared files. A declared file nobody changed is the
- * declared-file check's business, not a syntax verdict on this task.
+ * and is still there, and the task's declared files. Both: a shell
+ * command writes files the file tools never record, so a row whose
+ * worker edited one file and wrote a declared one through a heredoc
+ * would otherwise pass on the first alone. Missing ones are skipped by
+ * the caller (a missing declared file is the declared-file check's).
  */
 export function syntaxPassFiles(
   row: WorkerTaskResult,
   task: DelegateTask | undefined,
 ): string[] {
-  const changed = presentChangedPaths(row.changes);
-  return changed.length > 0 ? changed : [...(task?.files ?? [])];
+  const files = presentChangedPaths(row.changes);
+  for (const file of task?.files ?? []) if (!files.includes(file)) files.push(file);
+  return files;
 }
 
 /**

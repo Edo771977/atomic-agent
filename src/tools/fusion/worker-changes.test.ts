@@ -116,6 +116,31 @@ describe("changed paths from the worker's tool events", () => {
     expect(describeChanges(r.changes)).toBeNull();
   });
 
+  it("marks the line when a shell command ran, since its writes are not seen", () => {
+    const c = new WorkerRunCollector({ workingDir: "/w" });
+    c.observe(executed("os.fs.edit", { path: "/w/a.ts", addedLines: 1, removedLines: 0 }));
+    // A refused or blocked command ran nothing; a failing one did run.
+    c.observe(executed("os.shell.run", { cmd: "rm", guardVerdict: "block" }, "error"));
+    expect(c.finish({ id: "t1", title: "T", reason: "reply", stepCount: 2, durationMs: 10 }).shellRan).toBeUndefined();
+    c.observe(executed("os.shell.run", { cmd: "sh", exitCode: 1 }, "error"));
+    const r = c.finish({ id: "t1", title: "T", reason: "reply", stepCount: 3, durationMs: 10 });
+    expect(r.shellRan).toBe(true);
+    expect(describeChanges(r.changes, { shellRan: r.shellRan })).toBe(
+      "changed (file tools only; shell commands ran): a.ts (+1/-0)",
+    );
+    expect(describeChanges(undefined, { shellRan: true })).toBe(
+      "changed (file tools only; shell commands ran): nothing by the file tools",
+    );
+    // verify.run in its throwaway copy writes nothing back; in place it may.
+    const v = new WorkerRunCollector({ workingDir: "/w" });
+    v.observe(executed("verify.run", { isolated: true }));
+    expect(v.finish({ id: "t1", title: "T", reason: "reply", stepCount: 1, durationMs: 10 }).shellRan).toBeUndefined();
+    v.observe(executed("verify.run", { isolated: false }, "error"));
+    expect(v.finish({ id: "t1", title: "T", reason: "reply", stepCount: 2, durationMs: 10 }).shellRan).toBe(true);
+    const out = formatDelegateOutput([row({ shellRan: true, changes: [{ path: "a.ts", kind: "new", addedLines: 2, removedLines: 0 }] })], 20_000);
+    expect(out).toContain("changed (file tools only; shell commands ran): a.ts (new, +2)");
+  });
+
   it("merges a split parent's and children's changes, last writer wins", () => {
     const merged = mergeFileChanges([
       [{ path: "a.ts", kind: "new", addedLines: 1, removedLines: 0 }],
