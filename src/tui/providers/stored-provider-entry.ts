@@ -14,10 +14,8 @@
 
 import { getConfig, readUserConfigFileSync } from "../../config/index.js";
 import type { UserLlmProviderEntry } from "../../config/llm-config.js";
-import {
-  isOtherComputerOnNetworkUrl,
-  withAssumedScheme,
-} from "../../llm/provider/openai/network-server-address.js";
+import { withAssumedScheme } from "../../llm/provider/openai/network-server-address.js";
+import { OPENAI_COMPAT_DEFAULT_BASE_URL } from "./providers-model-options.js";
 
 /** The `config.json` entry with this id, without anything filled in from the environment. */
 export function storedProviderFileEntry(
@@ -42,11 +40,11 @@ function serverOf(url: string | undefined): string | null {
 /**
  * `stored` as it will be once saved with `baseUrl` (an
  * `openai-compatible` entry's new address), so key resolution sees where
- * the key would actually go. A key saved in the entry for a different
- * server does not follow it to another computer on the network: it
- * belonged to that other server, usually a cloud account, and would go
- * out in clear. `apiKeyEnvVar` does follow it — the operator named that
- * variable for this entry.
+ * the key would actually go. A key saved in the entry does not follow it
+ * to a different server (scheme, host or port): it belonged to the old
+ * server's account, and would go to a different party over https or
+ * across the network in clear over http. `apiKeyEnvVar` does follow it —
+ * the operator named that variable for this entry.
  */
 export function storedEntryAtBaseUrl(
   stored: UserLlmProviderEntry,
@@ -54,13 +52,28 @@ export function storedEntryAtBaseUrl(
 ): UserLlmProviderEntry {
   if (stored.kind !== "openai-compatible" || !baseUrl) return stored;
   const moved = { ...stored, baseUrl };
-  if (
-    moved.apiKey &&
-    isOtherComputerOnNetworkUrl(baseUrl) &&
-    serverOf(stored.baseUrl) !== serverOf(baseUrl)
-  ) {
+  if (moved.apiKey && storedKeyServerChanged(stored, baseUrl)) {
     const { apiKey: _dropped, ...rest } = moved;
     return rest;
   }
   return moved;
+}
+
+/** The old and new server when `stored`'s key would be left behind by moving it to `baseUrl`, else `null`. */
+export function storedKeyMove(
+  stored: UserLlmProviderEntry,
+  baseUrl: string | undefined,
+): { readonly from: string; readonly to: string } | null {
+  if (stored.kind !== "openai-compatible" || !baseUrl || !stored.apiKey) return null;
+  if (!storedKeyServerChanged(stored, baseUrl)) return null;
+  return {
+    from: serverOf(stored.baseUrl ?? OPENAI_COMPAT_DEFAULT_BASE_URL) ?? String(stored.baseUrl),
+    to: serverOf(baseUrl) ?? baseUrl,
+  };
+}
+
+function storedKeyServerChanged(stored: UserLlmProviderEntry, baseUrl: string): boolean {
+  // No baseUrl in the file means the compat default endpoint.
+  const from = serverOf(stored.baseUrl ?? OPENAI_COMPAT_DEFAULT_BASE_URL);
+  return from === null || from !== serverOf(baseUrl);
 }

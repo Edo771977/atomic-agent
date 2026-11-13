@@ -12,6 +12,7 @@ import {
   emptyKeyMeaningForWizard,
   envHintForWizard,
   sharedKeyNotSentNote,
+  storedKeyLeftBehindNote,
   verifyTargetForWizard,
   wizardKeyIsOptional,
 } from "./providers-wizard-target.js";
@@ -259,6 +260,30 @@ describe("apiKeyPhaseError in configure mode", () => {
     expect(apiKeyForWizard(wizardFor("openrouter"))).toBeUndefined();
   });
 
+  it("asks again, and says why, when the entry moves to another server", () => {
+    upsertLlmProvider({
+      id: "my-compat",
+      kind: "openai-compatible",
+      baseUrl: "https://api.openai.com",
+      apiKey: "sk-literal",
+    });
+    const moved = {
+      ...configureWizard("openai-compatible", "my-compat"),
+      baseUrlLine: "https://other.example.com",
+    };
+    expect(apiKeyForWizard(moved)).toBeUndefined();
+    expect(apiKeyPhaseError(moved)).toContain("API key required");
+    expect(storedKeyLeftBehindNote(moved)).toBe(
+      "The key saved for https://api.openai.com is not sent to https://other.example.com: type this server's key.",
+    );
+    const same = {
+      ...configureWizard("openai-compatible", "my-compat"),
+      baseUrlLine: "https://api.openai.com/v1",
+    };
+    expect(apiKeyForWizard(same)).toBe("sk-literal");
+    expect(storedKeyLeftBehindNote(same)).toBeNull();
+  });
+
   it("tells the operator the saved key is what an empty screen keeps", () => {
     upsertLlmProvider({
       id: "openrouter",
@@ -305,7 +330,10 @@ describe("envHintForWizard where the shared key is not sent", () => {
         providerId: "my-vps",
       };
       expect(envHintForWizard(wizard)).toBe("ATOMIC_AGENT_KEY_MY_VPS");
-      expect(apiKeyPhaseError(wizard)).toContain("ATOMIC_AGENT_KEY_MY_VPS");
+      // `.localdomain` is the operator's own network: the key is optional there.
+      expect(apiKeyPhaseError(wizard) ?? "ATOMIC_AGENT_KEY_MY_VPS").toContain(
+        "ATOMIC_AGENT_KEY_MY_VPS",
+      );
     },
   );
 

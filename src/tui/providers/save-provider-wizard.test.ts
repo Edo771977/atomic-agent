@@ -281,6 +281,28 @@ describe("saveProviderWizardToConfig", () => {
     expect(built.entry.apiKey).toBe("sk-literal");
   });
 
+  it("does not carry a key written in config.json to a different server", () => {
+    upsertLlmProvider({
+      id: "my-compat",
+      kind: "openai-compatible",
+      baseUrl: "https://api.openai.com",
+      apiKey: "sk-literal",
+    });
+    resetConfigCache();
+    for (const baseUrl of ["http://203.0.113.5:8000", "https://other.example.com"]) {
+      expect(() =>
+        saveProviderWizardToConfig(configureCompat("my-compat", baseUrl)),
+      ).toThrow(/API key is empty/);
+    }
+    expect(configJsonText()).toContain("sk-literal");
+    const built = saveProviderWizardToConfig({
+      ...configureCompat("my-compat", "https://other.example.com"),
+      apiKeyBuffer: "other-key",
+    });
+    expect(built.entry.apiKey).toBeUndefined();
+    expect(configJsonText()).not.toContain("sk-literal");
+  });
+
   function groqWizard(apiKey: string) {
     return {
       ...createProvidersWizardState("add"),

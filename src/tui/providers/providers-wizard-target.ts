@@ -40,6 +40,7 @@ import { isLocalProviderUrl } from "./is-local-provider-url.js";
 import { findProviderPreset } from "./provider-presets.js";
 import {
   storedEntryAtBaseUrl,
+  storedKeyMove,
   storedProviderFileEntry,
 } from "./stored-provider-entry.js";
 import { subscriptionCliForWizardKind } from "./providers-wizard-state.js";
@@ -210,6 +211,20 @@ export function sharedKeyNotSentNote(wizard: ProvidersWizardState): string | nul
     `${set} is not sent ${where}. ` +
     "If this server needs a key, type the server's key here, or name its variable with apiKeyEnvVar in config.json."
   );
+}
+
+/**
+ * Why a reconfigure asks for a key again although `config.json` holds
+ * one, or `null`: the entry now names a different server, and the saved
+ * key stays behind (`storedEntryAtBaseUrl`).
+ */
+export function storedKeyLeftBehindNote(wizard: ProvidersWizardState): string | null {
+  if (wizard.mode !== "configure" || !wizard.providerId || wizard.kind !== "openai-compatible") return null;
+  if (wizard.apiKeyBuffer.trim()) return null;
+  const stored = storedProviderFileEntry(wizard.providerId);
+  const move = stored ? storedKeyMove(stored, baseUrlForWizard(wizard)) : null;
+  if (!move) return null;
+  return `The key saved for ${move.from} is not sent to ${move.to}: type this server's key.`;
 }
 
 /**

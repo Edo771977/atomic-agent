@@ -17,6 +17,7 @@ import {
   emptyKeyMeaningForWizard,
   envHintForWizard,
   sharedKeyNotSentNote,
+  storedKeyLeftBehindNote,
 } from "./providers-wizard-target.js";
 import { describeModelListError } from "./describe-model-list-error.js";
 import { PasteFieldTarget } from "../context-menu/paste-field-target.js";
@@ -432,6 +433,8 @@ export function ProvidersWizard(props: {
     // ATO-1066: the shared compat key used to reach a server on another
     // computer; say so while the operator can still type its own key.
     const sharedNote = sharedKeyNotSentNote(w);
+    // A key saved for the entry's old server does not follow it.
+    const leftBehindNote = storedKeyLeftBehindNote(w);
     return (
       <Box
         flexDirection="column"
@@ -449,6 +452,7 @@ export function ProvidersWizard(props: {
           {envHint} (mode 0600). {emptyMeans}
         </Text>
         {sharedNote ? <Text color={theme.colors.warn}>{sharedNote}</Text> : null}
+        {leftBehindNote ? <Text color={theme.colors.warn}>{leftBehindNote}</Text> : null}
         {/* The api_key screen is where paste matters most: keys are
             never typed by hand. Same adapter, same burst path. */}
         <PasteFieldTarget onPasteText={pasteIntoProvidersWizard}>
