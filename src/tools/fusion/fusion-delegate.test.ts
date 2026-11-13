@@ -603,8 +603,12 @@ describe("fusion.delegate", () => {
     const capture = (over: Partial<FusionDelegateDeps>) =>
       buildFusionDelegateTool(
         deps({
-          runTurn: async (_s, _m, options) => {
-            limits.push(options.taskMaxDurationMs);
+          runTurn: async (_s, message, options) => {
+            // The first turn only: a missing declared file earns a
+            // self-check grace turn, sized from what is left.
+            if (!message.startsWith("Your reply did not close the task")) {
+              limits.push(options.taskMaxDurationMs);
+            }
             return turnResult();
           },
           resolveRunMode: () => fusionMode({ workerTimeoutMs: 2_700_000 }),
@@ -1147,7 +1151,13 @@ describe("fusion.delegate", () => {
           { tasks: TASKS, contract: CONTRACT },
           ctx({ workingDir: dir }),
         );
-        expect(briefs).toHaveLength(2);
+        // t2's own check failed when it replied: it got one self-check
+        // notice with the verdict, then the turn ended as before.
+        expect(briefs).toHaveLength(3);
+        expect(briefs[2]).toContain("Your reply did not close the task");
+        expect(briefs[2]).toContain(
+          '- your check {"kind":"page","path":"index.html","checks":["no errors"]} failed: no errors: 1 pageerror — ReferenceError: p is not defined',
+        );
         expect(briefs[0]).toContain(
           "CONTRACT — the interface between the parts",
         );
@@ -1158,14 +1168,22 @@ describe("fusion.delegate", () => {
           "You may rely on: HD.Ship (symbol from t1 in js/ship.js)",
         );
 
+        // Each worker ran its own check once before its reply closed
+        // (t1's passed, t2's failed); then the fan-out's run of them all.
         // The runner sees the specs without their `task` key, and the call's cwd.
-        expect(runChecks).toHaveBeenCalledTimes(1);
+        expect(runChecks).toHaveBeenCalledTimes(3);
         expect(runChecks.mock.calls[0]![0]).toEqual([
+          { kind: "command", cmd: "node", args: ["--check", "js/ship.js"] },
+        ]);
+        expect(runChecks.mock.calls[1]![0]).toEqual([
+          { kind: "page", path: "index.html", checks: ["no errors"] },
+        ]);
+        expect(runChecks.mock.calls[2]![0]).toEqual([
           { kind: "command", cmd: "node", args: ["--check", "js/ship.js"] },
           { kind: "page", path: "index.html", checks: ["no errors"] },
           { kind: "command", cmd: "npm", args: ["test"] },
         ]);
-        expect(runChecks.mock.calls[0]![1].workingDir).toBe(dir);
+        expect(runChecks.mock.calls[2]![1].workingDir).toBe(dir);
 
         // Presence: `HD.Ship.reset` was never written; the id is spelled the other way.
         const lines = result.summary.split("\n");
@@ -1179,7 +1197,7 @@ describe("fusion.delegate", () => {
         );
         // The task whose declared check failed is `failed`, with the verdict as its error.
         expect(lines[3]).toBe(
-          "- [t2] failed — Two — error: checks: no errors: 1 pageerror — ReferenceError: p is not defined — checks: 1 of 1 failed — contract: id btn-launch not in index.html",
+          "- [t2] failed — Two — error: checks: no errors: 1 pageerror — ReferenceError: p is not defined — checks: 1 of 1 failed — self-check: its first reply left its own check failing; it was told once and given 4 more steps — contract: id btn-launch not in index.html",
         );
         const rows = result.details.tasks as WorkerTaskResult[];
         expect(rows.map((r) => r.status)).toEqual(["ok", "failed"]);

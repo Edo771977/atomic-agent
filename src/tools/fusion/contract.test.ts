@@ -47,7 +47,9 @@ describe("renderContractBlock", () => {
     expect(block).toContain("REQUIRES:");
     // Grouped per task, so a worker reads one line for its dependencies.
     expect(block).toContain("- [main] HD.Ship, btn-launch");
-    expect(block).toContain("CHECKS (run after the fan-out; a failing check fails its task):");
+    expect(block).toContain(
+      "CHECKS (all run after the fan-out; a failing check fails its task. Run only YOUR checks, listed for your task below, before you reply):",
+    );
     expect(block).toContain(
       '- [main] {"kind":"page","path":"index.html","checks":["no errors"]}',
     );
@@ -82,8 +84,13 @@ describe("renderContractForTask", () => {
       "You own: js/main.js",
       "You provide: nothing listed",
       "You may rely on: HD.Ship (symbol from ship in js/ship.js); btn-launch (id from html in index.html)",
+      // Its own check, to run before it replies; not the call-level one.
+      "Your checks — run each with verify.run, exactly as written, before you reply; every one must pass:",
+      '- [main] {"kind":"page","path":"index.html","checks":["no errors"]}',
     ]);
     const ship = renderContractForTask(CONTRACT, "ship");
+    // A task with no check of its own is told nothing about checks.
+    expect(ship).not.toContain("Your checks");
     expect(ship).toContain("You own: js/ship.js");
     expect(ship).toContain("You provide: symbol HD.Ship in js/ship.js; file js/hud.js");
     expect(ship).toContain("You may rely on: nothing from the other parts");

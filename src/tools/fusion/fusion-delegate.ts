@@ -24,7 +24,6 @@ import {
   renderContractLine,
   runContractChecks,
   type ContractCheckOutcome,
-  type ContractCheckRunner,
   type ContractReport,
 } from "./contract-checks.js";
 import {
@@ -122,13 +121,6 @@ export interface FusionDelegateDeps extends WorkerRunnerDeps {
    * only the orchestrator's instructions, as they did before.
    */
   resolveOriginalRequest?: (sessionId: string) => string | undefined;
-  /**
-   * Runs a contract's `checks` (`verify.run` specs) after the fan-out —
-   * the verify tool family's `runChecks`, wired by the runtime. Absent,
-   * declared checks are reported as not run; they are never assumed to
-   * have passed.
-   */
-  runChecks?: ContractCheckRunner;
   /**
    * Pricing for the worker model on the worker leg, when any is known
    * (`resolveModelPricingFor`). Present, the status table header states

@@ -59,6 +59,17 @@ import {
   type LocalLegHealth,
 } from "./local-leg-health.js";
 import { hasSplitProposal, splitSteer } from "./task-tree.js";
+import type { ContractCheckRunner } from "./contract-checks.js";
+import {
+  SELF_CHECK_GRACE_STEPS,
+  SELF_CHECK_MAX_MS,
+  SELF_CHECK_MIN_GRACE_STEPS,
+  SELF_CHECK_MIN_REMAINING_MS,
+  describeSelfCheck,
+  hasFindings,
+  renderSelfCheckNotice,
+  runSelfCheck,
+} from "./worker-self-check.js";
 
 /**
  * How many `phase: "tool"` lines one worker may put in the parent's
@@ -516,6 +527,14 @@ export interface WorkerRunnerDeps {
    * (tests, embedders), nothing is renewed.
    */
   renewLocalTransport?: () => boolean;
+  /**
+   * Runs a contract's `checks` (`verify.run` specs) — the verify tool
+   * family's `runChecks`, wired by the runtime. Used after the fan-out
+   * (`fusion-delegate.ts`) and by a worker's self-check before its reply
+   * closes the task (`worker-self-check.ts`). Absent, declared checks
+   * are reported as not run and never assumed to have passed.
+   */
+  runChecks?: ContractCheckRunner;
 }
 
 /** Escalations one worker may get, automatic and manual together. */
@@ -1159,9 +1178,13 @@ async function runOneTask(
     if (steered) splitAskedAt = stepsFinished;
     return steered;
   };
+  // Set while the worker fixes what its self-check found: those steps
+  // were granted on top of the hand-back rule, not measured against it.
+  let inSelfCheckGrace = false;
   const maybeHandBack = (): void => {
     if (declaredFiles === 0 || wroteSomething || handBack.signal.aborted)
       return;
+    if (inSelfCheckGrace) return;
     if (stepsFinished < HAND_BACK_MIN_COMPLETED_STEPS) return;
     const pastHalfTime = Date.now() - startedAt >= halfTimeMs;
     // The step half needs a stalled worker, not merely a busy one at
@@ -1376,13 +1399,116 @@ async function runOneTask(
     },
   );
 
+  const selfCheckNotes: string[] = [];
+  /**
+   * The worker replied: before that reply closes the task, ask what the
+   * fan-out will ask afterwards — declared files present, this task's
+   * own checks passing in its workspace (`worker-self-check.ts`). On a
+   * "no", the worker gets one notice as the next message of its own
+   * conversation and `SELF_CHECK_GRACE_STEPS` more steps, under the same
+   * session policy, signals and clocks as its first turn. Once per task;
+   * whatever the grace turn ends with is the turn's outcome.
+   */
+  const selfCheck = async (
+    first: RunTurnResult,
+    runTurnOptions: (maxSteps: number, taskMaxDurationMs: number) => Parameters<WorkerRunnerDeps["runTurn"]>[2],
+  ): Promise<RunTurnResult> => {
+    if (first.reason !== "reply" || first.stopCause !== undefined) return first;
+    const hasFiles = (task.files?.length ?? 0) > 0;
+    const hasChecks =
+      deps.runChecks !== undefined &&
+      (options.contract?.checks ?? []).some((check) => check.task === task.id);
+    if (!hasFiles && !hasChecks) return first;
+    const stopped = (): boolean =>
+      options.signal.aborted ||
+      timeLimit.aborted ||
+      stopByPerson.signal.aborted ||
+      replaceAbort.signal.aborted ||
+      handBack.signal.aborted;
+    if (stopped()) return first;
+    // A reply the worker was not allowed to close on (a refusal handed
+    // back) or a split proposal (its files are its children's) is not
+    // the worker's own claim of done.
+    const provisional = collector.finish({
+      id: task.id,
+      title: task.title,
+      reason: first.reason,
+      stepCount: first.stepCount,
+      durationMs: 0,
+    });
+    if (provisional.status !== "ok") return first;
+    if (mayPropose && hasSplitProposal(provisional.reply)) return first;
+    const stepsLeft = stepBudget.value - first.stepCount;
+    const graceSteps = Math.min(SELF_CHECK_GRACE_STEPS, stepsLeft);
+    if (graceSteps < SELF_CHECK_MIN_GRACE_STEPS) return first;
+    const remainingMs =
+      servedAt === null ? timeoutMs : timeoutMs - (Date.now() - servedAt);
+    if (remainingMs < SELF_CHECK_MIN_REMAINING_MS) return first;
+    const finding = await runSelfCheck({
+      task,
+      ...(options.contract === undefined ? {} : { contract: options.contract }),
+      workingDir,
+      startedAt,
+      ...(deps.runChecks === undefined ? {} : { runChecks: deps.runChecks }),
+      signal: AbortSignal.any([
+        options.signal,
+        timeLimit,
+        stopByPerson.signal,
+        replaceAbort.signal,
+      ]),
+      timeCapMs: Math.min(SELF_CHECK_MAX_MS, remainingMs),
+    });
+    if (finding.checksNotRun !== undefined) {
+      deps.logger?.info("fusion: a worker's self-check ran no checks", {
+        taskId: task.id,
+        reason: finding.checksNotRun,
+      });
+    }
+    if (!hasFindings(finding) || stopped()) return first;
+    selfCheckNotes.push(describeSelfCheck(finding, graceSteps));
+    const left =
+      servedAt === null ? timeoutMs + queueBudgetMs : timeoutMs - (Date.now() - servedAt);
+    inSelfCheckGrace = true;
+    let grace: RunTurnResult;
+    try {
+      grace = await deps.runTurn(
+        first.session,
+        renderSelfCheckNotice(finding, graceSteps),
+        runTurnOptions(graceSteps, Math.max(1, left)),
+      );
+    } finally {
+      inSelfCheckGrace = false;
+    }
+    countUnreadNotes(session.id, grace.undelivered);
+    // The grace's own step cap is not the worker's: a forced final step
+    // there says the grace ran out, not the task's budget. The fan-out's
+    // checks still decide whether the fix held.
+    const ownCeiling =
+      grace.stopCause === "step_ceiling" && graceSteps < stepsLeft;
+    // Read here: a grace that ended on its forced final step with a
+    // reply is reported like any reply; one with no reply at all keeps
+    // its `max_steps`.
+    if (ownCeiling) {
+      selfCheckNotes.push(
+        `self-check: the grace ran out of its ${graceSteps} steps; the last reply was written on the forced final step`,
+      );
+    }
+    const { stopCause: _cause, ...rest } = grace;
+    return {
+      ...(ownCeiling && grace.reason === "reply" ? rest : grace),
+      stepCount: first.stepCount + grace.stepCount,
+    };
+  };
   let result: WorkerTaskResult;
   try {
-    const turn = await deps.runTurn(session, brief, {
+    const workerTurnOptions = (
+      maxSteps: number,
+      taskMaxDurationMs: number,
+    ): Parameters<WorkerRunnerDeps["runTurn"]>[2] => ({
       origin: "fusion",
       providerId: options.providerId,
-      maxSteps: stepBudget.value,
-      taskMaxDurationMs: timeoutMs + queueBudgetMs,
+      maxSteps,
+      taskMaxDurationMs,
       toolFilter: isWorkerVisibleTool,
       toolRole: WORKER_TOOL_ROLE,
       ...(options.workerReasoning === undefined
@@ -1498,7 +1624,13 @@ async function runOneTask(
         collector.observe(event);
       },
     });
+    let turn = await deps.runTurn(
+      session,
+      brief,
+      workerTurnOptions(stepBudget.value, timeoutMs + queueBudgetMs),
+    );
     countUnreadNotes(session.id, turn.undelivered);
+    turn = await selfCheck(turn, workerTurnOptions);
     const timedOut = turn.reason === "cancelled" && hitTimeLimit();
     timedOutOutcome = timedOut;
     queuedOutcome = turn.reason === "cancelled" && hitQueueLimit();
@@ -1765,6 +1897,10 @@ async function runOneTask(
       ...result,
       notes: [...(result.notes ?? []), ...escalationNotes],
     };
+  }
+
+  if (selfCheckNotes.length > 0) {
+    result = { ...result, notes: [...(result.notes ?? []), ...selfCheckNotes] };
   }
 
   // A budget the orchestrator asked for and did not get is something it

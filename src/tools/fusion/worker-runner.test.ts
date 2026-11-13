@@ -690,7 +690,10 @@ describe("runWorkerTasks", () => {
       expect(results[0]).toMatchObject({
         status: "failed",
         error: "declared file js/scene.js does not exist after the task",
-        notes: ["spec.md unchanged by this task"],
+        notes: [
+          "self-check: its first reply left declared file js/scene.js missing; it was told once and given 2 more steps",
+          "spec.md unchanged by this task",
+        ],
       });
       expect(events.at(-1)!.event).toMatchObject({
         type: "fusion_worker",
@@ -819,10 +822,12 @@ describe("runWorkerTasks", () => {
         maxWorkers: 1,
         signal,
       });
+      // This fake worker writes the same file again in its self-check
+      // grace turn (`chart.png` was missing), so the hit is on it twice.
       expect(failed).toMatchObject({
         status: "failed",
         error: "declared file chart.png does not exist after the task",
-        replacedInputs: [{ path: "sales.csv" }],
+        replacedInputs: [{ path: "sales.csv" }, { path: "sales.csv" }],
       });
     } finally {
       rmSync(dir, { recursive: true, force: true });
