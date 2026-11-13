@@ -419,6 +419,50 @@ describe("checkShellCommandGuard on a subshell line", () => {
     expect(guardLine("echo hi ; rm -rf /").action).toBe("block");
   });
 
+  function guardPosixLine(line: string) {
+    const tokens = line.split(/\s+/).filter((t) => t.length > 0);
+    return checkShellCommandGuard({
+      cmd: tokens[0]!,
+      rawArgs: tokens.slice(1),
+      cwd: "/tmp",
+      shellLine: line,
+      shellQuoting: "posix",
+    });
+  }
+
+  it("reads a POSIX single-quoted argument as one literal", () => {
+    expect(guardPosixLine("gh pr list --json title --jq '.[] | .title'").action).toBe("allow");
+    expect(guardPosixLine("gh issue list --search 'is:open; label:bug'").action).toBe("allow");
+    // Without the POSIX hint (cmd.exe has no single quotes) it still asks.
+    expect(guardLine("gh pr list --json title --jq '.[] | .title'").rule).toBe(
+      "guard.compound_line",
+    );
+  });
+
+  it.each([
+    // The quote closes before `;`: `b;touch` is shell syntax.
+    "gh pr view 'a'b;touch pwned.txt",
+    // Unterminated: nothing is taken as quoted.
+    "gh pr view 'a ; touch pwned.txt",
+    // ANSI-C quoting has escapes: `\\'` does not close it.
+    "gh pr view $'a\\' ; touch pwned.txt ; echo '",
+    // An escaped quote opens nothing.
+    "gh pr view \\' ; touch pwned.txt ; echo '",
+    // Double quotes still expand substitutions and are not stripped.
+    'gh pr view "$(touch pwned.txt)"',
+    // A single quote inside double quotes is a plain character.
+    "gh pr view \"it's\" ; touch pwned.txt ; echo '",
+    // A comment hides the opening quote from sh: the next line runs.
+    "gh pr list # '\ntouch pwned.txt\n'",
+    // `${…}` nests quotes inside double quotes.
+    "gh pr view \"${x:-\"'\"}\" ; touch pwned.txt ; echo \"'\"",
+    // Unquoted redirects and pipes still ask.
+    "gh pr list 2>&1",
+    "gh pr list | head",
+  ])("still asks for %j", (line) => {
+    expect(guardPosixLine(line).action).not.toBe("allow");
+  });
+
   it("rejects a newline in an echo argument even without the line", () => {
     expect(guard("echo", ["hi\ntouch", "pwned.txt"]).action).toBe(
       "approval_required",

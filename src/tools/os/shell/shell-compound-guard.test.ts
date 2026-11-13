@@ -60,6 +60,9 @@ describe.skipIf(process.platform === "win32")(
       "gh pr view $(touch pwned.txt)",
       "icalBuddy eventsToday ; touch pwned.txt",
       "pwd\ntouch pwned.txt",
+      // Single-quoted text is literal, but not behind a comment.
+      "gh pr list # '\ntouch pwned.txt\n'",
+      "gh pr view 'x'y;touch pwned.txt",
     ])("asks before running %j", async (cmd) => {
       const asked: ApprovalRequest[] = [];
       try {

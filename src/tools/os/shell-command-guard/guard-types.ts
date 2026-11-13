@@ -18,6 +18,13 @@ export interface GuardInput {
    * chained command.
    */
   shellLine?: string;
+  /**
+   * `"posix"` when `shellLine` runs under `sh -c`: its single-quoted
+   * spans are literal text, so metacharacters inside them do not make
+   * the line compound. Absent (cmd.exe, which has no single quotes):
+   * every metacharacter counts.
+   */
+  shellQuoting?: "posix";
 }
 
 export interface NormalisedCommand {
