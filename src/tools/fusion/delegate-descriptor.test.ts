@@ -138,4 +138,10 @@ describe("fusion.delegate descriptor and schema agree", () => {
     expect(descriptor.summary).not.toContain("local worker agents");
     expect(descriptor.summary).toContain("### fusion");
   });
+
+  it("says a local worker sees only the first ~6,000 chars of the request", () => {
+    expect(descriptor.summary).toContain(
+      "A local worker's brief quotes only the first ~6,000 chars of the request, so there `instructions` must also carry whatever beyond those the task needs.",
+    );
+  });
 });

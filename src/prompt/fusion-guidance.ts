@@ -35,6 +35,7 @@ import {
   NO_FUSION_MACHINE_FACTS,
   type FusionMachineFacts,
 } from "./fusion-machine-facts.js";
+import { LOCAL_WORKER_REQUEST_CHAR_BUDGET } from "./request-section.js";
 import type { ToolDescriptor } from "./stable-prefix.js";
 
 /**
@@ -61,11 +62,11 @@ export function isFusionActive(
  * Exported as the base so tests and callers with no facts to hand get
  * exactly the block a machine-less build renders.
  */
-function fusionGuidanceLines(sizing: string): string {
+function fusionGuidanceLines(sizing: string, sees: string): string {
   return [
     "You orchestrate: read enough to decide, plan, delegate the doing, review what comes back.",
     `Plan in the open, then delegate in the same turn — never stop at the plan: list the independent parts, ${sizing}`,
-    "One task per part, in one `fusion.delegate` call; its `files` name the paths it will produce (approved once by the operator, so the workers can write). Each `instructions` must stand alone: workers see the operator's request, not this chat, and cannot ask.",
+    `One task per part, in one \`fusion.delegate\` call; its \`files\` name the paths it will produce (approved once by the operator, so the workers can write). Each \`instructions\` must stand alone: ${sees}`,
     "You choose `maxWorkers` per call; every part that changes something is a worker's.",
     "Tools that change things are refused for you: the workers build, you do not — the mode working, not a fault.",
     "Keep the design and the judgement: read every reply against its brief.",
@@ -92,7 +93,22 @@ export function localTaskSizing(maxNewLines: number): string {
   return `one file or one function per task, at most ~${maxNewLines} new lines; edit large files, never rewrite them.`;
 }
 
-export const FUSION_GUIDANCE = fusionGuidanceLines(DEFAULT_TASK_SIZING);
+/** What a worker sees, when nothing says its brief quotes less. */
+const DEFAULT_WORKER_SEES =
+  "workers see the operator's request, not this chat, and cannot ask.";
+
+/**
+ * What a local worker sees: its brief quotes only the head of the
+ * request (`LOCAL_WORKER_REQUEST_CHAR_BUDGET`), so what a task needs
+ * from past it must be in its `instructions`. One string per leg, so
+ * the prefix bytes stay stable.
+ */
+const LOCAL_WORKER_SEES = `workers see only the first ~${LOCAL_WORKER_REQUEST_CHAR_BUDGET.toLocaleString("en-US")} chars of the request, not this chat, and cannot ask; put what a task needs past that in \`instructions\`.`;
+
+export const FUSION_GUIDANCE = fusionGuidanceLines(
+  DEFAULT_TASK_SIZING,
+  DEFAULT_WORKER_SEES,
+);
 
 /**
  * The lines that differ per machine. Each clause is dropped whole when
@@ -177,8 +193,13 @@ export function buildFusionGuidance(
   const machine = formatFusionMachineLine(facts);
   const roles = formatFusionRolesLine(facts);
   const base =
-    facts.workerLeg === "local" && facts.workerMaxNewLines !== undefined
-      ? fusionGuidanceLines(localTaskSizing(facts.workerMaxNewLines))
+    facts.workerLeg === "local"
+      ? fusionGuidanceLines(
+          facts.workerMaxNewLines === undefined
+            ? DEFAULT_TASK_SIZING
+            : localTaskSizing(facts.workerMaxNewLines),
+          LOCAL_WORKER_SEES,
+        )
       : FUSION_GUIDANCE;
   return [base, machine, roles]
     .filter((line): line is string => line !== null)

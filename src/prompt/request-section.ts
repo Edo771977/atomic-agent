@@ -17,6 +17,13 @@ import {
  * that carried it. While the carrier is in view it costs nothing.
  */
 
+/**
+ * How much of the operator's request a local worker's brief quotes
+ * (`worker-prompt.ts`, ~1.5K tokens). Here so the orchestrator's
+ * `### fusion` block can name it.
+ */
+export const LOCAL_WORKER_REQUEST_CHAR_BUDGET = 6_000;
+
 /** Same 16,000-char clip as a cloud worker's quoted request (`worker-prompt.ts`). */
 export const REQUEST_SECTION_CHAR_BUDGET = 16_000;
 

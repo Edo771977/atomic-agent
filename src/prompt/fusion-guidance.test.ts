@@ -152,16 +152,19 @@ describe("the ### fusion prefix section", () => {
     // F43's restore line was paid for by shortening the others — the
     // budget is the budget.
     expect(FUSION_GUIDANCE.length).toBeLessThan(1400);
-    expect(buildFusionGuidance(FACTS).length).toBeLessThan(1900);
+    // A local leg also says its workers see only the request's head
+    // (~65 more chars): without it the orchestrator left in the request
+    // what a local worker never read.
+    expect(buildFusionGuidance(FACTS).length).toBeLessThan(1975);
     expect(
       buildFusionGuidance({ ...FACTS, tokensPerSecond: 6.4 }).length,
-    ).toBeLessThan(1900);
-    // A local leg's task-sizing clause is the one line that grows: one
+    ).toBeLessThan(1975);
+    // A local leg's task-sizing clause is the other line that grows: one
     // file or function and ~N new lines instead of "a big one".
     expect(
       buildFusionGuidance({ ...FACTS, tokensPerSecond: 6.4, workerMaxNewLines: 650 })
         .length,
-    ).toBeLessThan(2000);
+    ).toBeLessThan(2075);
   });
 });
 
@@ -281,6 +284,22 @@ describe("task sizing per worker leg", () => {
     );
     expect(block).not.toContain("a big one per worker");
     expect(localTaskSizing(650)).toContain("at most ~650 new lines");
+  });
+
+  it("tells the orchestrator a local worker sees only the head of the request", () => {
+    // A local brief quotes the first 6,000 chars (`worker-prompt.ts`):
+    // what the task needs past them has to ride in `instructions`.
+    const note =
+      "workers see only the first ~6,000 chars of the request, not this chat, and cannot ask; put what a task needs past that in `instructions`.";
+    expect(buildFusionGuidance({ ...FACTS, workerMaxNewLines: 300 })).toContain(note);
+    expect(buildFusionGuidance(FACTS)).toContain(note);
+    // A cloud leg and an unknown one keep the line byte for byte.
+    const cloud = buildFusionGuidance(facts({ workerLeg: "cloud", workerModel: "gpt-x" }));
+    expect(cloud).not.toContain("6,000");
+    expect(cloud).toContain(
+      "workers see the operator's request, not this chat, and cannot ask.",
+    );
+    expect(FUSION_GUIDANCE).not.toContain("6,000");
   });
 
   it("keeps the big-part line for a cloud leg and an unknown one", () => {

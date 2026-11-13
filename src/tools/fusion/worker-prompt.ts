@@ -3,6 +3,7 @@ import {
   type ConversationTurn,
 } from "../../session/conversation-turn.js";
 import {
+  LOCAL_WORKER_REQUEST_CHAR_BUDGET,
   ORIGINAL_REQUEST_BEGIN_MARKER,
   ORIGINAL_REQUEST_END_MARKER,
   REQUEST_FOLLOW_UP_MARKER,
@@ -64,9 +65,11 @@ export const ORIGINAL_REQUEST_CHAR_BUDGET = 16_000;
  * at a few hundred tokens a second, so 4K tokens of a spec it needs only
  * for names and formats is a real share of its slot and of its first
  * minute. What a clip reaches is the quoted request, never the task
- * (`renderWorkerBrief` puts the task first).
+ * (`renderWorkerBrief` puts the task first). The orchestrator is told
+ * the cap (`### fusion`, the `fusion.delegate` summary), so what a task
+ * needs from past it rides in `instructions`.
  */
-export const LOCAL_ORIGINAL_REQUEST_CHAR_BUDGET = 6_000;
+export const LOCAL_ORIGINAL_REQUEST_CHAR_BUDGET = LOCAL_WORKER_REQUEST_CHAR_BUDGET;
 
 /** The request budget for a worker's leg: local or cloud. */
 export function originalRequestCharBudget(localLeg: boolean): number {
