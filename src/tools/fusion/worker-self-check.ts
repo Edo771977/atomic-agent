@@ -88,6 +88,8 @@ export async function runSelfCheck(input: {
   runChecks?: ContractCheckRunner;
   signal: AbortSignal;
   timeCapMs: number;
+  /** The agent's own keys, for masking the checks' output. */
+  knownSecrets?: readonly KnownSecret[];
 }): Promise<SelfCheckFinding & { checksNotRun?: string }> {
   const finding: SelfCheckFinding = { missing: [], degenerate: [], failed: [] };
   const files = input.task.files ?? [];
@@ -122,6 +124,7 @@ export async function runSelfCheck(input: {
       runContractChecks(checks, input.runChecks, {
         workingDir: input.workingDir,
         signal: AbortSignal.any([input.signal, cap.signal]),
+        ...(input.knownSecrets === undefined ? {} : { knownSecrets: input.knownSecrets }),
       }),
       capped,
       stopped,

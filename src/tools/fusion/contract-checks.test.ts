@@ -462,4 +462,31 @@ describe("a failing check's output (the assertion, not the boilerplate)", () => 
     expect(r!.checks!.output).toContain("END-B");
     expect(tailClip("abcdef", 4)).toBe("…def");
   });
+  it("masks secrets before it clips, so a key cut at the boundary leaves no fragment", async () => {
+    const token = `ghp_${"Ab3".repeat(12)}`;
+    // Sized so the tail clip starts in the middle of the token.
+    const stderr = `${token}\n${"y".repeat(CHECK_OUTPUT_CHARS - "stderr (tail):\n".length - 22)}`;
+    const runner: ContractCheckRunner = async () => ({
+      ok: false,
+      results: [
+        {
+          ok: false,
+          summary: `verify.run command: FAILED postgres://app:hunter2-pw-9@db/app\nexit 1`,
+          stderrTail: stderr,
+        },
+      ],
+    });
+    const out = await runContractChecks([{ task: "t1", cmd: "npm test" }], runner, {
+      ...ctx,
+      knownSecrets: [{ label: "DB_PASSWORD", value: "hunter2-pw-9" }],
+    });
+    const outcome = out.outcomes[0]!;
+    // Unmasked, the clip would have kept the token's last chars.
+    expect(stderr.slice(-(CHECK_OUTPUT_CHARS - 16))).toContain(token.slice(-10));
+    expect(outcome.output).not.toContain(token.slice(-10));
+    expect(outcome.detail).not.toContain("hunter2-pw-9");
+    const [r] = applyCheckOutcomes([row()], out.outcomes);
+    expect(r!.checks!.output).not.toContain(token.slice(-10));
+    expect(r!.error ?? "").not.toContain("hunter2-pw-9");
+  });
 });

@@ -1456,6 +1456,7 @@ async function runOneTask(
     const remainingMs =
       servedAt === null ? timeoutMs : timeoutMs - (Date.now() - servedAt);
     if (remainingMs < SELF_CHECK_MIN_REMAINING_MS) return first;
+    const knownSecrets = deps.knownSecrets?.() ?? knownSecretsFromEnv();
     const finding = await runSelfCheck({
       task,
       ...(options.contract === undefined ? {} : { contract: options.contract }),
@@ -1469,6 +1470,7 @@ async function runOneTask(
         replaceAbort.signal,
       ]),
       timeCapMs: Math.min(SELF_CHECK_MAX_MS, remainingMs),
+      knownSecrets,
     });
     if (finding.checksNotRun !== undefined) {
       deps.logger?.info("fusion: a worker's self-check ran no checks", {
@@ -1485,11 +1487,7 @@ async function runOneTask(
     try {
       grace = await deps.runTurn(
         first.session,
-        renderSelfCheckNotice(
-          finding,
-          graceSteps,
-          deps.knownSecrets?.() ?? knownSecretsFromEnv(),
-        ),
+        renderSelfCheckNotice(finding, graceSteps, knownSecrets),
         runTurnOptions(graceSteps, Math.max(1, left)),
       );
     } finally {

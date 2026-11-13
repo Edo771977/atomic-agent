@@ -1092,7 +1092,13 @@ export function buildFusionDelegateTool(
                 const checks = await runContractChecks(
                   childContract.checks ?? [],
                   deps.runChecks,
-                  { workingDir: ctx.workingDir, signal: ctx.signal },
+                  {
+                    workingDir: ctx.workingDir,
+                    signal: ctx.signal,
+                    ...(deps.knownSecrets === undefined
+                      ? {}
+                      : { knownSecrets: deps.knownSecrets() }),
+                  },
                 );
                 const failedChecks = checks.outcomes
                   .filter((o) => o.task === undefined && !o.ok)
@@ -1284,7 +1290,13 @@ export function buildFusionDelegateTool(
         const checks = await runContractChecks(
           parsed.contract.checks ?? [],
           deps.runChecks,
-          { workingDir: ctx.workingDir, signal: ctx.signal },
+          {
+            workingDir: ctx.workingDir,
+            signal: ctx.signal,
+            ...(deps.knownSecrets === undefined
+              ? {}
+              : { knownSecrets: deps.knownSecrets() }),
+          },
         );
         out = applyCheckOutcomes(out, checks.outcomes);
         checkOutcomes =
