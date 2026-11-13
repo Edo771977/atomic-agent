@@ -9,7 +9,6 @@
  * wizard.
  */
 
-import { getConfig } from "../../config/index.js";
 import { resolveLlmProviderApiKey } from "../../config/resolve-llm-api-key.js";
 import type { UserLlmProviderEntry } from "../../config/llm-config.js";
 import { DEFAULT_AIMLAPI_BASE } from "../../llm/provider/aimlapi/aimlapi-provider.js";
@@ -36,6 +35,10 @@ import type { ProviderVerifyTarget } from "../../llm/provider/verify/index.js";
 import { isLoopbackBaseUrl } from "../persist-user-local-models-config.js";
 import { isLocalProviderUrl } from "./is-local-provider-url.js";
 import { findProviderPreset } from "./provider-presets.js";
+import {
+  storedEntryAtBaseUrl,
+  storedProviderFileEntry,
+} from "./stored-provider-entry.js";
 import { subscriptionCliForWizardKind } from "./providers-wizard-state.js";
 import {
   AIMLAPI_DEFAULT_CHAT_MODEL,
@@ -51,8 +54,11 @@ import type {
 
 /** Normalized so the fetch, the cache key and the displayed URL always agree. */
 export function baseUrlForWizard(wizard: ProvidersWizardState): string {
+  // ATO-1066: with the scheme a typed address left out, so `192.168.1.20:8080`
+  // reads as the host it names everywhere, the key rules included.
   return (
-    normalizeOpenAiBaseUrl(wizard.baseUrlLine) || OPENAI_COMPAT_DEFAULT_BASE_URL
+    normalizeOpenAiBaseUrl(withAssumedScheme(wizard.baseUrlLine)) ||
+    OPENAI_COMPAT_DEFAULT_BASE_URL
   );
 }
 
@@ -74,13 +80,18 @@ function keyLookupEntryForWizard(
   return {
     id: wizard.providerId ?? preset?.id ?? kind,
     kind,
+    // ATO-1066: the address decides whether the shared compat variables
+    // may answer at all. Without it the resolver never saw a server on
+    // another computer and handed it the operator's cloud key.
+    ...(kind === "openai-compatible" ? { baseUrl: baseUrlForWizard(wizard) } : {}),
     ...(preset ? { apiKeyEnvVar: preset.envVar } : {}),
   };
 }
 
 /**
- * The `config.json` entry a `configure` run would overwrite, or
- * `undefined` while adding. `saveProviderWizardToConfig` keeps this
+ * The `config.json` entry a `configure` run would overwrite, as written
+ * in the file and moved to the address the wizard now names
+ * (`storedEntryAtBaseUrl`), or `undefined` while adding. `saveProviderWizardToConfig` keeps this
  * entry's `apiKey` when the key screen is left blank, so every question
  * about "does this wizard have a key" has to see it: a key the operator
  * typed once lives in `config.json` with nothing in `.env` to find.
@@ -90,9 +101,13 @@ function storedEntryForWizard(
 ): UserLlmProviderEntry | undefined {
   const { mode, providerId } = wizard;
   if (mode !== "configure" || !providerId) return undefined;
-  return getConfig().llm?.providers.find(
-    (provider) => provider.id === providerId,
-  );
+  const stored = storedProviderFileEntry(providerId);
+  return stored
+    ? storedEntryAtBaseUrl(
+        stored,
+        wizard.kind === "openai-compatible" ? baseUrlForWizard(wizard) : undefined,
+      )
+    : undefined;
 }
 
 /**

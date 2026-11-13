@@ -15,6 +15,7 @@ import {
   wizardKeyIsOptional,
 } from "./providers-wizard-target.js";
 import { createProvidersWizardState } from "./providers-wizard-state.js";
+import { contractProbeTargetForWizard } from "./contract-probe-target.js";
 import type {
   ProvidersWizardKind,
   ProvidersWizardState,
@@ -372,5 +373,127 @@ describe("verifyTargetForWizard", () => {
       "https://api.perplexity.ai/chat/completions",
     );
     expect(result.status).toBe("ok");
+  });
+});
+
+describe("the shared compat key and a server on another computer (ATO-1066)", () => {
+  // `OPENAI_COMPAT_API_KEY` / `OPENAI_API_KEY` usually hold the
+  // operator's real cloud key. The wizard lists models and runs the
+  // contract probe with `apiKeyForWizard`, so if that answers with the
+  // shared key the key goes out as a Bearer over plain http:// to the
+  // box on the LAN — the leak the resolver guard exists to prevent.
+  let stateDir: string;
+  let previousStateDir: string | undefined;
+
+  beforeEach(() => {
+    previousStateDir = process.env.ATOMIC_AGENT_STATE_DIR;
+    stateDir = mkdtempSync(join(tmpdir(), "wizard-lan-key-"));
+    process.env.ATOMIC_AGENT_STATE_DIR = stateDir;
+    for (const key of ENV_KEYS) delete process.env[key];
+    resetConfigCache();
+  });
+
+  afterEach(() => {
+    rmSync(stateDir, { recursive: true, force: true });
+    if (previousStateDir === undefined) {
+      delete process.env.ATOMIC_AGENT_STATE_DIR;
+    } else {
+      process.env.ATOMIC_AGENT_STATE_DIR = previousStateDir;
+    }
+    for (const key of ENV_KEYS) delete process.env[key];
+    resetConfigCache();
+  });
+
+  function lanAddWizard(baseUrlLine: string): ProvidersWizardState {
+    return {
+      ...wizardFor("openai-compatible"),
+      phase: "chat_model_line",
+      baseUrlLine,
+      chatModelLine: "qwen",
+      selectedChatModelId: "qwen",
+    };
+  }
+
+  it("does not hand the shared key to a new server on another computer", () => {
+    process.env.OPENAI_COMPAT_API_KEY = "sk-SHARED";
+    process.env.OPENAI_API_KEY = "sk-SHARED-2";
+    for (const line of ["http://192.168.1.20:8080", "192.168.1.20:8080"]) {
+      const wizard = lanAddWizard(line);
+      expect(apiKeyForWizard(wizard), line).toBeUndefined();
+      expect(contractProbeTargetForWizard(wizard), line).toEqual({
+        kind: "skipped",
+        reason: "no_api_key",
+      });
+    }
+  });
+
+  it("still sends a key typed for that server", () => {
+    process.env.OPENAI_COMPAT_API_KEY = "sk-SHARED";
+    const wizard = { ...lanAddWizard("http://192.168.1.20:8080"), apiKeyBuffer: "lan-key" };
+    expect(apiKeyForWizard(wizard)).toBe("lan-key");
+    const probe = contractProbeTargetForWizard(wizard);
+    expect(probe.kind === "target" && probe.target.apiKey).toBe("lan-key");
+  });
+
+  it("still resolves the shared key for a cloud compat endpoint", () => {
+    process.env.OPENAI_COMPAT_API_KEY = "sk-SHARED";
+    expect(apiKeyForWizard(lanAddWizard("https://api.example.com"))).toBe("sk-SHARED");
+  });
+
+  it("does not hand the shared key over when a cloud entry is moved to another computer", () => {
+    process.env.OPENAI_COMPAT_API_KEY = "sk-SHARED";
+    upsertLlmProvider({
+      id: "my-compat",
+      kind: "openai-compatible",
+      baseUrl: "https://api.example.com",
+    });
+    resetConfigCache();
+    const wizard: ProvidersWizardState = {
+      ...createProvidersWizardState("configure", {
+        providerId: "my-compat",
+        kind: "openai-compatible",
+        baseUrl: "http://192.168.1.20:8080",
+      }),
+      phase: "chat_model_line",
+      chatModelLine: "qwen",
+      selectedChatModelId: "qwen",
+    };
+    expect(apiKeyForWizard(wizard)).toBeUndefined();
+    expect(contractProbeTargetForWizard(wizard)).toEqual({
+      kind: "skipped",
+      reason: "no_api_key",
+    });
+  });
+
+  it("does not send a cloud entry's saved key to another computer it is moved to", () => {
+    upsertLlmProvider({
+      id: "my-compat",
+      kind: "openai-compatible",
+      baseUrl: "https://api.example.com",
+      apiKey: "sk-cloud-literal",
+    });
+    resetConfigCache();
+    const wizard = createProvidersWizardState("configure", {
+      providerId: "my-compat",
+      kind: "openai-compatible",
+      baseUrl: "http://192.168.1.20:8080",
+    });
+    expect(apiKeyForWizard(wizard)).toBeUndefined();
+  });
+
+  it("keeps the saved key of a server on another computer that stays put", () => {
+    upsertLlmProvider({
+      id: "gpu-box",
+      kind: "openai-compatible",
+      baseUrl: "http://192.168.1.20:8080",
+      apiKey: "lan-literal",
+    });
+    resetConfigCache();
+    const wizard = createProvidersWizardState("configure", {
+      providerId: "gpu-box",
+      kind: "openai-compatible",
+      baseUrl: "http://192.168.1.20:8080",
+    });
+    expect(apiKeyForWizard(wizard)).toBe("lan-literal");
   });
 });
