@@ -1973,14 +1973,16 @@ export function buildFusionDelegateTool(
           });
           deps.outcomeLog?.append(outcomeRows.map((o) => o.record));
           deps.turnLedger?.noteFanout(ctx.sessionId, {
-            tasks: outcomeRows.map(({ row, pricing }) => ({
+            tasks: outcomeRows.map(({ row, record, pricing }) => ({
               ok: row.status === "ok",
               tokens: (row.usage?.promptTokens ?? 0) + (row.usage?.completionTokens ?? 0),
               durationMs: row.durationMs,
               costUsd: rowCostUsd(row, pricing),
+              orchestrator: record.leg === "orchestrator",
             })),
             wallMs: now.getTime() - fanoutStartedAt,
-            sideCostUsd: escalationSpendUsd + judgeSpendUsd,
+            judgeCostUsd: judgeSpendUsd,
+            escalationCostUsd: escalationSpendUsd,
           });
         } catch (err) {
           deps.logger.warn("fusion: the fan-out's outcomes were not recorded", {

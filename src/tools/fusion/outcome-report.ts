@@ -80,6 +80,8 @@ export interface FusionReport {
   orchestrator: OrchestratorStats[];
   /** Priced strong-side spend: orchestrator turns plus orchestrator-target tasks. */
   strongSpendUsd: number | null;
+  /** Some strong-side requests or orchestrator-target tasks were unpriced. */
+  strongSpendPartial: boolean;
 }
 
 function isRecord(value: unknown): value is OutcomeRecord {
@@ -195,6 +197,14 @@ function orchestratorStats(turns: TurnOutcomeRecord[]): OrchestratorStats {
     ),
   );
   const priced = turns.filter((t) => t.orchestrator.costUsd !== null);
+  // A turn whose requests were unpriced is unpriced, even when its judge
+  // or escalation calls were priced.
+  const unpriced = turns.filter(
+    (t) =>
+      t.orchestrator.requests > 0 &&
+      // A record without the split field: its total is all it has.
+      ("requestCostUsd" in t.orchestrator ? t.orchestrator.requestCostUsd : t.orchestrator.costUsd) === null,
+  );
   return {
     provider: turns[0]!.orchestrator.provider,
     models: [...new Set(turns.map((t) => t.orchestrator.model))],
@@ -210,7 +220,7 @@ function orchestratorStats(turns: TurnOutcomeRecord[]): OrchestratorStats {
         : Math.round((stepRates.reduce((a, b) => a + b, 0) / stepRates.length) * 100),
     costUsd:
       priced.length === 0 ? null : priced.reduce((n, t) => n + (t.orchestrator.costUsd ?? 0), 0),
-    unpricedTurns: turns.length - priced.length,
+    unpricedTurns: unpriced.length,
   };
 }
 
@@ -263,6 +273,9 @@ export function aggregateOutcomes(
     orchestratorTargets,
     orchestrator,
     strongSpendUsd: strongParts.length === 0 ? null : strongParts.reduce((a, b) => a + b, 0),
+    strongSpendPartial:
+      orchestrator.some((o) => o.unpricedTurns > 0) ||
+      tasks.some((r) => r.leg === "orchestrator" && r.costUsd === null),
   };
 }
 
@@ -373,7 +386,11 @@ export function formatFusionReport(report: FusionReport, options: ReportOptions 
   }
   lines.push(
     "",
-    `Strong-side spend: ${report.strongSpendUsd === null ? "unpriced (subscription or no price known)" : formatUsdShort(report.strongSpendUsd)}`,
+    `Strong-side spend: ${
+      report.strongSpendUsd === null
+        ? "unpriced (subscription or no price known)"
+        : `${formatUsdShort(report.strongSpendUsd)}${report.strongSpendPartial ? " + unpriced (subscription or no price known)" : ""}`
+    }`,
     "1st-pass: green on the first attempt with no judge retry and no self-check notice. after retry: green after a replan or judge retry.",
   );
   return `${lines.join("\n")}\n`;

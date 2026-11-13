@@ -478,6 +478,12 @@ describe("fusion.delegate end to end", () => {
       expect(rows[0]!.tools.errors).toBe(1);
       // A refused approval is the worker policy's verdict on the row.
       expect(rows[0]!.status).toBe("needs_orchestrator");
+      // The receipt counts the task on the strong side, as the report does.
+      const receipt = events.find(
+        (event) => event.type === "fusion_worker" && event.taskId === "fusion.turn",
+      );
+      expect(receipt).toMatchObject({ summary: expect.stringContaining("orchestrator task") });
+      expect(receipt).toMatchObject({ summary: expect.stringContaining("workers 0 tokens") });
     } finally {
       await runtime.shutdown();
       rmSync(outsideDir, { recursive: true, force: true });

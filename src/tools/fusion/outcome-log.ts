@@ -120,16 +120,31 @@ export interface TurnOutcomeRecord {
     tokensOut: number;
     /** Null when no step reported a cache figure. */
     cachedTokens: number | null;
-    /** Null when nothing was priced (a subscription CLI leg). */
+    /**
+     * The orchestrator's requests plus the judge and escalation calls;
+     * null when none of them was priced.
+     */
     costUsd: number | null;
+    /** The requests alone; null when unpriced (a subscription CLI leg). */
+    requestCostUsd: number | null;
+    judgeCostUsd: number;
+    escalationCostUsd: number;
     /** Per orchestrator step: prompt tokens and cache hits (null: not reported). */
     steps: Array<{ in: number; cached: number | null }>;
   };
   fanouts: number;
+  /** Every task that ran, worker and orchestrator legs alike. */
   tasks: { total: number; ok: number; failed: number };
+  /**
+   * Of those, the `model: "orchestrator"` tasks: strong-side spend (null
+   * when unpriced), kept out of the worker figures. Their own `"task"`
+   * records carry the same cost.
+   */
+  orchestratorTasks: { total: number; costUsd: number | null };
+  /** Worker-leg tasks' tokens. */
   workerTokens: number;
   workerMs: number;
-  /** Priced worker spend; null when no worker row was priced. */
+  /** Priced worker-leg spend; null when no worker row was priced. */
   workerCostUsd: number | null;
 }
 
