@@ -195,6 +195,16 @@ const PRELUDE_STEM_RE = /^root ::= ([a-z]+)-prelude tool-call-array$/m;
 const FRAGMENT_HEAD_RE = /^[a-z]+-fragment ::= (\[\^(?:\\.|[^\]\\])+\])\+/;
 
 /**
+ * Whether the grammar opens on a reasoning prelude (`root ::= think-prelude
+ * tool-call-array`): the only grammar a think-block bound can apply to.
+ * A plain-instruct profile's grammar, or one under `thinking: off`, has
+ * none.
+ */
+export function hasReasoningPrelude(grammar: string): boolean {
+  return PRELUDE_ROOT_RE.test(grammar);
+}
+
+/**
  * The grammar with the plain root — `root ::= tool-call-array`, no
  * prelude — for `localModels.thinking: "off"` on the hand-built prompt
  * path, where the prompt ends with the template's own disabled marker

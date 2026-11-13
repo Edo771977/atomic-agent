@@ -7,7 +7,8 @@ import { resolveStepGrammar } from "./step-inference.js";
 import { ToolRegistry } from "../../tools/tool-registry.js";
 import { compressToolResult } from "../../compressor/result-compressor.js";
 import { SlotManager } from "../../llm/slot-manager.js";
-import { QWEN_THINK_PROFILE } from "../../llm/model-profile.js";
+import { PLAIN_INSTRUCT_PROFILE, QWEN_THINK_PROFILE, type ModelProfile } from "../../llm/model-profile.js";
+import type { CompletionResult } from "../../llm/llama-server-client.js";
 import { buildGrammar } from "../../llm/grammar/build-grammar.js";
 import { createEmptySessionState } from "../../session/session-state.js";
 import { DEFAULT_TOOL_DESCRIPTORS } from "../../prompt/tool-descriptors.js";
@@ -36,15 +37,32 @@ function registry(): ToolRegistry {
   return reg;
 }
 
+interface StepRun {
+  params: LlmStreamParams;
+  baseGrammar: string;
+  prompt: BuiltPrompt;
+  /** `reasoningBoundTokens` on the step's `llm_completed`; `null` when absent. */
+  reportedBound: number | null;
+}
+
 async function runStep(
   ctxExtra: Partial<Parameters<typeof executeStep>[0]>,
   baseBudgetTokens = 0,
-): Promise<{ params: LlmStreamParams; baseGrammar: string; prompt: BuiltPrompt }> {
-  const grammar = await buildGrammar(QWEN_THINK_PROFILE, grammarsDir, {
+  opts: {
+    profile?: ModelProfile;
+    toolTransport?: "grammar" | "native_tools";
+    /** Stamped on the completion, as the fallback seam does for the link that served. */
+    served?: Pick<CompletionResult, "servedTransport">;
+    content?: string;
+  } = {},
+): Promise<StepRun> {
+  const profile = opts.profile ?? QWEN_THINK_PROFILE;
+  const grammar = await buildGrammar(profile, grammarsDir, {
     reasoningBudgetTokens: baseBudgetTokens,
   });
   const seen: LlmStreamParams[] = [];
   let prompt: BuiltPrompt | undefined;
+  let reportedBound: number | null | undefined;
   await executeStep(
     {
       session: createEmptySessionState({ id: "s-worker-reasoning", workingDir: "/w" }),
@@ -65,7 +83,8 @@ async function runStep(
       llmComplete: async (params) => {
         seen.push(params);
         return {
-          content: `</think>${JSON.stringify([{ tool: "reply", args: { text: "done" } }])}`,
+          ...opts.served,
+          content: opts.content ?? `</think>${JSON.stringify([{ tool: "reply", args: { text: "done" } }])}`,
           reasoningContent: "",
           stop: true,
           truncated: false,
@@ -77,15 +96,16 @@ async function runStep(
       },
       onEvent: (event: StepEvent) => {
         if (event.type === "prompt_built") prompt ??= event.prompt;
+        if (event.type === "llm_completed") reportedBound ??= event.reasoningBoundTokens ?? null;
       },
       grammar,
-      profile: QWEN_THINK_PROFILE,
-      toolTransport: "grammar",
+      profile,
+      toolTransport: opts.toolTransport ?? "grammar",
       toolCallAdapter: null,
       supportsSlotAffinity: true,
     },
   );
-  return { params: seen[0]!, baseGrammar: grammar, prompt: prompt! };
+  return { params: seen[0]!, baseGrammar: grammar, prompt: prompt!, reportedBound: reportedBound ?? null };
 }
 
 /** The head line of the think body in a grammar. */
@@ -140,5 +160,41 @@ describe("a local fusion worker's reasoning bound on the per-request grammar", (
     expect(off).toMatch(/^root ::= tool-call-array$/m);
     expect(resolveStepGrammar({ reasoningBudgetTokens: 512 }, deps, [], false))
       .toMatch(/^root ::= think-prelude tool-call-array$/m);
+  });
+});
+
+describe("the step reports the worker bound only when the served request carried it", () => {
+  const PLAIN_REPLY = JSON.stringify([{ tool: "reply", args: { text: "done" } }]);
+
+  it("reports the bound a think-prelude grammar link applied", async () => {
+    expect((await runStep({ reasoningBudgetTokens: 1_536 })).reportedBound).toBe(1_536);
+  });
+
+  it("reports nothing without a turn bound, on the forced final step, or at 0 (unbounded)", async () => {
+    expect((await runStep({})).reportedBound).toBeNull();
+    expect((await runStep({ reasoningBudgetTokens: 512, terminalOnly: true })).reportedBound).toBeNull();
+    expect((await runStep({ reasoningBudgetTokens: 0 })).reportedBound).toBeNull();
+  });
+
+  it("reports nothing on a plain-instruct profile, whose grammar has no think prelude", async () => {
+    const run = await runStep({ reasoningBudgetTokens: 1_536 }, 0, {
+      profile: PLAIN_INSTRUCT_PROFILE,
+      content: PLAIN_REPLY,
+    });
+    expect(run.params.grammar).toBe(run.baseGrammar);
+    expect(run.reportedBound).toBeNull();
+  });
+
+  it("reports nothing when a native-tools link served, primary or fallback", async () => {
+    const native = await runStep({ reasoningBudgetTokens: 1_536 }, 0, {
+      toolTransport: "native_tools",
+      content: PLAIN_REPLY,
+    });
+    expect(native.reportedBound).toBeNull();
+    const fellToCloud = await runStep({ reasoningBudgetTokens: 1_536 }, 0, {
+      served: { servedTransport: "native_tools" },
+      content: PLAIN_REPLY,
+    });
+    expect(fellToCloud.reportedBound).toBeNull();
   });
 });

@@ -12,12 +12,12 @@ import { hashPrefix } from "../../llm/slot-manager.js";
 import { checkProfilePromptAligned } from "../../llm/profile-invariants.js";
 import type { BuiltPrompt } from "../../prompt/build-prompt.js";
 import type { CompletionResult, StreamChunk } from "../../llm/llama-server-client.js";
-import { estimateReasoningTokens, reasoningBudgetChars } from "../../llm/reasoning-budget.js";
+import { effectiveReasoningBudgetTokens, estimateReasoningTokens, reasoningBudgetChars } from "../../llm/reasoning-budget.js";
 import { localReplyCapEnvSet, thinkingReplyCap } from "./thinking-reply-cap.js";
 import { parseDepsFor } from "./step-parsing.js";
 import type { ToolDescriptor } from "../../prompt/stable-prefix.js";
 import { refusedToolNames } from "../policies/fusion-orchestrator-mode.js";
-import { withoutReasoningPrelude, withReasoningBudget, withUnboundedReasoningPrelude } from "../../llm/grammar/reasoning-prelude.js";
+import { hasReasoningPrelude, withoutReasoningPrelude, withReasoningBudget, withUnboundedReasoningPrelude } from "../../llm/grammar/reasoning-prelude.js";
 import { buildGrammarForTools } from "../../llm/grammar/build-grammar.js";
 import type { PromptMessages, ToolCallTransport } from "../../llm/provider/completion-types.js";
 import { openAiToolCallAdapter } from "../../llm/provider/openai/openai-tool-call-adapter.js";
@@ -281,6 +281,17 @@ export function prepareStepInference(ctx: StepContext, deps: StepDependencies) {
     stepDescriptors,
     thinkingOff,
   );
+  // Whether the turn's own think-block bound reaches the model, per link:
+  // the primary's from its grammar; a fallback grammar link's from the
+  // one `prepareForLink` rebuilt it with (a link it does not rebuild
+  // goes out with the primary's grammar).
+  const primaryBound = appliedReasoningBound(ctx, deps.grammar, thinkingOff);
+  let grammarLinkBound: { tokens: number | undefined } | undefined;
+  const reasoningBoundFor = (completion: CompletionResult): number | undefined => {
+    if ((completion.servedTransport ?? deps.toolTransport ?? "grammar") !== "grammar") return undefined;
+    if ((completion.servedModelMode ?? deps.modelMode)?.mode === "cloud") return undefined;
+    return grammarLinkBound ? grammarLinkBound.tokens : primaryBound;
+  };
   const llmParams: LlmStreamParams = {
     ...(prompt.contextBudget ? { contextBudget: prompt.contextBudget } : {}),
     ...buildLlmStreamParams({
@@ -336,6 +347,9 @@ export function prepareStepInference(ctx: StepContext, deps: StepDependencies) {
       if (ctx.workspace?.cloud !== (link.modelMode.mode === "cloud")) refreshStepWorkspace(ctx, linkDeps);
       const linked = deps.prepareWorkspace ? prepareStepPrompt(ctx, linkDeps) : null;
       const linkDescriptors = linked?.stepDescriptors ?? stepDescriptors;
+      if (link.transport === "grammar" && linked) {
+        grammarLinkBound = { tokens: appliedReasoningBound(ctx, deps.grammar, linked.thinkingOff) };
+      }
       const wire = linked ? buildLlmStreamParams({ promptText: "", deps: linkDeps,
         grammar: resolveStepGrammar(ctx, linkDeps, linkDescriptors, linked.thinkingOff),
         slotId: slot.slotId, sessionId: ctx.session.id, toolDescriptors: linkDescriptors,
@@ -363,6 +377,7 @@ export function prepareStepInference(ctx: StepContext, deps: StepDependencies) {
   }
   if (prompt.contextBudget) assertContextCapacity(prompt.text + JSON.stringify(llmParams.tools ?? []), prompt.contextBudget);
   return { prompt, slot, replyCap, stepDescriptors, stepToolDescriptors, grammarPrompt, promptCarriesPrefill, thinkingOff, llmParams,
+    reasoningBoundFor,
     reasoningBudgetTokens: ctx.reasoningBudgetTokens ?? getConfig().localModels.reasoningBudgetTokens };
 }
 
@@ -378,6 +393,12 @@ export interface InitialCompletionArgs {
   llmParams: LlmStreamParams;
   /** `thinking: off` honoured on this step's built prompt (F49). */
   thinkingOff: boolean;
+  /**
+   * The turn's own think-block bound the link that served `completion`
+   * actually carried, if any (`PreparedStepInference.reasoningBoundFor`);
+   * reported on `llm_completed` as `reasoningBoundTokens`.
+   */
+  reasoningBoundFor?: (completion: CompletionResult) => number | undefined;
 }
 
 
@@ -388,7 +409,7 @@ export interface InitialCompletionArgs {
 export async function runInitialCompletion(
   args: InitialCompletionArgs,
 ): Promise<{ completion: CompletionResult }> {
-  const { ctx, deps, prompt, slot, llmParams, thinkingOff } = args;
+  const { ctx, deps, prompt, slot, llmParams, thinkingOff, reasoningBoundFor } = args;
   const startedAt = Date.now();
   // ATO-1027: only a session whose host asked (the desktop's stream).
   const reportWait = deps.onEvent !== undefined && turnProgressWanted(ctx.session.id);
@@ -420,7 +441,9 @@ export async function runInitialCompletion(
     ),
   );
   deps.onCompletion?.(completion);
-  deps.onEvent?.({ type: "llm_completed", completion });
+  const reasoningBoundTokens = reasoningBoundFor?.(completion);
+  deps.onEvent?.({ type: "llm_completed", completion,
+    ...(reasoningBoundTokens === undefined ? {} : { reasoningBoundTokens }) });
   deps.onEvent?.({
     type: "llm_raw_completion",
     stepIndex: ctx.stepIndex,
@@ -498,6 +521,24 @@ export function stepGrammarToolNames(
   return restricted ? names : null;
 }
 
+
+/**
+ * The turn's own think-block bound (`ctx.reasoningBudgetTokens`), in
+ * budget tokens, when `resolveStepGrammar` really applies it to
+ * `grammar`: a positive bound, a non-final step, thinking not off, and a
+ * grammar with a reasoning prelude (a plain-instruct profile has none).
+ * `undefined` otherwise, a turn bound of `0` (unbounded) included. Says
+ * nothing about the link: a native-tools link never reads the grammar.
+ */
+export function appliedReasoningBound(
+  ctx: Pick<StepContext, "terminalOnly" | "reasoningBudgetTokens">,
+  grammar: string,
+  thinkingOff: boolean,
+): number | undefined {
+  if (ctx.reasoningBudgetTokens === undefined || ctx.terminalOnly || thinkingOff) return undefined;
+  const tokens = effectiveReasoningBudgetTokens(ctx.reasoningBudgetTokens);
+  return tokens > 0 && hasReasoningPrelude(grammar) ? tokens : undefined;
+}
 
 /**
  * The grammar for THIS request. The reasoning prelude first (F49): gone

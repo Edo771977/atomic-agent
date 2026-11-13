@@ -183,7 +183,13 @@ export function describeFirstAnswerCut(input: {
   capTokens: number;
   tokensPerSecond: number;
   timeoutMs: number;
-  /** The worker's think-block bound on a local leg; absent on a cloud leg. */
+  /**
+   * The think-block bound the cut completion's request actually carried,
+   * as the step reported it (`llm_completed`'s `reasoningBoundTokens`).
+   * Absent when nothing bounded the thinking: a plain-instruct profile
+   * with no think prelude, a native-tools link, a fallback to a cloud
+   * link. The hint names the bound only then.
+   */
   reasoningBudgetTokens?: number;
 }): { reply: string; note: string; hint: string } {
   const budget =
@@ -1217,8 +1223,10 @@ async function runOneTask(
       )
     : undefined;
   // How long the first answer ran when it spent the time-fitted cap
-  // before any step had completed; read once the turn is over.
+  // before any step had completed, and the think-block bound that
+  // answer's request really carried; read once the turn is over.
   let firstCutTokens: number | undefined;
+  let firstCutBoundTokens: number | undefined;
 
   // Escalation (ATO-942, ATO-66). The person's stop, the advisor that
   // reads a stuck worker's trace and steers it, and — behind
@@ -1474,6 +1482,7 @@ async function runOneTask(
             spent + REPLY_CAP_SLACK_TOKENS >= timeFittedCap
           ) {
             firstCutTokens = spent;
+            firstCutBoundTokens = event.event.reasoningBoundTokens;
             askForSplit("answer-cut");
             autoEscalate({
               kind: "first-answer-cut",
@@ -1865,6 +1874,7 @@ async function runOneTask(
   // Widened by hand: it is assigned inside the event hook, which the
   // compiler's flow analysis does not follow.
   const cutAt = firstCutTokens as number | undefined;
+  const cutBound = firstCutBoundTokens as number | undefined;
   if (
     cutAt !== undefined &&
     timeFittedCap !== undefined &&
@@ -1879,7 +1889,7 @@ async function runOneTask(
       capTokens: timeFittedCap,
       tokensPerSecond: options.localTokensPerSecond ?? 0,
       timeoutMs,
-      ...(reasoningBudgetTokens === undefined ? {} : { reasoningBudgetTokens }),
+      ...(cutBound === undefined ? {} : { reasoningBudgetTokens: cutBound }),
     });
     result = {
       ...result,
