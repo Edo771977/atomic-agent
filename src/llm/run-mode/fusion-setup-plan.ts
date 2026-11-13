@@ -55,6 +55,12 @@ export interface FusionSetupFacts {
     /** The catalog's pick for this machine, when the managed engine has nothing on disk. */
     readonly recommendedModelId: string | null;
   };
+  /**
+   * Enum values a newer build wrote that this build set aside on read
+   * (dotted key → the value on disk). Read as unset, but the person's:
+   * never filled over.
+   */
+  readonly setAside?: Readonly<Record<string, string>>;
 }
 
 /** Defaults this preset writes; documented in src/cli/README.md. */
@@ -94,6 +100,8 @@ export type FusionSetupPlan =
       readonly changes: readonly FusionSetupChange[];
       /** Keys already at the preset's value, or set by the person and kept. */
       readonly unchanged: readonly string[];
+      /** Values a newer build wrote that this build cannot read; left as they are. */
+      readonly keptNewer: readonly { readonly key: string; readonly value: string }[];
       readonly write: FusionSetupWrite;
       readonly tips: readonly string[];
     }
@@ -271,6 +279,11 @@ export function planFusionSetup(
   const stored = facts.runMode?.fusion ?? {};
   const changes: FusionSetupChange[] = [];
   const unchanged: string[] = [];
+  const keptNewer: { key: string; value: string }[] = [];
+  const setAside = facts.setAside ?? {};
+  /** Set by the person: stored, or a newer build's value this build set aside. */
+  const isSet = (k: keyof UserLlmFusionConfig): boolean =>
+    stored[k] !== undefined || setAside[`llm.runMode.fusion.${k}`] !== undefined;
   const fusion: Partial<UserLlmFusionConfig> = {};
   const tips: string[] = [];
 
@@ -290,12 +303,24 @@ export function planFusionSetup(
   };
   /** A setting the person wrote is theirs; only an unset one gets the preset's value. */
   const fill = <K extends keyof UserLlmFusionConfig>(k: K, to: UserLlmFusionConfig[K]): void => {
-    if (stored[k] === undefined) {
-      changes.push({ key: `llm.runMode.fusion.${k}`, from: undefined, to });
+    const key = `llm.runMode.fusion.${k}`;
+    const newer = setAside[key];
+    if (newer !== undefined) {
+      // Writing over it would replace a newer build's choice with this
+      // build's default; leaving it out of the write keeps it on disk.
+      keptNewer.push({ key, value: newer });
+    } else if (stored[k] === undefined) {
+      changes.push({ key, from: undefined, to });
       fusion[k] = to;
     } else {
-      unchanged.push(`llm.runMode.fusion.${k}`);
+      unchanged.push(key);
     }
+  };
+  /** An opt-in left alone: listed when a newer build set it. */
+  const noteNewer = (k: keyof UserLlmFusionConfig): void => {
+    const key = `llm.runMode.fusion.${k}`;
+    const newer = setAside[key];
+    if (newer !== undefined) keptNewer.push({ key, value: newer });
   };
   pin("orchestratorProvider", orchestrator.providerId);
   pin("workerProvider", worker.providerId);
@@ -304,7 +329,7 @@ export function planFusionSetup(
     fill("escalation", "advisor");
     fill("turnBudgetUsd", FUSION_SETUP_TURN_BUDGET_USD);
   } else {
-    if (stored.escalation === undefined) {
+    if (!isSet("escalation")) {
       tips.push(
         "escalation stays off: its per-escalation dollar cap needs a priced orchestrator, and a subscription leg has none.",
       );
@@ -314,13 +339,15 @@ export function planFusionSetup(
     );
   }
   if (options.judge) pin("judge", "on");
-  else if (stored.judge === undefined) {
+  else if (isSet("judge")) noteNewer("judge");
+  else {
     tips.push(
       "judge is off: re-run with --judge to close each task only on a green acceptance checklist (more orchestrator calls).",
     );
   }
   if (options.isolation) pin("isolation", "worktree");
-  else if (stored.isolation === undefined) {
+  else if (isSet("isolation")) noteNewer("isolation");
+  else {
     tips.push(
       "isolation is off (a global setting): re-run with --isolation to give each task its own workspace, merged back after its wave; best in git repos.",
     );
@@ -331,6 +358,7 @@ export function planFusionSetup(
     worker,
     changes,
     unchanged,
+    keptNewer,
     write: {
       ...(o.addProvider ? { addProvider: o.addProvider } : {}),
       activeTextProvider: orchestrator.providerId,

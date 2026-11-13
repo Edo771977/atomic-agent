@@ -224,6 +224,19 @@ describe("atomic-agent setup fusion", () => {
     expect(h.out()).toContain(`Fusion is on, in ${getConfig().paths.userConfigFile}.`);
   });
 
+  it("keeps a fusion value a newer build wrote and says so", async () => {
+    seed();
+    const path = getUserConfigPath(stateDir);
+    const disk = JSON.parse(raw()) as { llm: Record<string, unknown> };
+    disk.llm.runMode = { fusion: { escalation: "future-mode" } };
+    writeFileSync(path, JSON.stringify(disk));
+    const h = harness();
+    expect(await setupCommand(["fusion", "--yes"], h.deps)).toBe(0);
+    expect(h.out()).toMatch(/llm\.runMode\.fusion\.escalation\s+"future-mode" kept \(set by a newer version\)/);
+    expect(h.out()).not.toMatch(/escalation\s+\(unset\)/);
+    expect(fileJson().llm.runMode?.fusion?.escalation).toBe("future-mode");
+  });
+
   it("usage errors exit 2", async () => {
     expect(await setupCommand([], harness().deps)).toBe(2);
     expect(await setupCommand(["nope"], harness().deps)).toBe(2);

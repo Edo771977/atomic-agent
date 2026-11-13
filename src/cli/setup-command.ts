@@ -85,6 +85,13 @@ export function renderFusionPlan(plan: FusionSetupPlan): string {
   if (plan.changes.length > 0) {
     lines.push("Will change:", ...plan.changes.map(changeLine), "");
   }
+  if (plan.keptNewer.length > 0) {
+    lines.push(
+      "Will keep:",
+      ...plan.keptNewer.map((k) => `  ${k.key.padEnd(36)} ${JSON.stringify(k.value)} kept (set by a newer version)`),
+      "",
+    );
+  }
   if (plan.unchanged.length > 0) {
     lines.push(`Already set: ${plan.unchanged.join(", ")}`, "");
   }

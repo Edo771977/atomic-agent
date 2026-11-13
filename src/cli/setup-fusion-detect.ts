@@ -6,6 +6,7 @@ import {
   readUserConfigSnapshotSync,
   type UserConfigFile,
 } from "../config/index.js";
+import { readSetAsideEnumValueOnDiskSync } from "../config/config-file.js";
 import { SUBSCRIPTION_CLIS, type SubscriptionCliName } from "../config/llm-config.js";
 import {
   dotenvKeyForProviderKind,
@@ -89,6 +90,13 @@ function defaultClaudeModel(): string | null {
   return resolveCliAdapter("claude").defaultChatModel || null;
 }
 
+/** The enum settings the preset fills or mentions; a newer build's value there is kept. */
+const SET_ASIDE_FUSION_KEYS = [
+  "llm.runMode.fusion.escalation",
+  "llm.runMode.fusion.judge",
+  "llm.runMode.fusion.isolation",
+] as const;
+
 const CREDENTIAL_KINDS = new Set(["openrouter", "aimlapi", "gemini", "openai-compatible"]);
 
 export async function detectFusionSetup(
@@ -98,7 +106,8 @@ export async function detectFusionSetup(
   (deps.loadDotenv ?? ((dir) => { loadDotenvFromStateDir(dir); }))(stateDir);
   // The snapshot read names the file in a validation error (a missing
   // file reads as the defaults); the caller prints it and stops.
-  const file = readUserConfigSnapshotSync(getUserConfigPath(stateDir)).config;
+  const configPath = getUserConfigPath(stateDir);
+  const file = readUserConfigSnapshotSync(configPath).config;
   setCustomLocalModels(file.localModels.customModels);
   const llm = readLlmBlockOrDefault(file);
 
@@ -147,6 +156,12 @@ export async function detectFusionSetup(
       ? await (deps.recommendModelId ?? defaultRecommend)(dataDir, file)
       : null;
 
+  const setAside: Record<string, string> = {};
+  for (const key of SET_ASIDE_FUSION_KEYS) {
+    const value = readSetAsideEnumValueOnDiskSync(configPath, key);
+    if (value !== undefined) setAside[key] = value;
+  }
+
   return {
     stateDir,
     activeTextProvider: llm.activeTextProvider,
@@ -163,5 +178,6 @@ export async function detectFusionSetup(
       downloadedModelIds,
       recommendedModelId,
     },
+    setAside,
   };
 }

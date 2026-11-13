@@ -134,6 +134,21 @@ describe("planFusionSetup: defaults", () => {
     expect(plan.tips.join("\n")).not.toMatch(/judge is off|isolation is off/);
   });
 
+  it("a value a newer build wrote is the person's: kept, not filled, and no tip for it", () => {
+    const plan = planFusionSetup({
+      ...facts({ providers: [LOCAL, OPENROUTER("present")] }),
+      setAside: { "llm.runMode.fusion.escalation": "future-mode", "llm.runMode.fusion.judge": "strict" },
+    });
+    if (!plan.ok) throw new Error("expected ok");
+    expect(plan.write.fusion).not.toHaveProperty("escalation");
+    expect(plan.changes.map((c) => c.key)).not.toContain("llm.runMode.fusion.escalation");
+    expect(plan.keptNewer).toEqual([
+      { key: "llm.runMode.fusion.escalation", value: "future-mode" },
+      { key: "llm.runMode.fusion.judge", value: "strict" },
+    ]);
+    expect(plan.tips.join("\n")).not.toMatch(/judge is off/);
+  });
+
   it("--judge and --isolation opt in through the same write", () => {
     const plan = planFusionSetup(facts({ providers: [LOCAL, OPENROUTER("present")] }), { judge: true, isolation: true });
     if (!plan.ok) throw new Error("expected ok");
