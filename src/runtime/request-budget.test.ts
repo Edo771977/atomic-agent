@@ -76,7 +76,7 @@ describe("request budget scope", () => {
     return error;
   }
 
-  it.each(["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN"])("releases a hold whose send failed with %s before any connection", code => {
+  it.each(["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "ENETUNREACH", "EHOSTUNREACH", "EADDRNOTAVAIL"])("releases a hold whose send failed with %s before any connection", code => {
     const { budget, scope } = setup(2);
     const s = scope();
     s.beforeSend({ model: "m", messages: [] });

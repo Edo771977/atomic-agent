@@ -12,10 +12,10 @@ import type { FusionTurnBudget } from "../tools/fusion/turn-budget.js";
 // proxies (Envoy "upstream reset before headers", Heroku H12) return it after
 // the request was delivered and generation was billed.
 const RELEASED_STATUSES = new Set([400, 401, 402, 403, 404, 405, 413, 415, 422, 429, 529]);
-// Failures before a connection exists: no request byte reached a server.
-// A reset, timeout or TLS/socket error can follow a delivered body and
-// stays charged.
-const UNSENT_ERRNOS = new Set(["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN"]);
+// Failures before a connection exists (refused, unresolved, no route, no
+// usable local address): no request byte reached a server. A reset,
+// timeout or TLS/socket error can follow a delivered body and stays charged.
+const UNSENT_ERRNOS = new Set(["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "ENETUNREACH", "EHOSTUNREACH", "EADDRNOTAVAIL"]);
 
 /**
  * True when the provider can add prompt input the serialized body does not
