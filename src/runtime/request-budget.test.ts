@@ -12,11 +12,11 @@ const model = { id: "m", contextWindow: 200_000, source: "user", pricing: { inpu
 const provider = { id: "cloud", supportsRequestBudget: true } as LlmProvider;
 const entry = { id: "cloud", kind: "openai-compatible" } as LlmProviderConfigEntry;
 
-function setup(usd: number, request: Partial<CompletionRequest> = {}) {
+function setup(usd: number, request: Partial<CompletionRequest> = {}, providerEntry: LlmProviderConfigEntry = entry) {
   const budget = new FusionTurnBudget();
   budget.begin("p", 0, { usd });
   const req = { sessionId: "p", prompt: "hi", maxOutputTokens: 4096, ...request } as CompletionRequest;
-  const scope = () => createRequestBudgetScope(budget, req, provider, entry, model)!;
+  const scope = () => createRequestBudgetScope(budget, req, provider, providerEntry, model)!;
   return { budget, scope };
 }
 
@@ -35,13 +35,40 @@ describe("request budget scope", () => {
     expect(outcomes).toEqual(["ok", "ok", "ok"]);
   });
 
-  it("still overestimates input tokens with the UTF-8 byte count plus framing", () => {
-    const body = () => ({ model: "m", messages: [{ role: "user", content: "é".repeat(1200) }] });
-    const sent = { ...body(), max_tokens: 4096 };
-    const bound = ((Buffer.byteLength(JSON.stringify(sent), "utf8") + 1024) * 3.75 + 4096 * 15) / 1_000_000;
-    expect(() => setup(bound * 0.999).scope().beforeSend(body())).toThrow(/budget|cap/i);
-    expect(() => setup(bound * 1.001).scope().beforeSend(body())).not.toThrow();
-});
+  it("reserves at least one input token per character of a multi-byte prompt", () => {
+    // Independent bound: even a tokenizer emitting one token per character
+    // of N characters needs N input tokens at the highest ($3.75) rate.
+    const n = 20_000;
+    const body = () => ({ model: "m", messages: [{ role: "user", content: "é".repeat(n) }] });
+    const perCharacterUsd = (n * 3.75 + 4096 * 15) / 1_000_000;
+    expect(() => setup(perCharacterUsd).scope().beforeSend(body())).toThrow(/budget|cap/i);
+    expect(() => setup(perCharacterUsd * 4).scope().beforeSend(body())).not.toThrow();
+  });
+
+  // A 200k window at the $3.75 cache-write rate alone holds $0.75.
+  it.each<[string, Record<string, unknown>]>([
+    ["OpenRouter plugins", { plugins: [{ id: "web" }] }],
+    ["an :online model id", { model: "m:online" }],
+    ["web_search_options", { web_search_options: {} }],
+    ["a non-function tool", { tools: [{ type: "web_search_preview" }] }],
+  ])("reserves the context window for provider-side input added by %s", (_label, extra) => {
+    const body = () => ({ model: "m", messages: [{ role: "user", content: "hi" }], ...extra });
+    expect(() => setup(0.75).scope().beforeSend(body())).toThrow(/budget|cap/i);
+    expect(() => setup(0.82).scope().beforeSend(body())).not.toThrow();
+  });
+
+  it("refuses provider-side input when the context window is not verified", () => {
+    const budget = new FusionTurnBudget();
+    budget.begin("p", 0, { usd: 10 });
+    const req = { sessionId: "p", prompt: "hi", maxOutputTokens: 4096 } as CompletionRequest;
+    const s = createRequestBudgetScope(budget, req, provider, entry, { ...model, source: "default" })!;
+    expect(() => s.beforeSend({ model: "m", messages: [], plugins: [{ id: "web" }] })).toThrow(/provider-side input/);
+  });
+
+  it("keeps the byte-sized input reservation for function tools", () => {
+    const body = { model: "m", messages: [], tools: [{ type: "function", function: { name: "f", parameters: {} } }] };
+    expect(() => setup(0.1).scope().beforeSend(body)).not.toThrow();
+  });
 
   function refused(code: string): Error {
     const error = new TypeError("fetch failed") as TypeError & { cause?: unknown };
@@ -49,7 +76,7 @@ describe("request budget scope", () => {
     return error;
   }
 
-  it.each(["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN"])("releases a hold whose send failed with %s before any connection", code => {
+  it.each(["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "ENETUNREACH", "EHOSTUNREACH", "EADDRNOTAVAIL"])("releases a hold whose send failed with %s before any connection", code => {
     const { budget, scope } = setup(2);
     const s = scope();
     s.beforeSend({ model: "m", messages: [] });
@@ -67,7 +94,7 @@ describe("request budget scope", () => {
     expect(spent(budget)).toBeGreaterThan(0.06);
   });
 
-  it.each([[503, 0], [529, 0], [500, 1], [502, 1], [504, 1]])("status %s releases (0) or retains (1) the hold", (status, retained) => {
+  it.each([[529, 0], [429, 0], [500, 1], [502, 1], [503, 1], [504, 1]])("status %s releases (0) or retains (1) the hold", (status, retained) => {
     const { budget, scope } = setup(2);
     const s = scope();
     s.beforeSend({ model: "m", messages: [] });
@@ -95,11 +122,26 @@ describe("request budget scope", () => {
   }, 30_000);
 
   it("writes the model profile's cap field when the body carries none", () => {
-    const { scope } = setup(10, { maxOutputTokens: undefined });
+    const { scope } = setup(10, { maxOutputTokens: undefined }, { ...entry, maxOutputTokens: 8192 });
     const body: Record<string, unknown> = { model: "openai/gpt-5.1", messages: [] };
     scope().beforeSend(body);
-    expect(body).toMatchObject({ max_completion_tokens: 200_000 });
+    expect(body).toMatchObject({ max_completion_tokens: 8192 });
     expect(body).not.toHaveProperty("max_tokens");
+  });
+
+  it("refuses a paid send without any explicit output ceiling instead of reserving the context window", () => {
+    const { budget, scope } = setup(10, { maxOutputTokens: undefined });
+    const body: Record<string, unknown> = { model: "openai/gpt-5.1", messages: [] };
+    expect(() => scope().beforeSend(body)).toThrow(/set `maxOutputTokens` on provider entry cloud/);
+    expect(body).not.toHaveProperty("max_completion_tokens");
+    expect(spent(budget)).toBe(0);
+  });
+
+  it("accepts a cap field already in the body as the explicit ceiling", () => {
+    const { scope } = setup(10, { maxOutputTokens: undefined });
+    const body: Record<string, unknown> = { model: "m", messages: [], max_tokens: 2048 };
+    scope().beforeSend(body);
+    expect(body).toEqual({ model: "m", messages: [], max_tokens: 2048 });
   });
 
   it("clamps an existing max_completion_tokens without adding max_tokens", () => {
@@ -120,6 +162,7 @@ describe("request budget scope", () => {
     const budget = new FusionTurnBudget();
     budget.begin("p", 0, { usd: 10 });
     const req = { sessionId: "p", prompt: "hi" } as CompletionRequest;
-    expect(() => createRequestBudgetScope(budget, req, provider, entry, { ...model, source: "default" })).toThrow(/output ceiling/);
+    const s = createRequestBudgetScope(budget, req, provider, entry, { ...model, source: "default" })!;
+    expect(() => s.beforeSend({ model: "m", messages: [] })).toThrow(/output ceiling/);
   });
 });

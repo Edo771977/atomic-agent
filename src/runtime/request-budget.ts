@@ -7,14 +7,31 @@ import { readErrnoCode } from "../llm/errno-code.js";
 import { modelParamProfile } from "../llm/provider/openai/model-params.js";
 import type { FusionTurnBudget } from "../tools/fusion/turn-budget.js";
 
-// Explicit rejections before generation. 503/529 are overload answers
-// returned instead of generating, which providers do not bill; other 5xx
-// (500/502/504) can follow partial or proxied generation and stay charged.
-const RELEASED_STATUSES = new Set([400, 401, 402, 403, 404, 405, 413, 415, 422, 429, 503, 529]);
-// Failures before a connection exists: no request byte reached a server.
-// A reset, timeout or TLS/socket error can follow a delivered body and
-// stays charged.
-const UNSENT_ERRNOS = new Set(["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN"]);
+// Explicit rejections before generation. 529 is Anthropic's overload answer
+// returned instead of generating. 503 stays charged like 500/502/504:
+// proxies (Envoy "upstream reset before headers", Heroku H12) return it after
+// the request was delivered and generation was billed.
+const RELEASED_STATUSES = new Set([400, 401, 402, 403, 404, 405, 413, 415, 422, 429, 529]);
+// Failures before a connection exists (refused, unresolved, no route, no
+// usable local address): no request byte reached a server. A reset,
+// timeout or TLS/socket error can follow a delivered body and stays charged.
+const UNSENT_ERRNOS = new Set(["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "ENETUNREACH", "EHOSTUNREACH", "EADDRNOTAVAIL"]);
+
+/**
+ * True when the provider can add prompt input the serialized body does not
+ * contain: OpenRouter `plugins` (e.g. web) or `:online` models, OpenAI
+ * `web_search_options`, or any tool that is not a client-side function.
+ */
+function addsProviderSideInput(body: Record<string, unknown>): boolean {
+  const plugins = body.plugins;
+  if (plugins !== undefined && plugins !== null && !(Array.isArray(plugins) && plugins.length === 0)) return true;
+  if (typeof body.model === "string" && body.model.endsWith(":online")) return true;
+  if (body.web_search_options !== undefined && body.web_search_options !== null) return true;
+  const tools = body.tools;
+  if (tools === undefined || tools === null) return false;
+  if (!Array.isArray(tools)) return true;
+  return tools.some(tool => typeof tool !== "object" || tool === null || (tool as { type?: unknown }).type !== "function");
+}
 
 export interface RequestBudgetScope extends CompletionRequestBudget {
   signal?: AbortSignal;
@@ -43,8 +60,9 @@ export function createRequestBudgetScope(
   }
   if (priceRequired && provider.supportsRequestBudget !== true) throw new Error(`turn budget cannot authorize physical requests for provider ${provider.id}`);
   const caps = [request.maxTokens, request.maxOutputTokens, entry?.maxOutputTokens].filter((value): value is number => typeof value === "number" && Number.isFinite(value) && value > 0);
-  const outputCap = caps.length > 0 ? Math.min(...caps) : model?.source !== "default" ? model?.contextWindow : undefined;
-  if (priceRequired && (outputCap === undefined || !Number.isFinite(outputCap) || outputCap <= 0)) throw new Error("turn budget needs a verified output ceiling before sending");
+  // No context-window fallback: providers reject a window-sized output
+  // limit, and reserving one would hold dollars per request.
+  const outputCap = caps.length > 0 ? Math.min(...caps) : undefined;
   const timeLeft = budget.requestTimeLeftMs(sessionId);
   if (timeLeft !== undefined && timeLeft <= 0) throw new Error("the turn time cap has been reached before this request");
   let held = !priceRequired && limits.usd !== undefined ? budget.reserveRequest(sessionId, 0) : undefined;
@@ -64,7 +82,11 @@ export function createRequestBudgetScope(
       held = undefined;
       if (request.signal?.aborted) throw request.signal.reason;
       const wireCaps = [body.max_tokens, body.max_completion_tokens].filter((value): value is number => typeof value === "number" && Number.isFinite(value) && value > 0);
-      const ceiling = Math.floor(Math.min(outputCap!, ...wireCaps));
+      const explicitCaps = outputCap === undefined ? wireCaps : [outputCap, ...wireCaps];
+      if (explicitCaps.length === 0) {
+        throw new Error(`turn budget needs a verified output ceiling before sending; set \`maxOutputTokens\` on provider entry ${entry?.id ?? provider.id}`);
+      }
+      const ceiling = Math.floor(Math.min(...explicitCaps));
       // Runs after extraBody/model-parameter conversion, immediately before
       // serialization. Those overrides cannot raise this enforced ceiling.
       // Clamp the field(s) the body already uses. With neither, write the
@@ -76,9 +98,18 @@ export function createRequestBudgetScope(
       // Every tokenizer emits at most one token per UTF-8 byte of text, so
       // the serialized body bounds the prompt; JSON keys/escaping and a fixed
       // framing allowance deliberately overestimate the server's template.
-      // The context window is not a floor: it would reserve a full window
-      // for every short request and starve parallel workers.
-      const inputTokens = Buffer.byteLength(JSON.stringify(body), "utf8") + 1024;
+      // The context window is not a floor for ordinary bodies: it would
+      // reserve a full window for every short request and starve parallel
+      // workers. It is the floor when the provider adds input of its own
+      // (web search results, server tools) that the body cannot bound.
+      const bodyTokens = Buffer.byteLength(JSON.stringify(body), "utf8") + 1024;
+      let inputTokens = bodyTokens;
+      if (addsProviderSideInput(body)) {
+        if (model?.source === "default" || !Number.isFinite(model?.contextWindow) || model!.contextWindow <= 0) {
+          throw new Error("turn budget cannot bound provider-side input (web search plugins or server tools) without a verified model context window");
+        }
+        inputTokens = Math.max(bodyTokens, model!.contextWindow);
+      }
       const inputRate = Math.max(pricing!.input, pricing!.cacheWrite ?? pricing!.input, pricing!.cacheRead ?? pricing!.input);
       const copies = [body.n, body.best_of].filter(value => value !== undefined);
       if (!copies.every(value => typeof value === "number" && Number.isInteger(value) && value > 0)) throw new Error("turn budget cannot verify the request's completion count");
