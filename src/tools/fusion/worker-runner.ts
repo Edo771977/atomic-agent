@@ -1215,7 +1215,11 @@ async function runOneTask(
   const replyCap = timeFittedCap ?? options.workerMaxOutputTokens;
   // A local leg bounds each worker step's thinking per request: unbounded,
   // it ran to thousands of tokens a step and the time limit cut the
-  // answer. A cloud leg keeps the provider's own (the effort above).
+  // answer. A cloud leg keeps the provider's own (the effort above), and
+  // needs no bound for a fallback: the turn is pinned to
+  // `options.providerId` and a pinned request never falls over to
+  // another link (`llm-fallback-seam.ts`), so a cloud worker's step never
+  // lands on a local grammar link.
   const reasoningBudgetTokens = options.localLeg === true
     ? localWorkerReasoningBudgetTokens(
         options.workerReasoning,

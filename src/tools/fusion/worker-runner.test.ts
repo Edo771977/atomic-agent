@@ -224,7 +224,12 @@ describe("runWorkerTasks", () => {
     const high = await run({ localLeg: true, workerReasoning: "high" });
     expect(high).toMatchObject({ reasoningBudgetTokens: 4096, reasoningEffort: "high" });
     // A cloud leg keeps the provider's own reasoning: no grammar bound.
-    expect(await run({ workerReasoning: "low" })).not.toHaveProperty("reasoningBudgetTokens");
+    // Its turn is pinned to the leg, and a pinned request never falls
+    // over (llm-fallback-seam), so no step of it reaches a local grammar
+    // link that would want one.
+    const cloud = await run({ workerReasoning: "low" });
+    expect(cloud).not.toHaveProperty("reasoningBudgetTokens");
+    expect(cloud.providerId).toBe(BASE.providerId);
     expect(await run({})).not.toHaveProperty("reasoningBudgetTokens");
   });
 
