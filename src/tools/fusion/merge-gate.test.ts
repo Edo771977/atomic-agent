@@ -256,6 +256,40 @@ describe("merge only green tasks (isolation)", () => {
     expect(list).toHaveLength(1);
   });
 
+  it("holds a task the judge could not verify as needs_orchestrator, so its dependent is held too", async () => {
+    const repo = await gitRepo({ "a.txt": "a\n" });
+    const ran: string[] = [];
+    const d = deps(
+      repo,
+      async (id, _n, dir) => {
+        ran.push(id);
+        await writeFile(join(dir, `${id}.js`), "x\n");
+      },
+      // An answer that cannot be read: the judge leaves it unverified.
+      { escalationComplete: async () => ({ content: "no json here" }) },
+      { judge: { providerId: "cloud", model: "judge" }, autoReplan: 1 },
+    );
+    const result = await buildFusionDelegateTool(d).run(
+      {
+        tasks: [
+          { id: "core", title: "Core", instructions: "make core.js", files: ["core.js"] },
+          { id: "ui", title: "UI", instructions: "make ui.js", files: ["ui.js"] },
+        ],
+        contract: {
+          provides: [{ task: "core", kind: "symbol", name: "x", in: "core.js" }],
+          requires: [{ task: "ui", name: "x" }],
+        },
+      },
+      ctx(repo),
+    );
+    const rows = result.details.tasks as WorkerTaskResult[];
+    expect(rows[0]!.status).toBe("needs_orchestrator");
+    expect(rows[0]!.notes?.join(" ")).toContain("not merged (the judge could not verify it");
+    await expect(readFile(join(repo, "core.js"), "utf8")).rejects.toThrow();
+    expect(ran).toEqual(["core"]);
+    expect(rows[1]!.error).toMatch(/held for the replan: it depends on core/);
+  });
+
   it("off: a task whose check fails still wrote into the folder, as before", async () => {
     const repo = await gitRepo({ "a.txt": "a\n" });
     const seen: Array<{ file: string; dir: string; ok: boolean }> = [];

@@ -166,7 +166,14 @@ export function buildMergeGate(input: MergeGateInput): MergeGate {
       input.state.verdicts.set(row.id, verdict);
       if (verdict.green) return { row: gated, merge: true };
       if (verdict.unverified !== undefined) {
-        return { row: gated, merge: false, reason: "the judge could not verify it" };
+        // Not `ok`: its files are not in the folder, so a later wave must
+        // not start its dependents (autoReplan holds them) and the
+        // orchestrator decides what to do with it.
+        return {
+          row: { ...gated, status: "needs_orchestrator" },
+          merge: false,
+          reason: `the judge could not verify it: ${verdict.unverified}`,
+        };
       }
       const red = verdict.items.filter((v) => !v.pass && v.by !== "skipped").length;
       return {
