@@ -267,6 +267,8 @@ export function taskOutcomeRecord(
     role: context.role,
     ...(context.taskRole === undefined ? {} : { taskRole: context.taskRole }),
     ...(context.routingIdentity !== undefined && /^[a-f0-9]{64}$/.test(context.routingIdentity) ? { routingIdentity: context.routingIdentity } : {}),
+    // Checks ran in the workspace this worker edited: a weakened test still
+    // passes. The row cannot tell; see README "Measured routing".
     ...((row.checks?.total ?? 0) > 0 && (row.escalations ?? 0) === 0 && row.judge?.retried !== true &&
       context.merge !== "held" && context.merge !== "conflict"
       ? (row.checks!.failed > 0 && row.status === "failed"
