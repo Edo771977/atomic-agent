@@ -1,4 +1,4 @@
-import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -6,6 +6,10 @@ import { runIsolatedWave } from "./branch-merge.js";
 import { createBranchSet, defaultGitExec, touchedPaths } from "./branch-workspace.js";
 import type { DelegateTask } from "./delegate-args.js";
 import type { WorkerTaskResult } from "./worker-result.js";
+import { runWorkerTasks, type WorkerRunnerDeps } from "./worker-runner.js";
+import type { RunTurnResult } from "../../agent/agent-loop.js";
+import { createEmptySessionState } from "../../session/session-state.js";
+import { FUSION_WORKER_ID_PREFIX, type FusionWorkerMeta } from "../../session/fusion-worker-session.js";
 import { makeGitRepo, runGitRaw, writeRepoFile } from "../os/git/test-helpers.js";
 
 const cleanup: string[] = [];
@@ -316,5 +320,62 @@ describe("required branch isolation", () => {
     } finally {
       await set!.cleanup();
     }
+  });
+});
+
+describe("declared-file status in a fresh private workspace", () => {
+  async function runIdle(method: "copy" | "worktree", act?: (dir: string) => Promise<void>): Promise<WorkerTaskResult> {
+    const repo = await makeGitRepo("atag-fresh-stamp-");
+    cleanup.push(repo);
+    await writeRepoFile(repo, "core.js", "export const core = 1;\n");
+    // An original written long ago: only the copy into the workspace is fresh.
+    const past = new Date(Date.now() - 3_600_000);
+    await utimes(join(repo, "core.js"), past, past);
+    await runGitRaw(repo, ["add", "-A"]);
+    await runGitRaw(repo, ["commit", "-q", "-m", "init"]);
+    const { root } = await fixture();
+    const set = await createBranchSet(repo, ["core"], { tmpRoot: root, ...(method === "copy" ? { git: async () => null } : {}) });
+    expect(set?.method).toBe(method);
+    try {
+      const ws = set!.workspaces.get("core")!.dir;
+      const deps: WorkerRunnerDeps = {
+        runTurn: async (session) => {
+          await act?.(ws);
+          return { session, reason: "reply", stepCount: 1 } as RunTurnResult;
+        },
+        createEphemeralSession: (meta: FusionWorkerMeta, workingDir?: string) =>
+          createEmptySessionState({ id: `${FUSION_WORKER_ID_PREFIX}${meta.taskId}`, workingDir: workingDir ?? repo, metadata: { fusionWorker: { ...meta } } }),
+        approvals: { setSessionPolicy: () => undefined, clearSessionPolicy: () => undefined },
+        emitEvent: () => undefined,
+        workingDir: repo,
+      };
+      const [result] = await runWorkerTasks(deps, {
+        parentSessionId: "s-parent", providerId: "local-llama", workerModel: "m", workerMaxSteps: 3, workerTimeoutMs: 60_000,
+        tasks: [{ id: "core", title: "Core", instructions: "provide core", files: ["core.js"] }],
+        maxWorkers: 1,
+        signal: new AbortController().signal,
+        taskWorkspace: () => ({ workingDir: ws, writeScope: [ws] }),
+      });
+      return result!;
+    } finally { await set?.cleanup(); }
+  }
+
+  it.each(["copy", "worktree"] as const)("reports no_changes for an idle worker in a %s workspace made just before it ran", async (method) => {
+    const result = await runIdle(method);
+    expect(result.status).toBe("no_changes");
+    expect(result.notes).toContain("core.js unchanged by this task");
+  });
+
+  it.each(["copy", "worktree"] as const)("still sees an immediate same-size shell edit in a %s workspace", async (method) => {
+    const result = await runIdle(method, async (ws) => {
+      const file = join(ws, "core.js");
+      const before = await stat(file);
+      await writeFile(file, "export const core = 2;\n");
+      const after = await stat(file);
+      expect(after.size).toBe(before.size);
+      expect(after.mtimeMs).not.toBe(before.mtimeMs);
+    });
+    expect(result.status).toBe("ok");
+    expect(result.notes ?? []).not.toContain("core.js unchanged by this task");
   });
 });

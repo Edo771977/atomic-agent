@@ -48,6 +48,7 @@ import {
   rm,
   stat,
   symlink,
+  utimes,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -342,11 +343,21 @@ export async function stampTree(
   return out;
 }
 
+/**
+ * Copy one file with its permission bits and its times. The times are
+ * the source's, not the copy's: the declared-file check reads an mtime
+ * at or after the worker's start as "written by this task", so a
+ * workspace made just before it ran would make every idle worker look
+ * like it wrote its files (`ok` instead of `no_changes`). The task's
+ * manifest is still stamped from the copy, and any later write moves
+ * the mtime away from the preserved one.
+ */
 async function copyFileKeepingMode(from: string, to: string): Promise<void> {
   await mkdir(dirname(to), { recursive: true });
   await copyFile(from, to);
-  const mode = (await lstat(from)).mode & 0o777;
-  await chmod(to, mode);
+  const info = await lstat(from);
+  await chmod(to, info.mode & 0o777);
+  await utimes(to, info.atime, info.mtime);
 }
 
 class PrivateCopyLimitError extends Error {
