@@ -58,10 +58,12 @@ export function createRequestBudgetScope(
       // serialization. Those overrides cannot raise this enforced ceiling.
       if (body.max_completion_tokens !== undefined) body.max_completion_tokens = ceiling;
       if (body.max_tokens !== undefined || body.max_completion_tokens === undefined) body.max_tokens = ceiling;
-      // Byte fallback bounds text tokens; JSON keys/escaping and a fixed
+      // Every tokenizer emits at most one token per UTF-8 byte of text, so
+      // the serialized body bounds the prompt; JSON keys/escaping and a fixed
       // framing allowance deliberately overestimate the server's template.
-      const inputTokens = Math.max(Buffer.byteLength(JSON.stringify(body), "utf8") + 1024,
-        model?.source !== "default" && Number.isFinite(model?.contextWindow) ? model!.contextWindow : 0);
+      // The context window is not a floor: it would reserve a full window
+      // for every short request and starve parallel workers.
+      const inputTokens = Buffer.byteLength(JSON.stringify(body), "utf8") + 1024;
       const inputRate = Math.max(pricing!.input, pricing!.cacheWrite ?? pricing!.input, pricing!.cacheRead ?? pricing!.input);
       const copies = [body.n, body.best_of].filter(value => value !== undefined);
       if (!copies.every(value => typeof value === "number" && Number.isInteger(value) && value > 0)) throw new Error("turn budget cannot verify the request's completion count");
