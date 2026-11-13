@@ -454,6 +454,31 @@ describe("llm-config", () => {
     ).toThrow(/llm\.providers\[1\]\.userModels\[0\]\.pricing\.output/);
   });
 
+  it("parses long-context pricing and service-tier multipliers", () => {
+    const pricing = {
+      input: 3,
+      output: 15,
+      longContext: { thresholdTokens: 200_000, input: 6, output: 22.5, cacheRead: 0.6, cacheWrite: 7.5 },
+      serviceTierMultipliers: { priority: 2, flex: 0.5 },
+    };
+    const parsed = parseUserConfigFile(withUserModels([{ id: "a", kind: "chat", pricing }]));
+    expect(parsed.llm?.providers[1]?.userModels?.[0]?.pricing).toEqual(pricing);
+  });
+
+  it.each<[string, Record<string, unknown>, RegExp]>([
+    ["a negative long-context rate", { longContext: { thresholdTokens: 1000, input: -1, output: 1 } }, /pricing\.longContext\.input/],
+    ["a non-positive threshold", { longContext: { thresholdTokens: 0, input: 1, output: 1 } }, /pricing\.longContext\.thresholdTokens/],
+    ["a missing long-context output rate", { longContext: { thresholdTokens: 1000, input: 1 } }, /pricing\.longContext\.output/],
+    ["a non-object longContext", { longContext: 2 }, /pricing\.longContext/],
+    ["an infinite tier multiplier", { serviceTierMultipliers: { priority: Infinity } }, /pricing\.serviceTierMultipliers\.priority/],
+    ["a negative tier multiplier", { serviceTierMultipliers: { priority: -2 } }, /pricing\.serviceTierMultipliers\.priority/],
+    ["an array of tier multipliers", { serviceTierMultipliers: [2] }, /pricing\.serviceTierMultipliers/],
+  ])("rejects %s", (_label, extra, field) => {
+    expect(() =>
+      parseUserConfigFile(withUserModels([{ id: "a", kind: "chat", pricing: { input: 1, output: 1, ...extra } }])),
+    ).toThrow(field);
+  });
+
   it("rejects duplicate model ids within one provider's userModels", () => {
     expect(() =>
       parseUserConfigFile(

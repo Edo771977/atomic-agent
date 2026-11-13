@@ -165,4 +165,45 @@ describe("request budget scope", () => {
     const s = createRequestBudgetScope(budget, req, provider, entry, { ...model, source: "default" })!;
     expect(() => s.beforeSend({ model: "m", messages: [] })).toThrow(/output ceiling/);
   });
+
+  describe("price modifiers carried by the request", () => {
+    function scoped(usd: number, priced: ResolvedModel) {
+      const budget = new FusionTurnBudget();
+      budget.begin("p", 0, { usd });
+      const req = { sessionId: "p", prompt: "hi", maxOutputTokens: 4096 } as CompletionRequest;
+      return { budget, scope: () => createRequestBudgetScope(budget, req, provider, entry, priced)! };
+    }
+
+    it.each(["priority", "flex", "scale", 7])("refuses service_tier %s without a configured multiplier", tier => {
+      const { budget, scope } = scoped(10, model);
+      expect(() => scope().beforeSend({ model: "m", messages: [], service_tier: tier })).toThrow(/service_tier/);
+      expect(spent(budget)).toBe(0);
+    });
+
+    it.each([undefined, null, "default", "auto"])("prices service_tier %s at the configured rates", tier => {
+      const { scope } = scoped(10, model);
+      expect(() => scope().beforeSend({ model: "m", messages: [], service_tier: tier })).not.toThrow();
+    });
+
+    it("reserves and settles a configured service-tier multiplier", () => {
+      const priced = { ...model, pricing: { ...model.pricing!, serviceTierMultipliers: { priority: 2 } } } as ResolvedModel;
+      // Base bound: ~1.1k body tokens at $3.75 + 4096 output at $15 ~= $0.066.
+      expect(() => scoped(0.1, priced).scope().beforeSend({ model: "m", messages: [], service_tier: "priority" })).toThrow(/budget|cap/i);
+      const { budget, scope } = scoped(0.2, priced);
+      const s = scope();
+      s.beforeSend({ model: "m", messages: [], service_tier: "priority" });
+      s.finish({ usage: { promptTokens: 1_000, completionTokens: 1_000, totalTokens: 2_000 } } as never);
+      expect(spent(budget)).toBeCloseTo(2 * (1_000 * 3 + 1_000 * 15) / 1_000_000, 9);
+    });
+
+    it("reserves long-context rates when the bound input can exceed the threshold", () => {
+      const priced = { ...model, pricing: { ...model.pricing!, longContext: { thresholdTokens: 100_000, input: 6, output: 22.5, cacheWrite: 7.5, cacheRead: 0.6 } } } as ResolvedModel;
+      const body = () => ({ model: "m", messages: [{ role: "user", content: "a".repeat(120_000) }] });
+      // Base rates hold ~$0.52; long-context rates ~$1.00.
+      expect(() => scoped(0.8, priced).scope().beforeSend(body())).toThrow(/budget|cap/i);
+      expect(() => scoped(1.2, priced).scope().beforeSend(body())).not.toThrow();
+      // Below the threshold the base rates still apply.
+      expect(() => scoped(0.1, priced).scope().beforeSend({ model: "m", messages: [] })).not.toThrow();
+    });
+  });
 });

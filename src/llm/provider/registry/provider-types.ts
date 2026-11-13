@@ -98,6 +98,15 @@ export type UserModelConfigEntry = {
     output: number;
     cacheRead?: number;
     cacheWrite?: number;
+    /** Long-context and service-tier modifiers; see `UserModelEntry.pricing` in llm-config.ts. */
+    longContext?: {
+      thresholdTokens: number;
+      input: number;
+      output: number;
+      cacheRead?: number;
+      cacheWrite?: number;
+    };
+    serviceTierMultipliers?: Record<string, number>;
   };
   /** Per-model wire parameters; see `UserModelEntry.params`. */
   params?: Record<string, unknown>;
