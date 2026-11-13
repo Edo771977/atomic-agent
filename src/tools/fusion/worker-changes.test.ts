@@ -98,6 +98,19 @@ describe("changed paths from the worker's tool events", () => {
     expect(presentChangedPaths(changes)).toEqual(["final.js", "data.csv", "big.json"]);
   });
 
+  it("moves the changed files under a moved directory with it", () => {
+    const log = new FileChangeLog("/w");
+    log.observe({ tool: "os.fs.write", status: "ok", summary: "", truncated: false, details: { path: "/w/lib/a.ts", existed: false, addedLines: 2, removedLines: 0 } });
+    log.observe({ tool: "os.fs.edit", status: "ok", summary: "", truncated: false, details: { path: "/w/lib/b.ts", addedLines: 1, removedLines: 0 } });
+    log.observe({ tool: "os.fs.edit", status: "ok", summary: "", truncated: false, details: { path: "/w/library.ts", addedLines: 1, removedLines: 1 } });
+    log.observe({ tool: "os.fs.move", status: "ok", summary: "", truncated: false, details: { moves: [{ from: "/w/lib", to: "/w/src" }] } });
+    const changes = log.list();
+    expect(describeChanges(changes)).toBe(
+      "changed: library.ts (+1/-1), src/a.ts (new, +2), src/b.ts (+1/-0, moved from lib/b.ts), src (moved from lib)",
+    );
+    expect(presentChangedPaths(changes)).not.toContain("lib/a.ts");
+  });
+
   it("names at most CHANGED_PATHS_SHOWN paths, then how many more", () => {
     const log = new FileChangeLog("/w");
     for (let i = 0; i < CHANGED_PATHS_SHOWN + 3; i += 1) {

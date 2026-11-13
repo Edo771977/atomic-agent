@@ -1,4 +1,4 @@
-import { isAbsolute, relative, resolve } from "node:path";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 
 import type { CompressedToolResult } from "../../compressor/result-compressor.js";
 
@@ -118,18 +118,18 @@ export class FileChangeLog {
           const to = stringOf((raw as Record<string, unknown>).to);
           if (from === undefined || to === undefined) continue;
           const fromKey = this.key(from);
+          const toKey = this.key(to);
+          // A moved directory takes the changed files under it along:
+          // each is re-keyed under the new path, as its own move.
+          for (const [key, child] of [...this.entries]) {
+            const rest = underDirectory(key, fromKey);
+            if (rest === undefined) continue;
+            this.entries.delete(key);
+            this.entries.set(`${toKey}${rest}`, movedEntry(child, key));
+          }
           const prior = this.entries.get(fromKey);
           this.entries.delete(fromKey);
-          // A file this worker created and then renamed is still new;
-          // one it found and moved keeps where it came from.
-          this.entries.set(this.key(to), {
-            kind: prior?.kind ?? "modified",
-            added: prior?.added ?? 0,
-            removed: prior?.removed ?? 0,
-            ...(prior?.kind === "new"
-              ? {}
-              : { movedFrom: prior?.movedFrom ?? fromKey }),
-          });
+          this.entries.set(toKey, movedEntry(prior, fromKey));
         }
         return;
       }
@@ -199,6 +199,27 @@ function ranUntrackedWriter(result: CompressedToolResult): boolean {
   if (!UNTRACKED_WRITE_TOOLS.has(result.tool)) return false;
   if (result.status === "ok") return true;
   return result.tool === "os.shell.run" && ("exitCode" in d || d.detached === true);
+}
+
+/**
+ * A path's entry after a move from `fromKey`. A file this worker
+ * created and then renamed is still new; one it found and moved keeps
+ * where it came from (its first place, over several moves).
+ */
+function movedEntry(prior: Entry | undefined, fromKey: string): Entry {
+  return {
+    kind: prior?.kind ?? "modified",
+    added: prior?.added ?? 0,
+    removed: prior?.removed ?? 0,
+    ...(prior?.kind === "new" ? {} : { movedFrom: prior?.movedFrom ?? fromKey }),
+  };
+}
+
+/** `key`'s remainder (`/a.ts`) when it lies under directory `dir`, else `undefined`. */
+function underDirectory(key: string, dir: string): string | undefined {
+  if (key.length <= dir.length || !key.startsWith(dir)) return undefined;
+  const next = key[dir.length];
+  return next === "/" || next === sep ? key.slice(dir.length) : undefined;
 }
 
 /** Two rows' changes as one (a split task's parent and its children). */
