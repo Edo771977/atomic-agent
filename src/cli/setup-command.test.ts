@@ -306,6 +306,21 @@ describe("atomic-agent setup fusion", () => {
     });
   });
 
+  it("--budget sets the turn cap, 0 turns it off, and a bad value is a usage error", async () => {
+    seed();
+    const h = harness();
+    expect(await setupCommand(["fusion", "--yes", "--budget", "2.5"], h.deps)).toBe(0);
+    expect(fileJson().llm.runMode?.fusion?.turnBudgetUsd).toBe(2.5);
+    expect(h.out()).toMatch(/once a turn has spent \$2\.5/);
+    const off = harness();
+    expect(await setupCommand(["fusion", "--yes", "--budget", "0"], off.deps)).toBe(0);
+    expect(fileJson().llm.runMode?.fusion?.turnBudgetUsd).toBe(0);
+    expect(off.out()).toMatch(/turnBudgetUsd\s+2\.5 → 0/);
+    for (const bad of [["--budget"], ["--budget", "-1"], ["--budget", "abc"], ["--budget", "1e9"]]) {
+      expect(await setupCommand(["fusion", "--yes", ...bad], harness().deps)).toBe(2);
+    }
+  });
+
   it("usage errors exit 2", async () => {
     expect(await setupCommand([], harness().deps)).toBe(2);
     expect(await setupCommand(["nope"], harness().deps)).toBe(2);

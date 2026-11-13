@@ -393,12 +393,27 @@ function pickWorker(facts: FusionSetupFacts): { leg: FusionSetupLeg } | { proble
   };
 }
 
+const BUDGET_COMMAND = "atomic-agent setup fusion --budget <usd>";
+
+/** What the turn spend cap does, and how to change it (`config set` cannot reach the fusion block). */
+function turnBudgetTip(usd: number | undefined): string {
+  if (usd === undefined || usd === 0) {
+    return `turnBudgetUsd ${usd ?? "unset"}: no spend cap on a fusion turn. Set one with: ${BUDGET_COMMAND}`;
+  }
+  return (
+    `turnBudgetUsd ${usd}: once a turn has spent $${usd} (planning and workers), it starts no new delegation or worker ` +
+    `and the orchestrator reports what is done. 0 means no cap. Change it with: ${BUDGET_COMMAND} (--budget 0 for none)`
+  );
+}
+
 /** Opt-ins the person asked for on top of the preset. */
 export interface FusionSetupOptions {
   /** `judge: "on"`. */
   readonly judge?: boolean;
   /** `isolation: "worktree"`. */
   readonly isolation?: boolean;
+  /** `turnBudgetUsd`, set even over a stored value; 0 means no cap. */
+  readonly budgetUsd?: number;
   /** The orchestrator the person picked (a candidate's provider id); default: the planner's first. */
   readonly orchestrator?: string;
 }
@@ -469,9 +484,13 @@ export function planFusionSetup(
   pin("orchestratorProvider", orchestrator.providerId);
   pin("workerProvider", worker.providerId);
   fill("autoReplan", FUSION_SETUP_AUTO_REPLAN);
+  if (options.budgetUsd !== undefined) pin("turnBudgetUsd", options.budgetUsd);
   if (orchestrator.priced) {
     fill("escalation", "advisor");
-    fill("turnBudgetUsd", FUSION_SETUP_TURN_BUDGET_USD);
+    if (options.budgetUsd === undefined) fill("turnBudgetUsd", FUSION_SETUP_TURN_BUDGET_USD);
+    tips.push(turnBudgetTip(fusion.turnBudgetUsd ?? stored.turnBudgetUsd));
+  } else if (options.budgetUsd !== undefined) {
+    tips.push(turnBudgetTip(options.budgetUsd));
   } else {
     if (!isSet("escalation")) {
       tips.push(

@@ -226,6 +226,26 @@ describe("planFusionSetup: defaults", () => {
     expect(plan.tips.join("\n")).not.toMatch(/judge is off/);
   });
 
+  it("the $1 turn cap comes with a tip: what it does, 0 for none, and the command", () => {
+    const plan = planFusionSetup(facts({ providers: [LOCAL, OPENROUTER("present")] }));
+    if (!plan.ok) throw new Error("expected ok");
+    const tip = plan.tips.find((t) => t.startsWith("turnBudgetUsd"));
+    expect(tip).toMatch(/once a turn has spent \$1/);
+    expect(tip).toMatch(/no new delegation or worker/);
+    expect(tip).toMatch(/reports what is done/);
+    expect(tip).toMatch(/0 means no cap/);
+    expect(tip).toMatch(/atomic-agent setup fusion --budget <usd>/);
+  });
+
+  it("budgetUsd pins the cap, over a stored value and on 0 too", () => {
+    const f = facts({ providers: [LOCAL, OPENROUTER("present")], runMode: { fusion: { turnBudgetUsd: 5 } } });
+    const plan = planFusionSetup(f, { budgetUsd: 0 });
+    if (!plan.ok) throw new Error("expected ok");
+    expect(plan.write.fusion.turnBudgetUsd).toBe(0);
+    expect(plan.changes).toContainEqual({ key: "llm.runMode.fusion.turnBudgetUsd", from: 5, to: 0 });
+    expect(plan.tips.join("\n")).toMatch(/turnBudgetUsd 0: no spend cap/);
+  });
+
   it("--judge and --isolation opt in through the same write", () => {
     const plan = planFusionSetup(facts({ providers: [LOCAL, OPENROUTER("present")] }), { judge: true, isolation: true });
     if (!plan.ok) throw new Error("expected ok");

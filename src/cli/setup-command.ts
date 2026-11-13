@@ -1,5 +1,6 @@
 import { ConfigValidationError, getUserConfigPath, resolveStateDir } from "../config/index.js";
 import { applyFusionSetupInConfig } from "../config/fusion-setup-commands.js";
+import { FUSION_TURN_BUDGET_USD_MAX } from "../config/llm-run-mode-config.js";
 import {
   planFusionSetup,
   type FusionSetupChange,
@@ -21,7 +22,7 @@ import { createSetupPrompter, type SetupPrompter, type SetupTerminal } from "./s
  */
 const HELP = [
   "Usage: atomic-agent setup fusion [--yes] [--dry-run] [--judge] [--isolation]",
-  "                                 [--orchestrator <provider-id>]",
+  "                                 [--orchestrator <provider-id>] [--budget <usd>]",
   "",
   "Sets up Fusion: a strong model orchestrates (a cloud provider with a key, or",
   "your signed-in Claude Code subscription) and the local model runs the workers.",
@@ -34,6 +35,10 @@ const HELP = [
   "  --isolation  Also give each worker task its own workspace (worktree)",
   "  --orchestrator <provider-id>",
   "               Orchestrate with this ready provider instead of the suggested one",
+  "  --budget <usd>",
+  "               Spend cap per fusion turn (default 1 on a per-token orchestrator):",
+  "               once reached, no new delegation or worker starts and the",
+  "               orchestrator reports what is done. 0 means no cap",
 ].join("\n");
 
 export interface SetupCommandDeps {
@@ -171,6 +176,7 @@ async function runSetupFusion(
   let judge = false;
   let isolation = false;
   let orchestrator: string | undefined;
+  let budgetUsd: number | undefined;
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
     if (a === "--yes" || a === "-y") yes = true;
@@ -181,6 +187,15 @@ async function runSetupFusion(
       const v = args[++i];
       if (!v || v.startsWith("-")) { write(`--orchestrator needs a provider id\n\n${HELP}\n`); return 2; }
       orchestrator = v;
+    }
+    else if (a === "--budget") {
+      const v = args[++i];
+      const n = v === undefined || v.trim() === "" ? Number.NaN : Number(v);
+      if (!Number.isFinite(n) || n < 0 || n > FUSION_TURN_BUDGET_USD_MAX) {
+        write(`--budget needs a dollar amount from 0 to ${FUSION_TURN_BUDGET_USD_MAX} (0 = no cap)\n\n${HELP}\n`);
+        return 2;
+      }
+      budgetUsd = n;
     }
     else if (a === "-h" || a === "--help") { write(`${HELP}\n`); return 0; }
     else { write(`unknown option "${a}"\n\n${HELP}\n`); return 2; }
@@ -195,11 +210,12 @@ async function runSetupFusion(
     write(`${err.message}\n\nFix or move ${configPath}, then run this again. Nothing was written.\n`);
     return 1;
   }
-  let plan = planFusionSetup(facts, { judge, isolation, ...(orchestrator ? { orchestrator } : {}) });
+  const opts = { judge, isolation, ...(budgetUsd === undefined ? {} : { budgetUsd }) };
+  let plan = planFusionSetup(facts, { ...opts, ...(orchestrator ? { orchestrator } : {}) });
   if (plan.ok && plan.candidates.length > 1 && !yes && !dryRun && orchestrator === undefined && prompter.isTerminal) {
     const picked = await pickOrchestrator(plan.candidates, prompter, write);
     if (picked !== null && picked !== plan.orchestrator.providerId) {
-      plan = planFusionSetup(facts, { judge, isolation, orchestrator: picked });
+      plan = planFusionSetup(facts, { ...opts, orchestrator: picked });
     }
     write("\n");
   }
