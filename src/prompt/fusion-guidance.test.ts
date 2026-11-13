@@ -265,8 +265,13 @@ describe("the machine facts in the ### fusion block", () => {
     // Never "do it yourself": the orchestrator's mutations are refused.
     expect(FUSION_GUIDANCE).not.toMatch(/yourself/);
     expect(FUSION_GUIDANCE).toContain("independent parts");
-    // And to check a fan-out before accepting it, with the tools that can.
-    expect(FUSION_GUIDANCE).toContain("`verify.syntax` on the declared files");
+    // And to check a fan-out before accepting it, but only what the
+    // delegate's own contract checks and syntax pass left uncovered:
+    // a re-run of `verify.syntax` is a strong step for nothing.
+    expect(FUSION_GUIDANCE).toContain(
+      "Re-verify only what contract checks and the syntax pass did not cover",
+    );
+    expect(FUSION_GUIDANCE).not.toContain("`verify.syntax` on the declared files");
     expect(FUSION_GUIDANCE).toContain("`verify.run` on what the request must do");
     expect(FUSION_GUIDANCE).toMatch(/only makes sense with this conversation/i);
     // And the width is stated as the model's own call.

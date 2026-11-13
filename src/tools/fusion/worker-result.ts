@@ -19,6 +19,7 @@ import {
 import type { JudgeSummary } from "./judge.js";
 import { CHECK_OUTPUT_CHARS, tailClip } from "./contract-checks.js";
 import { describeChanges, FileChangeLog, type FileChange } from "./worker-changes.js";
+import { describeSyntax, type TaskSyntaxSummary } from "./syntax-pass.js";
 
 /**
  * The note on a task a worker could not finish because a step needs the
@@ -220,6 +221,12 @@ export interface WorkerTaskResult {
    * block's `changed:` line; absent when the file tools changed nothing.
    */
   changes?: FileChange[];
+  /**
+   * The delegate's own syntax pass over this row's changed (else
+   * declared) files (`syntax-pass.ts`), when it ran. A failure is also
+   * the row's `error` and made it `failed`.
+   */
+  syntax?: TaskSyntaxSummary;
 }
 
 export interface TaskCheckSummary {
@@ -1115,6 +1122,7 @@ function renderStatusTable(
       ...(r.checks
         ? [describeChecks(r.checks, TABLE_DETAIL_CHARS, r.error)]
         : []),
+      ...syntaxClause(r),
       ...(r.notes ?? []).map((note) => oneLine(note, TABLE_DETAIL_CHARS)),
     ].join(" — "),
   );
@@ -1124,6 +1132,12 @@ function renderStatusTable(
     ...lines,
     ...(clock === null ? [] : [clock]),
   ].join("\n");
+}
+
+function syntaxClause(r: WorkerTaskResult): string[] {
+  if (r.syntax === undefined) return [];
+  const clause = describeSyntax(r.syntax, r.error);
+  return clause === null ? [] : [oneLine(clause, TABLE_DETAIL_CHARS)];
 }
 
 function oneLine(text: string, cap: number): string {
@@ -1161,6 +1175,9 @@ function renderBlock(
     ...(result.checks?.output !== undefined && outputCap > 40
       ? [`check output:\n${tailClip(result.checks.output, outputCap)}`]
       : []),
+    ...(result.syntax?.output === undefined
+      ? []
+      : [`syntax output:\n${result.syntax.output}`]),
     ...(result.notes ?? []).map((note) => `note: ${note}`),
   ];
   const used = [head, ...diagnosis].join("\n").length;

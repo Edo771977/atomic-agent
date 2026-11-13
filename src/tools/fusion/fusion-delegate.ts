@@ -99,6 +99,7 @@ import {
   type WorkerPricing,
   type WorkerTaskResult,
 } from "./worker-result.js";
+import { runSyntaxPass, type SyntaxCheckRunner } from "./syntax-pass.js";
 
 export const FUSION_DELEGATE_TOOL = "fusion.delegate";
 
@@ -118,6 +119,12 @@ export interface FusionDelegateDeps extends WorkerRunnerDeps {
   warmWorkerBackend: (providerId: string) => Promise<void>;
   /** Budget for the rendered result block. */
   outputCharCap: number;
+  /**
+   * `verify.syntax`'s checker (`verifySyntax`), which the delegate runs
+   * itself on every green row's changed files after the waves
+   * (`syntax-pass.ts`). Absent, no pass runs and no row claims one.
+   */
+  syntaxCheck?: SyntaxCheckRunner;
   logger: StructuredLogger;
   /**
    * The operator's request behind the turn now running on `sessionId`
@@ -1385,7 +1392,28 @@ export function buildFusionDelegateTool(
         };
         return out;
       };
-      results = await evaluateContract(results, results);
+      // The delegate's own syntax pass (`syntax-pass.ts`): the green
+      // rows' changed files through `verify.syntax`'s checker, inside the
+      // session's read scope, before the judge and the head line see
+      // them. A failure demotes the row as a failed check does.
+      const syntaxRoots = [
+        ctx.workingDir,
+        ...(ctx.readRoots ?? []),
+        ...writeScope,
+      ];
+      const syntaxPass = (
+        rows: readonly WorkerTaskResult[],
+      ): Promise<WorkerTaskResult[]> =>
+        runSyntaxPass(rows, parsed.tasks, {
+          runner: deps.syntaxCheck,
+          workingDir: ctx.workingDir,
+          roots: syntaxRoots,
+          signal: ctx.signal,
+          ...(deps.knownSecrets === undefined
+            ? {}
+            : { knownSecrets: deps.knownSecrets() }),
+        });
+      results = await syntaxPass(await evaluateContract(results, results));
 
       // The judge (ATO-944): a task closes on a green acceptance list, a
       // red list is re-run once with the findings, and a list still red
@@ -1480,9 +1508,11 @@ export function buildFusionDelegateTool(
           const merged = results.map(
             (r) => retried.find((x) => x.id === r.id) ?? r,
           );
-          const evaluated = await evaluateContract(
-            merged.filter((r) => retryIds.has(r.id)),
-            merged,
+          const evaluated = await syntaxPass(
+            await evaluateContract(
+              merged.filter((r) => retryIds.has(r.id)),
+              merged,
+            ),
           );
           results = merged.map(
             (r) => evaluated.find((x) => x.id === r.id) ?? r,

@@ -2060,3 +2060,94 @@ describe("fusion.delegate — task size on a local leg", () => {
     expect(result.summary).not.toContain("for a local worker");
   });
 });
+
+describe("fusion.delegate — the delegate's own syntax pass", () => {
+  function writeEvent(path: string) {
+    return {
+      type: "llm_event" as const,
+      event: {
+        type: "tool_call_executed" as const,
+        result: {
+          tool: "os.fs.write",
+          status: "ok" as const,
+          summary: `wrote ${path}`,
+          details: { path, existed: false, addedLines: 1, removedLines: 0 },
+          truncated: false,
+        },
+        batchIndex: 0,
+        batchSize: 1,
+      },
+    };
+  }
+
+  it("checks each green row's changed files, renders the verdict and demotes a failure", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "fusion-delegate-syntax-"));
+    try {
+      const syntaxCheck = vi.fn<NonNullable<FusionDelegateDeps["syntaxCheck"]>>(
+        async (files) => ({
+          results: files.map((file) =>
+            file.endsWith("bad.js")
+              ? { file, ok: false, checker: "node --check", error: "SyntaxError: Unexpected token '='" }
+              : { file, ok: true, checker: "node --check" },
+          ),
+        }),
+      );
+      const tool = buildFusionDelegateTool(
+        deps({
+          workingDir: dir,
+          syntaxCheck,
+          runTurn: async (session, _message, options) => {
+            const name = session.id.endsWith("1") ? "good.js" : "bad.js";
+            const path = join(dir, name);
+            writeFileSync(path, "x\n");
+            options.eventHook?.(writeEvent(path));
+            options.eventHook?.({
+              type: "llm_event",
+              event: {
+                type: "assistant_reply",
+                text: `STATUS: done\nwrote ${name}\n${"detail ".repeat(50)}`,
+              },
+            });
+            return turnResult();
+          },
+        }),
+      );
+      const result = await tool.run(
+        {
+          tasks: [
+            { id: "t1", title: "Good", instructions: "write good.js", files: ["good.js"] },
+            { id: "t2", title: "Bad", instructions: "write bad.js", files: ["bad.js"] },
+          ],
+        },
+        ctx({ workingDir: dir }),
+      );
+      // One run for the fan-out, on the files the workers wrote.
+      expect(syntaxCheck).toHaveBeenCalledTimes(1);
+      expect(syntaxCheck.mock.calls[0]![0]).toEqual([
+        join(dir, "good.js"),
+        join(dir, "bad.js"),
+      ]);
+      const rows = result.details.tasks as WorkerTaskResult[];
+      expect(rows.map((r) => r.status)).toEqual(["ok", "failed"]);
+      const lines = result.summary.split("\n");
+      expect(lines[0]).toBe("2 tasks: 1 ok, 1 failed");
+      expect(lines[1]).toBe("- [t1] ok — Good — syntax ok (1 file)");
+      expect(lines[2]).toBe(
+        "- [t2] failed — Bad — error: syntax: 1 file failed (bad.js)",
+      );
+      expect(result.summary).toContain(
+        "syntax output:\nbad.js: SyntaxError: Unexpected token '='",
+      );
+      // The runtime's changed line on both; the green row's prose is
+      // cut to its first line, the red row's kept whole.
+      expect(result.summary).toContain("changed: good.js (new, +1)");
+      expect(result.summary).toContain("changed: bad.js (new, +1)");
+      expect(result.summary).toContain("reply: STATUS: done …");
+      expect(result.summary.match(/wrote (good|bad)\.js\n/g)).toEqual([
+        "wrote bad.js\n",
+      ]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

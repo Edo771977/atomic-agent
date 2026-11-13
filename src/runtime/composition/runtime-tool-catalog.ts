@@ -24,7 +24,7 @@ import { replyTool } from "../../tools/conversation/index.js";
 import { buildBrowserTools, UserSiteApprovals } from "../../tools/browser/index.js";
 import type { BrowserBackend } from "../../tools/browser/browser-backend.js";
 import { registerOsScreenTools, registerOsTools, type DeclaredInputsRegistry, type ShellJobRegistry, type WebSearchKeyHelp } from "../../tools/os/index.js";
-import { registerVerifyTools, runChecks } from "../../tools/verify/index.js";
+import { registerVerifyTools, runChecks, verifySyntax } from "../../tools/verify/index.js";
 import { registerGithubTools } from "../../tools/github/index.js";
 import { resolveGithubToken } from "../../github/index.js";
 import { registerSkillTools } from "../../tools/skill/index.js";
@@ -843,6 +843,10 @@ export function registerRuntimeFusionAndReadScope(input: {
           signal: ctx.signal,
           config,
         }),
+      // `verify.syntax`'s own checker: the delegate syntax-checks every
+      // green row's changed files itself, so the orchestrator does not
+      // spend a step (and its context) on it after each fan-out.
+      syntaxCheck: (files, dir) => verifySyntax(files, dir),
       // Check output reaches workers outside the registry: masked with
       // the same keys the registry masks tool results with (ATO-1077).
       knownSecrets: () => runtimeKnownSecrets(getConfig()),
