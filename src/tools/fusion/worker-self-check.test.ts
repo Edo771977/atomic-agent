@@ -77,6 +77,24 @@ function say(call: Call, text: string): void {
   call.options.eventHook?.({ type: "llm_event", event: { type: "assistant_reply", text } });
 }
 
+/** One finished step of the worker's that ran `tool` with `args`. */
+function step(call: Call, tool: string, args: Record<string, unknown>, status: "ok" | "error" = "ok"): void {
+  const hook = call.options.eventHook!;
+  hook({ type: "llm_event", event: { type: "tool_call_parsed", call: { tool, args }, batchIndex: 0, batchSize: 1 } });
+  hook({
+    type: "llm_event",
+    event: {
+      type: "tool_call_executed",
+      result: { tool, status, summary: `${tool} ${status}`, details: {}, truncated: false },
+      batchIndex: 0,
+      batchSize: 1,
+    },
+  });
+  hook({ type: "step_finished" } as never);
+}
+
+const OWN_SPEC = { kind: "command", args: ["score.test.js"], cmd: "node" };
+
 const CHECKED: DelegateContract = {
   checks: [
     { task: "t", kind: "command", cmd: "node", args: ["score.test.js"] },
@@ -233,6 +251,10 @@ describe("a worker's self-check before its reply closes the task", () => {
     const [row] = await run;
     expect(calls).toHaveLength(1);
     expect(row!.status).toBe("ok");
+    // The orchestrator learns the self-check gave nothing.
+    expect(row!.notes).toContain(
+      "self-check: its own checks did not finish within 120s, so it was told nothing; only the post-fan-out run judges them",
+    );
   });
 
   it("masks secrets in a failing check's output before the notice reaches the worker", async () => {
@@ -366,6 +388,58 @@ describe("a worker's self-check before its reply closes the task", () => {
         signal: new AbortController().signal,
       });
       expect(runChecks.mock.calls[0]![0]).toHaveLength(2);
+    });
+  });
+
+  describe("a check the worker already ran", () => {
+    const ONLY_OWN: DelegateContract = { checks: [CHECKED.checks![0]!] };
+    const run = async (
+      worker: (call: Call) => void,
+    ): Promise<{ runChecks: ReturnType<typeof vi.fn<ContractCheckRunner>>; calls: Call[] }> => {
+      const runChecks = vi.fn<ContractCheckRunner>(async (specs) => ({
+        ok: false,
+        results: specs.map(() => FAILING),
+      }));
+      const { deps, calls } = harness(dir, (call, i) => {
+        if (i === 0) worker(call);
+        say(call, "done");
+        return {};
+      }, runChecks);
+      await runWorkerTasks(deps, {
+        ...BASE,
+        tasks: [{ id: "t", title: "T", instructions: "x" }],
+        contract: ONLY_OWN,
+        signal: new AbortController().signal,
+      });
+      return { runChecks, calls };
+    };
+
+    it("is not run again when its identical spec passed after the worker's last write", async () => {
+      const { runChecks, calls } = await run((call) => {
+        step(call, "os.fs.write", { path: "score.js", content: "x" });
+        // Same spec, keys in another order.
+        step(call, "verify.run", OWN_SPEC);
+        step(call, "os.fs.read", { path: "score.js" });
+      });
+      expect(runChecks).not.toHaveBeenCalled();
+      expect(calls).toHaveLength(1);
+    });
+
+    it("is run again when the worker wrote after it passed, it failed, or the spec differs", async () => {
+      const writeAfter = await run((call) => {
+        step(call, "verify.run", OWN_SPEC);
+        step(call, "os.fs.edit", { path: "score.js" });
+      });
+      expect(writeAfter.runChecks).toHaveBeenCalledTimes(1);
+      const failed = await run((call) => step(call, "verify.run", OWN_SPEC, "error"));
+      expect(failed.runChecks).toHaveBeenCalledTimes(1);
+      const other = await run((call) => step(call, "verify.run", { ...OWN_SPEC, args: ["other.test.js"] }));
+      expect(other.runChecks).toHaveBeenCalledTimes(1);
+      const shell = await run((call) => {
+        step(call, "verify.run", OWN_SPEC);
+        step(call, "os.shell", { cmd: "sed -i s/a/b/ score.js" });
+      });
+      expect(shell.runChecks).toHaveBeenCalledTimes(1);
     });
   });
 

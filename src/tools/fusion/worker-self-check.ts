@@ -119,6 +119,74 @@ function mentionsAny(text: string, paths: readonly string[]): string | undefined
   return paths.find((path) => mentionsPath(text, path));
 }
 
+/** JSON with object keys sorted, so key order never makes two specs differ. */
+function canonical(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, v]) => v !== undefined)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonical(v)}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+/**
+ * The identity of a check's `verify.run` spec: the contract's entry
+ * without its `task`, or a worker's `verify.run` arguments.
+ */
+export function checkSpecKey(spec: Record<string, unknown>): string {
+  const { task: _task, ...rest } = spec;
+  return canonical(rest);
+}
+
+/** Tools whose call changes nothing the self-check could ask about. */
+const NON_MUTATING_TOOLS: ReadonlySet<string> = new Set(["verify.run", "reply", "finish"]);
+
+/**
+ * Which of its checks a worker has already seen pass on its own work:
+ * a `verify.run` call with the identical spec that succeeded in a step
+ * after the worker's last step that could have changed a file. Any tool
+ * outside `readOnlyTools` counts as a change (a shell command can write
+ * as surely as `os.fs.write`), and a pass in the same step as a change
+ * does not count, since a batch's order is not the order it reads in.
+ * Fed from the worker turn's `tool_call_parsed` / `tool_call_executed`
+ * events, both turns of it.
+ */
+export class WorkerCheckRuns {
+  private readonly passedAt = new Map<string, number>();
+  private lastChangeStep = -1;
+  private readonly parsed = new Map<number, Record<string, unknown>>();
+
+  constructor(private readonly readOnlyTools: ReadonlySet<string>) {}
+
+  parsedCall(tool: string, args: Record<string, unknown>, batchIndex: number): void {
+    if (tool === "verify.run") this.parsed.set(batchIndex, args);
+    else this.parsed.delete(batchIndex);
+  }
+
+  executed(tool: string, status: string, batchIndex: number, step: number): void {
+    if (tool === "verify.run") {
+      const args = this.parsed.get(batchIndex);
+      this.parsed.delete(batchIndex);
+      const key = args === undefined ? undefined : checkSpecKey(args);
+      if (key === undefined) return;
+      if (status === "ok") this.passedAt.set(key, step);
+      else this.passedAt.delete(key);
+      return;
+    }
+    if (!NON_MUTATING_TOOLS.has(tool) && !this.readOnlyTools.has(tool)) {
+      this.lastChangeStep = step;
+    }
+  }
+
+  /** Whether `check` passed after the worker's last change. */
+  passedSinceLastChange(check: ContractCheck): boolean {
+    const at = this.passedAt.get(checkSpecKey(check));
+    return at !== undefined && at > this.lastChangeStep;
+  }
+}
+
 export interface SelfCheckFinding {
   /** Declared paths that do not exist. */
   missing: string[];
@@ -158,7 +226,21 @@ export async function runSelfCheck(input: {
    * output names one is not this worker's to fix and gives no finding.
    */
   concurrentPaths?: readonly string[];
-}): Promise<SelfCheckFinding & { checksNotRun?: string; checksDeferred?: string[] }> {
+  /**
+   * A check the worker's own `verify.run` already passed on its final
+   * state (`WorkerCheckRuns`): running it again tells nobody anything.
+   */
+  alreadyPassed?: (check: ContractCheck) => boolean;
+}): Promise<
+  SelfCheckFinding & {
+    checksNotRun?: string;
+    /** The run was cut at `timeCapMs`: it told the worker nothing. */
+    checksCapped?: true;
+    checksDeferred?: string[];
+    /** Own checks not run because the worker's own run already passed. */
+    checksAlreadyPassed?: number;
+  }
+> {
   const finding: SelfCheckFinding = { missing: [], degenerate: [], failed: [] };
   const files = input.task.files ?? [];
   if (files.length > 0) {
@@ -168,13 +250,24 @@ export async function runSelfCheck(input: {
   }
   const siblings = input.concurrentPaths ?? [];
   const deferred: string[] = [];
+  let alreadyPassed = 0;
   const checks = ownChecks(input.contract, input.task.id).filter((check) => {
     const path = mentionsAny(describeSpec(check), siblings);
     if (path !== undefined) deferred.push(path);
-    return path === undefined;
+    if (path !== undefined) return false;
+    if (input.alreadyPassed?.(check) === true) {
+      alreadyPassed += 1;
+      return false;
+    }
+    return true;
   });
-  const withDeferred = <T extends object>(out: T): T & { checksDeferred?: string[] } =>
-    deferred.length === 0 ? out : { ...out, checksDeferred: [...new Set(deferred)] };
+  const withDeferred = <T extends object>(
+    out: T,
+  ): T & { checksDeferred?: string[]; checksAlreadyPassed?: number } => ({
+    ...out,
+    ...(deferred.length === 0 ? {} : { checksDeferred: [...new Set(deferred)] }),
+    ...(alreadyPassed === 0 ? {} : { checksAlreadyPassed: alreadyPassed }),
+  });
   if (checks.length === 0 || input.runChecks === undefined) return withDeferred(finding);
   if (input.signal.aborted || input.timeCapMs <= 0) {
     return { ...finding, checksNotRun: "no time left" };
@@ -206,7 +299,11 @@ export async function runSelfCheck(input: {
       stopped,
     ]);
     if (run === "cap") {
-      return withDeferred({ ...finding, checksNotRun: `not finished within ${Math.round(input.timeCapMs / 1000)}s` });
+      return withDeferred({
+        ...finding,
+        checksNotRun: `not finished within ${Math.round(input.timeCapMs / 1000)}s`,
+        checksCapped: true as const,
+      });
     }
     if (run === "stopped") return withDeferred({ ...finding, checksNotRun: "the worker was stopped" });
     if (run.checksSkipped !== undefined) return withDeferred({ ...finding, checksNotRun: run.checksSkipped });

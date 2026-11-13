@@ -69,6 +69,7 @@ import {
   SELF_CHECK_MAX_MS,
   SELF_CHECK_MIN_GRACE_STEPS,
   SELF_CHECK_MIN_REMAINING_MS,
+  WorkerCheckRuns,
   concurrentPaths,
   describeSelfCheck,
   hasFindings,
@@ -1200,6 +1201,9 @@ async function runOneTask(
   // Set while the worker fixes what its self-check found: those steps
   // were granted on top of the hand-back rule, not measured against it.
   let inSelfCheckGrace = false;
+  // The worker's own `verify.run` passes, so the self-check does not
+  // run a check a third time that the worker already saw pass.
+  const checkRuns = new WorkerCheckRuns(READ_ONLY_TOOLS);
   const maybeHandBack = (): void => {
     if (declaredFiles === 0 || wroteSomething || handBack.signal.aborted)
       return;
@@ -1483,7 +1487,16 @@ async function runOneTask(
         task.id,
         options.concurrentTaskIds ?? options.tasks.map((t) => t.id),
       ),
+      alreadyPassed: (check) => checkRuns.passedSinceLastChange(check),
     });
+    if (finding.checksCapped === true) {
+      // Said on the row, not only in the log: a check that always runs
+      // past the cap makes the self-check a no-op for this task, and
+      // the orchestrator should know its worker saw nothing.
+      selfCheckNotes.push(
+        `self-check: its own checks did not finish within ${Math.round(Math.min(SELF_CHECK_MAX_MS, remainingMs) / 1000)}s, so it was told nothing; only the post-fan-out run judges them`,
+      );
+    }
     if (finding.checksDeferred !== undefined) {
       deps.logger?.info("fusion: a worker's self-check left checks to the fan-out", {
         taskId: task.id,
@@ -1591,6 +1604,11 @@ async function runOneTask(
           // a batched step, so the dedupe above earns its keep.
           announceStart();
           announceTool(event.event.call.tool);
+          checkRuns.parsedCall(
+            event.event.call.tool,
+            event.event.call.args,
+            event.event.batchIndex,
+          );
           try {
             options.onWorkerTool?.(task.id, event.event.call.tool);
           } catch {
@@ -1647,6 +1665,12 @@ async function runOneTask(
           if (result.status === "ok" && WRITE_TOOLS.has(result.tool)) {
             wroteSomething = true;
           }
+          checkRuns.executed(
+            result.tool,
+            result.status,
+            event.event.batchIndex,
+            stepsFinished,
+          );
           currentFingerprints.push(fingerprintToolOutcome(result.tool, result));
           if (result.status === "ok" && !READ_ONLY_TOOLS.has(result.tool)) {
             currentBusy = true;
