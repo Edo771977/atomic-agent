@@ -1,3 +1,5 @@
+import { classifiableHostOf } from "../url-host.js";
+
 /**
  * Whether an OpenAI-compatible base URL points at a server on this
  * machine or the local network (llama-server, vLLM, LM Studio and the
@@ -8,15 +10,8 @@
  * reject a field they do not know, so they are never treated as local.
  */
 export function isLocalServerUrl(url: string | undefined): boolean {
-  if (!url) return false;
-  let hostname: string;
-  try {
-    hostname = new URL(url).hostname.toLowerCase();
-  } catch {
-    return false;
-  }
-  const host = hostname.replace(/^\[|\]$/g, "").replace(/\.$/, "");
-  if (host.length === 0) return false;
+  const host = classifiableHostOf(url);
+  if (host === null) return false;
   if (host === "localhost" || host.endsWith(".localhost") || host === "::1" || host === "0.0.0.0") return true;
   const v4 = host.split(".");
   if (v4.length === 4 && v4.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255)) {

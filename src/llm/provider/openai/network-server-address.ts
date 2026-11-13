@@ -1,4 +1,5 @@
 import { isLocalProviderUrl } from "../presets/is-local-provider-url.js";
+import { classifiableHostOf } from "../url-host.js";
 import { isLocalServerUrl } from "./local-server-url.js";
 import { normalizeOpenAiBaseUrl } from "./normalize-openai-base-url.js";
 
@@ -24,15 +25,6 @@ import { normalizeOpenAiBaseUrl } from "./normalize-openai-base-url.js";
 
 const SCHEME = /^[a-z][a-z0-9+.-]*:\/\//i;
 
-/** Hostname of `url` without IPv6 brackets, lower-cased; `null` when unparsable. */
-function hostnameOf(url: string): string | null {
-  try {
-    return new URL(url).hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  } catch {
-    return null;
-  }
-}
-
 /**
  * `true` for a server on the local network that is not this machine:
  * RFC 1918 / link-local / unique-local addresses and `.local`, `.lan`,
@@ -41,7 +33,7 @@ function hostnameOf(url: string): string | null {
  */
 export function isOtherComputerOnNetworkUrl(url: string | undefined): boolean {
   if (!url || !isLocalServerUrl(url) || isLocalProviderUrl(url)) return false;
-  const host = hostnameOf(url);
+  const host = classifiableHostOf(url);
   if (host === null) return false;
   return !host.startsWith("127.") && host !== "::1";
 }
