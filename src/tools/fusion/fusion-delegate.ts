@@ -1283,11 +1283,17 @@ export function buildFusionDelegateTool(
       if (autoReplan > 0) {
         // Rows carried from before a restart (ATO-617) were not run now.
         const carried = new Set(resume?.carried.map((r) => r.id) ?? []);
-        for (const r of results) {
-          if (!(r.error ?? "").startsWith("not started:") && !carried.has(r.id)) {
-            turnBudget.noteAttempt(ctx.sessionId, r.id);
-          }
-        }
+        // One round per family: a split's continuations (`t3.a`, `t3.b`)
+        // count once, on the task they continue.
+        turnBudget.noteRoundAttempts(
+          ctx.sessionId,
+          results
+            .filter(
+              (r) =>
+                !(r.error ?? "").startsWith("not started:") && !carried.has(r.id),
+            )
+            .map((r) => r.id),
+        );
       }
       // What the failure breakers saw (ATO-1406): remembered for the
       // rest of the turn, so the next round on a broken leg is refused.
@@ -1522,6 +1528,7 @@ export function buildFusionDelegateTool(
               results.filter((r) => !awaitingYes.has(r.id)),
               (id) => turnBudget.attempts(ctx.sessionId, id),
               autoReplan,
+              (id) => taskLegs.get(id)?.orchestrator === true,
             )
           : undefined;
       const contractLine =

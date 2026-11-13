@@ -37,8 +37,13 @@ interface TurnState {
   workerUsd: number;
   /** The orchestrator's meter reading when the turn began; spend is the delta. */
   orchestratorBaseUsd: number;
-  /** Task id → how many times it was run this turn (ATO-941's replans). */
+  /**
+   * Task id → how many rounds ran it this turn (ATO-941's replans),
+   * keyed by the family's root: a continuation (`t3.a`) counts on `t3`.
+   */
   attempts: Map<string, number>;
+  /** Continuation id → the root it continues (`continuationRoot`). */
+  family: Map<string, string>;
   /** Delegations started this turn, and the tasks they carried (ATO-1406). */
   rounds: number;
   tasks: number;
@@ -61,6 +66,34 @@ export interface TurnCountStop {
   message: string;
 }
 
+/**
+ * The task a continuation id continues: `t3.a` (or `t3.a.x`) is `t3`'s
+ * once `t3` ran earlier this turn, else the id is its own root. The
+ * longest prefix that ran wins, then its own root, so a split of a
+ * split still counts on the first task.
+ */
+function continuationRoot(
+  state: Pick<TurnState, "attempts" | "family">,
+  taskId: string,
+): string {
+  const known = state.family.get(taskId);
+  if (known !== undefined) return known;
+  if (state.attempts.has(taskId)) return taskId;
+  for (
+    let dot = taskId.lastIndexOf(".");
+    dot > 0;
+    dot = taskId.lastIndexOf(".", dot - 1)
+  ) {
+    if (dot === taskId.length - 1) continue;
+    const prefix = taskId.slice(0, dot);
+    const root =
+      state.family.get(prefix) ??
+      (state.attempts.has(prefix) ? prefix : undefined);
+    if (root !== undefined) return root;
+  }
+  return taskId;
+}
+
 export class FusionTurnBudget {
   private readonly turns = new Map<string, TurnState>();
 
@@ -77,6 +110,7 @@ export class FusionTurnBudget {
       workerUsd: 0,
       orchestratorBaseUsd,
       attempts: new Map(),
+      family: new Map(),
       rounds: 0,
       tasks: 0,
       trips: [],
@@ -93,6 +127,7 @@ export class FusionTurnBudget {
         workerUsd: 0,
         orchestratorBaseUsd: 0,
         attempts: new Map(),
+        family: new Map(),
         rounds: 0,
         tasks: 0,
         trips: [],
@@ -109,14 +144,37 @@ export class FusionTurnBudget {
 
   /** Count one run of `taskId` this turn; returns the count so far. */
   noteAttempt(sessionId: string, taskId: string): number {
-    const attempts = this.turn(sessionId).attempts;
-    const count = (attempts.get(taskId) ?? 0) + 1;
-    attempts.set(taskId, count);
-    return count;
+    this.noteRoundAttempts(sessionId, [taskId]);
+    return this.attempts(sessionId, taskId);
   }
 
+  /**
+   * Count one round's runs: each family the round ran is one attempt,
+   * however many of its members ran. A replan may split a failed `t3`
+   * into `t3.a` and `t3.b`; the split is one more attempt at `t3`, and
+   * the children share its remaining replans, so splitting can neither
+   * spend two replans at once nor mint fresh ones. Families are read
+   * before anything is counted, so a task and a continuation of it that
+   * are both new this round stay two families (nothing ran yet).
+   */
+  noteRoundAttempts(sessionId: string, taskIds: readonly string[]): void {
+    const state = this.turn(sessionId);
+    const roots = new Map(
+      taskIds.map((id) => [id, continuationRoot(state, id)] as const),
+    );
+    for (const [id, root] of roots) {
+      if (root !== id) state.family.set(id, root);
+    }
+    for (const root of new Set(roots.values())) {
+      state.attempts.set(root, (state.attempts.get(root) ?? 0) + 1);
+    }
+  }
+
+  /** How many rounds ran `taskId`'s family this turn. */
   attempts(sessionId: string, taskId: string): number {
-    return this.turns.get(sessionId)?.attempts.get(taskId) ?? 0;
+    const state = this.turns.get(sessionId);
+    if (state === undefined) return 0;
+    return state.attempts.get(continuationRoot(state, taskId)) ?? 0;
   }
 
   /** What this turn's delegations so far ran: rounds and tasks. */

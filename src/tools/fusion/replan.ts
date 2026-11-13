@@ -12,6 +12,13 @@ import type { WorkerTaskResult, WorkerTaskStatus } from "./worker-result.js";
  * then holds the planner's next step to `fusion.delegate`
  * (`src/agent/fusion-replan.ts`). A task that used its N replans is
  * listed as exhausted, for the planner to report, not to retry.
+ *
+ * A replan may keep a task's id or split it into continuation ids
+ * (`t3.a`, `t3.b`: the failed id, a dot, a suffix). Continuations count
+ * on the task they continue (`FusionTurnBudget.noteRoundAttempts`): one
+ * attempt per round for the whole family, and they share its replans,
+ * so a split never buys more than the cap. Each pending task carries
+ * the fix its status calls for (`replanFix`).
  */
 
 /** Statuses that leave a task open. `cancelled` only when it was held. */
@@ -33,6 +40,8 @@ export interface ReplanTask {
   why: string;
   /** Replans left after this one is sent back; 0 for an exhausted task. */
   replansLeft: number;
+  /** What the next brief should change, when the status says. */
+  fix?: string;
 }
 
 export interface ReplanReport {
@@ -50,26 +59,60 @@ function isOpen(result: WorkerTaskResult): boolean {
 }
 
 /**
+ * The fix a pending task's status calls for. A task that is still open
+ * after two runs is past what a re-brief fixes on the worker: it goes to
+ * the orchestrator's model, unless it already ran there. Otherwise by
+ * status: out of steps or time is too big, so split it; no change at all
+ * means the brief did not say what to change.
+ */
+export function replanFix(
+  id: string,
+  status: WorkerTaskStatus,
+  attempts: number,
+  ranOnOrchestrator: boolean,
+): string | undefined {
+  if (attempts >= 2 && status !== "cancelled" && !ranOnOrchestrator) {
+    return 'it failed twice on a worker: send it with `model: "orchestrator"`';
+  }
+  if (status === "max_steps" || status === "timeout") {
+    return `split it into smaller tasks, as continuation ids \`${id}.a\`, \`${id}.b\` (they share its replans)`;
+  }
+  if (status === "no_changes") {
+    return "name the file and the exact edit in the brief";
+  }
+  return undefined;
+}
+
+/**
  * Which tasks go back to the planner. `attempts(id)` is how many times
- * the task was run this turn, this call included; a task run `max + 1`
- * times has used every replan.
+ * the task (its continuation family) was run this turn, this call
+ * included; a task run `max + 1` times has used every replan.
+ * `ranOnOrchestrator(id)` says the task already ran on the orchestrator
+ * leg, so its fix is never "send it there".
  */
 export function describeReplan(
   results: readonly WorkerTaskResult[],
   attempts: (taskId: string) => number,
   max: number,
+  ranOnOrchestrator: (taskId: string) => boolean = () => false,
 ): ReplanReport {
   const pending: ReplanTask[] = [];
   const exhausted: ReplanTask[] = [];
   for (const result of results) {
     if (!isOpen(result)) continue;
-    const used = Math.max(0, attempts(result.id) - 1);
+    const runs = attempts(result.id);
+    const used = Math.max(0, runs - 1);
     const left = max - used;
+    const fix =
+      left > 0
+        ? replanFix(result.id, result.status, runs, ranOnOrchestrator(result.id))
+        : undefined;
     const task: ReplanTask = {
       id: result.id,
       status: result.status,
       why: (result.error ?? result.status).replace(/\s+/g, " ").slice(0, 300),
       replansLeft: Math.max(0, left - 1),
+      ...(fix === undefined ? {} : { fix }),
     };
     if (left > 0) pending.push(task);
     else exhausted.push(task);
@@ -82,10 +125,10 @@ export function renderReplanBlock(report: ReplanReport): string {
   if (report.pending.length > 0) {
     parts.push(
       [
-        `REPLAN REQUIRED — these tasks did not close. Your next step must be \`fusion.delegate\` again: rewrite each brief from the facts above (the error, the failed checks, the judge's findings), keep the same task ids, and include anything held for them.`,
+        `REPLAN REQUIRED — these tasks did not close. Your next step must be \`fusion.delegate\` again: rewrite each brief from the facts above (the error, the failed checks, the judge's findings), keep each task's id or split it into continuation ids (\`<id>.a\`, \`<id>.b\`, sharing its replans), and include anything held for them.`,
         ...report.pending.map(
           (t) =>
-            `- ${t.id} (${t.status}): ${t.why} — ${t.replansLeft} more replan${t.replansLeft === 1 ? "" : "s"} after this one`,
+            `- ${t.id} (${t.status}): ${t.why} — ${t.replansLeft} more replan${t.replansLeft === 1 ? "" : "s"} after this one${t.fix === undefined ? "" : `; fix: ${t.fix}`}`,
         ),
       ].join("\n"),
     );
