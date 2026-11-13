@@ -7,10 +7,17 @@ import {
   type LocalModelDef,
   type LocalModelId,
 } from "./models-catalog.js";
+import { GPU_AUTO_MAX_SLOTS } from "../server/context-growth.js";
+import {
+  MAX_AUTO_SLOTS,
+  resolveWorkerSlots,
+  workerSlotFootprint,
+} from "../server/worker-slots.js";
 import {
   recommendWorkerModel,
   recommendedModelFor,
   workerSlotKvGb,
+  workerSlotsByMemory,
 } from "./recommended-model.js";
 
 function def(
@@ -246,7 +253,48 @@ describe("recommendedModelFor (role worker)", () => {
     expect(pick!.why[2]).toBe("catalog rank 1");
     const rated = recommendWorkerModel(64, { parallel: 2 });
     expect(rated!.why[0]).toMatch(/^rated good as a fusion worker: GAIA L1/);
-    expect(rated!.why[1]).toMatch(/^fits 2 worker slots: needs about [\d.]+ GB of 64 GB$/);
+    expect(rated!.why[1]).toMatch(/^fits 2 worker slots: needs about [\d.]+ GB of 64 GB RAM$/);
+  });
+
+  it("counts slots against the GPU budget too, not RAM alone", () => {
+    // 64 GB RAM holds eight worker slots of a 22 GB model; a 32 GB card
+    // holds the weights and about four slots' KV cache beside them.
+    const big = def("big-1", 36, { recommendRank: 1, fileSizeGb: 22.4 });
+    const perSlot = workerSlotKvGb(big);
+    expect(workerSlotsByMemory(big, 64, null)).toBe(1 + Math.floor((64 - 36) / perSlot));
+    const onCard = workerSlotsByMemory(big, 64, 32);
+    expect(onCard).toBe(Math.floor((32 - 22.4) / perSlot));
+    expect(onCard).toBeLessThan(workerSlotsByMemory(big, 64, null));
+    const pinned = recommendWorkerModel(64, { catalog: [big], parallel: 8, gpuBudgetGb: 32 });
+    expect(pinned).toMatchObject({ slots: onCard, slotsWanted: 8 });
+    expect(pinned!.why[1]).toMatch(/fits \d of 8 worker slots in 64 GB RAM \/ 32 GB GPU/);
+    // Never fewer than one: the model was found to fit the card already.
+    expect(workerSlotsByMemory(big, 64, 20)).toBe(1);
+  });
+
+  it("sizes auto as the managed daemon does: memory fit, its slot ceilings, one on the CPU", () => {
+    const small = def("small-1", 8, { recommendRank: 1, fileSizeGb: 2 });
+    const held = workerSlotsByMemory(small, 128, null);
+    expect(held).toBeGreaterThan(MAX_AUTO_SLOTS);
+    const auto = (over: Parameters<typeof recommendWorkerModel>[1]) =>
+      recommendWorkerModel(128, { catalog: [small], ...over });
+    for (const [over, expected] of [
+      [{}, MAX_AUTO_SLOTS],
+      [{ parallel: "auto" as const }, MAX_AUTO_SLOTS],
+      [{ dedicatedGpu: true, gpuBudgetGb: 80 }, GPU_AUTO_MAX_SLOTS],
+      [{ cpuOnly: true }, 1],
+    ] as const) {
+      const pick = auto(over);
+      const daemon = resolveWorkerSlots({
+        contextSize: workerSlotsByMemory(small, 128, over.cpuOnly === true ? null : (over as { gpuBudgetGb?: number }).gpuBudgetGb) * workerSlotFootprint(),
+        cpuOnly: over.cpuOnly === true,
+        ...(over.dedicatedGpu === true ? { maxSlots: GPU_AUTO_MAX_SLOTS } : {}),
+      });
+      expect(pick?.slots, JSON.stringify(over)).toBe(expected);
+      expect(pick?.slots).toBe(daemon);
+      expect(pick?.slotsWanted).toBe(pick?.slots);
+      expect(pick!.why[1]).toMatch(/^auto sizing gives \d worker slots? here/);
+    }
   });
 
   it("treats a malformed rating as unrated and keeps the same eligibility rules", () => {

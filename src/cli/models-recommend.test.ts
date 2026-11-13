@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { decideModelUpgrade, recommendModelTiers } from "../local-llm/catalog/model-upgrade.js";
+import { GPU_AUTO_MAX_SLOTS } from "../local-llm/server/context-growth.js";
 import {
   describeRecommendation,
   describeWorkerRecommendation,
@@ -98,10 +99,23 @@ describe("models recommend --role worker", () => {
     expect(describeRecommendation(snap)).toMatch(/quality\s+gemma-4-26b-a4b/);
   });
 
-  it("follows the configured slot count, and auto keeps the default", () => {
+  it("follows the configured slot count, and sizes auto as the daemon does", () => {
     const machine = { ramGb: 64, gpuBudgetGb: 48, freeDiskGb: 200, cpuOnly: false };
-    expect(workerRecommendation(machine, "auto")?.slotsWanted).toBe(2);
-    expect(workerRecommendation(machine, 4)?.slotsWanted).toBe(4);
+    // A card with memory of its own: the daemon's auto ceiling there.
+    expect(workerRecommendation(machine, "auto", "linux")?.slotsWanted).toBe(GPU_AUTO_MAX_SLOTS);
+    expect(workerRecommendation(machine, 4, "linux")?.slotsWanted).toBe(4);
+    // Unified memory (macOS) is not held to the card's ceiling.
+    expect(workerRecommendation(machine, "auto", "darwin")!.slots).toBeGreaterThan(GPU_AUTO_MAX_SLOTS);
+    expect(workerRecommendation({ ...machine, gpuBudgetGb: null, cpuOnly: true }, "auto")?.slots ?? 1).toBe(1);
+  });
+
+  it("does not promise slots the GPU cannot hold: 64 GB RAM, 32 GB card", () => {
+    const ramOnly = { ramGb: 64, gpuBudgetGb: null, freeDiskGb: 200, cpuOnly: false };
+    const card = { ...ramOnly, gpuBudgetGb: 32 };
+    expect(workerRecommendation(ramOnly, 8, "linux")?.slots).toBe(8);
+    const pick = workerRecommendation(card, 8, "linux");
+    expect(pick?.slots).toBeLessThanOrEqual(4);
+    expect(pick!.why[1]).toMatch(/32 GB GPU/);
   });
 
   it("adds role and worker to the JSON without changing the default fields", () => {

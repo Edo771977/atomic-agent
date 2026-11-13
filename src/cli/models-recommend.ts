@@ -106,15 +106,23 @@ export function readRoleFlag(args: readonly string[]): RecommendRole | null {
 /**
  * The worker pick for this machine: among the models it carries (RAM,
  * GPU share, disk, as for the tiers), with `parallel` worker slots
- * (`localModels.managed.parallel`; `auto` leaves the default).
+ * (`localModels.managed.parallel`; `auto` sizes them as the managed
+ * daemon does). The slots must fit the GPU budget beside the weights as
+ * well as RAM. A GPU off macOS is taken to have memory of its own (the
+ * daemon's lower auto ceiling); this probe cannot tell an integrated
+ * one, which the daemon sizes against RAM.
  */
 export function workerRecommendation(
   machine: MachineForModels,
   parallel: number | "auto",
+  platform: NodeJS.Platform = process.platform,
 ): WorkerModelPick | null {
   return recommendWorkerModel(machine.ramGb, {
     catalog: modelsThisMachineCarries(machine),
-    ...(typeof parallel === "number" ? { parallel } : {}),
+    parallel,
+    gpuBudgetGb: machine.gpuBudgetGb,
+    cpuOnly: machine.cpuOnly,
+    dedicatedGpu: !machine.cpuOnly && machine.gpuBudgetGb !== null && platform !== "darwin",
   });
 }
 
