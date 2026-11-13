@@ -160,7 +160,7 @@ export async function runWithFallback<T>(
         throw err;
       }
       if (
-        chain.isPrimary(currentId) &&
+        chain.isPrimary(currentId, partitionKey) &&
         (isCredentialRejection(err) ||
           isBillingRefusal(err) ||
           isSpendLimitRefusal(err) ||
