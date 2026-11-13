@@ -3,6 +3,7 @@
  * happened, then the output tails — clipped to 4,000 chars, because the
  * whole thing lands in the prompt.
  */
+import { knownSecretsFromEnv, maskSecrets } from "../../error-reporting/secret-detector.js";
 import type { CheckOutcome } from "./verify-checks.js";
 import type { VerifyRunResult } from "./run-verify.js";
 
@@ -37,7 +38,11 @@ function outcomeLine(r: VerifyRunResult): string {
 
 function tailBlock(label: string, tail: string | undefined, budget: number): string[] {
   if (tail === undefined || tail.trim().length === 0 || budget <= 40) return [];
-  const text = tail.length > budget ? `…${tail.slice(-(budget - 1))}` : tail;
+  // Mask before clipping: a key cut at the clip boundary no longer
+  // matches the detector, and its fragment would reach the model even
+  // though the registry masks the summary afterwards.
+  const masked = maskSecrets(tail, knownSecretsFromEnv());
+  const text = masked.length > budget ? `…${masked.slice(-(budget - 1))}` : masked;
   return [`${label}:`, text];
 }
 
