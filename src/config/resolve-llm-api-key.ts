@@ -1,4 +1,5 @@
 import { isOtherComputerOnNetworkUrl } from "../llm/provider/openai/network-server-address.js";
+import { isLoopbackUrl } from "../llm/provider/url-host.js";
 import type { UserLlmProviderEntry } from "./llm-config.js";
 
 /**
@@ -37,16 +38,75 @@ export function resolveLlmProviderApiKey(
     entry.kind === "openai-compatible" ||
     entry.kind === "qwen-openai-compatible"
   ) {
-    // ATO-1066: a server on another computer on this network gets only
-    // its own stored key. The shared variables usually hold the
-    // operator's real OpenAI key, and sending that as a Bearer over
-    // plain http:// to a box on the LAN would leak it.
-    if (isOtherComputerOnNetworkUrl(entry.baseUrl)) return undefined;
-    const key =
-      process.env.OPENAI_COMPAT_API_KEY ??
-      process.env.OPENAI_API_KEY ??
-      process.env.ATOMIC_AGENT_OPENAI_API_KEY;
-    return key && key.length > 0 ? key : undefined;
+    // The shared variables usually hold the operator's real OpenAI key:
+    // never as a Bearer over plain http:// off this machine, nor to
+    // another computer on the network (ATO-1066). An explicit
+    // `apiKeyEnvVar` above, even one naming OPENAI_API_KEY, is the
+    // operator's own choice and is honoured.
+    if (!maySendSharedOpenAiKey(entry.baseUrl)) return undefined;
+    return sharedOpenAiKey()?.value;
   }
   return undefined;
+}
+
+/**
+ * The shared variable that holds a key this entry would use if the shared
+ * key were sent to its endpoint, when it is not (`maySendSharedOpenAiKey`):
+ * an `openai-compatible` entry with no `apiKey` and no `apiKeyEnvVar` of
+ * its own, aimed at plain http:// off this machine or at another computer
+ * on the network. `undefined` otherwise. Readiness checks use it to say why
+ * a set OPENAI_API_KEY does not count for that entry.
+ */
+export function sharedOpenAiKeyNotSent(
+  entry: Pick<UserLlmProviderEntry, "kind" | "baseUrl" | "apiKey" | "apiKeyEnvVar">,
+): string | undefined {
+  if (entry.kind !== "openai-compatible" && entry.kind !== "qwen-openai-compatible") return undefined;
+  if (entry.apiKey || entry.apiKeyEnvVar) return undefined;
+  const shared = sharedOpenAiKey();
+  if (shared === undefined || maySendSharedOpenAiKey(entry.baseUrl)) return undefined;
+  return shared.name;
+}
+
+/** The shared per-kind variables, in the order they are read. */
+const SHARED_OPENAI_KEY_VARS = [
+  "OPENAI_COMPAT_API_KEY",
+  "OPENAI_API_KEY",
+  "ATOMIC_AGENT_OPENAI_API_KEY",
+] as const;
+
+/**
+ * The shared OpenAI-compatible key and the variable it came from, read
+ * with `??` semantics: the first variable that is set wins, even empty
+ * (an empty one means "no key").
+ */
+function sharedOpenAiKey(): { readonly name: string; readonly value: string } | undefined {
+  for (const name of SHARED_OPENAI_KEY_VARS) {
+    const value = process.env[name];
+    if (value === undefined) continue;
+    return value.length > 0 ? { name, value } : undefined;
+  }
+  return undefined;
+}
+
+/**
+ * Whether the shared OPENAI_* key may go to `baseUrl`. Those variables
+ * usually hold the operator's real OpenAI key, so it goes only where it
+ * cannot be read on the way or by the wrong party: an https:// endpoint
+ * (the default endpoint, when no `baseUrl` is set, is https) or plain
+ * http:// to this machine. Plain http:// to any other host (a public IP,
+ * a box on the LAN) and a server on another computer on the network, over
+ * either scheme (ATO-1066), get no shared key; an entry that wants one
+ * there sets `apiKey` or `apiKeyEnvVar`.
+ */
+function maySendSharedOpenAiKey(baseUrl: string | undefined): boolean {
+  if (baseUrl === undefined || baseUrl.trim().length === 0) return true;
+  if (isOtherComputerOnNetworkUrl(baseUrl)) return false;
+  let protocol: string;
+  try {
+    protocol = new URL(baseUrl).protocol;
+  } catch {
+    return false;
+  }
+  if (protocol === "https:") return true;
+  return protocol === "http:" && isLoopbackUrl(baseUrl);
 }
