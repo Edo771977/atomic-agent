@@ -1,4 +1,4 @@
-import { lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
@@ -466,4 +466,24 @@ it("marks a delivered promotion committed before removing its journal and report
     expect(journal.state).toBe("committed");
     expect(journal.steps.map((step: { status: string }) => step.status)).toEqual(["applied"]);
   } finally { await candidate.cleanup(); }
+});
+
+it("keeps promotion backups owner-only while recording the original mode in the journal", async () => {
+  const root = await project();
+  await writeFile(join(root, "secret.env"), "TOKEN=abc\n"); await chmod(join(root, "secret.env"), 0o644);
+  const seen: { folder?: number; backup?: number; recorded?: number } = {};
+  const candidate = await createCandidateIntegration(root, { beforeCommit: async () => {
+    const merge = mergeDir(root); const names = await readdir(merge);
+    const folder = names.find(name => name.endsWith(".promotion-backup"))!;
+    seen.folder = (await stat(join(merge, folder))).mode & 0o777;
+    seen.backup = (await stat(join(merge, folder, "0"))).mode & 0o777;
+    const journal = JSON.parse(await readFile(join(merge, names.find(name => name.endsWith(".promotion.json"))!), "utf8"));
+    seen.recorded = journal.steps[0].original.mode;
+  } });
+  try {
+    await writeFile(join(candidate.dir, "secret.env"), "TOKEN=new\n");
+    expect((await candidate.finish({ rows, contract, signal, runChecks: pass })).status).toBe("promoted");
+  } finally { await candidate.cleanup(); }
+  expect(seen).toEqual({ folder: 0o700, backup: 0o600, recorded: 0o644 });
+  expect((await stat(join(root, "secret.env"))).mode & 0o777).toBe(0o644);
 });

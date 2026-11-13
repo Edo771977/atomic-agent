@@ -399,7 +399,7 @@ export async function createCandidateIntegration(
     };
     const describe = (entry: Entry | undefined, link?: string): JournalEntry | null => entry === undefined ? null
       : { kind: entry.kind, mode: entry.mode, ...(entry.kind === "file" && entry.hash !== undefined ? { sha256: entry.hash } : {}), ...(link === undefined ? {} : { linkTarget: link }) };
-    await mkdir(backups); write();
+    await mkdir(backups, { mode: 0o700 }); await chmod(backups, 0o700); write();
     return {
       journal, file, backups, write,
       async step(path, original, promoted) {
@@ -409,7 +409,10 @@ export async function createCandidateIntegration(
         if (original?.kind === "file") {
           backup = join(`${id}.promotion-backup`, String(index));
           const destination = join(merge, backup);
+          // Pre-images may be secrets: owner-only, whatever the source mode
+          // (recorded in `original.mode`). The folder is owner-only too.
           await copyFile(join(set.baseDir, path), destination);
+          await chmod(destination, 0o600);
           const handle = await open(destination, "r+");
           try { await handle.sync().catch((err: NodeJS.ErrnoException) => { if (!["EINVAL", "ENOTSUP", "EOPNOTSUPP"].includes(err.code ?? "")) throw err; }); } finally { await handle.close(); }
           syncDirectoryBestEffort(backups);
