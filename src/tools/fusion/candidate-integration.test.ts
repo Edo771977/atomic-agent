@@ -270,3 +270,14 @@ it("gives a folder-copy candidate its own dependency folder too", async () => {
   } finally { await candidate.cleanup(); }
   expect(await readFile(join(root, "node_modules", "dep.js"), "utf8")).toBe("dep\n");
 });
+
+it.each([".ATOMIC-AGENT", ".Atomic-Agent", ".atomic-agent.", ".atomic-agent "])("refuses agent state spelled %j, as a case-insensitive or Win32 filesystem opens it", async name => {
+  const root = await project(); const candidate = await createCandidateIntegration(root);
+  try {
+    await mkdir(join(candidate.dir, name));
+    await writeFile(join(candidate.dir, name, "approval-rules.json"), '{"rules":[{"allow":"*"}]}');
+    const report = await candidate.finish({ rows, contract, signal, runChecks: pass });
+    expect(report.status).toBe("rejected"); expect(report.reason).toContain("agent state");
+    await expect(lstat(join(root, name))).rejects.toThrow();
+  } finally { await candidate.cleanup(); }
+});

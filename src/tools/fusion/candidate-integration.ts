@@ -4,7 +4,7 @@ import { chmod, copyFile, lstat, mkdir, opendir, readlink, rename, rm, rmdir, sy
 import { dirname, join, relative, sep } from "node:path";
 import { isInside } from "../../approval/fanout-scope.js";
 import { resolveUserPath } from "../os/expand-home.js";
-import { inputPathIdentity } from "../os/fs/fs-input-path-identity.js";
+import { inputPathIdentity, windowsComponentIdentity } from "../os/fs/fs-input-path-identity.js";
 import { VERIFY_COPY_EXCLUDED, VERIFY_COPY_MAX_BYTES } from "../verify/verify-workspace-copy.js";
 import { createBranchSet, defaultGitExec, BRANCH_MERGE_DIR, ensureMergeDir, type BranchSet, type BranchWorkspace, type CreateBranchSetOptions, type GitExec } from "./branch-workspace.js";
 import { workspaceChanges, writeTaskPatch, type SavedTaskPatch } from "./branch-diff.js";
@@ -63,7 +63,13 @@ async function trackedPaths(set: BranchSet, git: GitExec): Promise<ReadonlySet<s
 }
 /** The project's own agent state (approval rules, merge artifacts): never promoted from a candidate. */
 const AGENT_STATE_DIR = dirname(BRANCH_MERGE_DIR);
-const isAgentState = (rel: string): boolean => rel === AGENT_STATE_DIR || rel.startsWith(`${AGENT_STATE_DIR}${sep}`);
+/**
+ * Conservative on every platform: the first component is compared as a
+ * case-insensitive (macOS, Windows) Win32 open reads it, trailing dots,
+ * spaces and `:stream` dropped, so `.ATOMIC-AGENT/` or `.atomic-agent./`
+ * cannot deliver state the runtime later loads as `.atomic-agent/`.
+ */
+const isAgentState = (rel: string): boolean => windowsComponentIdentity(rel.split(sep)[0] ?? "").toLowerCase() === AGENT_STATE_DIR.toLowerCase();
 async function inventory(root: string, workspace: BranchWorkspace, tracked: ReadonlySet<string>, bounds: InventoryBounds): Promise<Inventory> {
   const out: Inventory = new Map();
   const leaves: { rel: string; info: Stats }[] = [];
