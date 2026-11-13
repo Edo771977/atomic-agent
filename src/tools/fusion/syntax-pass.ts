@@ -67,6 +67,14 @@ export const SYNTAX_OUTPUT_CHARS = 600;
 export const TYPE_OUTPUT_CHARS = 300;
 
 /**
+ * The pass's wall-time budget. `verify.syntax` gives tsc 300 s; the
+ * delegate's call must not wait that long for an advisory pass, so at
+ * this budget the checkers are killed and the rows say "not checked"
+ * (no demotion, no pass).
+ */
+export const SYNTAX_PASS_BUDGET_MS = 60_000;
+
+/**
  * The files a row is checked on: what its worker's file tools changed
  * and is still there, and the task's declared files. Both: a shell
  * command writes files the file tools never record, so a row whose
@@ -85,8 +93,11 @@ export function syntaxPassFiles(
 
 /**
  * Run the syntax pass over every `ok` row and fold the verdicts in.
- * Never throws: a checker that throws leaves the rows `ok` with the
- * reason on their `syntax` summary, never a pass it did not make.
+ * Never throws: a checker that throws, or outlasts `budgetMs`
+ * (`SYNTAX_PASS_BUDGET_MS`), leaves the rows `ok` with the reason on
+ * their `syntax` summary, never a pass it did not make. The checkers
+ * run under `signal` and the budget, and are killed at either; a
+ * cancelled delegate gets its rows back as they were, at once.
  * Files outside `roots` (the session's read scope: its working
  * directory, the paths the user named, the fan-out's write scope) are
  * not read; directories and missing paths are skipped (a missing
@@ -101,6 +112,7 @@ export async function runSyntaxPass(
     roots: readonly string[];
     signal: AbortSignal;
     knownSecrets?: readonly KnownSecret[];
+    budgetMs?: number;
   },
 ): Promise<WorkerTaskResult[]> {
   if (options.runner === undefined || options.signal.aborted) return [...rows];
@@ -141,20 +153,47 @@ export async function runSyntaxPass(
   const known = options.knownSecrets ?? knownSecretsFromEnv();
   let verdicts: Map<string, SyntaxFileResult>;
   let failure: string | undefined;
+  const budgetMs = options.budgetMs ?? SYNTAX_PASS_BUDGET_MS;
+  const budget = new AbortController();
+  const signal = AbortSignal.any([options.signal, budget.signal]);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
   try {
     // One run for the whole fan-out: a TypeScript project is checked
-    // once, however many rows touched it.
-    const { results } =
-      queued.length === 0
-        ? { results: [] }
-        : await options.runner(queued, options.workingDir, { typescript: "parse" });
-    verdicts = new Map(queued.map((file, i) => [file, results[i]!]));
+    // once, however many rows touched it. Raced against the signal, so
+    // a runner that does not honour it still cannot hold the call.
+    const stopped = new Promise<"stopped">((resolve) => {
+      onAbort = () => resolve("stopped");
+      signal.addEventListener("abort", onAbort, { once: true });
+      timer = setTimeout(() => budget.abort(), budgetMs);
+    });
+    let outcome: { results: readonly SyntaxFileResult[] } | "stopped" = { results: [] };
+    if (queued.length > 0) {
+      const run = options.runner(queued, options.workingDir, { typescript: "parse", signal });
+      // A run left behind by the race may still reject; nobody waits for it.
+      run.catch(() => {});
+      outcome = await Promise.race([run, stopped]);
+    }
+    if (options.signal.aborted) return [...rows];
+    if (outcome === "stopped" || budget.signal.aborted) {
+      verdicts = new Map();
+      failure = `syntax: not checked, the pass ran out of its ${describeBudget(budgetMs)} budget`;
+    } else {
+      const { results } = outcome;
+      verdicts = new Map(queued.map((file, i) => [file, results[i]!]));
+    }
   } catch (error) {
+    if (options.signal.aborted) return [...rows];
     verdicts = new Map();
     failure = maskSecrets(
       `the syntax pass did not run: ${error instanceof Error ? error.message : String(error)}`,
       known,
     );
+  } finally {
+    clearTimeout(timer);
+    if (onAbort !== undefined) signal.removeEventListener("abort", onAbort);
+    // Kills whatever checker is still running.
+    budget.abort();
   }
   return rows.map((row) => {
     const plan = plans.get(row.id);
@@ -209,6 +248,11 @@ export async function runSyntaxPass(
       error: row.error === undefined ? error : `${error}; ${row.error}`,
     };
   });
+}
+
+/** `60 s`, or `50 ms` under a second. */
+function describeBudget(ms: number): string {
+  return ms < 1000 ? `${ms} ms` : `${Math.round(ms / 1000)} s`;
 }
 
 /** `syntax: 2 files failed (a.ts, b.js)` — the row's error. */

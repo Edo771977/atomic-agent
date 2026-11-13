@@ -100,6 +100,7 @@ const DIAGNOSTIC = /^(.+?)\((\d+),(\d+)\): (error TS(\d+): .*)$/;
 async function checkProject(
   tsconfig: string,
   tsc: string,
+  signal: AbortSignal | undefined,
 ): Promise<ProjectCheck> {
   const projectDir = dirname(tsconfig);
   // An `incremental` (or `composite`) project writes `tsconfig.tsbuildinfo`
@@ -110,14 +111,15 @@ async function checkProject(
   const run = await runChecker(
     tsc,
     ["--noEmit", "-p", tsconfig, "--pretty", "false", "--listFiles", "--incremental", "--tsBuildInfoFile", buildInfo],
-    { cwd: projectDir, timeoutMs: TSC_TIMEOUT_MS },
+    { cwd: projectDir, timeoutMs: TSC_TIMEOUT_MS, ...(signal === undefined ? {} : { signal }) },
   );
   await rm(buildInfo, { force: true });
   if (run.missing) {
     return { ok: false, diagnostics: new Map(), included: new Set(), errorCount: 0, failure: "tsc could not be started" };
   }
   if (run.timedOut) {
-    return { ok: false, diagnostics: new Map(), included: new Set(), errorCount: 0, failure: "tsc timed out" };
+    const failure = run.aborted === true ? "not checked: cancelled" : "tsc timed out";
+    return { ok: false, diagnostics: new Map(), included: new Set(), errorCount: 0, failure };
   }
   const diagnostics = new Map<string, Diagnostic[]>();
   const included = new Set<string>();
@@ -156,6 +158,8 @@ function withoutVerdict(file: string, error: string): SyntaxFileResult {
 export interface TypeScriptCheckOptions {
   /** Fail a file only on its parse diagnostics (`isParseDiagnostic`). */
   readonly parseOnly?: boolean;
+  /** Kills `tsc` when it aborts; the files get no verdict. */
+  readonly signal?: AbortSignal;
 }
 
 /**
@@ -187,7 +191,7 @@ export async function checkTypeScriptFiles(
       }
       continue;
     }
-    const project = await checkProject(tsconfig, tsc);
+    const project = await checkProject(tsconfig, tsc, options.signal);
     for (const entry of group) {
       results.set(entry.absolute, attribute(entry, project, tsconfig, options.parseOnly === true));
     }

@@ -36,6 +36,19 @@ describe("runChecker", () => {
     expect(run.missing).toBe(true);
     expect(run.exitCode).toBeNull();
   });
+
+  it.skipIf(process.platform === "win32")("kills the child when the signal aborts", async () => {
+    const controller = new AbortController();
+    const started = Date.now();
+    const pending = runChecker("sleep", ["30"], { signal: controller.signal });
+    setTimeout(() => controller.abort(), 50);
+    const run = await pending;
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(run).toMatchObject({ aborted: true, timedOut: true, missing: false });
+    // Already aborted: nothing is started.
+    const none = await runChecker("sleep", ["30"], { signal: controller.signal });
+    expect(none).toMatchObject({ aborted: true, exitCode: null });
+  });
 });
 
 describe("checkJavaScriptFile", () => {

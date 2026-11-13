@@ -73,6 +73,15 @@ describe("verifySyntax", () => {
     expect(byFile.get("missing.js")).toMatchObject({ ok: false, error: "no such file" });
     expect(byFile.get("bad.json")?.ok).toBe(false);
   });
+
+  it("checks nothing once its signal has aborted, and passes nothing either", async () => {
+    await writeFile(join(dir, "ok.js"), "var a = 1;\n");
+    const controller = new AbortController();
+    controller.abort();
+    const out = await verifySyntax(["ok.js"], dir, { signal: controller.signal });
+    expect(out.results[0]).toMatchObject({ ok: null, error: "not checked: cancelled" });
+    expect(out.passed).toBe(0);
+  });
 });
 
 describe("verify.syntax tool", () => {

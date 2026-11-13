@@ -228,6 +228,46 @@ describe("runSyntaxPass", () => {
     expect(rendered).toContain("type errors:\na/src/typed.ts: line 1: error TS2");
   }, 60_000);
 
+  it("gives up at its budget without demoting, and aborts the runner's signal", async () => {
+    let seen: AbortSignal | undefined;
+    const runner: SyntaxCheckRunner = (_files, _dir, options) => {
+      seen = options.signal;
+      return new Promise(() => {}); // a checker that never answers
+    };
+    const started = Date.now();
+    const [out] = await runSyntaxPass(
+      [row({ changes: [{ path: "bad.js", kind: "new" }] })],
+      [{ id: "t1", title: "Task", instructions: "x" }],
+      { runner, workingDir: dir, roots: [dir], signal, budgetMs: 50 },
+    );
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(out!.status).toBe("ok");
+    expect(out!.syntax).toMatchObject({ checked: 0, unchecked: 1 });
+    expect(describeSyntax(out!.syntax!)).toBe(
+      "syntax: not checked, the pass ran out of its 50 ms budget",
+    );
+    expect(seen?.aborted).toBe(true);
+  });
+
+  it("returns at once when the delegate is cancelled mid-pass, claiming nothing", async () => {
+    const controller = new AbortController();
+    let seen: AbortSignal | undefined;
+    const runner: SyntaxCheckRunner = (_files, _dir, options) => {
+      seen = options.signal;
+      setTimeout(() => controller.abort(), 20);
+      return new Promise(() => {});
+    };
+    const rows = [row({ changes: [{ path: "bad.js", kind: "new" }] })];
+    const out = await runSyntaxPass(rows, [{ id: "t1", title: "Task", instructions: "x" }], {
+      runner,
+      workingDir: dir,
+      roots: [dir],
+      signal: controller.signal,
+    });
+    expect(out).toEqual(rows);
+    expect(seen?.aborted).toBe(true);
+  });
+
   it("does nothing without a runner", async () => {
     const rows = [row({ changes: [{ path: "bad.js", kind: "new" }] })];
     expect(
