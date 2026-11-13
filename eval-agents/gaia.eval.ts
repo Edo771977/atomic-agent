@@ -15,7 +15,9 @@ import { runGaiaCase } from "./harness/run-gaia-case.js";
 
 const HERE = fileURLToPath(new URL(".", import.meta.url));
 const TIMESTAMP = new Date().toISOString().replace(/[:.]/g, "-");
-const REPORT_DIR = resolve(HERE, "reports", `run-${TIMESTAMP}`);
+const REPORT_DIR = process.env.ATOMIC_AGENT_GAIA_REPORT_DIR
+  ? resolve(process.env.ATOMIC_AGENT_GAIA_REPORT_DIR)
+  : resolve(HERE, "reports", `run-${TIMESTAMP}`);
 const CSV_PATH = resolve(REPORT_DIR, "matrix.csv");
 const JSONL_PATH = resolve(REPORT_DIR, "matrix.jsonl");
 const TRACES_DIR = resolve(REPORT_DIR, "traces");
@@ -62,20 +64,23 @@ beforeAll(async () => {
   }
 });
 
-afterAll(() => {
-  // reports are persisted under REPORT_DIR
-});
-
 describe("GAIA multi-agent matrix", () => {
   const rows = loadRows();
   const adapters = listAgentAdapters(parseAgentFilter());
+  const campaign = { selected: rows.length * adapters.length, executed: 0, skipped: 0 };
+
+  afterAll(() => {
+    writeFileSync(resolve(REPORT_DIR, "campaign.json"), `${JSON.stringify(campaign, null, 2)}\n`, "utf8");
+    console.error(`[GAIA campaign] selected=${campaign.selected} executed=${campaign.executed} skipped=${campaign.skipped}`);
+    if (campaign.selected > 0) {
+      expect(campaign.executed, "no GAIA agent cases executed; all selected cases were skipped or filtered out").toBeGreaterThan(0);
+    }
+  });
 
   if (rows.length === 0 || adapters.length === 0) {
     test("matrix is empty (no rows or no adapters selected)", () => {
-      // Guard so an empty filter/dataset does not surface as a vitest
-      // "no test found" hard failure in the orchestrators.
-      expect.soft(rows.length, "no GAIA rows loaded").toBeGreaterThanOrEqual(0);
-      expect.soft(adapters.length, "no adapters selected").toBeGreaterThanOrEqual(0);
+      expect.soft(rows.length, "no GAIA rows selected; check dataset and task filters").toBeGreaterThan(0);
+      expect.soft(adapters.length, "no agent adapters selected; check ATOMIC_AGENT_EVAL_AGENTS").toBeGreaterThan(0);
     });
   }
 
@@ -83,7 +88,7 @@ describe("GAIA multi-agent matrix", () => {
     describe(adapter.label, () => {
       for (const row of rows) {
         const title = `[L${row.Level}] ${row.task_id}`;
-        test(title, async () => {
+        test(title, async (context) => {
           if (!chatUrl) {
             expect.fail("ATOMIC_AGENT_EVAL_LLAMA_URL is required for agent runs");
           }
@@ -102,9 +107,11 @@ describe("GAIA multi-agent matrix", () => {
           appendJsonlRow(JSONL_PATH, row, result);
 
           if (result.skipped) {
-            expect.soft(result.skipReason).toBeTruthy();
-            return;
+            campaign.skipped += 1;
+            expect(result.skipReason, "skipped cases must report a reason").toBeTruthy();
+            context.skip();
           }
+          campaign.executed += 1;
 
           expect.soft(result.error, result.error ?? "no error").toBeNull();
           expect(result.correct, `extracted=${result.extractedAnswer} gold=${row["Final answer"]}`).toBe(
@@ -114,14 +121,4 @@ describe("GAIA multi-agent matrix", () => {
       }
     });
   }
-});
-
-describe("GAIA smoke (scoring only)", () => {
-  test("questionScorer smoke fixtures are self-consistent", async () => {
-    const { questionScorer } = await import("./harness/score-gaia.js");
-    const rows = loadGaiaRows({ source: "fixtures" });
-    for (const row of rows) {
-      expect(questionScorer(row["Final answer"], row["Final answer"])).toBe(true);
-    }
-  });
 });
