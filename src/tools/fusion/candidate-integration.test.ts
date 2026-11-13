@@ -1,11 +1,22 @@
 import { lstat, mkdir, mkdtemp, readFile, realpath, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import { createBranchSet } from "./branch-workspace.js";
 import { createCandidateIntegration } from "./candidate-integration.js";
 import type { WorkerTaskResult } from "./worker-result.js";
 import { makeGitRepo, runGitRaw, writeRepoFile } from "../os/git/test-helpers.js";
+
+// Pass-through spy: counts byte reads per absolute path (promotion work bound).
+const reads = vi.hoisted(() => new Map<string, number>());
+vi.mock("node:fs", async importOriginal => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  const createReadStream = ((path: Parameters<typeof actual.createReadStream>[0], ...rest: unknown[]) => {
+    reads.set(String(path), (reads.get(String(path)) ?? 0) + 1);
+    return (actual.createReadStream as (...args: unknown[]) => unknown)(path, ...rest);
+  }) as typeof actual.createReadStream;
+  return { ...actual, default: { ...actual, createReadStream }, createReadStream };
+});
 
 const roots: string[] = [];
 afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
@@ -325,5 +336,24 @@ it("promotes but reports new ignored paths it kept private", async () => {
     const report = await candidate.finish({ rows, contract, signal, runChecks: pass });
     expect(report.status).toBe("promoted"); expect(report.changes).toEqual(["a.txt"]);
     expect(report.ignoredChanges).toEqual(["out", "run.log"]);
+  } finally { await candidate.cleanup(); }
+});
+
+it("verifies only the paths it promotes instead of re-hashing the untouched original tree per step", async () => {
+  const root = await project();
+  for (let i = 0; i < 30; i += 1) await writeFile(join(root, `keep-${i}.txt`), `untouched ${i}\n`);
+  const candidate = await createCandidateIntegration(root);
+  try {
+    for (let i = 0; i < 6; i += 1) await writeFile(join(candidate.dir, `new-${i}.txt`), `new ${i}\n`);
+    await writeFile(join(candidate.dir, "api.json"), '{"name":"after"}');
+    reads.clear();
+    const report = await candidate.finish({ rows, contract, signal, runChecks: async () => ({ ok: true, results: [{ ok: true }] }) });
+    expect(report.status).toBe("promoted");
+    // One full inventory of the original confirms it still matches the
+    // snapshot; per-step and final checks touch only the promoted paths.
+    const untouched = [...reads].filter(([path]) => path.startsWith(join(root, "keep-")));
+    expect(untouched.length).toBe(30);
+    expect(Math.max(...untouched.map(([, n]) => n))).toBe(1);
+    expect(await readFile(join(root, "new-5.txt"), "utf8")).toBe("new 5\n");
   } finally { await candidate.cleanup(); }
 });

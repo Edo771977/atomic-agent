@@ -173,6 +173,31 @@ async function lostToIgnoreRules(changed: readonly string[], base: Inventory, fi
   if (renamed.length > 0) return `tracked files would be deleted while their bytes survive only in ignored files that are never promoted (${renamed.join(", ")})`;
   return undefined;
 }
+/** `rel` and each of its ancestor directories, nearest first. */
+const withAncestors = (rel: string): string[] => {
+  const out = [rel];
+  for (let parent = dirname(rel); parent !== "."; parent = dirname(parent)) out.push(parent);
+  return out;
+};
+/**
+ * One entry of a live tree, judged exactly like the inventory (never
+ * following links, hashing bytes); `undefined` when absent. A file must
+ * keep its lstat identity while it is hashed. The returned stat is the
+ * identity the caller re-checks immediately before replacing the entry.
+ */
+async function observeEntry(root: string, rel: string, bounds: InventoryBounds): Promise<{ entry: Entry | undefined; stat: Stats | undefined }> {
+  bounds.signal?.throwIfAborted();
+  const path = join(root, rel);
+  const info = await lstat(path).catch((err: NodeJS.ErrnoException) => { if (err.code === "ENOENT") return undefined; throw err; });
+  if (info === undefined) return { entry: undefined, stat: undefined };
+  if (info.isDirectory()) return { entry: { kind: "directory", mode: info.mode & 0o777 }, stat: info };
+  if (info.isSymbolicLink()) return { entry: { kind: "symlink", mode: 0, hash: createHash("sha256").update(await readlink(path)).digest("hex") }, stat: info };
+  if (!info.isFile()) throw new Error(`unsupported candidate entry: ${rel}`);
+  if (info.size > bounds.bytes) throw new Error("candidate inventory byte limit exceeded");
+  const hash = await fileHash(path, bounds); const after = await lstat(path);
+  if (!after.isFile() || after.size !== info.size || after.mtimeMs !== info.mtimeMs || after.ctimeMs !== info.ctimeMs) throw new Error(`file changed while snapshotting: ${rel}`);
+  return { entry: { kind: "file", mode: info.mode & 0o777, hash }, stat: info };
+}
 function differences(a: Inventory, b: Inventory): string[] {
   return [...new Set([...a.keys(), ...b.keys()])].filter(path => !equal(a.get(path), b.get(path))).sort();
 }
@@ -229,6 +254,8 @@ export async function createCandidateIntegration(
   let tracked: ReadonlySet<string>;
   try { tracked = await trackedPaths(set, options.git ?? defaultGitExec); } catch (err) { await set.cleanup(); throw err; }
   const snapshot = (root: string, signal?: AbortSignal, dropped?: Dropped): Promise<Inventory> => inventory(root, workspace, tracked, { bytes: options.maxInventoryBytes ?? options.maxCopyBytes ?? VERIFY_COPY_MAX_BYTES, entries: options.maxInventoryEntries ?? 100_000, signal: signal === undefined ? AbortSignal.timeout(options.maxInventoryMs ?? 30_000) : AbortSignal.any([signal, AbortSignal.timeout(options.maxInventoryMs ?? 30_000)]) }, dropped);
+  /** Bounds for re-verifying single live entries during delivery and rollback. */
+  const liveBounds = (signal: AbortSignal): InventoryBounds => ({ bytes: options.maxInventoryBytes ?? options.maxCopyBytes ?? VERIFY_COPY_MAX_BYTES, entries: 1, signal });
   let retain = false;
   let base: Inventory;
   const baseDropped: Dropped = new Map();
@@ -382,26 +409,38 @@ export async function createCandidateIntegration(
         const files = changed.filter(p => (final!.get(p) ?? base.get(p))?.kind !== "directory");
         const removals = changed.filter(p => base.get(p)?.kind === "directory" && !final!.has(p)).sort((a, b) => depth(b) - depth(a));
         const promotionSignal = AbortSignal.any([input.signal, AbortSignal.timeout(120_000)]);
+        // The full inventory above proved the original still equals the
+        // snapshot. Each step re-verifies only the paths it involves (the
+        // target and its ancestors) against base, overlaid with our own
+        // already-applied entries, so work stays O(changed bytes), not
+        // O(changed paths × tree bytes). A concurrent change there stops
+        // delivery and rolls back.
+        const appliedSet = new Set<string>();
+        const expectedAt = (path: string): Entry | undefined => appliedSet.has(path) ? final!.get(path) : base.get(path);
+        const verifyPaths = async (paths: readonly string[], expected: (path: string) => Entry | undefined, message: string): Promise<void> => {
+          for (const path of paths) {
+            const observed = await observeEntry(set.realDir, path, liveBounds(promotionSignal));
+            if (!equal(observed.entry, expected(path))) throw new Error(message);
+          }
+        };
         for (const [index, path] of [...additions, ...files, ...removals].entries()) {
           promotionSignal.throwIfAborted(); await options.beforeApply?.(path, index); promotionSignal.throwIfAborted();
-          // Check the whole current state before each write, accounting only
-          // for our already-applied paths. Refuse concurrent user changes.
-          const expected = new Map(base); for (const appliedPath of applied) { const entry = final.get(appliedPath); if (entry === undefined) expected.delete(appliedPath); else expected.set(appliedPath, entry); }
-          if (differences(expected, await snapshot(set.realDir, promotionSignal)).length > 0) throw new Error("original project changed during candidate delivery");
+          await verifyPaths(withAncestors(path), expectedAt, "original project changed during candidate delivery");
           if (base.get(path)?.kind === "directory" && !final.has(path)) await rmdir(join(set.realDir, path));
           else await writeEntry(workspace.dir, path, final.get(path));
-          applied.push(path);
+          applied.push(path); appliedSet.add(path);
         }
         promotionSignal.throwIfAborted();
-        if (differences(final, await snapshot(set.realDir, promotionSignal)).length > 0) throw new Error("original project changed while completing candidate delivery");
+        // Final check of the touched paths only: each must now hold its candidate entry.
+        await verifyPaths([...new Set(changed.flatMap(withAncestors))], path => final!.get(path), "original project changed while completing candidate delivery");
         return { status: "promoted", nonResumable: true, changes: changed.map(posixPath), contract: evidence, artifactManifest, ...(ignoredChanges.length === 0 ? {} : { ignoredChanges: ignoredChanges.map(posixPath) }) };
       } catch (err) {
         // Roll back only bytes we still own. If a user edited a delivered
         // path, retain that edit and report it instead of overwriting it.
         for (const path of applied.reverse()) {
           try {
-            const current = await snapshot(set.realDir);
-            if (!equal(current.get(path), final?.get(path))) { rollbackConflicts.push(path); continue; }
+            const current = await observeEntry(set.realDir, path, liveBounds(AbortSignal.timeout(options.maxInventoryMs ?? 30_000)));
+            if (!equal(current.entry, final?.get(path))) { rollbackConflicts.push(path); continue; }
             if (final?.get(path)?.kind === "directory" && !base.has(path)) await rmdir(join(set.realDir, path));
             else await writeEntry(set.baseDir, path, base.get(path));
           } catch { rollbackConflicts.push(path); }
