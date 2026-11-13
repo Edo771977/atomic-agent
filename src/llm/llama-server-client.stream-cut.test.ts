@@ -56,6 +56,79 @@ describe("parseSseErrorEvent", () => {
   });
 });
 
+describe("LlamaServerClient.completeStream: CRLF framing", () => {
+  it("reads events separated by CRLF, including a boundary split across reads", async () => {
+    const client = new LlamaServerClient({
+      baseUrl: "http://127.0.0.1:9999",
+      progressWatch: false,
+      fetchImpl: fetchReturning(() =>
+        streamOf([
+          'data: {"content":"hel","stop":false}\r\n\r',
+          '\ndata: {"content":"lo","stop":false}\r\n\r\n',
+          'data: {"content":"","stop":true}\r\n\r\n',
+        ]),
+      ),
+    });
+    const iterator = client.completeStream({ prompt: "hi" });
+    const deltas: string[] = [];
+    for (;;) {
+      const step = await iterator.next();
+      if (step.done) {
+        expect(step.value.content).toBe("hello");
+        break;
+      }
+      if (step.value.delta.length > 0) deltas.push(step.value.delta);
+    }
+    expect(deltas).toEqual(["hel", "lo"]);
+  });
+
+  async function collect(chunks: string[]) {
+    const client = new LlamaServerClient({
+      baseUrl: "http://127.0.0.1:9999",
+      progressWatch: false,
+      fetchImpl: fetchReturning(() => streamOf(chunks)),
+    });
+    const iterator = client.completeStream({ prompt: "hi" });
+    const steps: { delta: string; done: boolean }[] = [];
+    for (;;) {
+      const step = await iterator.next();
+      if (step.done) return { steps, result: step.value };
+      steps.push({ delta: step.value.delta, done: step.value.done });
+    }
+  }
+
+  it("reads CR-only framing through EOF, keeping the final stop event", async () => {
+    const { steps, result } = await collect([
+      'data: {"content":"hel","stop":false}\r\r',
+      'data: {"content":"lo","stop":false}\r\r',
+      'data: {"content":"","stop":true}\r\r',
+    ]);
+    expect(steps.filter((s) => s.delta.length > 0).map((s) => s.delta)).toEqual([
+      "hel",
+      "lo",
+    ]);
+    expect(steps.at(-1)).toEqual({ delta: "", done: true });
+    expect(result.stop).toBe(true);
+    expect(result.content).toBe("hello");
+  });
+
+  it("reads a final stop event the server closed without a blank line", async () => {
+    const { steps, result } = await collect([
+      'data: {"content":"hi","stop":false}\r\r',
+      'data: {"content":"","stop":true}\r',
+    ]);
+    expect(steps.at(-1)).toEqual({ delta: "", done: true });
+    expect(result.stop).toBe(true);
+    expect(result.content).toBe("hi");
+  });
+
+  it("reads an error event whose lines end in a bare CR", () => {
+    expect(
+      parseSseErrorEvent('event: x\rerror: {"code":503,"message":"busy"}'),
+    ).toEqual({ status: 503, detail: "busy" });
+  });
+});
+
 describe("LlamaServerClient.completeStream: a cut stream (ATO-1279)", () => {
   it("throws a mid-stream 500 for an error event inside the stream instead of ending empty", async () => {
     const client = new LlamaServerClient({

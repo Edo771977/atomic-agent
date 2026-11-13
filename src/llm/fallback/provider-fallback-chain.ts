@@ -39,6 +39,20 @@ export interface ProviderSwitchNotice {
   failure?: FailureCauseId;
 }
 
+/**
+ * One turn's walk down the chain, owned by the caller and passed to every
+ * `advanceFrom` of that turn: the links already tried, and the links
+ * passed over because they were cooling (the turn's last resort).
+ */
+export interface AdvanceTurn {
+  readonly tried: Set<string>;
+  readonly skipped: Set<string>;
+}
+
+export function newAdvanceTurn(): AdvanceTurn {
+  return { tried: new Set(), skipped: new Set() };
+}
+
 /** What `pickProvider` decided for the turn about to run. */
 export interface ProviderPick {
   /** Provider id to route this turn through. */
@@ -150,11 +164,18 @@ export class ProviderFallbackChain {
    * and return the next provider to try this turn, or null when there is
    * nothing left to try (chain exhausted) or the error is not
    * fallover-worthy.
+   *
+   * `turn` is the caller's per-turn record (`newAdvanceTurn`): the links
+   * already tried, which are never offered again, and the links passed
+   * over for cooldown. Once no untried link after `fromId` is left, the
+   * skipped link whose cooldown ends soonest is tried before the turn
+   * gives up. Without it a cooling link that was skipped is never tried.
    */
   advanceFrom(
     fromId: string,
     err: unknown,
     partitionKey: string = DEFAULT_PARTITION,
+    turn?: AdvanceTurn,
   ): string | null {
     const decision = shouldAdvance(err);
     if (!decision.advance) return null;
@@ -169,12 +190,38 @@ export class ProviderFallbackChain {
     );
 
     const idx = chain.indexOf(fromId);
-    // Next healthy link after `fromId`. When `fromId` is not in the chain
-    // (raced config edit) start from the top.
+    // Next healthy link after `fromId`: one whose cooldown has elapsed, so
+    // a probe of the primary does not walk back through a middle link that
+    // just failed. When every remaining link is cooling, the first of them
+    // is still tried as a last resort rather than failing the turn. When
+    // `fromId` is not in the chain (raced config edit) start from the top.
+    // The cooling links stepped past go into `turn.skipped`; when nothing
+    // untried is left after `fromId`, they are the last resort (soonest
+    // cooldown end first), so a skipped link is tried before the turn
+    // fails (on a probe of a in [a, b, c] with b cooling: a, c, then b).
     const startFrom = idx < 0 ? 0 : idx + 1;
-    for (let i = startFrom; i < chain.length; i += 1) {
-      const candidate = chain[i]!;
-      if (candidate === fromId) continue;
+    const now = this.now();
+    const cooldownEnd = (id: string): number =>
+      p.breakers.get(id)?.cooldownUntil ?? 0;
+    turn?.tried.add(fromId);
+    turn?.skipped.delete(fromId);
+    const remaining = chain
+      .slice(startFrom)
+      .filter((id) => id !== fromId && !turn?.tried.has(id));
+    const healthyAt = remaining.findIndex((id) => now >= cooldownEnd(id));
+    let candidate: string | undefined;
+    if (healthyAt >= 0) {
+      candidate = remaining[healthyAt];
+      for (const id of remaining.slice(0, healthyAt)) turn?.skipped.add(id);
+    } else if (remaining.length > 0) {
+      candidate = remaining[0];
+    } else if (turn) {
+      candidate = [...turn.skipped]
+        .filter((id) => chain.includes(id))
+        .sort((x, y) => cooldownEnd(x) - cooldownEnd(y))[0];
+    }
+    if (candidate !== undefined) {
+      turn?.skipped.delete(candidate);
       logFallbackAdvance(this.logger, {
         from: fromId,
         to: candidate,

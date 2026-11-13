@@ -8,7 +8,10 @@ import {
   isCliSetupRefusal,
   isCredentialRejection,
 } from "./link-failure-kind.js";
-import type { ProviderFallbackChain } from "./provider-fallback-chain.js";
+import {
+  newAdvanceTurn,
+  type ProviderFallbackChain,
+} from "./provider-fallback-chain.js";
 import { shouldAdvance } from "./should-advance.js";
 
 /**
@@ -105,6 +108,9 @@ export async function runWithFallback<T>(
     before: FailedAttempt[];
   } | null = null;
 
+  /** Links this call tried, and those it stepped past for cooldown. */
+  const turn = newAdvanceTurn();
+
   for (;;) {
     try {
       const result = await attempt(currentId);
@@ -117,7 +123,12 @@ export async function runWithFallback<T>(
       }
       // Read before `advanceFrom` moves the override past this link.
       const serving = chain.isServingFallback(currentId, partitionKey);
-      const nextId = chain.advanceFrom(currentId, err, partitionKey);
+      const nextId = chain.advanceFrom(
+        currentId,
+        err,
+        partitionKey,
+        turn,
+      );
       if (nextId === null) {
         // `null` is also the answer for an error that must not fall over
         // (a cancellation, a request-shape error): that one is thrown as

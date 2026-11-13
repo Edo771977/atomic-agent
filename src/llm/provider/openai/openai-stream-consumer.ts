@@ -7,6 +7,7 @@ import type {
 } from "../completion-types.js";
 import type { ReasoningFormat } from "../llm-provider.js";
 import { createFabricatedTranscriptWatcher } from "../../reliability/fabricated-tool-transcript.js";
+import { createSseLineNormaliser } from "../../sse-line-endings.js";
 import { normaliseOpenAiUsage } from "./openai-normalise-response.js";
 import { createReasoningExtractor } from "./reasoning-extractor.js";
 import {
@@ -78,6 +79,8 @@ export function createOpenAiStreamConsumer(
       if (!body) return;
       const reader = body.getReader();
       const decoder = new TextDecoder();
+      // SSE allows CRLF, CR or LF line endings; events are split on "\n\n".
+      const lineEndings = createSseLineNormaliser();
       let buffer = "";
       let toolArgsBuffer = "";
       let content = "";
@@ -157,9 +160,9 @@ export function createOpenAiStreamConsumer(
             // as an implicit last boundary. Some providers/proxies close the
             // response immediately after the terminal event instead of
             // writing the conventional trailing blank line.
-            buffer += decoder.decode();
+            buffer += lineEndings.push(decoder.decode(), true);
           } else {
-            buffer += decoder.decode(value, { stream: true });
+            buffer += lineEndings.push(decoder.decode(value, { stream: true }));
           }
           let boundary = buffer.indexOf("\n\n");
           while (boundary >= 0 || (done && buffer.trim().length > 0)) {
@@ -170,6 +173,14 @@ export function createOpenAiStreamConsumer(
               reasoning,
               toolArgsBuffer,
             );
+            if (chunk.noData === true) {
+              // A keep-alive comment is not output: yielding it would
+              // commit the stream, and a socket that died before any real
+              // delta could then no longer be reopened. The transport's
+              // body deadline still re-arms on its bytes.
+              boundary = buffer.indexOf("\n\n");
+              continue;
+            }
             generationId = chunk.id ?? generationId;
             if (chunk.error !== null) {
               // Whatever streamed before this is billed under the id;

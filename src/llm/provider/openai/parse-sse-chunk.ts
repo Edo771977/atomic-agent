@@ -1,5 +1,6 @@
 import type { ReasoningExtractor } from "./reasoning-extractor.js";
 import { extractPartialReplyTextFromToolArguments } from "./tool-arguments-stream-parser.js";
+import { SSE_LINE_BREAK } from "../../sse-line-endings.js";
 
 export interface OpenAiToolCallDelta {
   /**
@@ -55,9 +56,15 @@ export function parseOpenAiSseEvent(
    * The consumer throws on it; a chunk carrying one has no delta.
    */
   error: { status: number | null; message: string } | null;
+  /**
+   * The event carried no `data:` line: a keep-alive comment
+   * (`: OPENROUTER PROCESSING`) or a bare `event:`/`id:` frame. It is
+   * not provider output, so the consumer does not yield it.
+   */
+  noData?: true;
 } {
   const dataLines: string[] = [];
-  for (const line of rawEvent.split("\n")) {
+  for (const line of rawEvent.split(SSE_LINE_BREAK)) {
     if (line.startsWith("data:")) {
       dataLines.push(line.slice(5).trimStart());
     }
@@ -77,6 +84,7 @@ export function parseOpenAiSseEvent(
       toolCallDeltas: [],
       id: null,
       error: null,
+      noData: true,
     };
   }
   const joined = dataLines.join("\n");

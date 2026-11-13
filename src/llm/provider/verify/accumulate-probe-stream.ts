@@ -18,6 +18,7 @@
 import { mergeToolName } from "../openai/openai-stream-consumer.js";
 import { parseOpenAiSseEvent } from "../openai/parse-sse-chunk.js";
 import { createReasoningExtractor } from "../openai/reasoning-extractor.js";
+import { createSseLineNormaliser } from "../../sse-line-endings.js";
 
 export interface ProbeToolCallObservation {
   readonly index: number;
@@ -119,13 +120,15 @@ export function accumulateProbeStream(sse: string): ProbeStreamObservation {
 }
 
 /**
- * SSE events are blank-line separated. A trailing chunk with no closing
+ * SSE events are blank-line separated (any of CRLF, CR, LF line endings,
+ * normalised to LF first). A trailing chunk with no closing
  * blank line still counts: providers and proxies routinely close the
  * response straight after the terminal event, and treating that last
  * event as noise would turn a clean finish into a false early EOF.
  */
 function splitSseEvents(sse: string): string[] {
-  return sse
+  return createSseLineNormaliser()
+    .push(sse, true)
     .split("\n\n")
     .map((part) => part.trim())
     .filter((part) => part.length > 0);

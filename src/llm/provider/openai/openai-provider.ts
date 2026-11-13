@@ -1125,6 +1125,9 @@ function cancellationError(signal: AbortSignal, fallback: unknown): unknown {
  *    delta does. We cannot know what a downstream consumer did with it,
  *    and being wrong here means duplicating a user's reply. Reasoning
  *    deltas are output for the same reason — the TUI renders them live.
+ *    A keep-alive comment (`: OPENROUTER PROCESSING`) is not: the stream
+ *    consumer never yields an event without a `data:` line, so a socket
+ *    that dies after only keep-alives is still reopened.
  *
  *    What this does NOT cover is a completion that streamed nothing but
  *    tool-call arguments: `createOpenAiStreamConsumer` yields on a

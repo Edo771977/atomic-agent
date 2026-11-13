@@ -99,6 +99,19 @@ describe("accumulateProbeStream", () => {
     expect(observation.terminalObserved).toBe(true);
   });
 
+  it("reads events framed with CRLF line endings", () => {
+    const observation = accumulateProbeStream(
+      sse(
+        { choices: [{ delta: { content: "I can " } }] },
+        { choices: [{ delta: { content: "help." }, finish_reason: "stop" }] },
+        "[DONE]",
+      ).replace(/\n/g, "\r\n"),
+    );
+    expect(observation.text).toBe("I can help.");
+    expect(observation.finishReason).toBe("stop");
+    expect(observation.terminalObserved).toBe(true);
+  });
+
   it("reports no terminal signal when the body simply stops", () => {
     const observation = accumulateProbeStream(
       sse(toolCallChunk({ name: "atomic_contract_probe", arguments: '{"ok"' })),

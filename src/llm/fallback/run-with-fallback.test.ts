@@ -92,6 +92,30 @@ describe("runWithFallback", () => {
     expect(attempts).toBe(2); // tried both links this turn
   });
 
+  it("tries a middle link skipped for cooldown before giving up on the turn", async () => {
+    let t = 1_000_000;
+    const chain = new ProviderFallbackChain({
+      resolve: () => ({ chain: ["a", "b", "c"], timing: DEFAULT_FALLBACK_TIMING }),
+      now: () => t,
+    });
+    // Turn 1: a and b fail (cooling, b ends later), c serves: override c.
+    await runWithFallback(chain, async (id) => {
+      if (id !== "c") throw http(503);
+      return id;
+    });
+    // a's cooldown has elapsed, b's has not: the probe of a skips b.
+    t += DEFAULT_FALLBACK_TIMING.cooldownMs[0]! + 1;
+    chain.advanceFrom("b", http(503));
+    const seen: string[] = [];
+    const out = await runWithFallback(chain, async (id) => {
+      seen.push(id);
+      if (id !== "b") throw http(503);
+      return id;
+    });
+    expect(seen).toEqual(["a", "c", "b"]);
+    expect(out).toBe("b");
+  });
+
   describe("an exhausted chain [cloud 404, local fetch failed]", () => {
     // The field shape: OpenRouter answers 404 for a retired model, and the
     // auto-appended llama-server is not running.

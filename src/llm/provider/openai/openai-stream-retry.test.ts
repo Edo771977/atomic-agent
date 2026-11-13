@@ -174,6 +174,32 @@ describe("OpenAiProvider stream transport retry (pre-first-chunk)", () => {
     expect(chunks.map((c) => c.delta).join("")).toBe("hello world");
   });
 
+  it("reopens when the body dies after only a keep-alive comment", async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(
+        streamingResponse([
+          ": OPENROUTER PROCESSING\n\n",
+          new Error("terminated"),
+        ]),
+      )
+      .mockResolvedValueOnce(
+        streamingResponse([
+          ": OPENROUTER PROCESSING\n\n",
+          contentFrame("hello world"),
+          STOP_FRAMES,
+        ]),
+      );
+
+    const { chunks, result } = await drain(
+      provider(fetchImpl).completeStream({ prompt: "hi" }),
+    );
+
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(result.content).toBe("hello world");
+    expect(chunks.map((c) => c.delta).join("")).toBe("hello world");
+  });
+
   it("does not retry once a delta has been yielded to the caller", async () => {
     const fetchImpl = vi
       .fn()
