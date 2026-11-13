@@ -266,11 +266,16 @@ describe("fusion.delegate end to end", () => {
         (e) => e.event.role === "orchestrator",
       );
       expect(
-        orchestratorLines.map((e) => [e.event.phase, e.event.model]),
+        orchestratorLines.map((e) => [e.event.phase, e.event.model, e.event.taskId]),
       ).toEqual([
-        ["tool", "orchestrator-model"],
-        ["finished", "orchestrator-model"],
+        ["tool", "orchestrator-model", "fusion.delegate"],
+        ["finished", "orchestrator-model", "fusion.delegate"],
+        // The turn's receipt, just before its `turn_finished`.
+        ["finished", "orchestrator-model", "fusion.turn"],
       ]);
+      expect(orchestratorLines.at(-1)!.event.summary).toMatch(
+        /^fusion receipt · strong .*· workers .* tokens, .* · tasks 3 ok$/,
+      );
 
       // No worker row in the session store: ephemeral means ephemeral.
       const stored = runtime.sessionStore.listRecent(50).map((s) => s.id);
