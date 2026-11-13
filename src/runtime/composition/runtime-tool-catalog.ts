@@ -709,11 +709,12 @@ export function registerRuntimeFusionAndReadScope(input: {
   turnLedger?: FusionDelegateDeps["turnLedger"];
   /**
    * What the local legs' format check sends with (`fusion-format-check.ts`):
-   * the step's live base grammar and the main local server's live profile
-   * and model id. Absent, no leg is checked.
+   * the step's live base grammar and tool names, and the main local
+   * server's live profile and model id. Absent, no leg is checked.
    */
   localFormatCheck?: {
     getGrammar: () => string;
+    getToolNames: () => readonly string[];
     getProfile: () => ModelProfile;
     getModelId: () => string | null;
   };

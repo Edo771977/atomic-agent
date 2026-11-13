@@ -814,6 +814,7 @@ export async function createAgentRuntime(
     orchestratorTurnSpendUsd: (sessionId) => turnUsageMeter.peekCostUsd(sessionId),
     localFormatCheck: {
       getGrammar,
+      getToolNames: () => effectiveToolDescriptors().map((d) => d.name),
       getProfile: connectedLocal.getLiveProfile,
       getModelId: connectedLocal.getLiveModelId,
     },

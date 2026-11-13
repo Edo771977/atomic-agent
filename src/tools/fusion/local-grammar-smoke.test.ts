@@ -27,6 +27,7 @@ import { FusionTurnBudget } from "./turn-budget.js";
 
 const FAIL: GrammarSmokeVerdict = {
   kind: "fail",
+  cause: "reply-unparsed",
   error: 'tool-call protocol mismatch: invalid tool-call JSON (reply began "Sure")',
 };
 
@@ -314,7 +315,7 @@ describe("fusion.delegate with the local format check", () => {
     const output = result.fullOutput ?? "";
     expect(output).toMatch(/^fusion\.delegate did not run: the fan-out was stopped because /);
     expect(output).toContain(TOOL_PROTOCOL_LABEL);
-    expect(output).toContain("format check on small");
+    expect(output).toContain("one short completion on small under the workers' grammar");
     expect(output).toContain("tool-call protocol mismatch: invalid tool-call JSON");
     expect(output).toContain(FAILURE_BREAKER_INSTRUCTION);
     expect(result.details).toMatchObject({ reason: "failure-breaker", blocker: true, formatCheck: true });
@@ -334,7 +335,7 @@ describe("fusion.delegate with the local format check", () => {
     expect((await tool.run({ tasks: TASKS }, ctx())).status).toBe("error");
     const later = await tool.run({ tasks: TASKS }, ctx());
     expect(later.status).toBe("error");
-    expect(later.fullOutput).toContain("format check on small");
+    expect(later.fullOutput).toContain("one short completion on small under the workers' grammar");
     expect(failing.run).toHaveBeenCalledOnce();
     expect(d.runTurn).not.toHaveBeenCalled();
   });

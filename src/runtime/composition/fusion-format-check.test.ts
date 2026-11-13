@@ -7,6 +7,8 @@ import { describe, expect, it, vi } from "vitest";
 import { getConfig, type AtomicAgentConfig } from "../../config/index.js";
 import { resolvePidFilePath, writeLaunchRecord } from "../../local-llm/index.js";
 import { buildGrammar } from "../../llm/grammar/build-grammar.js";
+import { GRAMMAR_SMOKE_MAX_TOKENS, buildGrammarSmokeRequest } from "../../llm/grammar/grammar-smoke.js";
+import { resolveServerTemplatePolicy } from "../../llm/server-template-policy.js";
 import { QWEN_THINK_PROFILE } from "../../llm/model-profile.js";
 import type { CompletionRequest, CompletionResult } from "../../llm/provider/completion-types.js";
 import {
@@ -71,8 +73,27 @@ describe("createFusionFormatProbeFor", () => {
     const [providerId, request] = complete.mock.calls[0]!;
     expect(providerId).toBe("local-llama");
     expect(request.sessionId).toBe("grammar-smoke:local-llama");
-    expect(request.maxTokens).toBe(48);
+    expect(request.maxTokens).toBe(GRAMMAR_SMOKE_MAX_TOKENS);
     expect(request.signal?.aborted).toBe(false);
+  });
+
+  it("sends a worker step's grammar: the live thinking setting and the worker's tool set", async () => {
+    const { make, complete } = await probeFor(undefined, {
+      getToolNames: () => ["os.fs.read", "plan.update", "fusion.delegate", "reply"],
+    });
+    await make("local-llama")!.run();
+    const [, request] = complete.mock.calls[0]!;
+    const localModels = getConfig().localModels;
+    expect(request.grammar).toBe(
+      buildGrammarSmokeRequest({
+        profile: QWEN_THINK_PROFILE,
+        baseGrammar: await buildGrammar(QWEN_THINK_PROFILE),
+        serverTemplate: resolveServerTemplatePolicy(localModels, QWEN_THINK_PROFILE),
+        thinking: localModels.thinking,
+        // What a worker turn keeps: in the builder role and not hidden.
+        toolNames: ["os.fs.read", "reply"],
+      }).grammar,
+    );
   });
 
   it("asks afresh after a daemon restart, and keeps nothing for an unknown model", async () => {

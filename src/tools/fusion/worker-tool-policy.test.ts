@@ -4,6 +4,7 @@ import {
   WORKER_EXCLUDED_TOOLS,
   WORKER_TOOL_ROLE,
   isWorkerVisibleTool,
+  workerStepToolNames,
 } from "./worker-tool-policy.js";
 import { roleAdmits } from "../tool-roles.js";
 import { DEFAULT_TOOL_DESCRIPTORS } from "../../prompt/tool-descriptors.js";
@@ -81,5 +82,17 @@ describe("worker tool policy", () => {
     expect(FUSION_WORKER_APPROVAL_REFUSED).toMatch(/orchestrator/);
     // A refused browser submit / password step is reported, not retried.
     expect(FUSION_WORKER_APPROVAL_REFUSED).toMatch(/browser step .*needs the user/);
+  });
+
+  it("names a fresh worker step's grammar tools: in the role and not hidden", () => {
+    const names = workerStepToolNames(DEFAULT_TOOL_DESCRIPTORS.map((d) => d.name));
+    expect(names).toContain("reply");
+    expect(names).toContain("os.fs.read");
+    for (const name of names) {
+      expect(roleAdmits(WORKER_TOOL_ROLE, name), name).toBe(true);
+      expect(isWorkerVisibleTool(name), name).toBe(true);
+    }
+    expect(names).not.toContain("plan.update");
+    expect(names).not.toContain("finish");
   });
 });

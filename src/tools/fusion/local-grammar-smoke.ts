@@ -14,11 +14,15 @@ import {
  * A worker model that cannot produce the agent's tool-call format is
  * caught by the failure breaker only once a worker on it has failed
  * that way, after spending its time. `runGrammarSmoke`
- * (`llm/grammar/grammar-smoke.ts`) asks the same question with one
- * completion of a few dozen tokens under the workers' own per-request
- * grammar; a reply that does not parse refuses the fan-out up front,
- * with the breaker's own protocol-mismatch words and instruction, and
- * the trip is noted on the turn like any blocker.
+ * (`llm/grammar/grammar-smoke.ts`) sends one completion of a few dozen
+ * tokens under a worker step's per-request grammar (its thinking
+ * decision, reasoning prelude and tool set, the think bound tightened to
+ * fit). Only a definite answer refuses the fan-out up front — the
+ * server rejected the workers' grammar, or a reply that finished did
+ * not parse with the step's parser — with the breaker's own
+ * protocol-mismatch words and instruction, and the trip is noted on the
+ * turn like any blocker. It checks that server, grammar, framing and
+ * parser agree, not that the model does useful work.
  *
  * Asked at most once per (server, model, profile, server launch): a
  * pass is kept under the probe's `key` for the process, a failure for
@@ -205,5 +209,5 @@ export function formatCheckTrip(providerId: string): BreakerTrip {
 
 /** The refusal the orchestrator reads, in the breaker's words. */
 export function describeFormatCheckRefusal(trip: BreakerTrip, error: string, model: string): string {
-  return `fusion.delegate did not run: ${describeTrip(trip)}. Before any worker started, a one-call format check on ${model} under the workers' own grammar failed: ${error}. ${FAILURE_BREAKER_INSTRUCTION}`;
+  return `fusion.delegate did not run: ${describeTrip(trip)}. Before any worker started, the local format check (one short completion on ${model} under the workers' grammar) found: ${error}. ${FAILURE_BREAKER_INSTRUCTION}`;
 }

@@ -7,6 +7,7 @@ import { readLaunchRecord, readRunningPid } from "../../local-llm/index.js";
 import { resolveServerTemplatePolicy } from "../../llm/server-template-policy.js";
 import type { LocalGrammarProbe } from "../../tools/fusion/local-grammar-smoke.js";
 import type { SlotOccupancy } from "../../tools/fusion/worker-result.js";
+import { workerStepToolNames } from "../../tools/fusion/worker-tool-policy.js";
 
 export interface FusionFormatCheckDeps {
   /** Live: the config the operator may change between turns. */
@@ -17,6 +18,12 @@ export interface FusionFormatCheckDeps {
   complete: (providerId: string, request: CompletionRequest) => Promise<CompletionResult>;
   /** The step's base grammar, read live (MCP refreshes rebuild it). */
   getGrammar: () => string;
+  /**
+   * The step's tool descriptor names, read live (`effectiveToolDescriptors`):
+   * narrowed to a worker's (`workerStepToolNames`) for the check's grammar.
+   * Absent: the grammar admits `reply` alone.
+   */
+  getToolNames?: () => readonly string[];
   /** The main local server's live profile and model id. */
   getProfile: () => ModelProfile;
   getModelId: () => string | null;
@@ -89,8 +96,11 @@ export function createFusionFormatProbeFor(
         runGrammarSmoke({
           profile,
           baseGrammar: deps.getGrammar(),
-          serverTemplate: resolveServerTemplatePolicy(deps.getConfig().localModels, profile)
-            .useServerTemplate,
+          serverTemplate: resolveServerTemplatePolicy(deps.getConfig().localModels, profile),
+          thinking: deps.getConfig().localModels.thinking,
+          ...(deps.getToolNames === undefined
+            ? {}
+            : { toolNames: workerStepToolNames(deps.getToolNames()) }),
           complete: (request) => deps.complete(providerId, request),
           partition: providerId,
           ...(signal === undefined ? {} : { signal }),
