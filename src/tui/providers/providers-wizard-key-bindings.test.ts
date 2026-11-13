@@ -664,6 +664,41 @@ describe("handleProvidersWizardKey", () => {
     expect(wizard.error).toBeNull();
   });
 
+  it("refuses an address that is not just a server address (ATO-1066)", () => {
+    const cases: ReadonlyArray<[string, string]> = [
+      ["user:pw@10.0.0.5:8080", "password"],
+      ["http://10.0.0.5:8080/?token=abc", "?"],
+      ["10.0.0.5:8080#frag", "#"],
+      ["10.0.0.5:8080 junk", "space"],
+      ["https://api.example.com/v1?x=1", "?"],
+      ["ftp://10.0.0.5", "http"],
+    ];
+    for (const [typed, reason] of cases) {
+      let wizard: ProvidersWizardState = {
+        ...createProvidersWizardState("add", { kind: "openai-compatible" }),
+        phase: "base_url",
+      };
+      for (const ch of typed) wizard = next(wizard, ch, emptyKey());
+      wizard = next(wizard, "", emptyKey({ return: true }));
+      expect(wizard.phase, typed).toBe("base_url");
+      expect(wizard.baseUrlLine, typed).toBe(typed);
+      expect(wizard.error, typed).toContain(reason);
+    }
+  });
+
+  it("still accepts plain addresses, with or without a path (ATO-1066)", () => {
+    for (const typed of ["", "gpu-box.local:1234", "http://10.0.0.5:11434/v1", "https://api.example.com/api"]) {
+      let wizard: ProvidersWizardState = {
+        ...createProvidersWizardState("add", { kind: "openai-compatible" }),
+        phase: "base_url",
+      };
+      for (const ch of typed) wizard = next(wizard, ch, emptyKey());
+      wizard = next(wizard, "", emptyKey({ return: true }));
+      expect(wizard.phase, typed).toBe("api_key");
+      expect(wizard.error, typed).toBeNull();
+    }
+  });
+
   describe("empty API key", () => {
     // The gate reads the environment, so a key left over from the host
     // shell would silently satisfy the screen under test.
