@@ -97,11 +97,19 @@ describe("renderWorkerBrief", () => {
     );
   });
 
-  it("says the reply is the whole handover, and bounds it", () => {
+  it("lays the reply out as a skeleton, and bounds it", () => {
     const brief = renderWorkerBrief(TASK, { workingDir: "/repo" });
     expect(brief).toContain("`reply`");
-    expect(brief).toMatch(/ONLY thing the orchestrator receives/);
     expect(brief).toContain("4000 characters");
+    // STATUS first: a green task with files is read by its first line.
+    const at = (s: string) => brief.indexOf(s);
+    expect(at("  STATUS: done | partial | blocked")).toBeGreaterThan(0);
+    expect(at("  CHANGED:")).toBeGreaterThan(at("  STATUS:"));
+    expect(at("  CHECKS RUN:")).toBeGreaterThan(at("  CHANGED:"));
+    expect(brief).toContain("→ its result");
+    expect(at("  ASSUMPTIONS:")).toBeGreaterThan(at("  CHECKS RUN:"));
+    expect(brief).toMatch(/runtime's own list of the files you changed/);
+    expect(brief).toMatch(/reads only your first line/);
   });
 });
 

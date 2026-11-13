@@ -198,6 +198,8 @@ describe("replace guard (F36)", () => {
         `wrote 16 bytes to ${join(dir, "out", "report.md")} (replace, new file, 3 lines)`,
       );
       expect(first.details.existed).toBe(false);
+      // The line delta a fan-out's `changed:` line is built from.
+      expect(first.details).toMatchObject({ addedLines: 3, removedLines: 0 });
       const second = await t.write.run(
         { path: "out/report.md", content: "# Done\n" },
         ctx(),
@@ -206,6 +208,7 @@ describe("replace guard (F36)", () => {
         `wrote 7 bytes to ${join(dir, "out", "report.md")} (replace, 3 lines → 1)`,
       );
       expect(second.details.replaced).toBeUndefined();
+      expect(second.details).toMatchObject({ addedLines: 1, removedLines: 3 });
       // No copy was taken: the working directory has no restore folder
       // at all, only the session's created-set record.
       expect(existsSync(copiesDir())).toBe(false);

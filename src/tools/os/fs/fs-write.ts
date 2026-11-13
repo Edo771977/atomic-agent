@@ -5,6 +5,7 @@ import { compressToolResult } from "../../../compressor/result-compressor.js";
 import { resolveUserPath } from "../expand-home.js";
 import { categorizeFsMutation } from "./fs-approval-scope.js";
 import { checkChangedFile } from "./fs-content-check.js";
+import { countLineDelta } from "./fs-edit-diff.js";
 import {
   checkInputReplacement,
   refuseInputReplacement,
@@ -193,6 +194,14 @@ export function buildOsFsWriteTool(
       // that had its target moved reads where the file actually landed
       // and keeps working against the right path.
       const wording = describeWrite(mode, prior, linesAfter);
+      // For a fan-out's `changed:` line (`WorkerRunCollector`); absent
+      // when the replaced file was too large to read.
+      const delta =
+        mode === "append" || prior === null
+          ? { addedLines: linesAfter, removedLines: 0 }
+          : prior.content === null
+            ? undefined
+            : countLineDelta(prior.content.toString("utf8"), content);
       return withStaleReadNotice(withReplaceNotes(
         withParseWarning(
           compressToolResult({
@@ -214,6 +223,7 @@ export function buildOsFsWriteTool(
                 ? {}
                 : { previousLines: prior.lines }),
               ...(target === absolute ? {} : { requestedPath: absolute }),
+              ...(delta ?? {}),
             },
           }),
           parseWarning,

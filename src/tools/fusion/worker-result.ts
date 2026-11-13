@@ -18,6 +18,7 @@ import {
 } from "./worker-tool-policy.js";
 import type { JudgeSummary } from "./judge.js";
 import { CHECK_OUTPUT_CHARS, tailClip } from "./contract-checks.js";
+import { describeChanges, FileChangeLog, type FileChange } from "./worker-changes.js";
 
 /**
  * The note on a task a worker could not finish because a step needs the
@@ -213,6 +214,12 @@ export interface WorkerTaskResult {
   model?: string;
   /** The role that picked `model`, when one did (ATO-943). */
   modelRole?: FusionRole;
+  /**
+   * What the worker's file tools changed, path by path, from the
+   * runtime's record of the calls (`worker-changes.ts`). Rendered as the
+   * block's `changed:` line; absent when the file tools changed nothing.
+   */
+  changes?: FileChange[];
 }
 
 export interface TaskCheckSummary {
@@ -277,6 +284,15 @@ export class WorkerRunCollector {
   /** The last few tool results, one line each — what a hand-back reports. */
   private readonly recent: string[] = [];
   private readonly replaced: ReplacedInput[] = [];
+  private readonly changes: FileChangeLog;
+
+  /**
+   * `workingDir` is the worker's own (its workspace under isolation):
+   * changed paths inside it are recorded relative to it.
+   */
+  constructor(options: { workingDir?: string } = {}) {
+    this.changes = new FileChangeLog(options.workingDir);
+  }
 
   /** Feed one `AgentLoopEvent` from the worker turn's hook. */
   observe(event: AgentLoopEvent): void {
@@ -321,6 +337,7 @@ export class WorkerRunCollector {
       this.byTool[result.tool] = (this.byTool[result.tool] ?? 0) + 1;
       if (result.status === "error") this.errors += 1;
       else if (FILE_WRITING_TOOLS.has(result.tool)) this.writes += 1;
+      this.changes.observe(result);
       if (resultCarriesApprovalRefusal(result.summary, result.details)) {
         this.approvalRefused = true;
         if (resultCarriesOperatorOnlyRefusal(result.summary, result.details)) {
@@ -421,6 +438,7 @@ export class WorkerRunCollector {
     if (this.operatorOnlyRefused && status === "needs_orchestrator") {
       notes.push(WORKER_OPERATOR_ONLY_NOTE);
     }
+    const changes = this.changes.list();
     return {
       id: input.id,
       title: input.title,
@@ -444,6 +462,7 @@ export class WorkerRunCollector {
       ...(this.replaced.length === 0
         ? {}
         : { replacedInputs: [...this.replaced] }),
+      ...(changes.length === 0 ? {} : { changes }),
     };
   }
 }
@@ -793,7 +812,7 @@ export function formatDelegateOutput(
       outputLeft,
       Math.floor(perTask / 2),
     );
-    const block = renderBlock(r, perTask, allowance);
+    const block = renderBlock(r, perTask, allowance, compactReply(r, extra));
     outputLeft -= Math.min(allowance, r.checks?.output?.length ?? 0);
     return block;
   });
@@ -989,6 +1008,39 @@ export interface DelegateOutputExtras {
    * the head line then reads exactly as before.
    */
   waves?: readonly (readonly string[])[];
+  /**
+   * The ids of the tasks that declared `files`. A green row among them
+   * shows only the first line of its worker's reply: its result is on
+   * disk and in its `changed:` line, and the prose is the worker's own
+   * account of it. Absent, every reply is shown whole.
+   */
+  declaredFiles?: ReadonlySet<string>;
+}
+
+/** How much of a green row's reply its block keeps (`compactReply`). */
+export const GREEN_REPLY_CHARS = 200;
+
+/**
+ * Whether a row's block shows only the first line of its reply: the
+ * row is green (`ok`) and its task declared files. A row that is not
+ * green keeps the whole reply (it is the evidence of what went wrong),
+ * and so does a task that declared no files (its reply IS the result:
+ * findings, an answer, a plan).
+ */
+function compactReply(
+  result: WorkerTaskResult,
+  extra: DelegateOutputExtras,
+): boolean {
+  return result.status === "ok" && extra.declaredFiles?.has(result.id) === true;
+}
+
+/** The reply's first non-blank line, at most `GREEN_REPLY_CHARS`, marked when cut. */
+export function replyFirstLine(reply: string): string {
+  const trimmed = reply.trim();
+  const first = trimmed.split(/\r?\n/).find((line) => line.trim().length > 0)?.trim() ?? "";
+  const cut = first.length > GREEN_REPLY_CHARS;
+  const line = cut ? first.slice(0, GREEN_REPLY_CHARS) : first;
+  return cut || line.length < trimmed.length ? `${line} …` : line;
 }
 
 /** `analyze → organize, index` — waves in order, each wave's tasks together. */
@@ -1089,6 +1141,7 @@ function renderBlock(
   result: WorkerTaskResult,
   perTaskCap: number,
   outputCap: number,
+  compact: boolean,
 ): string {
   const head =
     `[${result.id}] ${result.status} — ${result.title} ` +
@@ -1097,7 +1150,9 @@ function renderBlock(
     (result.error
       ? ` — error: ${oneLine(result.error, ERROR_HEAD_CHARS)}`
       : "");
+  const changed = describeChanges(result.changes);
   const diagnosis = [
+    ...(changed === null ? [] : [changed]),
     ...(result.replacedInputs ?? []).map(describeReplacedInput),
     ...(result.hint ? [`hint: ${result.hint}`] : []),
     ...(result.checks
@@ -1110,7 +1165,12 @@ function renderBlock(
   ];
   const used = [head, ...diagnosis].join("\n").length;
   const bodyCap = Math.max(100, perTaskCap - used);
-  const body = result.reply.length > 0 ? result.reply : NO_REPLY;
+  const body =
+    result.reply.length === 0
+      ? NO_REPLY
+      : compact
+        ? `reply: ${replyFirstLine(result.reply)}`
+        : result.reply;
   const clipped =
     body.length > bodyCap
       ? `${body.slice(0, Math.max(0, bodyCap - 15))}\n… [truncated]`

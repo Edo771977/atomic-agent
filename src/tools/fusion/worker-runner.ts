@@ -774,11 +774,13 @@ async function runOneTask(
   task: DelegateTask,
 ): Promise<WorkerTaskResult> {
   const startedAt = Date.now();
-  const collector = new WorkerRunCollector();
   // Branch isolation (ATO-946): the task's own workspace stands in for
   // the working directory everywhere below. Without it, nothing changes.
   const isolated = options.taskWorkspace?.(task.id);
   const workingDir = isolated?.workingDir ?? deps.workingDir;
+  // Changed paths are kept relative to it, so they name the same files
+  // in the folder once a workspace is merged back.
+  const collector = new WorkerRunCollector({ workingDir });
   // The worker always runs in this folder (the parent's, in every model
   // mode, #1121); only an isolated or cloud worker inherits a workspace.
   const inheritWorkspace = isolated !== undefined || deps.inheritWorkspace === true;
@@ -1797,7 +1799,7 @@ async function runOneTask(
       inheritWorkspace,
     );
     armWorkerSession(replaceSession.id);
-    const replaceCollector = new WorkerRunCollector();
+    const replaceCollector = new WorkerRunCollector({ workingDir });
     const capAbort = new AbortController();
     const replaceTimer = setTimeout(
       () => capAbort.abort(new Error("time limit")),

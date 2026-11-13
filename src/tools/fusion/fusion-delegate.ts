@@ -1657,6 +1657,12 @@ export function buildFusionDelegateTool(
             ...(contractLine === undefined ? {} : { contractLine }),
             spend,
             ...(ordered ? { waves: plan.waves } : {}),
+            // A green row of these shows its reply's first line only.
+            declaredFiles: new Set(
+              parsed.tasks
+                .filter((t) => (t.files?.length ?? 0) > 0)
+                .map((t) => t.id),
+            ),
           })}${hint}${
             escalationSpendUsd > 0
               ? `\n\nEscalations to ${escalationTarget?.model ?? escalationTarget?.providerId ?? "the escalation model"} cost ${formatUsd(escalationSpendUsd)} this fan-out (each worker's row says what for).`

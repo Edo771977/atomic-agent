@@ -194,6 +194,22 @@ export const BROWSER_CODE_RULE =
   "- Code meant for the browser (it uses `window`, `document`, the DOM or `<script>` loading) does not run under node: `node -e`, `require` or `import` of it fails with \"Cannot find module\" or \"document is not defined\", which says nothing about your code. Check its syntax with `verify.syntax` instead of running it.";
 
 /**
+ * The reply's layout. The orchestrator is the expensive model: it reads
+ * the runtime's own `changed:` line (`worker-changes.ts`) and, for a
+ * green task with files, only the reply's first line, so the first line
+ * carries the status and the rest is what the disk cannot say. The
+ * runtime line never depends on a worker following this.
+ */
+export const WORKER_REPLY_RULE = [
+  `- Finish with \`reply\` (about ${WORKER_REPLY_CHAR_BUDGET} characters at most), laid out as:`,
+  "  STATUS: done | partial | blocked, and why in a few words",
+  "  CHANGED: each file you wrote and what changed in it",
+  "  CHECKS RUN: each command or check you ran → its result",
+  "  ASSUMPTIONS: what you assumed, or none",
+  "  The orchestrator also gets the runtime's own list of the files you changed, and for a finished task with files it reads only your first line. Findings, decisions and anything it needs to merge your part that are not in a file must be in the reply.",
+].join("\n");
+
+/**
  * The brief, in reading order: the frame, this worker's TASK with its
  * FILES, DELIVERABLE and contract part, the RULES, then the quoted
  * ORIGINAL REQUEST, then one line naming the task again.
@@ -244,7 +260,7 @@ export function renderWorkerBrief(
     `- Read files only inside ${options.workingDir} and the directories this task writes in; a read anywhere else is refused. Do not search other projects for context — ${request.length > 0 ? "your task, its FILES and the original request are" : "your task and its FILES are"} the context you have.`,
     siblingFilesRule(options.contract !== undefined),
     BROWSER_CODE_RULE,
-    `- Finish with \`reply\` carrying the concise result of this task (about ${WORKER_REPLY_CHAR_BUDGET} characters at most). That reply is the ONLY thing the orchestrator receives — findings, file paths, decisions and anything it needs to merge your part must be inside it.`,
+    WORKER_REPLY_RULE,
     ...(options.contract
       ? [
           `- End the reply with a \`PROVIDED:\` list of what you produced, one line per item, using the CONTRACT's exact names (kind, name, path). Name anything you provide differently from the contract, or could not provide, on its own line.`,
