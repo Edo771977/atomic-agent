@@ -15,11 +15,16 @@ export {
   type LocalModelDef,
   type EmbeddingModelId,
   type EmbeddingModelDef,
+  type FusionWorkerFit,
+  type FusionWorkerRating,
 } from "./catalog/models-catalog.js";
 export { spotlightModelFor } from "./catalog/spotlight-model.js";
 export {
+  recommendWorkerModel,
   recommendedModelFor,
+  type RecommendRole,
   type RecommendedModelOptions,
+  type WorkerModelPick,
 } from "./catalog/recommended-model.js";
 export {
   BALANCED_MAX_DOWNLOAD_GB,

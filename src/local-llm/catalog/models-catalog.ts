@@ -46,6 +46,51 @@ export type EmbeddingModelId =
   | "jina-embeddings-v2-base-en"
   | "embeddinggemma-2";
 
+/**
+ * How a model did as a fusion worker, or on agentic tool-call work in
+ * general: following the tool-call grammar, finishing tasks through its
+ * tools rather than bailing out. `good` > `ok` > (unrated) > `poor` is
+ * the order `models recommend --role worker` ranks by.
+ */
+export type FusionWorkerRating = "good" | "ok" | "poor";
+
+export const FUSION_WORKER_RATINGS: readonly FusionWorkerRating[] = ["good", "ok", "poor"];
+
+export interface FusionWorkerFit {
+  rating: FusionWorkerRating;
+  /**
+   * The evidence, in one sentence, and where it is recorded in the repo
+   * (a benchmark document, a field case in a guard's comment). Shown as
+   * the reason by `models recommend --role worker`.
+   */
+  note: string;
+}
+
+/** Whether `value` is a rating this build knows. */
+export function isFusionWorkerRating(value: unknown): value is FusionWorkerRating {
+  return typeof value === "string" && (FUSION_WORKER_RATINGS as readonly string[]).includes(value);
+}
+
+/**
+ * Reads a `fusionWorker` value written as data (a fixture, a future
+ * catalog file): `undefined` stays unrated; anything but a known rating
+ * with a non-empty note is refused, so a typo can never rate a model.
+ */
+export function parseFusionWorkerFit(raw: unknown): FusionWorkerFit | undefined {
+  if (raw === undefined) return undefined;
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("fusionWorker: expected { rating, note }");
+  }
+  const { rating, note } = raw as Record<string, unknown>;
+  if (!isFusionWorkerRating(rating)) {
+    throw new Error(`fusionWorker.rating: expected ${FUSION_WORKER_RATINGS.join("|")}`);
+  }
+  if (typeof note !== "string" || note.trim().length === 0) {
+    throw new Error("fusionWorker.note: expected the evidence, in words");
+  }
+  return { rating, note: note.trim() };
+}
+
 export interface LocalModelDef {
   id: LocalModelId;
   name: string;
@@ -91,6 +136,24 @@ export interface LocalModelDef {
    * outrank one that fits the same memory (pinned by the tests).
    */
   recommendRank?: number;
+  /**
+   * How reliably the model works as a fusion worker (follows the
+   * tool-call grammar, does agentic work through its tools). Set ONLY
+   * where the repo records evidence for this exact model, and the note
+   * names it:
+   *
+   * - `eval-agents/docs/GAIA-L1-EXPERIMENT.md` §7.3 (also the root
+   *   README): GAIA L1 through the agent's own tool loop, one full
+   *   53-task run per model.
+   * - Field cases recorded beside the guards they produced
+   *   (`src/tools/control-marker-guard.ts`,
+   *   `src/tools/unknown-argument-guard.ts`,
+   *   `src/tools/fusion/replaced-inputs.ts`).
+   *
+   * Everything else stays unrated, which ranks between `ok` and `poor`:
+   * no evidence is not bad evidence. A user-added model is never rated.
+   */
+  fusionWorker?: FusionWorkerFit;
   tag?: string;
   /**
    * Reduced-refusal ("abliterated" / uncensored) weights. Such entries
@@ -160,6 +223,10 @@ export const LOCAL_MODELS_CATALOG: readonly LocalModelDef[] = [
     sizeLabel: "6.7 GB",
     description: "Mid-size Gemma, for 12 GB machines and up",
     recommendRank: 9,
+    fusionWorker: {
+      rating: "ok",
+      note: "GAIA L1 45.3% through the agent's tool loop, but it bails early on many tasks (~3 steps, many empty answers) (eval-agents/docs/GAIA-L1-EXPERIMENT.md)",
+    },
     maxContextLength: 262_144,
     contextLabel: "256K",
     minRamGb: 8,
@@ -203,6 +270,10 @@ export const LOCAL_MODELS_CATALOG: readonly LocalModelDef[] = [
     sizeLabel: "17.3 GB",
     description: "Biggest Gemma, for 24 GB machines and up",
     recommendRank: 6,
+    fusionWorker: {
+      rating: "poor",
+      note: "live fusion workers wrote control markers into call arguments and flags as argument keys, and one overwrote an input file (2026-09-15; control-marker-guard.ts, unknown-argument-guard.ts)",
+    },
     maxContextLength: 262_144,
     contextLabel: "256K",
     minRamGb: 20,
@@ -268,6 +339,10 @@ export const LOCAL_MODELS_CATALOG: readonly LocalModelDef[] = [
     sizeLabel: "22.4 GB",
     description: "Big Qwen that stays quick for its size, 36 GB and up",
     recommendRank: 1,
+    fusionWorker: {
+      rating: "good",
+      note: "GAIA L1 69.8% through the agent's tool loop, the best measured local model (eval-agents/docs/GAIA-L1-EXPERIMENT.md)",
+    },
     maxContextLength: 262_144,
     contextLabel: "256K",
     minRamGb: 24,
@@ -330,6 +405,10 @@ export const LOCAL_MODELS_CATALOG: readonly LocalModelDef[] = [
     sizeLabel: "5.3 GB",
     description: "Everyday mid-size Qwen, for 16 GB machines and up",
     recommendRank: 7,
+    fusionWorker: {
+      rating: "ok",
+      note: "GAIA L1 52.8% through the agent's tool loop and stays on task, though it can send a number where reply text belongs (eval-agents/docs/GAIA-L1-EXPERIMENT.md, conversation/reply.ts)",
+    },
     maxContextLength: 262_144,
     contextLabel: "256K",
     minRamGb: 10,
