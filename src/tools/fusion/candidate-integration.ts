@@ -223,6 +223,8 @@ interface PromotionJournalStep {
   promoted: JournalEntry | null;
   /** Pre-image bytes of a modified or deleted file, relative to the merge folder. */
   backup?: string;
+  /** Temp name (relative to the project) the new file or symlink is staged under before its rename; remove it if it is left behind. */
+  temp?: string;
 }
 interface PromotionJournal {
   version: 1; candidate: string; project: string; startedAt: string;
@@ -231,7 +233,7 @@ interface PromotionJournal {
   recovery: string;
   steps: PromotionJournalStep[];
 }
-const JOURNAL_RECOVERY = "If state is 'committed', delivery completed and was verified: change nothing, just delete this journal and its backup folder. Otherwise steps run in order. 'applied' paths hold the promoted entry; an 'intent' path may hold either. To undo, restore each such path from 'original': a file from 'backup' with its mode, a symlink from 'linkTarget', a directory with its mode; remove the path if 'original' is null. Verify sha256 before trusting a backup, then delete this journal and its backup folder.";
+const JOURNAL_RECOVERY = "If state is 'committed', delivery completed and was verified: change nothing, just delete this journal and its backup folder. Otherwise steps run in order. 'applied' paths hold the promoted entry; an 'intent' path may hold either. To undo, restore each such path from 'original': a file from 'backup' with its mode, a symlink from 'linkTarget', a directory with its mode; remove the path if 'original' is null. Verify sha256 before trusting a backup. Delete any step's leftover 'temp' file (an .atag-candidate-* staging copy), then this journal and its backup folder.";
 
 export interface CandidateIntegrationReport {
   status: "promoted" | "rejected";
@@ -363,9 +365,11 @@ export async function createCandidateIntegration(
   };
   // Same-directory rename never writes through an existing symlink. A fresh
   // ancestor scan also refuses a parent replaced with a link during delivery.
+  /** A fresh sibling temp name for staging `rel`, relative to the project. */
+  const tempFor = (rel: string): string => join(dirname(rel), `.atag-candidate-${randomBytes(8).toString("hex")}`);
   // `landed` runs right after the change itself, before any follow-up that
   // can still fail (a directory's chmod), so rollback knows to undo it.
-  const writeEntry = async (root: string, rel: string, expected: Entry | undefined, verified: Stats | undefined, landed: () => void = () => undefined): Promise<void> => {
+  const writeEntry = async (root: string, rel: string, expected: Entry | undefined, verified: Stats | undefined, landed: () => void = () => undefined, tempRel = tempFor(rel)): Promise<void> => {
     const target = join(set.realDir, rel);
     for (let parent = dirname(rel); parent !== "."; parent = dirname(parent)) {
       const info = await lstat(join(set.realDir, parent));
@@ -373,7 +377,7 @@ export async function createCandidateIntegration(
     }
     if (expected === undefined) { await commitGuard(rel, verified); await rm(target); landed(); syncDirectoryBestEffort(dirname(target)); return; }
     if (expected.kind === "directory") { await commitGuard(rel, verified); await mkdir(target, { mode: expected.mode }); landed(); syncDirectoryBestEffort(dirname(target)); await chmod(target, expected.mode); return; }
-    const tmp = join(dirname(target), `.atag-candidate-${randomBytes(8).toString("hex")}`);
+    const tmp = join(set.realDir, tempRel);
     try {
       if (expected.kind === "symlink") {
         const link = await readlink(join(root, rel));
@@ -397,7 +401,7 @@ export async function createCandidateIntegration(
    * modified or deleted file) before it is applied, and marked after, so
    * a hard stop mid-delivery leaves enough to restore by hand.
    */
-  const openJournal = async (): Promise<{ journal: PromotionJournal; file: string; backups: string; write(): void; step(path: string, original: Entry | undefined, promoted: Entry | undefined): Promise<PromotionJournalStep>; remove(): Promise<void> }> => {
+  const openJournal = async (): Promise<{ journal: PromotionJournal; file: string; backups: string; write(): void; step(path: string, original: Entry | undefined, promoted: Entry | undefined, temp?: string): Promise<PromotionJournalStep>; remove(): Promise<void> }> => {
     const merge = await ensureMergeDir(set.realDir);
     // ensureMergeDir may have just created `.atomic-agent/` and its merge
     // folder: flush those new directory entries before relying on them.
@@ -411,10 +415,11 @@ export async function createCandidateIntegration(
     };
     const describe = (entry: Entry | undefined, link?: string): JournalEntry | null => entry === undefined ? null
       : { kind: entry.kind, mode: entry.mode, ...(entry.kind === "file" && entry.hash !== undefined ? { sha256: entry.hash } : {}), ...(link === undefined ? {} : { linkTarget: link }) };
-    await mkdir(backups, { mode: 0o700 }); await chmod(backups, 0o700); syncDirectoryBestEffort(merge); write();
+    try { await mkdir(backups, { mode: 0o700 }); await chmod(backups, 0o700); syncDirectoryBestEffort(merge); write(); }
+    catch (err) { await rm(backups, { recursive: true, force: true }).catch(() => undefined); await rm(file, { force: true }).catch(() => undefined); throw err; }
     return {
       journal, file, backups, write,
-      async step(path, original, promoted) {
+      async step(path, original, promoted, temp) {
         const index = journal.steps.length;
         const action = original?.kind === "directory" && promoted === undefined ? "rmdir" : promoted === undefined ? "delete" : promoted.kind === "directory" ? "mkdir" : "write";
         let backup: string | undefined;
@@ -429,7 +434,7 @@ export async function createCandidateIntegration(
           syncDirectoryBestEffort(backups);
         }
         const link = original?.kind === "symlink" ? await readlink(join(set.baseDir, path)) : undefined;
-        const step: PromotionJournalStep = { path: posixPath(path), action, status: "intent", original: describe(original, link), promoted: describe(promoted), ...(backup === undefined ? {} : { backup: posixPath(backup) }) };
+        const step: PromotionJournalStep = { path: posixPath(path), action, status: "intent", original: describe(original, link), promoted: describe(promoted), ...(backup === undefined ? {} : { backup: posixPath(backup) }), ...(temp === undefined ? {} : { temp: posixPath(temp) }) };
         journal.steps.push(step); write();
         return step;
       },
@@ -539,10 +544,11 @@ export async function createCandidateIntegration(
         for (const [index, path] of [...additions, ...files, ...removals].entries()) {
           promotionSignal.throwIfAborted(); await options.beforeApply?.(path, index); promotionSignal.throwIfAborted();
           const verified = await verifyPaths(withAncestors(path), expectedAt, "original project changed during candidate delivery");
-          const step = await journal!.step(path, base.get(path), final.get(path)); steps.set(path, step);
+          const staged = final.get(path)?.kind === "file" || final.get(path)?.kind === "symlink" ? tempFor(path) : undefined;
+          const step = await journal!.step(path, base.get(path), final.get(path), staged); steps.set(path, step);
           const landed = (): void => { applied.push(path); appliedSet.add(path); };
           if (base.get(path)?.kind === "directory" && !final.has(path)) { await commitGuard(path, verified); await rmdir(join(set.realDir, path)); landed(); syncDirectoryBestEffort(dirname(join(set.realDir, path))); }
-          else await writeEntry(workspace.dir, path, final.get(path), verified, landed);
+          else await writeEntry(workspace.dir, path, final.get(path), verified, landed, staged);
           step.status = "applied"; journal!.write();
         }
         promotionSignal.throwIfAborted();
@@ -583,7 +589,12 @@ export async function createCandidateIntegration(
             const created = final?.get(path)?.kind === "directory" && !base.has(path);
             if (created ? current.entry?.kind !== "directory" : !equal(current.entry, final?.get(path))) { rollbackConflicts.push(path); if (step !== undefined) step.status = "rollback-conflict"; journalOk = record() && journalOk; continue; }
             if (created) { await commitGuard(path, current.stat); await rmdir(join(set.realDir, path)); }
-            else await writeEntry(set.baseDir, path, base.get(path), current.stat);
+            else {
+              // Restoring a file or symlink stages a temp too: journal it first.
+              const staged = base.get(path)?.kind === "file" || base.get(path)?.kind === "symlink" ? tempFor(path) : undefined;
+              if (step !== undefined && staged !== undefined) { step.temp = posixPath(staged); journalOk = record() && journalOk; }
+              await writeEntry(set.baseDir, path, base.get(path), current.stat, undefined, staged);
+            }
             if (step !== undefined) step.status = "rolled-back";
           } catch { rollbackConflicts.push(path); if (step !== undefined) step.status = "rollback-conflict"; }
           journalOk = record() && journalOk;

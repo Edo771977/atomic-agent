@@ -520,3 +520,39 @@ it("flushes a delivered temp file before renaming it and the merge folder's new 
   const opened = fsEvents.filter(([kind]) => kind === "openSync").map(([, path]) => path);
   expect(opened).toContain(root); expect(opened).toContain(join(root, ".atomic-agent"));
 });
+
+it("journals a step as intent, naming its temp file, until the change lands", async () => {
+  const root = await project();
+  const seen: { state?: string; steps?: [string, string, string | undefined][]; tempExists?: boolean } = {};
+  const candidate = await createCandidateIntegration(root, { beforeCommit: async path => {
+    if (path !== "api.json") return;
+    const merge = mergeDir(root);
+    const journal = JSON.parse(await readFile(join(merge, (await readdir(merge)).find(name => name.endsWith(".promotion.json"))!), "utf8"));
+    seen.state = journal.state;
+    seen.steps = journal.steps.map((step: { path: string; status: string; temp?: string }) => [step.path, step.status, step.temp]);
+    const temp = journal.steps[0]?.temp as string | undefined;
+    seen.tempExists = temp !== undefined && await lstat(join(root, temp)).then(() => true, () => false);
+  } });
+  try {
+    await writeFile(join(candidate.dir, "api.json"), "promoted api");
+    expect((await candidate.finish({ rows, contract, signal, runChecks: pass })).status).toBe("promoted");
+  } finally { await candidate.cleanup(); }
+  expect(seen.state).toBe("promoting");
+  expect(seen.steps).toEqual([["api.json", "intent", expect.stringMatching(/^\.atag-candidate-[0-9a-f]+$/)]]);
+  // A hard stop here would leave exactly that temp in the user's tree.
+  expect(seen.tempExists).toBe(true);
+  expect((await readdir(root)).filter(name => name.startsWith(".atag-candidate-"))).toEqual([]);
+});
+
+it("removes the backup folder when the first journal write fails", async () => {
+  const root = await project();
+  faults.openSync = path => path.endsWith(".promotion.json.tmp");
+  const candidate = await createCandidateIntegration(root);
+  try {
+    await writeFile(join(candidate.dir, "api.json"), "promoted api");
+    const report = await candidate.finish({ rows, contract, signal, runChecks: pass });
+    expect(report.status).toBe("rejected"); expect(report.reason).toMatch(/injected openSync failure/);
+  } finally { await candidate.cleanup(); }
+  expect(await promotionFiles(root)).toEqual([]);
+  expect(await readFile(join(root, "api.json"), "utf8")).toBe('{"name":"before"}');
+});
