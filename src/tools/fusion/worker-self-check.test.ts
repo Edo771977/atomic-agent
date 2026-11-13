@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -94,6 +94,17 @@ function step(call: Call, tool: string, args: Record<string, unknown>, status: "
 }
 
 const OWN_SPEC = { kind: "command", args: ["score.test.js"], cmd: "node" };
+
+/** One completion with `tokens` prompt and completion tokens each. */
+function complete(call: Call, tokens: number): void {
+  call.options.eventHook?.({
+    type: "llm_event",
+    event: {
+      type: "llm_completed",
+      completion: { content: "", usage: { promptTokens: tokens, completionTokens: tokens } },
+    },
+  } as never);
+}
 
 const CHECKED: DelegateContract = {
   checks: [
@@ -473,6 +484,112 @@ describe("a worker's self-check before its reply closes the task", () => {
     expect(done.calls).toHaveLength(2);
     expect(late!.status).toBe("max_steps");
     expect(late!.stepCount).toBe(3 + SELF_CHECK_GRACE_STEPS);
+  });
+
+  describe("when the worker's reply is not checked", () => {
+    const task: DelegateTask = { id: "t", title: "T", instructions: "x", files: ["out.txt"] };
+
+    it("skips a reply written on the first turn's forced final step", async () => {
+      const { deps, calls } = harness(dir, (call) => {
+        say(call, "ran out");
+        return { stopCause: "step_ceiling" };
+      });
+      const [row] = await runWorkerTasks(deps, { ...BASE, tasks: [task], signal: new AbortController().signal });
+      expect(calls).toHaveLength(1);
+      expect(row!.status).not.toBe("ok");
+    });
+
+    it("skips a split proposal: its files are its children's", async () => {
+      const { deps, calls } = harness(dir, (call) => {
+        say(call, "Too big.\n```split_proposal\n{\"tasks\":[]}\n```");
+        return {};
+      });
+      await runWorkerTasks(deps, {
+        ...BASE,
+        tasks: [task],
+        canProposeSplit: () => true,
+        signal: new AbortController().signal,
+      });
+      expect(calls).toHaveLength(1);
+    });
+
+    it("skips a worker with less than 10 s of its clock left", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      const { deps, calls } = harness(dir, (call) => {
+        // Served now, then most of the 600 s spent.
+        complete(call, 10);
+        vi.setSystemTime(Date.now() + 595_000);
+        say(call, "done");
+        return {};
+      });
+      await runWorkerTasks(deps, { ...BASE, tasks: [task], signal: new AbortController().signal });
+      expect(calls).toHaveLength(1);
+    });
+  });
+
+  it("asks the task's own workspace, not the working directory, under worktree isolation", async () => {
+    const ws = join(dir, "ws-t");
+    mkdirSync(ws);
+    // Present in the task's workspace only: no finding.
+    writeFileSync(join(ws, "out.txt"), "the result");
+    const runChecks = vi.fn<ContractCheckRunner>(async (specs) => ({
+      ok: true,
+      results: specs.map(() => ({ ok: true, summary: "verify.run command: ok" })),
+    }));
+    const { deps, calls } = harness(dir, (call) => {
+      say(call, "done");
+      return {};
+    }, runChecks);
+    const [row] = await runWorkerTasks(deps, {
+      ...BASE,
+      tasks: [{ id: "t", title: "T", instructions: "x", files: ["out.txt"] }],
+      contract: CHECKED,
+      taskWorkspace: () => ({ workingDir: ws, writeScope: [ws] }),
+      signal: new AbortController().signal,
+    });
+    expect(runChecks).toHaveBeenCalledTimes(1);
+    expect(runChecks.mock.calls[0]![1].workingDir).toBe(ws);
+    expect(calls).toHaveLength(1);
+    expect(row!.status).toBe("ok");
+  });
+
+  it("runs the grace under the first turn's tool view, signals and hook, and counts both turns' spend", async () => {
+    const controller = new AbortController();
+    const usage: number[] = [];
+    let graceSignal: AbortSignal | undefined;
+    const { deps, calls } = harness(dir, (call, i) => {
+      complete(call, i === 0 ? 100 : 7);
+      if (i === 1) {
+        graceSignal = call.options.signal;
+        step(call, "os.fs.write", { path: "out.txt" });
+        writeFileSync(join(dir, "out.txt"), "the result");
+      }
+      say(call, "done");
+      return {};
+    });
+    const [row] = await runWorkerTasks(deps, {
+      ...BASE,
+      workerReasoning: "low",
+      tasks: [{ id: "t", title: "T", instructions: "x", files: ["out.txt"] }],
+      onWorkerUsage: (_id, u) => usage.push(u.completionTokens),
+      signal: controller.signal,
+    });
+    expect(calls).toHaveLength(2);
+    const [first, grace] = calls.map((c) => c.options);
+    expect(grace!.toolFilter).toBe(first!.toolFilter);
+    expect(grace!.toolRole).toBe(first!.toolRole);
+    expect(grace!.origin).toBe(first!.origin);
+    expect(grace!.providerId).toBe(first!.providerId);
+    expect(grace!.reasoningEffort).toBe("low");
+    expect(grace!.eventHook).toBeDefined();
+    // The parent's signal reaches the grace turn.
+    expect(graceSignal!.aborted).toBe(false);
+    controller.abort();
+    expect(graceSignal!.aborted).toBe(true);
+    // The grace's events reach the same collector and the same spend.
+    expect(usage).toEqual([100, 7]);
+    expect(row!.usage).toMatchObject({ promptTokens: 107, completionTokens: 107 });
+    expect(row!.tools.writes).toBe(1);
   });
 
   it("runSelfCheck reports a check run it cut at the cap as not run, never as failed", async () => {
