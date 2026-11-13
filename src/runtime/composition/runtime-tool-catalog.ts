@@ -802,6 +802,13 @@ export function registerRuntimeFusionAndReadScope(input: {
                 }
                 return provider.complete(request);
               },
+              slotOccupancy: async () => {
+                try {
+                  return readSlotOccupancy(await llama.fetchSlots());
+                } catch {
+                  return null;
+                }
+              },
               ...localFormatCheck,
             }),
           }),

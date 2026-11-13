@@ -680,6 +680,9 @@ export function buildFusionDelegateTool(
       // here, with one short completion, before the person is asked and
       // before a worker spends its time on it (local-grammar-smoke.ts).
       // Never a cloud leg: only a slot-affine leg with a probe is asked.
+      // The servers this fan-out will load: while it runs, a check
+      // there (another session's fan-out) is skipped, not queued.
+      const checkedServers = new Set<string>();
       if (mode.localFormatCheck !== false && deps.localGrammarProbeFor !== undefined) {
         const localLegs = new Map<string, string>();
         if (slotAffine && legTaskCount > 0) localLegs.set(workerProviderId, workerModel);
@@ -689,6 +692,7 @@ export function buildFusionDelegateTool(
         for (const [providerId, model] of localLegs) {
           const probe = deps.localGrammarProbeFor(providerId);
           if (probe === undefined) continue;
+          checkedServers.add(probe.server);
           const checked = await formatCheck.check(probe, {
             sessionId: ctx.sessionId,
             leg: providerId,
@@ -699,6 +703,7 @@ export function buildFusionDelegateTool(
             verdict: checked.kind,
             ...("cached" in checked ? { cached: checked.cached } : {}),
             ...(checked.kind === "inconclusive" ? { reason: checked.reason } : {}),
+            ...(checked.kind === "skipped" ? { why: checked.why } : {}),
           });
           if (checked.kind === "fail") {
             const trip = formatCheckTrip(providerId);
@@ -1469,6 +1474,7 @@ export function buildFusionDelegateTool(
       };
 
       const fanoutStartedAt = Date.now();
+      const endLiveFanout = formatCheck.beginFanout(checkedServers);
       try {
         let results: WorkerTaskResult[];
         try {
@@ -2162,6 +2168,7 @@ export function buildFusionDelegateTool(
         // Kept workspaces (a judged-red task's, for its retry) are removed
         // whatever happens after the waves: a throw in the retry, the
         // contract pass, the syntax pass or the judge included.
+        endLiveFanout();
         await releaseKept();
       }
     },

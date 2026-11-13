@@ -45,11 +45,13 @@ import { parseToolCalls } from "./tool-call-grammar.js";
 export const GRAMMAR_SMOKE_MAX_TOKENS = 48;
 
 /**
- * The whole check's budget. The prompt is under a hundred tokens, so a
- * server that answers at all answers well inside it; one that does not
- * is left to the dispatch's own deadlines.
+ * The whole check's budget. The prompt is under a hundred tokens, so an
+ * idle server answers well inside it. A server that does not is busy or
+ * stuck, and waiting longer only delays the fan-out's approval prompt:
+ * the check ends without a verdict and the dispatch's own deadlines
+ * apply.
  */
-export const GRAMMAR_SMOKE_TIMEOUT_MS = 30_000;
+export const GRAMMAR_SMOKE_TIMEOUT_MS = 10_000;
 
 /** The one tool the check's grammar admits. */
 export const GRAMMAR_SMOKE_TOOL = "reply";

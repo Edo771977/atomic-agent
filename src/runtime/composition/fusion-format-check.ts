@@ -6,6 +6,7 @@ import type { LlmProviderConfigEntry } from "../../llm/provider/index.js";
 import { readLaunchRecord, readRunningPid } from "../../local-llm/index.js";
 import { resolveServerTemplatePolicy } from "../../llm/server-template-policy.js";
 import type { LocalGrammarProbe } from "../../tools/fusion/local-grammar-smoke.js";
+import type { SlotOccupancy } from "../../tools/fusion/worker-result.js";
 
 export interface FusionFormatCheckDeps {
   /** Live: the config the operator may change between turns. */
@@ -25,6 +26,11 @@ export interface FusionFormatCheckDeps {
    * {@link managedServerGeneration}.
    */
   getServerGeneration?: () => string | null;
+  /**
+   * The main local server's `/slots` load, `null` when unreadable. A
+   * server with every slot working skips the check rather than queue it.
+   */
+  slotOccupancy?: () => Promise<SlotOccupancy | null>;
 }
 
 /**
@@ -67,8 +73,18 @@ export function createFusionFormatProbeFor(
       "external";
     const key =
       modelId === null ? null : [normalise(main), modelId, profile.id, generation].join("\u0000");
+    const slots = deps.slotOccupancy;
     return {
       key,
+      server: normalise(main),
+      ...(slots === undefined
+        ? {}
+        : {
+            allSlotsBusy: async () => {
+              const occupancy = await slots();
+              return occupancy !== null && occupancy.busy >= occupancy.total;
+            },
+          }),
       run: (signal) =>
         runGrammarSmoke({
           profile,

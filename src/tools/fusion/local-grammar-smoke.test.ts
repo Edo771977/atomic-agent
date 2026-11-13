@@ -17,6 +17,7 @@ import {
 import { buildFusionDelegateTool, type FusionDelegateDeps } from "./fusion-delegate.js";
 import {
   FORMAT_CHECK_FAIL_TTL_MS,
+  FORMAT_CHECK_INCONCLUSIVE_TTL_MS,
   LocalGrammarSmoke,
   describeFormatCheckRefusal,
   formatCheckTrip,
@@ -31,7 +32,7 @@ const FAIL: GrammarSmokeVerdict = {
 
 function probe(verdicts: GrammarSmokeVerdict[], key = "srv\u0000model\u0000qwen-think") {
   const run = vi.fn(async (_signal?: AbortSignal) => verdicts.shift() ?? { kind: "pass" as const });
-  const p: LocalGrammarProbe = { key, run };
+  const p: LocalGrammarProbe = { key, server: "srv", run };
   return { probe: p, run };
 }
 
@@ -98,26 +99,76 @@ describe("LocalGrammarSmoke", () => {
     });
   });
 
-  it("keeps nothing from a timeout, so the next fan-out asks again", async () => {
-    const smoke = new LocalGrammarSmoke();
+  it("keeps a timeout for two minutes, so a busy server is not asked before every fan-out", async () => {
+    let now = 0;
+    const smoke = new LocalGrammarSmoke({ now: () => now });
     const flaky = probe([
-      { kind: "inconclusive", reason: "timeout", detail: "no answer within 30 s" },
+      { kind: "inconclusive", reason: "timeout", detail: "no answer within 10 s" },
       { kind: "pass" },
     ]);
     const at = { sessionId: "s1", leg: "local-llama" };
-    expect(await smoke.check(flaky.probe, at)).toMatchObject({ kind: "inconclusive", reason: "timeout" });
+    expect(await smoke.check(flaky.probe, at)).toMatchObject({
+      kind: "inconclusive",
+      reason: "timeout",
+      cached: false,
+    });
+    now += FORMAT_CHECK_INCONCLUSIVE_TTL_MS - 1;
+    expect(await smoke.check(flaky.probe, at)).toMatchObject({ kind: "inconclusive", cached: true });
+    now += 1;
     expect(await smoke.check(flaky.probe, at)).toEqual({ kind: "pass", cached: false });
     expect(flaky.run).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps nothing from a cancel", async () => {
+    const smoke = new LocalGrammarSmoke();
+    const p = probe([
+      { kind: "inconclusive", reason: "cancelled", detail: "cancelled while the check ran" },
+      { kind: "pass" },
+    ]);
+    const at = { sessionId: "s1", leg: "local-llama" };
+    await smoke.check(p.probe, at);
+    expect(await smoke.check(p.probe, at)).toEqual({ kind: "pass", cached: false });
+  });
+
+  it("skips a server a live fan-out is loading, and one whose slots are all working", async () => {
+    const smoke = new LocalGrammarSmoke();
+    const p = probe([{ kind: "pass" }]);
+    const at = { sessionId: "s2", leg: "local-llama" };
+    const end = smoke.beginFanout(["srv"]);
+    expect(await smoke.check(p.probe, at)).toEqual({ kind: "skipped", why: "server-busy" });
+    // Another server is not held by that fan-out.
+    const other = probe([{ kind: "pass" }], "other");
+    expect(await smoke.check({ ...other.probe, server: "other-srv" }, at)).toMatchObject({
+      kind: "pass",
+    });
+    end();
+    end(); // idempotent
+    let busy = true;
+    const slots: LocalGrammarProbe = { ...p.probe, allSlotsBusy: async () => busy };
+    expect(await smoke.check(slots, at)).toEqual({ kind: "skipped", why: "server-busy" });
+    busy = false;
+    expect(await smoke.check(slots, at)).toEqual({ kind: "pass", cached: false });
+    expect(p.run).toHaveBeenCalledOnce();
+    // An unreadable slot table says nothing: the check runs.
+    const unreadable = probe([{ kind: "pass" }], "u");
+    const throwing: LocalGrammarProbe = {
+      ...unreadable.probe,
+      allSlotsBusy: async () => {
+        throw new Error("no /slots");
+      },
+    };
+    expect(await smoke.check(throwing, at)).toMatchObject({ kind: "pass" });
   });
 
   it("asks once for two checks in flight", async () => {
     const smoke = new LocalGrammarSmoke();
     let release!: (v: GrammarSmokeVerdict) => void;
     const run = vi.fn(() => new Promise<GrammarSmokeVerdict>((resolve) => (release = resolve)));
-    const p = { key: "k", run };
+    const p = { key: "k", server: "srv", run };
     const at = { sessionId: "s1", leg: "local-llama" };
     const first = smoke.check(p, at);
     const second = smoke.check(p, at);
+    await vi.waitFor(() => expect(run).toHaveBeenCalled());
     release({ kind: "pass" });
     expect(await first).toEqual({ kind: "pass", cached: false });
     expect(await second).toEqual({ kind: "pass", cached: true });
@@ -147,7 +198,7 @@ describe("LocalGrammarSmoke", () => {
       throw new Error("socket hang up");
     });
     const verdict = await smoke.check(
-      { key: "k", run },
+      { key: "k", server: "srv", run },
       { sessionId: "s", leg: "l", signal: controller.signal },
     );
     expect(run).toHaveBeenCalledWith(controller.signal);
@@ -316,6 +367,36 @@ describe("fusion.delegate with the local format check", () => {
     expect((await after.run({ tasks: TASKS }, ctx({ sessionId: "s-other" }))).status).toBe("error");
   });
 
+  it("does not queue a check behind another session's live fan-out on the same server", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let started = 0;
+    const runTurn: FusionDelegateDeps["runTurn"] = async (session, message, options) => {
+      started += 1;
+      await gate;
+      return workerTurn(session, message, options);
+    };
+    const first = probe([{ kind: "pass" }], "first-key");
+    const later = probe([FAIL], "later-key");
+    const smoke = new LocalGrammarSmoke();
+    let current = first.probe;
+    const tool = buildFusionDelegateTool(
+      deps({ runTurn: vi.fn(runTurn), localGrammarSmoke: smoke, localGrammarProbeFor: () => current }),
+    );
+    const running = tool.run({ tasks: TASKS }, ctx());
+    await vi.waitFor(() => expect(started).toBeGreaterThan(0));
+    current = later.probe;
+    const second = tool.run({ tasks: TASKS }, ctx({ sessionId: "s-other" }));
+    await vi.waitFor(() => expect(started).toBeGreaterThan(2));
+    release();
+    expect((await running).status).toBe("ok");
+    expect((await second).status).toBe("ok");
+    expect(later.run).not.toHaveBeenCalled();
+    // Once nothing is live there, the next fan-out is checked again.
+    expect((await tool.run({ tasks: TASKS }, ctx({ sessionId: "s-third" }))).status).toBe("error");
+    expect(later.run).toHaveBeenCalledOnce();
+  });
+
   it("never asks a cloud leg", async () => {
     const probeFor = vi.fn(() => probe([FAIL]).probe);
     const d = deps({
@@ -350,6 +431,7 @@ describe("fusion.delegate with the local format check", () => {
     const seen: Array<AbortSignal | undefined> = [];
     const watching: LocalGrammarProbe = {
       key: "k",
+      server: "srv",
       run: async (signal) => {
         seen.push(signal);
         return { kind: "pass" };
