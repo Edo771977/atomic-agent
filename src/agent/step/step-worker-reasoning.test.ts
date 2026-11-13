@@ -7,7 +7,12 @@ import { resolveStepGrammar } from "./step-inference.js";
 import { ToolRegistry } from "../../tools/tool-registry.js";
 import { compressToolResult } from "../../compressor/result-compressor.js";
 import { SlotManager } from "../../llm/slot-manager.js";
-import { PLAIN_INSTRUCT_PROFILE, QWEN_THINK_PROFILE, type ModelProfile } from "../../llm/model-profile.js";
+import {
+  GEMMA4_THINK_PROFILE,
+  PLAIN_INSTRUCT_PROFILE,
+  QWEN_THINK_PROFILE,
+  type ModelProfile,
+} from "../../llm/model-profile.js";
 import type { CompletionResult } from "../../llm/llama-server-client.js";
 import { buildGrammar } from "../../llm/grammar/build-grammar.js";
 import { createEmptySessionState } from "../../session/session-state.js";
@@ -160,6 +165,34 @@ describe("a local fusion worker's reasoning bound on the per-request grammar", (
     expect(off).toMatch(/^root ::= tool-call-array$/m);
     expect(resolveStepGrammar({ reasoningBudgetTokens: 512 }, deps, [], false))
       .toMatch(/^root ::= think-prelude tool-call-array$/m);
+  });
+});
+
+describe("a Gemma channel grammar through the step", () => {
+  const GEMMA_REPLY = `<|channel>thought\nok<channel|>${JSON.stringify([{ tool: "reply", args: { text: "done" } }])}`;
+  const channelHead = (grammar: string) =>
+    grammar.split("\n").find((line) => line.startsWith("channel-body ::= "));
+
+  it("bounds the channel body, keeps the forced opener, and leaves the prompt alone", async () => {
+    const opts = { profile: GEMMA4_THINK_PROFILE, content: GEMMA_REPLY };
+    const plain = await runStep({}, 0, opts);
+    expect(plain.params.grammar).toBe(plain.baseGrammar);
+    expect(plain.reportedBound).toBeNull();
+
+    const worker = await runStep({ reasoningBudgetTokens: 1_536 }, 0, opts);
+    expect(worker.params.grammar).toMatch(/^root ::= channel-prelude tool-call-array$/m);
+    expect(worker.params.grammar).toContain('channel-prelude ::= "<|channel>thought\\n" channel-body');
+    expect(channelHead(worker.params.grammar)).toBe(
+      "channel-body ::= channel-char{0,1998} | channel-char{1999} channel-body-2",
+    );
+    expect(worker.params.grammar).toContain("channel-body-4 ::= channel-char{0,147}");
+    expect(worker.params.grammar).toMatch(/^channel-char ::= /m);
+    expect(worker.params.prompt).toBe(plain.params.prompt);
+    expect(worker.reportedBound).toBe(1_536);
+
+    const final = await runStep({ reasoningBudgetTokens: 1_536, terminalOnly: true }, 0, opts);
+    expect(channelHead(final.params.grammar)).toBe(channelHead(plain.baseGrammar));
+    expect(final.reportedBound).toBeNull();
   });
 });
 
