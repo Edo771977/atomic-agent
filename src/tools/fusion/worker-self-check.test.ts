@@ -16,6 +16,8 @@ import type { DelegateTask } from "./delegate-args.js";
 import { runWorkerTasks, type WorkerRunnerDeps } from "./worker-runner.js";
 import {
   SELF_CHECK_GRACE_STEPS,
+  concurrentPaths,
+  mentionsPath,
   runSelfCheck,
 } from "./worker-self-check.js";
 
@@ -264,6 +266,107 @@ describe("a worker's self-check before its reply closes the task", () => {
     expect(notice).not.toContain("custom-known-value-77");
     expect(notice).toContain("postgres://app:[redacted:password]@db");
     expect(notice).toContain("[redacted:MY_API_KEY]");
+  });
+
+  describe("a check that needs a file a task running alongside writes", () => {
+    const SIBLING: DelegateContract = {
+      owners: { "a.js": "a", "b.js": "t" },
+      checks: [
+        { task: "t", kind: "command", cmd: "node", args: ["b.test.js", "./a.js"] },
+        { task: "t", kind: "command", cmd: "node", args: ["b.test.js"] },
+      ],
+    };
+
+    it("is not self-run when its spec names a path a concurrent task owns", async () => {
+      const runChecks = vi.fn<ContractCheckRunner>(async (specs) => ({
+        ok: false,
+        results: specs.map(() => FAILING),
+      }));
+      const { deps, calls } = harness(dir, (call) => {
+        say(call, "done");
+        return {};
+      }, runChecks);
+      const [row] = await runWorkerTasks(deps, {
+        ...BASE,
+        maxWorkers: 2,
+        tasks: [
+          { id: "t", title: "T", instructions: "x" },
+          { id: "a", title: "A", instructions: "y" },
+        ],
+        contract: SIBLING,
+        signal: new AbortController().signal,
+      });
+      expect(runChecks).toHaveBeenCalledTimes(1);
+      expect(runChecks.mock.calls[0]![0]).toEqual([{ kind: "command", cmd: "node", args: ["b.test.js"] }]);
+      const notices = calls.filter((c) => c.message.startsWith("Your reply did not close the task"));
+      expect(notices).toHaveLength(1);
+      expect(notices[0]!.message).not.toContain("a.js");
+      expect(row!.id).toBe("t");
+    });
+
+    it("gives no notice for a failure whose output names a concurrent task's path", async () => {
+      const runChecks = vi.fn<ContractCheckRunner>(async (specs) => ({
+        ok: false,
+        results: specs.map(() => ({
+          ok: false,
+          summary: "verify.run command: FAILED\nexit 1 after 5 ms",
+          stderrTail: "Error: Cannot find module '/work/a.js'\n    at b.test.js:1:1",
+        })),
+      }));
+      const { deps, calls } = harness(dir, (call) => {
+        say(call, "done");
+        return {};
+      }, runChecks);
+      // Only `t` on this leg; `a` runs on another one in the same wave.
+      const [row] = await runWorkerTasks(deps, {
+        ...BASE,
+        tasks: [{ id: "t", title: "T", instructions: "x" }],
+        concurrentTaskIds: ["t", "a"],
+        contract: { owners: SIBLING.owners!, checks: [SIBLING.checks![1]!] },
+        signal: new AbortController().signal,
+      });
+      expect(runChecks).toHaveBeenCalledTimes(1);
+      expect(calls).toHaveLength(1);
+      expect(row!.status).toBe("ok");
+    });
+
+    it("reads the concurrent tasks' paths from owners and provides, never this task's or the inputs", () => {
+      const contract: DelegateContract = {
+        inputs: ["data.csv"],
+        owners: { "./a.js": "a", "lib/": "a", "b.js": "t", "data.csv": "a" },
+        provides: [
+          { task: "a", kind: "symbol", name: "A.run", in: "src/a-api.js" },
+          { task: "a", kind: "file", name: "out/report.md" },
+          { task: "later", kind: "file", name: "z.js" },
+        ],
+      };
+      expect(concurrentPaths(contract, "t", ["t", "a"]).sort()).toEqual(
+        ["a.js", "lib", "out/report.md", "src/a-api.js"].sort(),
+      );
+      expect(concurrentPaths(contract, "t", ["t"])).toEqual([]);
+      expect(mentionsPath('{"args":["./a.js"]}', "a.js")).toBe(true);
+      expect(mentionsPath("at /work/a.js:3:1", "a.js")).toBe(true);
+      expect(mentionsPath("data.js and a.jsx and a.js.map", "a.js")).toBe(false);
+    });
+
+    it("still runs a check naming a path of a task that is not running alongside it", async () => {
+      const runChecks = vi.fn<ContractCheckRunner>(async (specs) => ({
+        ok: false,
+        results: specs.map(() => FAILING),
+      }));
+      const { deps } = harness(dir, (call) => {
+        say(call, "done");
+        return {};
+      }, runChecks);
+      // `a` finished in an earlier wave: its file is there to read.
+      await runWorkerTasks(deps, {
+        ...BASE,
+        tasks: [{ id: "t", title: "T", instructions: "x" }],
+        contract: SIBLING,
+        signal: new AbortController().signal,
+      });
+      expect(runChecks.mock.calls[0]![0]).toHaveLength(2);
+    });
   });
 
   it("runSelfCheck reports a check run it cut at the cap as not run, never as failed", async () => {

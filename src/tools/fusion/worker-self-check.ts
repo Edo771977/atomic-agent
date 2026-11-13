@@ -5,7 +5,7 @@ import {
   type ContractCheckOutcome,
   type ContractCheckRunner,
 } from "./contract-checks.js";
-import type { ContractCheck, DelegateContract } from "./contract.js";
+import { ownedPaths, type ContractCheck, type DelegateContract } from "./contract.js";
 import type { DelegateTask } from "./delegate-args.js";
 import { inspectDeclaredFiles, type DegenerateFile } from "./declared-files.js";
 import {
@@ -57,6 +57,68 @@ export function ownChecks(
   return (contract?.checks ?? []).filter((check) => check.task === taskId);
 }
 
+function normalisePath(path: string): string {
+  return path.trim().replace(/^(?:\.\/)+/, "").replace(/\/+$/, "");
+}
+
+/**
+ * The paths a task running at the same time as `taskId` writes, by the
+ * contract: what `owners` gives a concurrent task, and where its
+ * `provides` must appear (`in`, or a `file` provide's own name). Less
+ * this task's own paths and the operator's `inputs`, which everyone may
+ * read. `concurrent` is every task id in the same run of tasks (a wave,
+ * a judge's retry), across legs.
+ *
+ * Why: the self-check runs mid-wave. Under `isolation: "worktree"` this
+ * task's workspace has none of its siblings' files; without isolation
+ * they are still being written. A check that needs one fails for a
+ * reason this worker cannot fix, and a weak worker told it failed may
+ * write a stub of the sibling's file. Tasks of earlier waves have
+ * finished, and their files are where a check reads them.
+ */
+export function concurrentPaths(
+  contract: DelegateContract | undefined,
+  taskId: string,
+  concurrent: readonly string[],
+): string[] {
+  if (contract === undefined) return [];
+  const others = new Set(concurrent.filter((id) => id !== taskId));
+  if (others.size === 0) return [];
+  const mine = new Set(
+    [...ownedPaths(contract, taskId), ...(contract.inputs ?? [])].map(normalisePath),
+  );
+  const out = new Set<string>();
+  const add = (path: string): void => {
+    const p = normalisePath(path);
+    if (p.length > 0 && !mine.has(p)) out.add(p);
+  };
+  for (const [path, owner] of Object.entries(contract.owners ?? {})) {
+    if (others.has(owner)) add(path);
+  }
+  for (const provide of contract.provides ?? []) {
+    if (!others.has(provide.task)) continue;
+    if (provide.in !== undefined) add(provide.in);
+    if (provide.kind === "file") add(provide.name);
+  }
+  return [...out];
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Whether `text` names `path` as a path: not as the tail of a longer
+ * name (`data.js` is not `a.js`), with any directory or `./` before it.
+ */
+export function mentionsPath(text: string, path: string): boolean {
+  return new RegExp(`(?:^|[^\\w.-])${escapeRegExp(path)}(?![\\w-]|\\.\\w)`).test(text);
+}
+
+function mentionsAny(text: string, paths: readonly string[]): string | undefined {
+  return paths.find((path) => mentionsPath(text, path));
+}
+
 export interface SelfCheckFinding {
   /** Declared paths that do not exist. */
   missing: string[];
@@ -90,7 +152,13 @@ export async function runSelfCheck(input: {
   timeCapMs: number;
   /** The agent's own keys, for masking the checks' output. */
   knownSecrets?: readonly KnownSecret[];
-}): Promise<SelfCheckFinding & { checksNotRun?: string }> {
+  /**
+   * Paths tasks running alongside this one write (`concurrentPaths`).
+   * A check whose spec names one is not run here; a failure whose
+   * output names one is not this worker's to fix and gives no finding.
+   */
+  concurrentPaths?: readonly string[];
+}): Promise<SelfCheckFinding & { checksNotRun?: string; checksDeferred?: string[] }> {
   const finding: SelfCheckFinding = { missing: [], degenerate: [], failed: [] };
   const files = input.task.files ?? [];
   if (files.length > 0) {
@@ -98,8 +166,16 @@ export async function runSelfCheck(input: {
     finding.missing = report.missing;
     finding.degenerate = report.degenerate ?? [];
   }
-  const checks = ownChecks(input.contract, input.task.id);
-  if (checks.length === 0 || input.runChecks === undefined) return finding;
+  const siblings = input.concurrentPaths ?? [];
+  const deferred: string[] = [];
+  const checks = ownChecks(input.contract, input.task.id).filter((check) => {
+    const path = mentionsAny(describeSpec(check), siblings);
+    if (path !== undefined) deferred.push(path);
+    return path === undefined;
+  });
+  const withDeferred = <T extends object>(out: T): T & { checksDeferred?: string[] } =>
+    deferred.length === 0 ? out : { ...out, checksDeferred: [...new Set(deferred)] };
+  if (checks.length === 0 || input.runChecks === undefined) return withDeferred(finding);
   if (input.signal.aborted || input.timeCapMs <= 0) {
     return { ...finding, checksNotRun: "no time left" };
   }
@@ -130,14 +206,20 @@ export async function runSelfCheck(input: {
       stopped,
     ]);
     if (run === "cap") {
-      return { ...finding, checksNotRun: `not finished within ${Math.round(input.timeCapMs / 1000)}s` };
+      return withDeferred({ ...finding, checksNotRun: `not finished within ${Math.round(input.timeCapMs / 1000)}s` });
     }
-    if (run === "stopped") return { ...finding, checksNotRun: "the worker was stopped" };
-    if (run.checksSkipped !== undefined) return { ...finding, checksNotRun: run.checksSkipped };
+    if (run === "stopped") return withDeferred({ ...finding, checksNotRun: "the worker was stopped" });
+    if (run.checksSkipped !== undefined) return withDeferred({ ...finding, checksNotRun: run.checksSkipped });
     run.outcomes.forEach((outcome, i) => {
-      if (!outcome.ok) finding.failed.push({ spec: checks[i]!, outcome });
+      if (outcome.ok) return;
+      const path = mentionsAny(`${outcome.detail}\n${outcome.output ?? ""}`, siblings);
+      if (path !== undefined) {
+        deferred.push(path);
+        return;
+      }
+      finding.failed.push({ spec: checks[i]!, outcome });
     });
-    return finding;
+    return withDeferred(finding);
   } finally {
     clearTimeout(timer);
     if (onStop !== undefined) input.signal.removeEventListener("abort", onStop);

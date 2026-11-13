@@ -69,6 +69,7 @@ import {
   SELF_CHECK_MAX_MS,
   SELF_CHECK_MIN_GRACE_STEPS,
   SELF_CHECK_MIN_REMAINING_MS,
+  concurrentPaths,
   describeSelfCheck,
   hasFindings,
   renderSelfCheckNotice,
@@ -555,6 +556,12 @@ export const MAX_ESCALATIONS_PER_WORKER = 2;
 export interface RunWorkerTasksOptions {
   parentSessionId: string;
   tasks: readonly DelegateTask[];
+  /**
+   * Every task id running at the same time as these (a wave, a judge's
+   * retry), across all legs. A worker's self-check does not ask a
+   * sibling's files of it (`concurrentPaths`). Absent: `tasks`.
+   */
+  concurrentTaskIds?: readonly string[];
   /** Concurrency ceiling, already reconciled against the slot pool. */
   maxWorkers: number;
   /** The local leg every worker turn is pinned to. */
@@ -1471,7 +1478,18 @@ async function runOneTask(
       ]),
       timeCapMs: Math.min(SELF_CHECK_MAX_MS, remainingMs),
       knownSecrets,
+      concurrentPaths: concurrentPaths(
+        options.contract,
+        task.id,
+        options.concurrentTaskIds ?? options.tasks.map((t) => t.id),
+      ),
     });
+    if (finding.checksDeferred !== undefined) {
+      deps.logger?.info("fusion: a worker's self-check left checks to the fan-out", {
+        taskId: task.id,
+        reason: `they read ${finding.checksDeferred.join(", ")}, written by a task running alongside it`,
+      });
+    }
     if (finding.checksNotRun !== undefined) {
       deps.logger?.info("fusion: a worker's self-check ran no checks", {
         taskId: task.id,

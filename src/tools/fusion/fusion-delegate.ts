@@ -908,6 +908,7 @@ export function buildFusionDelegateTool(
             ) => { workingDir: string; writeScope: readonly string[] } | undefined)
           | undefined,
         allowSplit: boolean,
+        concurrentTaskIds: readonly string[],
       ): Promise<WorkerTaskResult[]> =>
         runWorkerTasks(
           // Workers run in the parent's folder in every model mode, so a
@@ -919,6 +920,7 @@ export function buildFusionDelegateTool(
             ...(contract === undefined ? {} : { contract }),
             parentSessionId: ctx.sessionId,
             tasks,
+            concurrentTaskIds,
             maxWorkers,
             providerId: workerProviderId,
             workerModel,
@@ -965,6 +967,7 @@ export function buildFusionDelegateTool(
             ) => { workingDir: string; writeScope: readonly string[] } | undefined)
           | undefined,
         allowSplit: boolean,
+        concurrentTaskIds: readonly string[],
       ): Promise<WorkerTaskResult[]> => {
         const local = deps.workerSupportsSlotAffinity(leg.providerId);
         const pricing = rolePricing.get(leg.providerId);
@@ -979,6 +982,7 @@ export function buildFusionDelegateTool(
             ...(contract === undefined ? {} : { contract }),
             parentSessionId: ctx.sessionId,
             tasks,
+            concurrentTaskIds,
             maxWorkers: local
               ? 1
               : Math.max(
@@ -1029,8 +1033,11 @@ export function buildFusionDelegateTool(
           | undefined,
         allowSplit: boolean,
       ): Promise<WorkerTaskResult[]> => {
+        // The whole run of tasks, whichever leg each lands on: what a
+        // worker's self-check must not ask of it (`concurrentPaths`).
+        const concurrent = tasks.map((t) => t.id);
         if (roleLegs.size === 0) {
-          return runOnLeg(tasks, contract, briefSuffix, taskWorkspace, allowSplit);
+          return runOnLeg(tasks, contract, briefSuffix, taskWorkspace, allowSplit, concurrent);
         }
         const onWorkerLeg = tasks.filter(
           (t) => taskLegs.get(t.id)?.isWorkerLeg !== false,
@@ -1038,7 +1045,7 @@ export function buildFusionDelegateTool(
         const groups = await Promise.all([
           onWorkerLeg.length === 0
             ? Promise.resolve<WorkerTaskResult[]>([])
-            : runOnLeg(onWorkerLeg, contract, briefSuffix, taskWorkspace, allowSplit),
+            : runOnLeg(onWorkerLeg, contract, briefSuffix, taskWorkspace, allowSplit, concurrent),
           ...[...roleLegs.values()].map((leg) => {
             const mine = tasks.filter((t) => {
               const own = taskLegs.get(t.id);
@@ -1046,7 +1053,7 @@ export function buildFusionDelegateTool(
             });
             return mine.length === 0
               ? Promise.resolve<WorkerTaskResult[]>([])
-              : runOnRoleLeg(leg, mine, contract, briefSuffix, taskWorkspace, allowSplit);
+              : runOnRoleLeg(leg, mine, contract, briefSuffix, taskWorkspace, allowSplit, concurrent);
           }),
         ]);
         const byId = new Map(groups.flat().map((r) => [r.id, r]));
