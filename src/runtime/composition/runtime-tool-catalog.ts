@@ -727,6 +727,12 @@ export function registerRuntimeFusionAndReadScope(input: {
       createEphemeralSession,
       resolveOriginalRequest: resolveOriginalRequest,
       declaredInputs,
+      // The Codex CLI confines its own shell (`-s read-only`) rather than
+      // turning it off, so it is no `model: "orchestrator"` target.
+      cliToolsStayOn: (providerId) => {
+        const entry = resolveLlmConfig(getConfig()).providers.find((p) => p.id === providerId);
+        return entry?.kind === "subscription-cli" && entry.subscriptionCli?.cli === "codex";
+      },
       // The worker leg's pricing, when the catalogue or a hand-priced
       // entry knows it — the status table's spend line.
       resolveWorkerPricing: (providerId, modelId) =>

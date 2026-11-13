@@ -181,6 +181,13 @@ export interface FusionDelegateDeps extends WorkerRunnerDeps {
    * for itself. Absent (tests, embedders), no such check.
    */
   agentStateDir?: string;
+  /**
+   * Whether `providerId` is a subscription CLI whose own tools are only
+   * confined, not off: the Codex CLI runs `-s read-only`, and its shell
+   * can still read outside a worker's read scope. Such an orchestrator
+   * leg is refused as a `model: "orchestrator"` target. Absent: none is.
+   */
+  cliToolsStayOn?: (providerId: string) => boolean;
 }
 
 /**
@@ -365,8 +372,23 @@ export function buildFusionDelegateTool(
           { field: "tasks", reason: "orchestrator-target-off" },
         );
       }
+      // A CLI leg whose own shell stays on (Codex: `-s read-only`) can
+      // read past the worker's read scope; as a worker or role leg that
+      // is the operator's pick, but this target is the planner's.
+      const orchestratorCliToolsOn =
+        mode.orchestratorProviderId !== null &&
+        deps.cliToolsStayOn?.(mode.orchestratorProviderId) === true;
+      if (
+        orchestratorCliToolsOn &&
+        parsed.tasks.some((t) => t.model === ORCHESTRATOR_TASK_MODEL)
+      ) {
+        return error(
+          `validation: \`model: "orchestrator"\` is not available here: the orchestrator runs on a command-line agent whose own shell stays on (read-only, but not limited to the worker's read scope), so it cannot run a worker turn under the worker's rules. Send those tasks to a worker model: leave \`model\` out or name one from the \`### fusion\` list.`,
+          { field: "tasks", reason: "orchestrator-target-cli-tools" },
+        );
+      }
       const orchestratorLegRef =
-        mode.orchestratorProviderId === null
+        mode.orchestratorProviderId === null || orchestratorCliToolsOn
           ? undefined
           : {
               providerId: mode.orchestratorProviderId,
@@ -1639,6 +1661,14 @@ export function buildFusionDelegateTool(
               : [
                   `ran on ${leg.model}${leg.orchestrator === true ? " (the orchestrator's model)" : leg.role === undefined ? "" : ` (role ${leg.role})`}`,
                 ]),
+            // A subscription leg has no price: turnBudgetUsd cannot see
+            // these turns, only the count cap does.
+            ...(leg.orchestrator === true &&
+            rolePricing.get(leg.providerId) === undefined
+              ? [
+                  "unpriced: counted against llm.runMode.fusion.maxOrchestratorTasksPerTurn, not turnBudgetUsd",
+                ]
+              : []),
           ];
           return {
             ...r,

@@ -603,6 +603,27 @@ describe("the per-turn cap on model: \"orchestrator\" tasks", () => {
     expect(asked).toEqual(["third"]);
   });
 
+  it("says on an unpriced row that only the count cap holds it", async () => {
+    const d = deps({ resolveWorkerPricing: () => undefined });
+    const result = await buildFusionDelegateTool(d).run({ tasks: [hard(1)] }, ctx());
+    const rows = result.details.tasks as Array<{ notes?: string[] }>;
+    expect(rows[0]!.notes).toContain(
+      "unpriced: counted against llm.runMode.fusion.maxOrchestratorTasksPerTurn, not turnBudgetUsd",
+    );
+  });
+
+  it("refuses the target when the orchestrator leg's CLI keeps its own shell on", async () => {
+    const d = deps({ cliToolsStayOn: (id) => id === "openrouter" });
+    const tool = buildFusionDelegateTool(d);
+    const refused = await tool.run({ tasks: [hard(1)] }, ctx());
+    expect(d.turns).toBe(0);
+    expect(refused.details).toMatchObject({ reason: "orchestrator-target-cli-tools" });
+    expect(refused.summary).toContain("not limited to the worker's read scope");
+    // Worker tasks are unaffected.
+    await tool.run({ tasks: [{ id: "w", instructions: "bulk" }] }, ctx());
+    expect(d.turns).toBe(1);
+  });
+
   it("parses the cap, 0 included, and resolves the default", async () => {
     const { parseLlmRunModeConfig } = await import("../../config/llm-run-mode-config.js");
     const { resolveRunMode } = await import("../../llm/run-mode/resolve-run-mode.js");
