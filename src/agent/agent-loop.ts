@@ -481,6 +481,9 @@ export class AgentLoop {
             ...(options.maxOutputTokens !== undefined
               ? { maxOutputTokens: options.maxOutputTokens }
               : {}),
+            ...(options.reasoningBudgetTokens !== undefined
+              ? { reasoningBudgetTokens: options.reasoningBudgetTokens }
+              : {}),
           };
         const contextProviderId = options.providerId ?? this.deps.contextProviderId?.(state.id);
         const initialMode = options.modelModePolicy ? resolveModelMode(options.modelModePolicy, options.providerId) : undefined;

@@ -136,6 +136,7 @@ export function createRuntimeTurnService(
     toolRole?: ToolRole;
     reasoningEffort?: ReasoningEffort;
     maxOutputTokens?: number;
+    reasoningBudgetTokens?: number;
     interactive?: boolean;
   }) => ({
     // A person is watching this chat: a model that runs out of memory
@@ -147,6 +148,9 @@ export function createRuntimeTurnService(
     ...(runOptions.maxOutputTokens === undefined
       ? {}
       : { maxOutputTokens: runOptions.maxOutputTokens }),
+    ...(runOptions.reasoningBudgetTokens === undefined
+      ? {}
+      : { reasoningBudgetTokens: runOptions.reasoningBudgetTokens }),
     maxSteps: Math.min(
       config.agent.maxSteps,
       runOptions.maxSteps ?? config.agent.maxSteps,
@@ -353,6 +357,7 @@ export function createRuntimeTurnService(
       toolRole?: ToolRole;
       reasoningEffort?: ReasoningEffort;
       maxOutputTokens?: number;
+      reasoningBudgetTokens?: number;
       interactive?: boolean;
       /** What the turn's progress marker records beyond the message (ATO-1109). */
       checkpoint?: TurnCheckpointOptions;
@@ -625,6 +630,7 @@ export function createRuntimeTurnService(
       toolRole?: ToolRole;
       reasoningEffort?: ReasoningEffort;
       maxOutputTokens?: number;
+      reasoningBudgetTokens?: number;
       interactive?: boolean;
       checkpoint?: TurnCheckpointOptions;
       goal?: GoalSpec;

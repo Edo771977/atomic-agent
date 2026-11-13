@@ -371,6 +371,14 @@ export interface StepContext {
   /** The turn's output ceiling — see `LlmStreamParams.maxOutputTokens`. */
   maxOutputTokens?: number;
   /**
+   * The turn's own think-block bound, in place of
+   * `localModels.reasoningBudgetTokens` (`RunTurnOptions.reasoningBudgetTokens`,
+   * a local fusion worker's). Applied per request to the grammar
+   * (`resolveStepGrammar`), so only a grammar link sees it; the prompt
+   * and the base grammar are untouched.
+   */
+  reasoningBudgetTokens?: number;
+  /**
    * Only the terminal `reply`/`finish` tools may run this step (the
    * loop's reserved final step). The prompt's tool catalog is left as it
    * is — it is stable-prefix bytes, and narrowing it for one step moved

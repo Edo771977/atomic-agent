@@ -256,6 +256,43 @@ describe("AgentLoop end-to-end with mock LLM", () => {
     expect(seen).toEqual([{ effort: "low", cap: 12_000 }, {}]);
   });
 
+  it("passes RunTurnOptions.reasoningBudgetTokens to every step's grammar, not the prompt", async () => {
+    const grammar = [
+      "root ::= think-prelude tool-call-array",
+      'think-prelude ::= think-body "</think>" prelude-trail-ws',
+      "think-body ::= think-fragment*",
+      'think-fragment ::= [^<]+ | "<" [^/]',
+      "prelude-trail-ws ::= ( [ \\t\\n\\r] ){0,8}",
+      'tool-call-array ::= "ok"',
+      "",
+    ].join("\n");
+    const seen: Array<{ grammar: string; prompt: string }> = [];
+    const loop = new AgentLoop({
+      registry: buildDefaultToolRegistry(),
+      slotManager: new SlotManager(2),
+      grammar,
+      llmComplete: async (params) => {
+        seen.push({ grammar: params.grammar, prompt: params.prompt });
+        return makeCompletion(JSON.stringify({ tool: "reply", args: { text: "done" } }));
+      },
+      toolDescriptors: TOOLS,
+      capabilities: CAPS,
+      skillCatalog: SKILLS,
+    });
+    const run = (id: string, extra: { reasoningBudgetTokens?: number }) =>
+      loop.runTurn(createEmptySessionState({ id, workingDir }), {
+        userMessage: "go",
+        maxSteps: 2,
+        ...extra,
+        signal: new AbortController().signal,
+      });
+    await run("s-budget", { reasoningBudgetTokens: 64 });
+    await run("s-budget", {});
+    expect(seen[0]!.grammar).toMatch(/^think-body ::= think-char\{0,256\}$/m);
+    expect(seen[1]!.grammar).toBe(grammar);
+    expect(seen[0]!.prompt).toBe(seen[1]!.prompt);
+  });
+
   it("keeps working past the leg length while the task is progressing", async () => {
     // The point of the change: `maxSteps` is a checkpoint, not the end
     // of the work. A task that is still getting usable results out of

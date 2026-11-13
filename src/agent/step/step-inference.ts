@@ -12,12 +12,12 @@ import { hashPrefix } from "../../llm/slot-manager.js";
 import { checkProfilePromptAligned } from "../../llm/profile-invariants.js";
 import type { BuiltPrompt } from "../../prompt/build-prompt.js";
 import type { CompletionResult, StreamChunk } from "../../llm/llama-server-client.js";
-import { estimateReasoningTokens } from "../../llm/reasoning-budget.js";
+import { estimateReasoningTokens, reasoningBudgetChars } from "../../llm/reasoning-budget.js";
 import { localReplyCapEnvSet, thinkingReplyCap } from "./thinking-reply-cap.js";
 import { parseDepsFor } from "./step-parsing.js";
 import type { ToolDescriptor } from "../../prompt/stable-prefix.js";
 import { refusedToolNames } from "../policies/fusion-orchestrator-mode.js";
-import { withoutReasoningPrelude, withUnboundedReasoningPrelude } from "../../llm/grammar/reasoning-prelude.js";
+import { withoutReasoningPrelude, withReasoningBudget, withUnboundedReasoningPrelude } from "../../llm/grammar/reasoning-prelude.js";
 import { buildGrammarForTools } from "../../llm/grammar/build-grammar.js";
 import type { PromptMessages, ToolCallTransport } from "../../llm/provider/completion-types.js";
 import { openAiToolCallAdapter } from "../../llm/provider/openai/openai-tool-call-adapter.js";
@@ -363,7 +363,7 @@ export function prepareStepInference(ctx: StepContext, deps: StepDependencies) {
   }
   if (prompt.contextBudget) assertContextCapacity(prompt.text + JSON.stringify(llmParams.tools ?? []), prompt.contextBudget);
   return { prompt, slot, replyCap, stepDescriptors, stepToolDescriptors, grammarPrompt, promptCarriesPrefill, thinkingOff, llmParams,
-    reasoningBudgetTokens: getConfig().localModels.reasoningBudgetTokens };
+    reasoningBudgetTokens: ctx.reasoningBudgetTokens ?? getConfig().localModels.reasoningBudgetTokens };
 }
 
 export type PreparedStepInference = ReturnType<typeof prepareStepInference>;
@@ -503,16 +503,18 @@ export function stepGrammarToolNames(
  * The grammar for THIS request. The reasoning prelude first (F49): gone
  * under `thinking: off` (the prompt ends with the template's disabled
  * marker, so the completion starts on the call); unbounded on the forced
- * final step — a `reply` / `finish` is never cut mid-thought; the base
- * grammar's configured bound (`localModels.reasoningBudgetTokens`)
- * otherwise. Then the tool names (`stepGrammarToolNames`). An
- * unrestricted, non-final step under `thinking: on|auto` sends the base
- * grammar byte-identical.
+ * final step — a `reply` / `finish` is never cut mid-thought; the
+ * turn's own bound (`ctx.reasoningBudgetTokens`, a local fusion worker's)
+ * when it has one; the base grammar's configured bound
+ * (`localModels.reasoningBudgetTokens`) otherwise. Then the tool names
+ * (`stepGrammarToolNames`). An unrestricted, non-final step under
+ * `thinking: on|auto` with no turn bound sends the base grammar
+ * byte-identical.
  */
 export function resolveStepGrammar(
   ctx: Pick<
     StepContext,
-    "terminalOnly" | "toolSet" | "toolFilter" | "toolRole"
+    "terminalOnly" | "toolSet" | "toolFilter" | "toolRole" | "reasoningBudgetTokens"
   >,
   deps: Pick<StepDependencies, "registry" | "isFusionOrchestrator" | "grammar">,
   descriptors: readonly ToolDescriptor[],
@@ -522,7 +524,9 @@ export function resolveStepGrammar(
     ? withoutReasoningPrelude(deps.grammar)
     : ctx.terminalOnly
       ? withUnboundedReasoningPrelude(deps.grammar)
-      : deps.grammar;
+      : ctx.reasoningBudgetTokens !== undefined
+        ? withReasoningBudget(deps.grammar, reasoningBudgetChars(ctx.reasoningBudgetTokens))
+        : deps.grammar;
   const names = stepGrammarToolNames(ctx, deps, descriptors);
   return names === null ? base : buildGrammarForTools(base, names);
 }

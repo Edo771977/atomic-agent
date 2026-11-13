@@ -578,6 +578,14 @@ export interface RunTurnOptions {
    */
   maxOutputTokens?: number;
   /**
+   * Think-block bound for every non-final step of this turn, in
+   * `localModels.reasoningBudgetTokens` units, in place of that setting.
+   * Per request on the grammar (`resolveStepGrammar`), so only a local
+   * grammar link sees it. A fusion worker on a local leg
+   * (`localWorkerReasoningBudgetTokens`); absent, the config's bound.
+   */
+  reasoningBudgetTokens?: number;
+  /**
    * Pin every completion of this turn to one configured provider id.
    * The step is built for that link's transport (via
    * `AgentLoopDependencies.resolveLlmSlice`) and the request bypasses
