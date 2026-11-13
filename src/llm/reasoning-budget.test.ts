@@ -73,5 +73,17 @@ describe("a local fusion worker's reasoning bound (workerReasoning on a grammar 
   it("keeps a configured localModels.reasoningBudgetTokens when workerReasoning is unset", () => {
     expect(localWorkerReasoningBudgetTokens(undefined, 800)).toBe(800);
     expect(localWorkerReasoningBudgetTokens(undefined, 8000.7)).toBe(8000);
+    // As set, not capped at the default: a larger bound was chosen too.
+    expect(localWorkerReasoningBudgetTokens(undefined, 8000)).toBe(8000);
+  });
+
+  it("lets an explicit level win over a stricter configured bound", () => {
+    expect(localWorkerReasoningBudgetTokens("low", 256)).toBe(512);
+  });
+
+  it("opts out with \"unbounded\": 0, no bound, whatever the config says", () => {
+    for (const configured of [0, 256, 8000]) {
+      expect(localWorkerReasoningBudgetTokens("unbounded", configured)).toBe(0);
+    }
   });
 });

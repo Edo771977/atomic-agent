@@ -72,7 +72,7 @@ async function executeStepInner(
   deps: StepDependencies,
 ): Promise<StepOutcome> {
   const prepared = prepareStepInference(ctx, deps);
-  const { prompt, slot, replyCap, thinkingOff, llmParams } = prepared;
+  const { prompt, slot, replyCap, thinkingOff, llmParams, reasoningBoundFor } = prepared;
 
   const firstAttempt = await runInitialCompletion({
     ctx,
@@ -81,6 +81,7 @@ async function executeStepInner(
     slot,
     llmParams,
     thinkingOff,
+    reasoningBoundFor,
   });
   // The server named the slot it put a pending session's prompt in: pin
   // it so every later request of the session — the repair retry below

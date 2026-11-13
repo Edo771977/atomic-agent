@@ -54,7 +54,20 @@ export type StepEvent =
       slotId: number;
       cacheReused: boolean;
     }
-  | { type: "llm_completed"; completion: CompletionResult }
+  | {
+      type: "llm_completed";
+      completion: CompletionResult;
+      /**
+       * The turn's own think-block bound (`StepContext.reasoningBudgetTokens`,
+       * a fusion worker's), in budget tokens, when the request that served
+       * this completion actually carried it: a grammar link not in cloud
+       * mode, a grammar with a reasoning prelude, a non-final step, thinking
+       * not off. Absent whenever nothing bounded the thinking, so a caller
+       * never claims a bound that did not apply. Set on the step's first
+       * completion only.
+       */
+      reasoningBoundTokens?: number;
+    }
   /**
    * Full completion payload (content, reasoning, timing) paired with the
    * attempt index (1 for the first call, 2 for the parse-retry) so the
