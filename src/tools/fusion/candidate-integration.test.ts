@@ -556,3 +556,41 @@ it("removes the backup folder when the first journal write fails", async () => {
   expect(await promotionFiles(root)).toEqual([]);
   expect(await readFile(join(root, "api.json"), "utf8")).toBe('{"name":"before"}');
 });
+
+// Moves a real parent elsewhere and leaves a symlink to it: every entry under
+// it keeps its identity, so only a parent dev/ino re-check at commit sees it.
+async function swapParentForLink(root: string, parent: string): Promise<string> {
+  const outside = await mkdtemp(join(tmpdir(), "atag-candidate-outside-")); roots.push(outside);
+  await rename(join(root, parent), join(outside, parent)); await symlink(join(outside, parent), join(root, parent));
+  return join(outside, parent);
+}
+
+it("re-checks parent identity at commit, refusing an rmdir through a parent swapped for a link", async () => {
+  const root = await project();
+  await mkdir(join(root, "a", "old"), { recursive: true }); await writeFile(join(root, "a", "keep.txt"), "keep");
+  let moved: string | undefined;
+  const candidate = await createCandidateIntegration(root, { beforeCommit: async path => {
+    if (path === join("a", "old")) moved = await swapParentForLink(root, "a");
+  } });
+  try {
+    await rm(join(candidate.dir, "a", "old"), { recursive: true });
+    const report = await candidate.finish({ rows, contract, signal, runChecks: pass });
+    expect(report.status).toBe("rejected"); expect(report.reason).toMatch(/delivery parent/);
+  } finally { await candidate.cleanup(); }
+  expect((await lstat(join(moved!, "old"))).isDirectory()).toBe(true);
+});
+
+it("re-checks parent identity at commit, refusing a rename through a parent swapped for a link", async () => {
+  const root = await project();
+  await mkdir(join(root, "src")); await writeFile(join(root, "src", "a.ts"), "a\n");
+  let moved: string | undefined;
+  const candidate = await createCandidateIntegration(root, { beforeCommit: async path => {
+    if (path === join("src", "new.ts")) moved = await swapParentForLink(root, "src");
+  } });
+  try {
+    await writeFile(join(candidate.dir, "src", "new.ts"), "NEW\n");
+    const report = await candidate.finish({ rows, contract, signal, runChecks: pass });
+    expect(report.status).toBe("rejected"); expect(report.reason).toMatch(/delivery parent/);
+  } finally { await candidate.cleanup(); }
+  expect((await readdir(moved!)).sort()).toEqual(["a.ts"]);
+});

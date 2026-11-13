@@ -208,6 +208,8 @@ async function syncFile(path: string): Promise<void> {
   const handle = await open(path, "r");
   try { await handle.sync().catch((err: NodeJS.ErrnoException) => { if (!["EINVAL", "ENOTSUP", "EOPNOTSUPP"].includes(err.code ?? "")) throw err; }); } finally { await handle.close(); }
 }
+/** What a step verified: the target's stat (undefined when absent) and each ancestor directory's. */
+interface Verified { stat: Stats | undefined; parents: ReadonlyMap<string, Stats> }
 function differences(a: Inventory, b: Inventory): string[] {
   return [...new Set([...a.keys(), ...b.keys()])].filter(path => !equal(a.get(path), b.get(path))).sort();
 }
@@ -353,28 +355,45 @@ export async function createCandidateIntegration(
   };
 
   /**
-   * The last check before a replace or remove: the target must still be the
-   * very entry this step verified (or still absent). A user edit after the
-   * hash is a concurrent change. The rename/rm itself cannot compare-and-swap,
-   * so an edit landing between this lstat and that call is not detected.
+   * Each ancestor of `rel` must still be the real directory (same device and
+   * inode, not a link) this step verified, so no change lands through a
+   * parent swapped for a symlink to elsewhere.
    */
-  const commitGuard = async (rel: string, verified: Stats | undefined): Promise<void> => {
-    await options.beforeCommit?.(rel);
-    const now = await lstat(join(set.realDir, rel)).catch((err: NodeJS.ErrnoException) => { if (err.code === "ENOENT") return undefined; throw err; });
-    if (!sameIdentity(now, verified)) throw new Error(`original project changed during candidate delivery: ${posixPath(rel)}`);
+  const checkParents = async (rel: string, verified: Verified): Promise<void> => {
+    for (let parent = dirname(rel); parent !== "."; parent = dirname(parent)) {
+      const info = await lstat(join(set.realDir, parent)).catch(() => undefined);
+      const then = verified.parents.get(parent);
+      if (info === undefined || then === undefined || !info.isDirectory() || info.dev !== then.dev || info.ino !== then.ino) throw new Error(`delivery parent is no longer the verified directory: ${posixPath(parent)}`);
+    }
   };
-  // Same-directory rename never writes through an existing symlink. A fresh
-  // ancestor scan also refuses a parent replaced with a link during delivery.
+  /**
+   * The last check before a replace, remove or directory create/remove: the
+   * parent chain and the target must still be the very entries this step
+   * verified (the target possibly still absent). A user edit after the hash
+   * is a concurrent change. The call itself cannot compare-and-swap, so an
+   * edit landing between these lstats and that call is not detected.
+   */
+  const commitGuard = async (rel: string, verified: Verified): Promise<void> => {
+    await options.beforeCommit?.(rel);
+    await checkParents(rel, verified);
+    const now = await lstat(join(set.realDir, rel)).catch((err: NodeJS.ErrnoException) => { if (err.code === "ENOENT") return undefined; throw err; });
+    if (!sameIdentity(now, verified.stat)) throw new Error(`original project changed during candidate delivery: ${posixPath(rel)}`);
+  };
+  /** Live identities of `rel`'s ancestors (rollback's verification point). */
+  const liveParents = async (rel: string): Promise<Map<string, Stats>> => {
+    const parents = new Map<string, Stats>();
+    for (let parent = dirname(rel); parent !== "."; parent = dirname(parent)) parents.set(parent, await lstat(join(set.realDir, parent)));
+    return parents;
+  };
+  // Same-directory rename never writes through an existing symlink; the
+  // parent chain is re-checked before staging and again at commit.
   /** A fresh sibling temp name for staging `rel`, relative to the project. */
   const tempFor = (rel: string): string => join(dirname(rel), `.atag-candidate-${randomBytes(8).toString("hex")}`);
   // `landed` runs right after the change itself, before any follow-up that
   // can still fail (a directory's chmod), so rollback knows to undo it.
-  const writeEntry = async (root: string, rel: string, expected: Entry | undefined, verified: Stats | undefined, landed: () => void = () => undefined, tempRel = tempFor(rel)): Promise<void> => {
+  const writeEntry = async (root: string, rel: string, expected: Entry | undefined, verified: Verified, landed: () => void = () => undefined, tempRel = tempFor(rel)): Promise<void> => {
     const target = join(set.realDir, rel);
-    for (let parent = dirname(rel); parent !== "."; parent = dirname(parent)) {
-      const info = await lstat(join(set.realDir, parent));
-      if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`delivery parent is no longer a directory: ${parent}`);
-    }
+    await checkParents(rel, verified);
     if (expected === undefined) { await commitGuard(rel, verified); await rm(target); landed(); syncDirectoryBestEffort(dirname(target)); return; }
     if (expected.kind === "directory") { await commitGuard(rel, verified); await mkdir(target, { mode: expected.mode }); landed(); syncDirectoryBestEffort(dirname(target)); await chmod(target, expected.mode); return; }
     const tmp = join(set.realDir, tempRel);
@@ -529,15 +548,16 @@ export async function createCandidateIntegration(
         // delivery and rolls back.
         const appliedSet = new Set<string>();
         const expectedAt = (path: string): Entry | undefined => appliedSet.has(path) ? final!.get(path) : base.get(path);
-        /** Returns the first path's verified stat, re-checked just before its write. */
-        const verifyPaths = async (paths: readonly string[], expected: (path: string) => Entry | undefined, message: string): Promise<Stats | undefined> => {
-          let first: Stats | undefined;
+        /** Returns the first path's verified stat and the others' (its ancestors), re-checked just before its write. */
+        const verifyPaths = async (paths: readonly string[], expected: (path: string) => Entry | undefined, message: string): Promise<Verified> => {
+          let first: Stats | undefined; const parents = new Map<string, Stats>();
           for (const [index, path] of paths.entries()) {
             const observed = await observeEntry(set.realDir, path, liveBounds(promotionSignal));
             if (!equal(observed.entry, expected(path))) throw new Error(message);
             if (index === 0) first = observed.stat;
+            else if (observed.stat !== undefined) parents.set(path, observed.stat);
           }
-          return first;
+          return { stat: first, parents };
         };
         // Created before the first write; removed once delivery or a full rollback completes.
         if (changed.length > 0) journal = await openJournal();
@@ -588,12 +608,13 @@ export async function createCandidateIntegration(
             // be what failed); rmdir removes it only while it is empty.
             const created = final?.get(path)?.kind === "directory" && !base.has(path);
             if (created ? current.entry?.kind !== "directory" : !equal(current.entry, final?.get(path))) { rollbackConflicts.push(path); if (step !== undefined) step.status = "rollback-conflict"; journalOk = record() && journalOk; continue; }
-            if (created) { await commitGuard(path, current.stat); await rmdir(join(set.realDir, path)); }
+            const live: Verified = { stat: current.stat, parents: await liveParents(path) };
+            if (created) { await commitGuard(path, live); await rmdir(join(set.realDir, path)); }
             else {
               // Restoring a file or symlink stages a temp too: journal it first.
               const staged = base.get(path)?.kind === "file" || base.get(path)?.kind === "symlink" ? tempFor(path) : undefined;
               if (step !== undefined && staged !== undefined) { step.temp = posixPath(staged); journalOk = record() && journalOk; }
-              await writeEntry(set.baseDir, path, base.get(path), current.stat, undefined, staged);
+              await writeEntry(set.baseDir, path, base.get(path), live, undefined, staged);
             }
             if (step !== undefined) step.status = "rolled-back";
           } catch { rollbackConflicts.push(path); if (step !== undefined) step.status = "rollback-conflict"; }
