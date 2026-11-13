@@ -248,6 +248,7 @@ async function diffEvidence(
   declared: readonly string[],
   changes: readonly WorkspaceChange[],
   workingDir: string,
+  known: readonly KnownSecret[],
 ): Promise<string> {
   const listed = changes
     .slice(0, JUDGE_TOUCHED_PATHS)
@@ -272,10 +273,13 @@ async function diffEvidence(
       parts.push(`### ${change.path} (${change.kind})\n[not shown: evidence budget spent]`);
       continue;
     }
+    // Masked whole, then clipped: a secret the cap cuts in half would
+    // no longer match the detector. Only this copy is masked; the
+    // saved patch in the person's folder stays as written (appliable).
     const shown =
       change.kind === "added" && change.content !== undefined
-        ? clipped(change.content, Math.min(JUDGE_FILE_CHARS, budget), "")
-        : clipped(change.patch, Math.min(JUDGE_DIFF_FILE_CHARS, budget), "of diff ");
+        ? clipped(maskSecrets(change.content, known), Math.min(JUDGE_FILE_CHARS, budget), "")
+        : clipped(maskSecrets(change.patch, known), Math.min(JUDGE_DIFF_FILE_CHARS, budget), "of diff ");
     budget -= shown.length;
     parts.push(
       `### ${change.path} (${change.kind === "added" ? "new file" : change.kind === "modified" ? "diff" : change.kind})\n${shown}`,
@@ -293,7 +297,7 @@ async function diffEvidence(
       parts.push(`### ${path}\n[missing]`);
       continue;
     }
-    const shown = clipped(body, Math.min(JUDGE_FILE_CHARS, budget), "");
+    const shown = clipped(maskSecrets(body, known), Math.min(JUDGE_FILE_CHARS, budget), "");
     budget -= shown.length;
     parts.push(`### ${path} (unchanged)\n${shown}`);
   }
@@ -314,8 +318,11 @@ export async function gatherEvidence(
   knownSecrets?: readonly KnownSecret[],
 ): Promise<string> {
   const known = knownSecrets ?? knownSecretsFromEnv();
+  // Each part is masked before it is clipped (a secret cut at a cap
+  // escapes the detector); the whole is masked again for what spans
+  // parts.
   return maskSecrets(
-    await rawEvidence(task, contract, reply, workingDir, changes),
+    await rawEvidence(task, contract, reply, workingDir, changes, known),
     known,
   );
 }
@@ -326,6 +333,7 @@ async function rawEvidence(
   reply: string,
   workingDir: string,
   changes: readonly WorkspaceChange[] | undefined,
+  known: readonly KnownSecret[],
 ): Promise<string> {
   const paths = [
     ...(task.files ?? []),
@@ -334,13 +342,13 @@ async function rawEvidence(
       .map((p) => p.in!),
   ].filter((p, i, all) => all.indexOf(p) === i);
   if (changes !== undefined && changes.length > 0) {
-    return diffEvidence(paths, changes, workingDir);
+    return diffEvidence(paths, changes, workingDir, known);
   }
   if (paths.length === 0) {
     return [
       "This task declared no files, so its reply is the deliverable. Judge what the reply contains, not what it says it did elsewhere.",
       "### reply",
-      reply.length > JUDGE_EVIDENCE_CHARS ? `${reply.slice(0, JUDGE_EVIDENCE_CHARS)}\n[… clipped]` : reply,
+      clipped(maskSecrets(reply, known), JUDGE_EVIDENCE_CHARS, ""),
     ].join("\n");
   }
   const parts: string[] = [];
@@ -357,8 +365,7 @@ async function rawEvidence(
       parts.push(`### ${path}\n[missing]`);
       continue;
     }
-    const cap = Math.min(JUDGE_FILE_CHARS, budget);
-    const shown = body.length > cap ? `${body.slice(0, cap)}\n[… ${body.length - cap} more chars clipped]` : body;
+    const shown = clipped(maskSecrets(body, known), Math.min(JUDGE_FILE_CHARS, budget), "");
     budget -= shown.length;
     parts.push(`### ${path}\n${shown}`);
   }

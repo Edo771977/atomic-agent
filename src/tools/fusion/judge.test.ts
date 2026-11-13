@@ -11,6 +11,7 @@ import { StructuredLogger } from "../../tracing/structured-logger.js";
 import {
   buildAcceptanceChecklist,
   gatherEvidence,
+  JUDGE_DIFF_FILE_CHARS,
   JUDGE_FILE_CHARS,
   judgeTask,
   parseJudgeAnswer,
@@ -470,6 +471,44 @@ describe("judge evidence", () => {
     expect(evidence).toContain("### a.txt (unchanged)\nkept");
     expect(evidence).toContain("-old");
     expect(evidence).not.toContain(secret);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("masks a secret the clip would cut in half: masked first, then clipped", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "judge-ev-"));
+    const secret = "Kx9qWmTr4vLp8nZs2bYc7hJd3fGa";
+    const known = [{ label: "TEST_KEY", value: secret }];
+    // The secret starts just before the per-file diff cap and the file-head cap.
+    const header = "--- a/b.txt\n+++ b/b.txt\n@@ -1 +1 @@\n+";
+    const pad = "p".repeat(JUDGE_DIFF_FILE_CHARS - header.length - 10);
+    const diff = await gatherEvidence(
+      { ...task, files: ["b.txt"] },
+      undefined,
+      "",
+      dir,
+      [{ path: "b.txt", kind: "modified", patch: `${header}${pad}${secret}\n` }],
+      known,
+    );
+    expect(diff).not.toContain(secret.slice(0, 8));
+    const added = await gatherEvidence(
+      { ...task, files: ["c.txt"] },
+      undefined,
+      "",
+      dir,
+      [
+        {
+          path: "c.txt",
+          kind: "added",
+          patch: "--- /dev/null\n+++ b/c.txt\n",
+          content: `${"c".repeat(JUDGE_FILE_CHARS - 10)}${secret}\n`,
+        },
+      ],
+      known,
+    );
+    expect(added).not.toContain(secret.slice(0, 8));
+    writeFileSync(join(dir, "a.txt"), `${"a".repeat(JUDGE_FILE_CHARS - 10)}${secret}\n`);
+    const heads = await gatherEvidence(task, undefined, "", dir, undefined, known);
+    expect(heads).not.toContain(secret.slice(0, 8));
     rmSync(dir, { recursive: true, force: true });
   });
 });
