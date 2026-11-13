@@ -198,6 +198,10 @@ async function observeEntry(root: string, rel: string, bounds: InventoryBounds):
   if (!after.isFile() || after.size !== info.size || after.mtimeMs !== info.mtimeMs || after.ctimeMs !== info.ctimeMs) throw new Error(`file changed while snapshotting: ${rel}`);
   return { entry: { kind: "file", mode: info.mode & 0o777, hash }, stat: info };
 }
+/** Same live entry as when it was hashed: identity, size, times and kind/permission bits. */
+const sameIdentity = (a: Stats | undefined, b: Stats | undefined): boolean =>
+  a === undefined || b === undefined ? a === b
+    : a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeMs === b.mtimeMs && a.ctimeMs === b.ctimeMs && a.mode === b.mode;
 function differences(a: Inventory, b: Inventory): string[] {
   return [...new Set([...a.keys(), ...b.keys()])].filter(path => !equal(a.get(path), b.get(path))).sort();
 }
@@ -244,7 +248,11 @@ export interface CandidateIntegration {
  */
 export async function createCandidateIntegration(
   realDir: string,
-  options: CreateBranchSetOptions & { beforeApply?: (path: string, index: number) => Promise<void>; maxInventoryBytes?: number; maxInventoryEntries?: number; maxInventoryMs?: number } = {},
+  options: CreateBranchSetOptions & {
+    beforeApply?: (path: string, index: number) => Promise<void>;
+    /** Test-only: runs after a step verified its target, immediately before the identity re-check and the replace/remove. */
+    beforeCommit?: (path: string) => Promise<void>;
+    maxInventoryBytes?: number; maxInventoryEntries?: number; maxInventoryMs?: number } = {},
 ): Promise<CandidateIntegration> {
   const id = `candidate-${randomBytes(6).toString("hex")}`;
   const setupSignal = options.signal === undefined ? AbortSignal.timeout(120_000) : AbortSignal.any([options.signal, AbortSignal.timeout(120_000)]);
@@ -307,16 +315,27 @@ export async function createCandidateIntegration(
     }
   };
 
+  /**
+   * The last check before a replace or remove: the target must still be the
+   * very entry this step verified (or still absent). A user edit after the
+   * hash is a concurrent change. The rename/rm itself cannot compare-and-swap,
+   * so an edit landing between this lstat and that call is not detected.
+   */
+  const commitGuard = async (rel: string, verified: Stats | undefined): Promise<void> => {
+    await options.beforeCommit?.(rel);
+    const now = await lstat(join(set.realDir, rel)).catch((err: NodeJS.ErrnoException) => { if (err.code === "ENOENT") return undefined; throw err; });
+    if (!sameIdentity(now, verified)) throw new Error(`original project changed during candidate delivery: ${posixPath(rel)}`);
+  };
   // Same-directory rename never writes through an existing symlink. A fresh
   // ancestor scan also refuses a parent replaced with a link during delivery.
-  const writeEntry = async (root: string, rel: string, expected: Entry | undefined): Promise<void> => {
+  const writeEntry = async (root: string, rel: string, expected: Entry | undefined, verified: Stats | undefined): Promise<void> => {
     const target = join(set.realDir, rel);
     for (let parent = dirname(rel); parent !== "."; parent = dirname(parent)) {
       const info = await lstat(join(set.realDir, parent));
       if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`delivery parent is no longer a directory: ${parent}`);
     }
-    if (expected === undefined) { await rm(target); return; }
-    if (expected.kind === "directory") { await mkdir(target); await chmod(target, expected.mode); return; }
+    if (expected === undefined) { await commitGuard(rel, verified); await rm(target); return; }
+    if (expected.kind === "directory") { await commitGuard(rel, verified); await mkdir(target); await chmod(target, expected.mode); return; }
     const tmp = join(dirname(target), `.atag-candidate-${randomBytes(8).toString("hex")}`);
     try {
       if (expected.kind === "symlink") {
@@ -328,6 +347,7 @@ export async function createCandidateIntegration(
         if (await fileHash(tmp, { bytes: options.maxInventoryBytes ?? VERIFY_COPY_MAX_BYTES, entries: 1, signal: AbortSignal.timeout(30_000) }) !== expected.hash) throw new Error(`candidate changed before delivery: ${rel}`);
         await chmod(tmp, expected.mode);
       }
+      await commitGuard(rel, verified);
       await rename(tmp, target);
     } finally { await rm(tmp, { force: true }); }
   };
@@ -417,17 +437,21 @@ export async function createCandidateIntegration(
         // delivery and rolls back.
         const appliedSet = new Set<string>();
         const expectedAt = (path: string): Entry | undefined => appliedSet.has(path) ? final!.get(path) : base.get(path);
-        const verifyPaths = async (paths: readonly string[], expected: (path: string) => Entry | undefined, message: string): Promise<void> => {
-          for (const path of paths) {
+        /** Returns the first path's verified stat, re-checked just before its write. */
+        const verifyPaths = async (paths: readonly string[], expected: (path: string) => Entry | undefined, message: string): Promise<Stats | undefined> => {
+          let first: Stats | undefined;
+          for (const [index, path] of paths.entries()) {
             const observed = await observeEntry(set.realDir, path, liveBounds(promotionSignal));
             if (!equal(observed.entry, expected(path))) throw new Error(message);
+            if (index === 0) first = observed.stat;
           }
+          return first;
         };
         for (const [index, path] of [...additions, ...files, ...removals].entries()) {
           promotionSignal.throwIfAborted(); await options.beforeApply?.(path, index); promotionSignal.throwIfAborted();
-          await verifyPaths(withAncestors(path), expectedAt, "original project changed during candidate delivery");
-          if (base.get(path)?.kind === "directory" && !final.has(path)) await rmdir(join(set.realDir, path));
-          else await writeEntry(workspace.dir, path, final.get(path));
+          const verified = await verifyPaths(withAncestors(path), expectedAt, "original project changed during candidate delivery");
+          if (base.get(path)?.kind === "directory" && !final.has(path)) { await commitGuard(path, verified); await rmdir(join(set.realDir, path)); }
+          else await writeEntry(workspace.dir, path, final.get(path), verified);
           applied.push(path); appliedSet.add(path);
         }
         promotionSignal.throwIfAborted();
@@ -441,8 +465,8 @@ export async function createCandidateIntegration(
           try {
             const current = await observeEntry(set.realDir, path, liveBounds(AbortSignal.timeout(options.maxInventoryMs ?? 30_000)));
             if (!equal(current.entry, final?.get(path))) { rollbackConflicts.push(path); continue; }
-            if (final?.get(path)?.kind === "directory" && !base.has(path)) await rmdir(join(set.realDir, path));
-            else await writeEntry(set.baseDir, path, base.get(path));
+            if (final?.get(path)?.kind === "directory" && !base.has(path)) { await commitGuard(path, current.stat); await rmdir(join(set.realDir, path)); }
+            else await writeEntry(set.baseDir, path, base.get(path), current.stat);
           } catch { rollbackConflicts.push(path); }
         }
         return await reject(`candidate not promoted: ${err instanceof Error ? err.message : String(err)}`, { ...(evidence === undefined ? {} : { contract: evidence }), ...(artifactManifest === undefined ? {} : { artifactManifest }), ...(rollbackConflicts.length === 0 ? {} : { rollbackConflicts }) });

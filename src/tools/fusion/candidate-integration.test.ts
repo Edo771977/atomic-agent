@@ -357,3 +357,19 @@ it("verifies only the paths it promotes instead of re-hashing the untouched orig
     expect(await readFile(join(root, "new-5.txt"), "utf8")).toBe("new 5\n");
   } finally { await candidate.cleanup(); }
 });
+
+it("treats a user edit between the step's verification and the rename as a concurrent change", async () => {
+  const root = await project();
+  const candidate = await createCandidateIntegration(root, { beforeCommit: async path => {
+    if (path === "dirty.txt") await writeFile(join(root, "dirty.txt"), "user edit in the commit window");
+  } });
+  try {
+    await writeFile(join(candidate.dir, "api.json"), "candidate api");
+    await writeFile(join(candidate.dir, "dirty.txt"), "candidate dirty");
+    const report = await candidate.finish({ rows, contract, signal, runChecks: async () => ({ ok: true, results: [{ ok: true }] }) });
+    expect(report.status).toBe("rejected"); expect(report.reason).toMatch(/changed during candidate delivery/);
+    expect(await readFile(join(root, "dirty.txt"), "utf8")).toBe("user edit in the commit window");
+    // The already-delivered sibling is rolled back.
+    expect(await readFile(join(root, "api.json"), "utf8")).toBe('{"name":"before"}');
+  } finally { await candidate.cleanup(); }
+});
