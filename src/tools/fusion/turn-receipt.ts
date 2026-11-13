@@ -1,6 +1,7 @@
 import type { CompletionUsage } from "../../llm/provider/completion-types.js";
 import {
   OUTCOME_RECORD_VERSION,
+  outcomeLabel,
   roundUsd,
   TURN_STEPS_RECORDED,
   sessionTag,
@@ -46,8 +47,13 @@ interface OpenTurn {
   workerMs: number;
   workerCostUsd: number;
   sawWorkerPriced: boolean;
+  /** Tasks sent to `model: "orchestrator"`: strong-side spend, as the report counts it. */
+  orchestratorTasks: number;
+  orchestratorTaskCostUsd: number;
+  sawOrchestratorTaskPriced: boolean;
   /** Judge and escalation calls: strong-side spend outside the orchestrator's requests. */
-  sideCostUsd: number;
+  judgeCostUsd: number;
+  escalationCostUsd: number;
 }
 
 /** One finished fan-out, as the turn receipt counts it. */
@@ -57,11 +63,14 @@ export interface FanoutReceiptInput {
     tokens: number;
     durationMs: number;
     costUsd: number | null;
+    /** Ran on the orchestrator leg (`model: "orchestrator"`): strong side. */
+    orchestrator: boolean;
   }>;
   /** The fan-out's wall time; workers overlap, so this is not their sum. */
   wallMs: number;
-  /** Judge + escalation spend the fan-out reported. */
-  sideCostUsd: number;
+  /** Judge and escalation spend the fan-out reported. */
+  judgeCostUsd: number;
+  escalationCostUsd: number;
 }
 
 export interface FusionTurnReceipt {
@@ -97,7 +106,11 @@ export class FusionTurnLedger {
       workerMs: 0,
       workerCostUsd: 0,
       sawWorkerPriced: false,
-      sideCostUsd: 0,
+      orchestratorTasks: 0,
+      orchestratorTaskCostUsd: 0,
+      sawOrchestratorTaskPriced: false,
+      judgeCostUsd: 0,
+      escalationCostUsd: 0,
     });
   }
 
@@ -136,11 +149,20 @@ export class FusionTurnLedger {
     if (turn === undefined) return;
     turn.fanouts += 1;
     turn.workerMs += Math.max(0, fanout.wallMs);
-    turn.sideCostUsd += fanout.sideCostUsd;
+    turn.judgeCostUsd += Math.max(0, fanout.judgeCostUsd);
+    turn.escalationCostUsd += Math.max(0, fanout.escalationCostUsd);
     for (const task of fanout.tasks) {
       turn.tasks += 1;
       if (task.ok) turn.tasksOk += 1;
       else turn.tasksFailed += 1;
+      if (task.orchestrator) {
+        turn.orchestratorTasks += 1;
+        if (task.costUsd !== null) {
+          turn.sawOrchestratorTaskPriced = true;
+          turn.orchestratorTaskCostUsd += task.costUsd;
+        }
+        continue;
+      }
       turn.workerTokens += task.tokens;
       if (task.costUsd !== null) {
         turn.sawWorkerPriced = true;
@@ -155,23 +177,32 @@ export class FusionTurnLedger {
     this.turns.delete(sessionId);
     if (turn === undefined) return undefined;
     if (turn.requests === 0 && turn.fanouts === 0) return undefined;
+    const side = turn.judgeCostUsd + turn.escalationCostUsd;
     const record: TurnOutcomeRecord = {
       v: OUTCOME_RECORD_VERSION,
       type: "turn",
       ts: now.toISOString(),
       session: sessionTag(sessionId),
       orchestrator: {
-        provider: turn.servedProvider ?? turn.orchestratorProvider,
-        model: turn.orchestratorModel,
+        provider: outcomeLabel(turn.servedProvider ?? turn.orchestratorProvider),
+        model: outcomeLabel(turn.orchestratorModel),
         requests: turn.requests,
         tokensIn: turn.tokensIn,
         tokensOut: turn.tokensOut,
         cachedTokens: turn.sawCached ? turn.cachedTokens : null,
-        costUsd: turn.sawPriced || turn.sideCostUsd > 0 ? roundUsd(turn.costUsd + turn.sideCostUsd) : null,
+        costUsd:
+          turn.sawPriced || side > 0 ? roundUsd(turn.costUsd + side) : null,
+        requestCostUsd: turn.sawPriced ? roundUsd(turn.costUsd) : null,
+        judgeCostUsd: roundUsd(turn.judgeCostUsd),
+        escalationCostUsd: roundUsd(turn.escalationCostUsd),
         steps: turn.steps,
       },
       fanouts: turn.fanouts,
       tasks: { total: turn.tasks, ok: turn.tasksOk, failed: turn.tasksFailed },
+      orchestratorTasks: {
+        total: turn.orchestratorTasks,
+        costUsd: turn.sawOrchestratorTaskPriced ? roundUsd(turn.orchestratorTaskCostUsd) : null,
+      },
       workerTokens: turn.workerTokens,
       workerMs: turn.workerMs,
       workerCostUsd: turn.sawWorkerPriced ? roundUsd(turn.workerCostUsd) : null,
@@ -206,14 +237,48 @@ export function formatDurationShort(ms: number): string {
 }
 
 /**
+ * The strong side's spend: one total when every part of it is priced,
+ * else each part by name, so an unpriced subscription orchestrator beside
+ * a priced judge reads `unpriced (subscription) + $0.03 judge`, never as
+ * a $0.03 strong side.
+ */
+function strongSpend(record: TurnOutcomeRecord): string {
+  const o = record.orchestrator;
+  const tasks = record.orchestratorTasks;
+  const unpricedRequests = o.requestCostUsd === null && o.requests > 0;
+  const unpricedTasks = tasks.total > 0 && tasks.costUsd === null;
+  const total = roundUsd(
+    (o.requestCostUsd ?? 0) + (tasks.costUsd ?? 0) + o.judgeCostUsd + o.escalationCostUsd,
+  );
+  if (!unpricedRequests && !unpricedTasks) {
+    return o.requestCostUsd === null && tasks.costUsd === null && total === 0
+      ? "unpriced (subscription)"
+      : formatUsdShort(total);
+  }
+  const taskNoun = `orchestrator task${tasks.total === 1 ? "" : "s"}`;
+  return [
+    ...(o.requests === 0
+      ? []
+      : [o.requestCostUsd === null ? "unpriced (subscription)" : formatUsdShort(o.requestCostUsd)]),
+    ...(tasks.total === 0
+      ? []
+      : [tasks.costUsd === null ? `unpriced ${taskNoun}` : `${formatUsdShort(tasks.costUsd)} ${taskNoun}`]),
+    ...(o.judgeCostUsd > 0 ? [`${formatUsdShort(o.judgeCostUsd)} judge`] : []),
+    ...(o.escalationCostUsd > 0 ? [`${formatUsdShort(o.escalationCostUsd)} escalation`] : []),
+  ].join(" + ");
+}
+
+/**
  * `fusion receipt · strong $0.04, 6 requests, cache hit 83% · workers
- * 41.2k tokens, 2m10s · tasks 3 ok, 1 failed`.
+ * 41.2k tokens, 2m10s · tasks 3 ok, 1 failed`. The strong side is the
+ * orchestrator's requests, its `model: "orchestrator"` tasks and the
+ * judge and escalation calls; workers are the other tasks.
  */
 export function formatTurnReceipt(record: TurnOutcomeRecord): string {
   const o = record.orchestrator;
   const hit = cacheHitPercent(o);
   const strong = [
-    o.costUsd === null ? "unpriced" : formatUsdShort(o.costUsd),
+    strongSpend(record),
     `${o.requests} request${o.requests === 1 ? "" : "s"}`,
     ...(hit === null ? [] : [`cache hit ${hit}%`]),
   ].join(", ");

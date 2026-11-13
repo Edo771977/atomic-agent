@@ -11,8 +11,10 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 
+import { sanitizeModelAlias } from "../../analytics/sanitize-model-alias.js";
 import { reportedCostUsd } from "../../llm/provider/usage-cost.js";
 import { classifyWorkerFailure } from "./failure-breaker.js";
+import { tryAcquireOutcomeLock } from "./outcome-log-lock.js";
 import {
   taskSpendUsd,
   type WorkerPricing,
@@ -29,7 +31,8 @@ import {
  * Counts and categories only. No prompt, reply, instruction, title, task
  * id, path or error text is written: a failure is a category from a
  * fixed list (`failureCategory`), a session is a short one-way hash
- * (`sessionTag`), a model is the configured provider id and model label.
+ * (`sessionTag`), a model is the configured provider id and model label
+ * (a local file path cut to its base name, `outcomeLabel`).
  * The file is bounded (`OUTCOME_LOG_MAX_BYTES`, `OUTCOME_LOG_KEEP`
  * rotated files) and a failed write is logged and dropped: the log never
  * fails a fan-out or a turn.
@@ -85,7 +88,7 @@ export interface TaskOutcomeRecord {
   role: string | null;
   status: WorkerTaskStatus;
   failure: FailureCategory | null;
-  /** This turn's attempt at the task (1 = first); counted when autoReplan is on. */
+  /** This turn's attempt at the task (1 = first), replans and re-delegations alike. */
   attempt: number;
   /** The judge re-ran the task once with its findings. */
   judgeRetried: boolean;
@@ -119,16 +122,31 @@ export interface TurnOutcomeRecord {
     tokensOut: number;
     /** Null when no step reported a cache figure. */
     cachedTokens: number | null;
-    /** Null when nothing was priced (a subscription CLI leg). */
+    /**
+     * The orchestrator's requests plus the judge and escalation calls;
+     * null when none of them was priced.
+     */
     costUsd: number | null;
+    /** The requests alone; null when unpriced (a subscription CLI leg). */
+    requestCostUsd: number | null;
+    judgeCostUsd: number;
+    escalationCostUsd: number;
     /** Per orchestrator step: prompt tokens and cache hits (null: not reported). */
     steps: Array<{ in: number; cached: number | null }>;
   };
   fanouts: number;
+  /** Every task that ran, worker and orchestrator legs alike. */
   tasks: { total: number; ok: number; failed: number };
+  /**
+   * Of those, the `model: "orchestrator"` tasks: strong-side spend (null
+   * when unpriced), kept out of the worker figures. Their own `"task"`
+   * records carry the same cost.
+   */
+  orchestratorTasks: { total: number; costUsd: number | null };
+  /** Worker-leg tasks' tokens. */
   workerTokens: number;
   workerMs: number;
-  /** Priced worker spend; null when no worker row was priced. */
+  /** Priced worker-leg spend; null when no worker row was priced. */
   workerCostUsd: number | null;
 }
 
@@ -141,6 +159,28 @@ export type OutcomeRecord = TaskOutcomeRecord | TurnOutcomeRecord;
  */
 export function sessionTag(sessionId: string): string {
   return createHash("sha256").update(sessionId).digest("hex").slice(0, 12);
+}
+
+const MODEL_FILE_EXTENSION = /\.(?:gguf|ggml|bin|safetensors|onnx|pt|pth)$/i;
+
+/**
+ * A model or provider label safe to write: configured text kept as is,
+ * unless it reads as a local file path (a llama-server model set to
+ * `/home/alice/models/x.gguf`), which keeps only the file's base name,
+ * without its model-file extension, normalised by `sanitizeModelAlias`.
+ * Path-like: a backslash; a leading `/`, `~`, `.` or drive letter; more
+ * than one `/`; or a model-file extension. A single-slash `vendor/model`
+ * id is a model id, not a path.
+ */
+export function outcomeLabel(value: string): string {
+  const pathLike =
+    value.includes("\\") ||
+    /^(?:[/~.]|[A-Za-z]:)/.test(value) ||
+    value.split("/").length > 2 ||
+    MODEL_FILE_EXTENSION.test(value);
+  if (!pathLike) return value;
+  const base = value.split(/[/\\]/).filter((part) => part.length > 0).pop() ?? "";
+  return sanitizeModelAlias(base.replace(MODEL_FILE_EXTENSION, "")) ?? "local-model";
 }
 
 /** The category a non-green row is counted under; null for `ok`. */
@@ -212,8 +252,8 @@ export function taskOutcomeRecord(
     type: "task",
     ts: now.toISOString(),
     session: sessionTag(sessionId),
-    provider: context.provider,
-    model: context.model,
+    provider: outcomeLabel(context.provider),
+    model: outcomeLabel(context.model),
     leg: context.leg,
     role: context.role,
     status: row.status,
@@ -261,7 +301,8 @@ export function outcomeLogFiles(path: string, keep = OUTCOME_LOG_KEEP): string[]
 /**
  * Appends whole lines, rotating before an append would pass the size
  * bound: `.N` is dropped, each `.i` becomes `.i+1`, the live file `.1`.
- * Synchronous, so lines from concurrent fan-outs never interleave.
+ * Synchronous, so lines from concurrent fan-outs never interleave; across
+ * processes, rotation happens only under `<log>.lock` (`outcome-log-lock.ts`).
  */
 export class FusionOutcomeLog implements FusionOutcomeSink {
   private readonly path: string;
@@ -284,10 +325,23 @@ export class FusionOutcomeLog implements FusionOutcomeSink {
       if (!this.enabled()) return;
       const text = records.map((r) => `${JSON.stringify(r)}\n`).join("");
       mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
-      this.rotateFor(Buffer.byteLength(text));
-      // A crash mid-append leaves a torn last line: start on a fresh one,
-      // so only the torn line is lost to a reader.
-      appendFileSync(this.path, this.endsTorn() ? `\n${text}` : text, { mode: 0o600 });
+      // Other processes (TUI, sidecar, scheduler) append to the same file:
+      // only the lock's holder rotates, checking the size once it holds it.
+      // Without the lock in a short wait, the line goes in unrotated.
+      let release: (() => void) | undefined;
+      try {
+        release = tryAcquireOutcomeLock(`${this.path}.lock`);
+      } catch {
+        release = undefined;
+      }
+      try {
+        if (release !== undefined) this.rotateFor(Buffer.byteLength(text));
+        // A crash mid-append leaves a torn last line: start on a fresh one,
+        // so only the torn line is lost to a reader.
+        appendFileSync(this.path, this.endsTorn() ? `\n${text}` : text, { mode: 0o600 });
+      } finally {
+        release?.();
+      }
     } catch (err) {
       // Never the fan-out's problem: the line is dropped and said once here.
       this.warn?.("fusion: the outcome log could not be written", {
@@ -332,6 +386,11 @@ export class FusionOutcomeLog implements FusionOutcomeSink {
         // A gap in the chain is fine: that file did not exist.
       }
     }
-    renameSync(this.path, `${this.path}.1`);
+    try {
+      renameSync(this.path, `${this.path}.1`);
+    } catch {
+      // Gone already (a writer outside the lock's rules): the append
+      // starts a fresh live file.
+    }
   }
 }

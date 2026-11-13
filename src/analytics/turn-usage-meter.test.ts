@@ -269,6 +269,16 @@ describe("completionUsageForTurn (ATO-276)", () => {
     expect(completionUsageForTurn({ usage: own, timing, cacheHitTokens: 0 })).toBe(own);
   });
 
+  it("takes the cache hits from cacheHitTokens when the usage block has none (subscription CLIs)", () => {
+    expect(completionUsageForTurn({ usage: usage(9068, 4), cacheHitTokens: 3289 })).toEqual({
+      ...usage(9068, 4), cachedTokens: 3289,
+    });
+    // The block's own figure wins, and no hits stay absent.
+    const own = { ...usage(100, 5), cachedTokens: 40 };
+    expect(completionUsageForTurn({ usage: own, cacheHitTokens: 90 })).toBe(own);
+    expect(completionUsageForTurn({ usage: usage(100, 5), cacheHitTokens: 0 })).not.toHaveProperty("cachedTokens");
+  });
+
   it("counts a local llama-server's timings when it sent no usage block", () => {
     expect(completionUsageForTurn({ timing, cacheHitTokens: 100 })).toEqual({
       promptTokens: 300, completionTokens: 20, totalTokens: 320, cachedTokens: 100,

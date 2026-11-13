@@ -132,6 +132,31 @@ describe("fusion.delegate → outcome log", () => {
     expect(receipt?.record.tasks).toEqual({ total: 2, ok: 1, failed: 1 });
   });
 
+  it("counts a manual re-delegation of a failed task as its second attempt, autoReplan off", async () => {
+    const written: OutcomeRecord[] = [];
+    let fail = true;
+    const tool = buildFusionDelegateTool(
+      deps({
+        resolveRunMode: () => mode({ autoReplan: 0 }),
+        runTurn: async (_session, message) => {
+          if (fail && message.includes("PROMPT-TEXT-2")) throw new Error("invalid tool-call JSON");
+          return turn();
+        },
+        outcomeLog: { append: (records) => written.push(...records) },
+      }),
+    );
+    await tool.run({ tasks: TASKS }, ctx());
+    fail = false;
+    await tool.run({ tasks: [TASKS[1]!] }, ctx());
+    const tasks = written.filter((r): r is TaskOutcomeRecord => r.type === "task");
+    expect(tasks.map((t) => [t.status, t.attempt])).toEqual([
+      ["ok", 1],
+      ["failed", 1],
+      // Not a first-pass green: the same task, sent again.
+      ["ok", 2],
+    ]);
+  });
+
   it("keeps the fan-out going when the log throws", async () => {
     const warn = vi.spyOn(logger, "warn");
     const tool = buildFusionDelegateTool(
