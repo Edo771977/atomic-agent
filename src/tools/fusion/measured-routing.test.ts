@@ -57,6 +57,18 @@ describe("measured routing evidence and admission", () => {
     expect(result.legs.get("a")?.providerId).toBe("worker");
     expect(result.decisions[0]?.reason).toBe("blocking-history");
   });
+  it("lets a blocking row expire after the cooldown so an excluded alternative can be chosen again", () => {
+    const blocker = (hoursAgo: number) => record("strong", false, { status: "timeout", failure: "timeout", ts: new Date(now - hoursAgo * 3_600_000).toISOString() });
+    const older = samples("strong", true).map((r) => ({ ...r, ts: new Date(now - 72 * 3_600_000).toISOString() }));
+    const fresh = select([...samples("worker", false), ...older, blocker(1)]);
+    expect(fresh.legs.get("a")?.providerId).toBe("worker");
+    expect(fresh.decisions[0]?.excluded).toContainEqual({ provider: "strong", reason: "blocking-history" });
+    // A leg excluded by its last run never runs again, so that row stays the
+    // latest; after the cooldown its earlier verified history counts again.
+    const expired = select([...samples("worker", false), ...older, blocker(25)]);
+    expect(expired.legs.get("a")?.providerId).toBe("strong");
+    expect(expired.decisions[0]?.candidates[1]?.blocked).toBe(false);
+  });
   it("requires objective acceptance, first attempts and enough samples on each side", () => {
     for (const over of [{ acceptance: undefined }, { attempt: 2 }, { escalations: 1 }, { judgeRetried: true }, { judgeRetried: undefined }, { merge: "held" as const }, { ts: "bad" }, { ts: new Date(now + 1).toISOString() }, { v: 99 }, { durationMs: NaN }]) {
       expect(select([...samples("worker", false), ...samples("strong", true, over)]).legs.get("a")?.providerId).toBe("worker");
