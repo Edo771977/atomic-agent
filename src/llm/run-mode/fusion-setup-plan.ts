@@ -104,6 +104,8 @@ export type FusionSetupPlan =
       readonly keptNewer: readonly { readonly key: string; readonly value: string }[];
       readonly write: FusionSetupWrite;
       readonly tips: readonly string[];
+      /** About the orchestrator pick: a stored leg kept unverified, or replaced and why. */
+      readonly warnings: readonly string[];
     }
   | {
       readonly ok: false;
@@ -148,15 +150,68 @@ function freeId(base: string, taken: readonly string[]): string {
   for (let n = 2; ; n++) if (!taken.includes(`${base}-${n}`)) return `${base}-${n}`;
 }
 
+/**
+ * How the stored orchestrator stands: `ready`, `unverified` (the check
+ * was inconclusive: a CLI login that could not be read, a key that is
+ * not required or not checkable), or `broken` with the reason. Only a
+ * broken one is replaced: an inconclusive check (the CLI check timing
+ * out) must not swap a flat-rate leg for a billed one.
+ */
+function storedOrchestratorState(
+  facts: FusionSetupFacts,
+  id: string,
+): { state: "ready" } | { state: "unverified"; why: string } | { state: "broken"; why: string } {
+  const p = facts.providers.find((e) => e.id === id);
+  if (!p) return { state: "broken", why: `it is no longer in llm.providers` };
+  if (isLocal(p)) return { state: "broken", why: "it is a local provider" };
+  if (isSubscription(p)) {
+    const st = facts.subscriptionClis[p.subscriptionCli ?? ""];
+    if (st?.state === "ready") return { state: "ready" };
+    if (st?.state === "signed_out") {
+      return { state: "broken", why: `its CLI is not signed in${st.fix ? ` (run: ${st.fix})` : ""}` };
+    }
+    if (st?.state === "missing") {
+      return { state: "broken", why: `its CLI is not installed${st.fix ? ` (${st.fix})` : ""}` };
+    }
+    return { state: "unverified", why: "its CLI login could not be checked" };
+  }
+  if (p.keyState === "present") return { state: "ready" };
+  if (p.keyState === "missing") {
+    return { state: "broken", why: `it has no API key${p.envVar ? ` (${p.envVar})` : ""}` };
+  }
+  return { state: "unverified", why: "its key could not be checked" };
+}
+
 function pickOrchestrator(facts: FusionSetupFacts):
-  | { leg: FusionSetupLeg; addProvider?: UserLlmProviderEntry }
+  | { leg: FusionSetupLeg; addProvider?: UserLlmProviderEntry; warnings: string[] }
   | { problems: string[] } {
   const stored = facts.runMode?.fusion?.orchestratorProvider;
   const byId = (id: string | undefined) => facts.providers.find((p) => p.id === id);
-  const storedEntry = byId(stored);
-  if (storedEntry && orchestratorReady(facts, storedEntry)) {
-    return { leg: leg(storedEntry, "the orchestrator already set for fusion") };
+  const warnings: string[] = [];
+  if (stored !== undefined) {
+    const st = storedOrchestratorState(facts, stored);
+    const storedEntry = byId(stored);
+    if (storedEntry && st.state === "ready") {
+      return { leg: leg(storedEntry, "the orchestrator already set for fusion"), warnings };
+    }
+    if (storedEntry && st.state === "unverified") {
+      warnings.push(
+        `${stored} (the orchestrator already set) could not be verified: ${st.why}; kept. Check it with: atomic-agent providers status`,
+      );
+      return { leg: leg(storedEntry, "the orchestrator already set for fusion"), warnings };
+    }
+    if (st.state === "broken") {
+      warnings.push(`${stored} (the orchestrator already set) is replaced: ${st.why}.`);
+    }
   }
+  const found = pickFresh(facts);
+  if ("problems" in found) return { problems: [...warnings, ...found.problems] };
+  return { ...found, warnings };
+}
+
+function pickFresh(facts: FusionSetupFacts):
+  | { leg: FusionSetupLeg; addProvider?: UserLlmProviderEntry }
+  | { problems: string[] } {
   const keyed = facts.providers.filter((p) => !isSubscription(p) && orchestratorReady(facts, p));
   const active = keyed.find((p) => p.id === facts.activeTextProvider);
   const firstKeyed = active ?? keyed[0];
@@ -365,5 +420,6 @@ export function planFusionSetup(
       fusion,
     },
     tips,
+    warnings: o.warnings,
   };
 }

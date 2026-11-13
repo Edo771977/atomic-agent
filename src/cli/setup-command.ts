@@ -82,6 +82,9 @@ export function renderFusionPlan(plan: FusionSetupPlan): string {
     lines.push("Can't set it up yet:", ...plan.problems.map((p) => `  - ${p}`), "");
     return `${lines.join("\n")}\n`;
   }
+  if (plan.warnings.length > 0) {
+    lines.push(...plan.warnings.map((w) => `  ! ${w}`), "");
+  }
   if (plan.changes.length > 0) {
     lines.push("Will change:", ...plan.changes.map(changeLine), "");
   }

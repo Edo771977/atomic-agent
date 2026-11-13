@@ -95,6 +95,44 @@ describe("planFusionSetup: detection matrix", () => {
   });
 });
 
+describe("planFusionSetup: the stored orchestrator", () => {
+  const sub: FusionSetupProviderFact = { id: "my-claude", kind: "subscription-cli", keyState: "not-needed", envVar: null, subscriptionCli: "claude" };
+  const storedSub = { fusion: { orchestratorProvider: "my-claude" } };
+
+  it("keeps it when its check is inconclusive, and says it could not be verified", () => {
+    const plan = planFusionSetup(facts({
+      providers: [LOCAL, sub, OPENROUTER("present")],
+      claude: { state: "unknown", fix: null },
+      runMode: storedSub,
+    }));
+    if (!plan.ok) throw new Error("expected ok");
+    expect(plan.orchestrator.providerId).toBe("my-claude");
+    expect(plan.warnings.join("\n")).toMatch(/my-claude.*could not be verified/);
+  });
+
+  it("replaces it only when it is definitely not ready, and says why", () => {
+    const plan = planFusionSetup(facts({
+      providers: [LOCAL, sub, OPENROUTER("present")],
+      claude: { state: "signed_out", fix: "claude   (then /login)" },
+      runMode: storedSub,
+    }));
+    if (!plan.ok) throw new Error("expected ok");
+    expect(plan.orchestrator.providerId).toBe("openrouter");
+    expect(plan.warnings.join("\n")).toMatch(/my-claude.*not signed in.*claude {3}\(then \/login\)/);
+  });
+
+  it("a stored keyed provider whose key is gone is replaced with the reason", () => {
+    const other: FusionSetupProviderFact = { id: "gem", kind: "gemini", keyState: "present", envVar: "GEMINI_API_KEY", subscriptionCli: null };
+    const plan = planFusionSetup(facts({
+      providers: [LOCAL, OPENROUTER("missing"), other],
+      runMode: { fusion: { orchestratorProvider: "openrouter" } },
+    }));
+    if (!plan.ok) throw new Error("expected ok");
+    expect(plan.orchestrator.providerId).toBe("gem");
+    expect(plan.warnings.join("\n")).toMatch(/openrouter.*no API key/);
+  });
+});
+
 describe("planFusionSetup: defaults", () => {
   it("priced orchestrator: advisor escalation, one replan and a $1 turn cap", () => {
     const plan = planFusionSetup(facts({ providers: [LOCAL, OPENROUTER("present")] }));
