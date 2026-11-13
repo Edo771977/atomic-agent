@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { existsSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { FanoutScopeRegistry } from "../../approval/fanout-scope.js";
@@ -60,6 +60,26 @@ describe("dependency readiness before a later worker starts", () => {
 
   it.each(["failed", "max_steps", "timeout", "queued", "cancelled", "needs_orchestrator", "no_changes"] satisfies WorkerTaskStatus[])("warns about an incomplete %s provider", status => {
     expect(dependencyWarnings(["ui"], new Map([["ui", ["core"]]]), new Map([["core", { id: "core", status } as WorkerTaskResult]]))).toEqual([`task ui depends on core, which ended ${status}`]);
+  });
+
+  it.each([true, false])("releases a no_changes provider's dependents only when its artifact verifies (present=%s)", async present => {
+    const old = new Date(Date.now() - 3_600_000);
+    writeFileSync(join(dir, "aux.js"), "export const aux = 1;");
+    utimesSync(join(dir, "aux.js"), old, old);
+    if (present) {
+      writeFileSync(join(dir, "core.js"), "export const core = 1;");
+      utimesSync(join(dir, "core.js"), old, old);
+    }
+    const f = fixture(0, "reply", { runTurn: async (session, _brief, _options) => {
+      const id = (session.metadata as { fusionWorker: { taskId: string } }).fusionWorker.taskId;
+      f.ran.push(id);
+      return { session, reason: "reply", stepCount: 1 };
+    } });
+    const result = await f.run({ tasks: [{ ...tasks[0]!, files: ["aux.js"] }, tasks[1]!], contract: { provides: contract.provides.slice(0, 1), requires: contract.requires.slice(0, 1) } });
+    const rows = result.details.tasks as WorkerTaskResult[];
+    expect(rows[0]!.status).toBe("no_changes");
+    expect(f.ran).toEqual(present ? ["core", "ui"] : ["core"]);
+    expect(rows[1]!.status).toBe(present ? "ok" : "cancelled");
   });
 
   it("holds consumers when an ok provider's required file is absent", async () => {

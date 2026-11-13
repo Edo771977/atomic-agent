@@ -15,7 +15,9 @@ import type { WorkerTaskResult, WorkerTaskStatus } from "./worker-result.js";
  * task that provides X; wave 1 is every task with no unmet dependency,
  * and later waves can start only after successful providers have been
  * verified. Incomplete providers hold their dependents whether or not
- * automatic replanning is enabled.
+ * automatic replanning is enabled (before this, dependents ran with a
+ * `dependencyWarnings` note). A `no_changes` provider whose required
+ * artifacts verify releases them; `fusion-delegate.ts` decides.
  *
  * A cyclic remainder is held, with a warning; independent earlier waves
  * can still run. A contract without `requires`, or whose requires name
@@ -105,7 +107,11 @@ export function planWaves(
   return { waves, dependencies };
 }
 
-/** A provider that ended one of these did not deliver what its dependents rely on. */
+/**
+ * A provider that ended one of these did not deliver what its dependents
+ * rely on: they are warned, and held unless the provider is a verified
+ * `no_changes` one.
+ */
 export const UNDELIVERED_STATUSES: ReadonlySet<WorkerTaskStatus> = new Set([
   "failed",
   "cancelled",
