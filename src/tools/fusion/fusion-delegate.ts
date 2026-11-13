@@ -741,8 +741,23 @@ export function buildFusionDelegateTool(
         deps.escalationComplete === undefined
           ? undefined
           : (call) => deps.escalationComplete!({ ...call, sessionId: ctx.sessionId });
-      const workerDeps: FusionDelegateDeps =
-        sideComplete === undefined ? deps : { ...deps, escalationComplete: sideComplete };
+      // Every worker session carries the request unclipped: its brief
+      // may quote only the head (a local leg), and the input guard reads
+      // the whole request for the files it names (`workerRequestRecord`).
+      const workerDeps: FusionDelegateDeps = {
+        ...deps,
+        ...(sideComplete === undefined ? {} : { escalationComplete: sideComplete }),
+        ...(originalRequest === undefined
+          ? {}
+          : {
+              createEphemeralSession: (meta, workingDir, inheritWorkspace) =>
+                deps.createEphemeralSession(
+                  { ...meta, operatorRequest: originalRequest },
+                  workingDir,
+                  inheritWorkspace,
+                ),
+            }),
+      };
 
       // The judge's acceptance lists (ATO-944), built before any work so
       // every brief carries its own, read-only. Off: no list, no suffix.

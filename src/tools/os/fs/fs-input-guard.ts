@@ -40,7 +40,9 @@ export {
  * that existed before the turn and was not created by this session (the
  * restore store's created set), and whose basename appears in the
  * turn's pinned request (`pickOriginalRequest`; for a worker, the
- * ORIGINAL REQUEST block of its brief — `requestWords`), the call
+ * ORIGINAL REQUEST block of its record — `requestWords` — which holds
+ * the whole request even when the brief quotes only its head,
+ * `workerRequestRecord`), the call
  * is refused with the counts and the way onward: write the result to a
  * new file, edit it in place (`os.fs.edit` / `os.fs.patch`, never
  * refused by this rule), or ask the user. The refusal never names

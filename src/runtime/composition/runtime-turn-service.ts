@@ -388,8 +388,11 @@ export function createRuntimeTurnService(
           // in its ORIGINAL REQUEST block, which is what the input guard
           // reads (`requestWords`). A brief without the block carries
           // none, so it is recorded as names only: the orchestrator's
-          // words never stand for the user agreeing (ATO-860).
-          turnRequests.set(session.id, workerRequestRecord(userMessage));
+          // words never stand for the user agreeing (ATO-860). The block
+          // holds the whole request from the worker's stamp, not the
+          // brief's quote: a local brief clips it, and a file named past
+          // the clip is still the operator's input.
+          turnRequests.set(session.id, workerRequestRecord(userMessage, worker.operatorRequest));
           // The question a yes in that block answers was the parent's.
           const parentReply = turnPreviousReplies?.get(worker.parentSessionId);
           if (parentReply !== undefined) {

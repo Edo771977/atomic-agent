@@ -168,6 +168,24 @@ describe("os.fs.write after the agent asked to replace a file (ATO-860)", () => 
     expect(await readFile(join(dir, "sales.csv"), "utf8")).toBe("id,amount\n1,10\n2,20\n");
   });
 
+  it("protects a file named past a local brief's quote cap, as on a cloud leg", async () => {
+    // A 9K request naming sales.csv near its end: a local brief quotes
+    // the first 6,000 chars, so the name is not in the brief at all.
+    const long = `${"Build the quarterly report from the attached data. ".repeat(180)}Read the figures from sales.csv.`;
+    expect(long.length).toBeGreaterThan(9_000);
+    const task = { id: "t1", title: "Report", instructions: "Write report.md from the figures" };
+    const local = renderWorkerBrief(task, { workingDir: dir, originalRequest: long, localLeg: true });
+    expect(local).not.toContain("sales.csv");
+    const cloud = renderWorkerBrief(task, { workingDir: dir, originalRequest: long });
+    request = workerRequestRecord(cloud, long);
+    expect((await write().run({ path: "sales.csv", content: "x\n" }, ctx("s-w-1"))).status).toBe("error");
+    request = workerRequestRecord(local, long);
+    const result = await write().run({ path: "sales.csv", content: "x\n" }, ctx("s-w-2"));
+    expect(result.status).toBe("error");
+    expect(result.summary).toContain("sales.csv is an input the request names");
+    expect(await readFile(join(dir, "sales.csv"), "utf8")).toBe("id,amount\n1,10\n2,20\n");
+  });
+
   it("lets a worker act on the user's yes to its parent's question", async () => {
     const brief = renderWorkerBrief(
       { id: "t1", title: "Sales", instructions: "Write the cleaned rows", files: ["sales.csv"] },

@@ -62,11 +62,28 @@ export function quotedRequestText(request: string): string {
 export const NO_OPERATOR_WORDS_MARKER =
   "[a worker brief without an ORIGINAL REQUEST block: no operator words]";
 
-/** The record `executeTurn` keeps for a worker turn, from its brief. */
-export function workerRequestRecord(brief: string): string {
-  return brief.includes(ORIGINAL_REQUEST_BEGIN_MARKER)
-    ? brief
-    : `${NO_OPERATOR_WORDS_MARKER}\n${brief}`;
+/**
+ * The record `executeTurn` keeps for a worker turn, from its brief.
+ *
+ * `operatorRequest` is the request the brief quotes, unclipped
+ * (`FusionWorkerMeta.operatorRequest`): a local brief quotes only its
+ * head, so a file named past the cap would be missing from the quote
+ * and lose the input guard's refusal. With it, the record's ORIGINAL
+ * REQUEST block holds the whole request; the rest of the brief is kept.
+ */
+export function workerRequestRecord(
+  brief: string,
+  operatorRequest?: string,
+): string {
+  const begin = brief.indexOf(ORIGINAL_REQUEST_BEGIN_MARKER);
+  if (begin === -1) return `${NO_OPERATOR_WORDS_MARKER}\n${brief}`;
+  const full = operatorRequest?.trim() ?? "";
+  if (full.length === 0) return brief;
+  const start = begin + ORIGINAL_REQUEST_BEGIN_MARKER.length;
+  const end = brief.indexOf(ORIGINAL_REQUEST_END_MARKER, start);
+  return end === -1
+    ? `${brief.slice(0, start)}\n${full}\n${ORIGINAL_REQUEST_END_MARKER}`
+    : `${brief.slice(0, start)}\n${full}\n${brief.slice(end)}`;
 }
 
 /**

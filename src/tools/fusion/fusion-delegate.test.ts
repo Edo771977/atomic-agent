@@ -14,7 +14,7 @@ import { resetConfigCache } from "../../config/index.js";
 import type { ResolvedRunMode } from "../../llm/run-mode/index.js";
 import { createEmptySessionState, type SessionState } from "../../session/session-state.js";
 import { createRuntimeSessionFactories } from "../../runtime/composition/runtime-session-services.js";
-import { FUSION_WORKER_ID_PREFIX } from "../../session/fusion-worker-session.js";
+import { FUSION_WORKER_ID_PREFIX, type FusionWorkerMeta } from "../../session/fusion-worker-session.js";
 import { StructuredLogger } from "../../tracing/structured-logger.js";
 import type { ToolContext } from "../tool-registry.js";
 import {
@@ -140,6 +140,18 @@ describe("fusion.delegate", () => {
     expect(create.mock.calls[0]?.[2]).toBe(false);
     expect(runTurn).toHaveBeenCalledOnce();
   });
+  it("hands each worker session the operator's whole request, which its brief may clip", async () => {
+    const full = `${"spec ".repeat(2_000)}Read sales.csv.`;
+    const create = vi.fn((meta: FusionWorkerMeta, workingDir?: string) => createEmptySessionState({ id: `${FUSION_WORKER_ID_PREFIX}${meta.taskId}`, workingDir: workingDir ?? "/repo", metadata: { fusionWorker: { ...meta } } }));
+    const result = await buildFusionDelegateTool(deps({ createEphemeralSession: create, resolveOriginalRequest: () => full })).run(
+      { tasks: [...TASKS] }, ctx());
+    expect(result.status).toBe("ok");
+    expect(create.mock.calls.map((call) => call[0])).toEqual([
+      { parentSessionId: "s-parent", taskId: "t1", operatorRequest: full },
+      { parentSessionId: "s-parent", taskId: "t2", operatorRequest: full },
+    ]);
+  });
+
   it("is not readonly and carries its own name", () => {
     const tool = buildFusionDelegateTool(deps());
     expect(tool.name).toBe("fusion.delegate");

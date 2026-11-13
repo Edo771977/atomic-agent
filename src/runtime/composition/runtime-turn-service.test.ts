@@ -7,7 +7,7 @@ import * as analytics from "../../analytics/index.js";
 import { AnalyticsStateStore, TurnUsageMeter } from "../../analytics/index.js";
 import { createEmptySessionState, createFusionWorkerSession, SESSION_TITLE_TIMEOUT_MS, type SessionState } from "../../session/index.js";
 import { assistantReplyTurn, userTurn } from "../../session/conversation-turn.js";
-import { NO_OPERATOR_WORDS_MARKER } from "../../prompt/request-section.js";
+import { NO_OPERATOR_WORDS_MARKER, ORIGINAL_REQUEST_BEGIN_MARKER, ORIGINAL_REQUEST_END_MARKER } from "../../prompt/request-section.js";
 import type { RunTurnOptions, RunTurnResult } from "../../agent/agent-loop.js";
 import type { CompletionResult } from "../../llm/llama-server-client.js";
 import { LlamaServerClient } from "../../llm/llama-server-client.js";
@@ -243,6 +243,21 @@ describe("runtime turn ownership recipes", () => {
     expect(seen[1]?.reply).toBe("Replace sales.csv?");
     expect(seen[1]?.request?.startsWith(NO_OPERATOR_WORDS_MARKER)).toBe(true);
     expect(fixture.turnPreviousReplies.size).toBe(0);
+    expect(fixture.turnRequests.size).toBe(0);
+  });
+
+  it("records a worker's whole operator request for the input guard, not its brief's clipped quote", async () => {
+    const full = `${"spec ".repeat(2_000)}Read sales.csv.`;
+    const brief = `TASK t1\n${ORIGINAL_REQUEST_BEGIN_MARKER}\n${full.slice(0, 6_000)}\n${ORIGINAL_REQUEST_END_MARKER}\nYour part is TASK t1.`;
+    const worker = createFusionWorkerSession({ workingDir: dir, meta: { parentSessionId: "parent", taskId: "task", operatorRequest: full } });
+    let seen: string | undefined;
+    fixture.loop.runTurn.mockImplementationOnce(async (value, options) => {
+      seen = fixture.turnRequests.get(value.id);
+      return result(value, options);
+    });
+    await fixture.service.executeTurn(worker, brief);
+    expect(seen).toContain("Read sales.csv.");
+    expect(seen).toContain("Your part is TASK t1.");
     expect(fixture.turnRequests.size).toBe(0);
   });
 
