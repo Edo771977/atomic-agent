@@ -18,6 +18,7 @@ const TIMESTAMP = new Date().toISOString().replace(/[:.]/g, "-");
 const REPORT_DIR = process.env.ATOMIC_AGENT_GAIA_REPORT_DIR
   ? resolve(process.env.ATOMIC_AGENT_GAIA_REPORT_DIR)
   : resolve(HERE, "reports", `run-${TIMESTAMP}`);
+process.env.ATOMIC_AGENT_GAIA_REPORT_DIR = REPORT_DIR;
 const CSV_PATH = resolve(REPORT_DIR, "matrix.csv");
 const JSONL_PATH = resolve(REPORT_DIR, "matrix.jsonl");
 const TRACES_DIR = resolve(REPORT_DIR, "traces");
@@ -27,7 +28,7 @@ const embedUrl = process.env.ATOMIC_AGENT_EVAL_EMBED_URL ?? null;
 
 function parseAgentFilter(): string[] | undefined {
   const raw = process.env.ATOMIC_AGENT_EVAL_AGENTS;
-  if (!raw) return undefined;
+  if (raw === undefined) return undefined;
   return raw.split(",").map((s) => s.trim()).filter(Boolean);
 }
 
@@ -68,6 +69,10 @@ describe("GAIA multi-agent matrix", () => {
   const rows = loadRows();
   const adapters = listAgentAdapters(parseAgentFilter());
   const campaign = { selected: rows.length * adapters.length, executed: 0, skipped: 0 };
+  // Collection runs even when Vitest skips every test by title. Persist the
+  // initial zero counters before hooks so that skipped campaigns stay visible.
+  mkdirSync(REPORT_DIR, { recursive: true });
+  writeFileSync(resolve(REPORT_DIR, "campaign.json"), `${JSON.stringify(campaign, null, 2)}\n`, "utf8");
 
   afterAll(() => {
     writeFileSync(resolve(REPORT_DIR, "campaign.json"), `${JSON.stringify(campaign, null, 2)}\n`, "utf8");

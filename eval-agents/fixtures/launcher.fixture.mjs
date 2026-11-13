@@ -9,6 +9,7 @@ const running = runVitest({
   forwarded: JSON.parse(process.env.LAUNCHER_ARGS ?? "[]"),
   extraEnv: { LAUNCHER_EXTRA: "injected extra env" },
   signal: controller.signal,
+  ...(process.env.LAUNCHER_REQUIRE_CAMPAIGN === "1" ? { requireCampaign: true } : {}),
 });
 if (process.env.LAUNCHER_MODE === "cancel") {
   const deadline = Date.now() + 3000;

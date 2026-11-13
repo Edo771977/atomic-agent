@@ -1,7 +1,8 @@
 // Shared daemon-lifecycle + vitest helpers for eval-agents orchestrators.
 
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -136,14 +137,27 @@ export function teardownDaemons(log, startedByUs) {
 }
 
 export function runVitest({ extraEnv = {}, forwarded = [], signal,
-  entryPath = VITEST_ENTRY, cwd = REPO_ROOT } = {}) {
+  entryPath = VITEST_ENTRY, cwd = REPO_ROOT,
+  requireCampaign = entryPath === VITEST_ENTRY } = {}) {
+  const env = { ...process.env, ...extraEnv };
+  let campaignPath;
+  if (requireCampaign) {
+    const reportDir = env.ATOMIC_AGENT_GAIA_REPORT_DIR ?? resolve(REPO_ROOT, "eval-agents", "reports",
+      `run-${new Date().toISOString().replace(/[:.]/g, "-")}-${randomUUID()}`);
+    env.ATOMIC_AGENT_GAIA_REPORT_DIR = reportDir;
+    campaignPath = resolve(reportDir, "campaign.json");
+    mkdirSync(reportDir, { recursive: true });
+    // Never let a previous run in an explicitly reused directory prove that
+    // this invocation ran an agent. The campaign replaces this pending row.
+    writeFileSync(campaignPath, `${JSON.stringify({ selected: null, executed: 0, status: "pending" })}\n`);
+  }
   return new Promise((resolveExit) => {
     const child = spawn(
       process.execPath,
       [entryPath, "run", "--config", VITEST_CONFIG, ...forwarded],
       {
         cwd,
-        env: { ...process.env, ...extraEnv },
+        env,
         stdio: "inherit",
         windowsHide: true,
         signal,
@@ -169,7 +183,17 @@ export function runVitest({ extraEnv = {}, forwarded = [], signal,
     child.once("close", (code) => {
       process.removeListener("SIGINT", onInt);
       process.removeListener("SIGTERM", onTerm);
-      resolveExit(signal?.aborted || interrupted ? 130 : launchFailed ? 1 : code ?? 1);
+      let exitCode = signal?.aborted || interrupted ? 130 : launchFailed ? 1 : code ?? 1;
+      if (exitCode === 0 && campaignPath) {
+        try {
+          const campaign = JSON.parse(readFileSync(campaignPath, "utf8"));
+          if (!(campaign.executed > 0)) throw new Error("no GAIA agent cases executed");
+        } catch (error) {
+          console.error(`[eval-agents] invalid campaign completion: ${error.message}`);
+          exitCode = 1;
+        }
+      }
+      resolveExit(exitCode);
     });
   });
 }

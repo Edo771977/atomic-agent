@@ -9,12 +9,12 @@ const root = fileURLToPath(new URL("../..", import.meta.url));
 const scratch = mkdtempSync(join(tmpdir(), "gaia-campaign-test-"));
 afterAll(() => rmSync(scratch, { recursive: true, force: true }));
 
-function campaign(name: string, extra: Record<string, string>) {
+function campaign(name: string, extra: Record<string, string>, forwarded: string[] = []) {
   const reportDir = join(scratch, name);
   const result = spawnSync(process.execPath, [
     join(root, "node_modules/vitest/vitest.mjs"), "run", "--config",
     "eval-agents/fixtures/campaign.vitest.ts", "--reporter=default", "--reporter=json",
-    "--outputFile", `${reportDir}.vitest.json`,
+    "--outputFile", `${reportDir}.vitest.json`, ...forwarded,
   ], {
     cwd: root,
     env: { ...process.env, ATOMIC_AGENT_STATE_DIR: join(scratch, "state"),
@@ -31,6 +31,20 @@ function campaign(name: string, extra: Record<string, string>) {
 }
 
 describe("actual GAIA campaign wiring (hermetic child Vitest)", () => {
+  it("fails and persists a summary when the Vitest title filter selects no cases", () => {
+    const result = campaign("no-title-match", {}, ["-t", "nonexistent name"]);
+    expect(result.status, result.output).toBe(1);
+    expect(result.output).toContain("no GAIA agent cases executed");
+    const summary = JSON.parse(readFileSync(join(result.reportDir, "campaign.json"), "utf8"));
+    expect(summary).toMatchObject({ selected: 1, executed: 0, skipped: 0 });
+  });
+
+  it("does not expand an empty string agent selection into every agent", () => {
+    const result = campaign("empty-string-filter", { ATOMIC_AGENT_EVAL_AGENTS: "" });
+    expect(result.status, result.output).toBe(1);
+    expect(result.output).toContain("no agent adapters selected");
+  });
+
   it("fails an intended campaign selecting no dataset rows", () => {
     const result = campaign("no-rows", { ATOMIC_AGENT_GAIA_TASK_IDS: "does-not-exist" });
     expect(result.status, result.output).toBe(1);

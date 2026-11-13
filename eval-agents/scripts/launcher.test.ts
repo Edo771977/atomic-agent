@@ -39,6 +39,13 @@ describe("eval launcher actual Node children", () => {
     expect(result.status, result.diagnostic).toBe(7);
   });
 
+  it("rejects a successful child that never records a campaign execution", () => {
+    const result = launch("missing-campaign", { LAUNCHER_REQUIRE_CAMPAIGN: "1",
+      ATOMIC_AGENT_GAIA_REPORT_DIR: join(scratch, "missing-campaign") });
+    expect(result.status, result.diagnostic).toBe(1);
+    expect(result.diagnostic).toContain("no GAIA agent cases executed");
+  });
+
   it("settles a spawn error with a diagnostic instead of an unhandled error", () => {
     const result = launch("spawn-error", { LAUNCHER_CWD: join(scratch, "nonexistent") });
     expect(result.status).toBe(1);

@@ -72,6 +72,11 @@ agent filter selects no adapters, or no selected agent case executes. Missing
 competitor prerequisites remain genuine skipped tests with reasons in the
 matrix; partial skips do not count as executed successes. The scorer-only
 smoke is a separate hermetic unit test and does not establish agent execution.
+The campaign config runs only `gaia.eval.ts`; its runner checks completion
+outside test hooks, so a title filter matching nothing fails too. The
+orchestrator independently validates its fresh completion report after Vitest
+closes. An absent agent filter selects defaults; an explicitly empty string
+or comma-only filter selects no agents and fails.
 Set `ATOMIC_AGENT_GAIA_REPORT_DIR` to place a campaign's reports in a chosen
 directory (the default remains a timestamped directory under `reports/`).
 
