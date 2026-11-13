@@ -17,16 +17,19 @@
  * Git metadata only: tracked paths are overlaid from the original's
  * actual bytes into the base, then from that frozen base into each
  * task, bypassing clean/smudge filters and Git's stat cache. Untracked files are
- * copied in; ignored directories (`node_modules`, build output) and
- * ignored files are copied privately so a test run still finds them.
+ * copied in; ignored directories and ignored files are copied privately
+ * so a test run still finds them, except the shared dependency
+ * directories (`node_modules`, `target`, `.venv`), which are symlinked
+ * to the original's and cost no copy budget.
  * Outside git, or when git cannot snapshot
  * (no commit yet, a merge in progress, no git binary), a workspace is
  * a private folder copy without the original's git metadata. Copying
  * is bounded across the base and every task. A tree too large to copy is not
  * isolated at all; the caller refuses the wave before any worker starts.
  *
- * Dependencies and build outputs are readable but their private writes
- * are not merged. Existing user symlinks retain their targets; this is
+ * Dependencies and build outputs are readable but never merged; private
+ * copies keep a task's writes to them disposable, while writes through a
+ * shared dependency link land in the original (as on `verify.run`). Existing user symlinks retain their targets; this is
  * workspace isolation, not a process sandbox. Submodules are not checked
  * out in a worktree.
  */
@@ -47,7 +50,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, relative, sep } from "node:path";
+import { basename, dirname, join, relative, sep } from "node:path";
 import { runCommand, type CommandResult } from "../../sandbox/command-runner.js";
 import { buildCommandEnv } from "../../sandbox/command-env.js";
 import { VERIFY_COPY_EXCLUDED, VERIFY_COPY_MAX_BYTES } from "../verify/verify-workspace-copy.js";
@@ -337,7 +340,21 @@ class PrivateCopyLimitError extends Error {
 
 interface PrivateCopyBudget { left: number; signal?: AbortSignal }
 
-/** Copy entries without creating links back to the source or sharing its git metadata. */
+/**
+ * Dependency and build-cache directories shared with the original by a
+ * symlink instead of copied: they are routinely far larger than the
+ * project itself (hundreds of MB, 100k+ files), and copying them into
+ * the base and every task both blew the copy limit and refused isolation
+ * for ordinary repos. Never stamped or merged (`VERIFY_COPY_EXCLUDED`).
+ * Writes through the link reach the original, as for `verify.run`.
+ */
+export const SHARED_DEPENDENCY_DIRECTORIES: ReadonlySet<string> = new Set(["node_modules", "target", ".venv"]);
+
+/**
+ * Copy entries without sharing the source's git metadata. Only links
+ * created here point back at the source: a shared dependency directory
+ * (`SHARED_DEPENDENCY_DIRECTORIES`), which costs no copy budget.
+ */
 async function copyPrivateEntry(
   from: string,
   to: string,
@@ -347,7 +364,10 @@ async function copyPrivateEntry(
   budget.signal?.throwIfAborted();
   if (isUnderMergeDir(rel)) return;
   const info = await lstat(from);
-  if (info.isDirectory()) {
+  if (info.isDirectory() && rel.length > 0 && SHARED_DEPENDENCY_DIRECTORIES.has(basename(rel))) {
+    await mkdir(dirname(to), { recursive: true });
+    await symlink(await realpath(from), to, "dir");
+  } else if (info.isDirectory()) {
     await mkdir(to, { recursive: true });
     for (const name of await readdir(from)) {
       if (name === ".git") continue;

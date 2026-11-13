@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -13,8 +13,50 @@ afterEach(async () => {
   for (const dir of cleanup.splice(0)) await rm(dir, { recursive: true, force: true });
 });
 
+describe("shared dependency directories", () => {
+  it("isolates a repo whose ignored node_modules exceeds the copy budget across tasks", async () => {
+    const repo = await makeGitRepo("atag-shared-deps-");
+    cleanup.push(repo);
+    await writeRepoFile(repo, ".gitignore", "node_modules/\n");
+    await writeRepoFile(repo, "tracked.txt", "tracked\n");
+    await runGitRaw(repo, ["add", "-A"]);
+    await runGitRaw(repo, ["commit", "-q", "-m", "init"]);
+    await writeRepoFile(repo, "node_modules/dep/index.js", "x".repeat(300_000));
+    const { root } = await fixture();
+    const set = await createBranchSet(repo, ["t1", "t2", "t3"], { tmpRoot: root, maxCopyBytes: 100_000 });
+    expect(set).not.toBeNull();
+    try {
+      for (const id of ["t1", "t2", "t3"]) {
+        const dir = set!.workspaces.get(id)!.dir;
+        expect((await readFile(join(dir, "node_modules/dep/index.js"), "utf8")).length).toBe(300_000);
+        expect(await realpath(join(dir, "node_modules"))).toBe(await realpath(join(repo, "node_modules")));
+        expect([...set!.workspaces.get(id)!.manifest.keys()].some((p) => p.startsWith("node_modules"))).toBe(false);
+      }
+    } finally { await set?.cleanup(); }
+    expect(await readFile(join(repo, "node_modules/dep/index.js"), "utf8")).toHaveLength(300_000);
+  });
+
+  it("does not copy node_modules, target or .venv wholesale in the folder-copy fallback", async () => {
+    const { root, dir } = await fixture();
+    for (const name of ["node_modules", "target", ".venv"]) {
+      await mkdir(join(dir, name));
+      await writeFile(join(dir, name, "big.bin"), Buffer.alloc(300_000));
+    }
+    const set = await createBranchSet(dir, ["t1", "t2", "t3"], { tmpRoot: root, git: async () => null, maxCopyBytes: 100_000 });
+    expect(set).not.toBeNull();
+    try {
+      const one = set!.workspaces.get("t1")!.dir;
+      for (const name of ["node_modules", "target", ".venv"]) {
+        expect((await lstat(join(one, name))).isSymbolicLink()).toBe(true);
+        expect(await realpath(join(one, name))).toBe(await realpath(join(dir, name)));
+      }
+      expect(await readFile(join(one, "input.txt"), "utf8")).toBe("the user's original\n");
+    } finally { await set?.cleanup(); }
+  });
+});
+
 describe("private branch dependencies", () => {
-  it("keeps ignored dependencies readable without sharing a failed task's writes", async () => {
+  it("keeps ignored caches private and dependencies readable without sharing a failed task's cache writes", async () => {
     const repo = await makeGitRepo("atag-private-ignored-");
     cleanup.push(repo);
     await writeRepoFile(repo, ".gitignore", "cache/\nnode_modules/\n");
@@ -34,7 +76,8 @@ describe("private branch dependencies", () => {
         expect(await readFile(join(dir, "cache/state.txt"), "utf8")).toBe("original cache\n");
         expect(await readFile(join(dir, "node_modules/dependency/index.js"), "utf8")).toBe("original dependency\n");
         await writeFile(join(dir, "cache/state.txt"), "bad cache\n");
-        await writeFile(join(dir, "node_modules/dependency/index.js"), "bad dependency\n");
+        // Shared with the original by a link, never copied or merged.
+        expect(await realpath(join(dir, "node_modules"))).toBe(await realpath(join(repo, "node_modules")));
         expect(await readFile(join(repo, "cache/state.txt"), "utf8")).toBe("original cache\n");
         return [{ ...row("failed"), status: "failed" }];
       },
@@ -45,21 +88,21 @@ describe("private branch dependencies", () => {
     expect(await readFile(join(repo, "node_modules/dependency/index.js"), "utf8")).toBe("original dependency\n");
   });
 
-  it("copies excluded directories privately outside git and does not share git metadata", async () => {
+  it("copies non-dependency excluded directories privately outside git and does not share git metadata", async () => {
     const { root, dir } = await fixture();
     await mkdir(join(dir, ".git"));
     await writeFile(join(dir, ".git", "marker"), "original git metadata");
-    await mkdir(join(dir, "node_modules"));
-    await writeFile(join(dir, "node_modules", "dependency.js"), "dependency\n");
+    await mkdir(join(dir, "dist"));
+    await writeFile(join(dir, "dist", "dependency.js"), "dependency\n");
     const set = await createBranchSet(dir, ["one", "two"], { tmpRoot: root, git: async () => null });
     expect(set).not.toBeNull();
     try {
       const one = set!.workspaces.get("one")!.dir;
       const two = set!.workspaces.get("two")!.dir;
-      expect(await readFile(join(one, "node_modules/dependency.js"), "utf8")).toBe("dependency\n");
-      await writeFile(join(one, "node_modules/dependency.js"), "changed\n");
-      expect(await readFile(join(two, "node_modules/dependency.js"), "utf8")).toBe("dependency\n");
-      expect(await readFile(join(dir, "node_modules/dependency.js"), "utf8")).toBe("dependency\n");
+      expect(await readFile(join(one, "dist/dependency.js"), "utf8")).toBe("dependency\n");
+      await writeFile(join(one, "dist/dependency.js"), "changed\n");
+      expect(await readFile(join(two, "dist/dependency.js"), "utf8")).toBe("dependency\n");
+      expect(await readFile(join(dir, "dist/dependency.js"), "utf8")).toBe("dependency\n");
       expect(await readdir(one)).not.toContain(".git");
     } finally { await set?.cleanup(); }
   });
@@ -67,15 +110,15 @@ describe("private branch dependencies", () => {
   it("counts ignored directory data against the copy limit before any worker starts", async () => {
     const repo = await makeGitRepo("atag-private-limit-");
     cleanup.push(repo);
-    await writeRepoFile(repo, ".gitignore", "node_modules/\n");
+    await writeRepoFile(repo, ".gitignore", "cache/\n");
     await runGitRaw(repo, ["add", ".gitignore"]);
     await runGitRaw(repo, ["commit", "-q", "-m", "init"]);
-    await writeRepoFile(repo, "node_modules/dependency.js", "large dependency".repeat(10));
+    await writeRepoFile(repo, "cache/state.bin", "large cache".repeat(10));
     const { root } = await fixture();
     let runs = 0;
     const result = await runIsolatedWave({
       realDir: repo, tasks: [task("one")], writeScope: [repo], inputs: [],
-      options: { tmpRoot: root, maxCopyBytes: 10 },
+      options: { tmpRoot: root, maxCopyBytes: 60 },
       run: async () => { runs += 1; return [row("one")]; },
     });
     expect(runs).toBe(0);
