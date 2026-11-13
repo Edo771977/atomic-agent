@@ -221,11 +221,12 @@ interface PromotionJournalStep {
 }
 interface PromotionJournal {
   version: 1; candidate: string; project: string; startedAt: string;
-  state: "promoting" | "rolling-back" | "rolled-back-with-conflicts";
+  /** `committed`: every step landed and was verified; nothing to undo, delete the journal. */
+  state: "promoting" | "committed" | "rolling-back" | "rolled-back-with-conflicts";
   recovery: string;
   steps: PromotionJournalStep[];
 }
-const JOURNAL_RECOVERY = "Steps run in order. 'applied' paths hold the promoted entry; an 'intent' path may hold either. To undo, restore each such path from 'original': a file from 'backup' with its mode, a symlink from 'linkTarget', a directory with its mode; remove the path if 'original' is null. Verify sha256 before trusting a backup, then delete this journal and its backup folder.";
+const JOURNAL_RECOVERY = "If state is 'committed', delivery completed and was verified: change nothing, just delete this journal and its backup folder. Otherwise steps run in order. 'applied' paths hold the promoted entry; an 'intent' path may hold either. To undo, restore each such path from 'original': a file from 'backup' with its mode, a symlink from 'linkTarget', a directory with its mode; remove the path if 'original' is null. Verify sha256 before trusting a backup, then delete this journal and its backup folder.";
 
 export interface CandidateIntegrationReport {
   status: "promoted" | "rejected";
@@ -243,8 +244,14 @@ export interface CandidateIntegrationReport {
   ignoredChanges?: string[];
   /** Concurrent edits prevent rollback of these paths; their current bytes were preserved. */
   rollbackConflicts?: string[];
-  /** Promotion journal kept after an incomplete rollback, relative to the project (with its pre-image backup folder). */
+  /**
+   * Promotion journal left on disk, relative to the project (with its
+   * pre-image backup folder): after an incomplete rollback, or after a
+   * successful delivery whose journal could not be removed (see the note).
+   */
   promotionJournal?: string;
+  /** Why `promotionJournal` remains and what to do with it. */
+  promotionJournalNote?: string;
   /** Recovery fallback if a bounded patch cannot be made; cleanup leaves this private workspace intact. */
   retainedWorkspace?: string;
   heldArtifactsDir?: string;
@@ -527,8 +534,21 @@ export async function createCandidateIntegration(
         promotionSignal.throwIfAborted();
         // Final check of the touched paths only: each must now hold its candidate entry.
         await verifyPaths([...new Set(changed.flatMap(withAncestors))], path => final!.get(path), "original project changed while completing candidate delivery");
-        await journal?.remove().catch(() => undefined);
-        return { status: "promoted", nonResumable: true, changes: changed.map(posixPath), contract: evidence, artifactManifest, ...(ignoredChanges.length === 0 ? {} : { ignoredChanges: ignoredChanges.map(posixPath) }) };
+        // Delivery is complete and verified: nothing may roll it back now. The
+        // journal is durably marked committed first, so one left behind by a
+        // failed removal never reads as a crashed delivery to undo.
+        let leftover: Partial<CandidateIntegrationReport> = {};
+        if (journal !== undefined) {
+          const done = journal;
+          let committed = true;
+          try { done.journal.state = "committed"; done.write(); } catch { committed = false; }
+          await done.remove().catch(() => {
+            leftover = { promotionJournal: posixPath(relative(set.realDir, done.file)), promotionJournalNote: committed
+              ? "Promotion committed and verified, but its journal could not be removed. Nothing to restore: delete the journal and its .promotion-backup folder."
+              : "Promotion committed and verified, but its journal could neither be marked committed nor removed; it may still read 'promoting'. Nothing to restore: delete the journal and its .promotion-backup folder." };
+          });
+        }
+        return { status: "promoted", nonResumable: true, changes: changed.map(posixPath), contract: evidence, artifactManifest, ...(ignoredChanges.length === 0 ? {} : { ignoredChanges: ignoredChanges.map(posixPath) }), ...leftover };
       } catch (err) {
         // Roll back only bytes we still own. If a user edited a delivered
         // path, retain that edit and report it instead of overwriting it.

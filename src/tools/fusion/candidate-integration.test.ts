@@ -15,8 +15,38 @@ vi.mock("node:fs", async importOriginal => {
     reads.set(String(path), (reads.get(String(path)) ?? 0) + 1);
     return (actual.createReadStream as (...args: unknown[]) => unknown)(path, ...rest);
   }) as typeof actual.createReadStream;
-  return { ...actual, default: { ...actual, createReadStream }, createReadStream };
+  // Fault seam: a test may refuse to open a path (journal writes use openSync).
+  const openSync = ((path: Parameters<typeof actual.openSync>[0], ...rest: unknown[]) => {
+    if (faults.openSync?.(String(path)) === true) throw Object.assign(new Error(`injected openSync failure: ${String(path)}`), { code: "EIO" });
+    return (actual.openSync as (...args: unknown[]) => unknown)(path, ...rest);
+  }) as typeof actual.openSync;
+  return { ...actual, default: { ...actual, createReadStream, openSync }, createReadStream, openSync };
 });
+// Pass-through promise fs: records rename/sync order and injects failures.
+const faults = vi.hoisted(() => ({} as { rm?: (path: string) => boolean; chmod?: (path: string) => boolean; openSync?: (path: string) => boolean }));
+const fsEvents = vi.hoisted(() => [] as [string, string][]);
+vi.mock("node:fs/promises", async importOriginal => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  const fail = (what: string, path: string) => Object.assign(new Error(`injected ${what} failure: ${path}`), { code: "EIO" });
+  const rm = (async (path: string, ...rest: unknown[]) => {
+    if (faults.rm?.(String(path)) === true) throw fail("rm", String(path));
+    return (actual.rm as (...args: unknown[]) => Promise<void>)(path, ...rest);
+  }) as typeof actual.rm;
+  const chmod = (async (path: string, mode: number) => {
+    if (faults.chmod?.(String(path)) === true) throw fail("chmod", String(path));
+    return actual.chmod(path, mode);
+  }) as typeof actual.chmod;
+  const rename = (async (from: string, to: string) => { fsEvents.push(["rename", String(from)]); return actual.rename(from, to); }) as typeof actual.rename;
+  const open = (async (path: string, ...rest: unknown[]) => {
+    const handle = await (actual.open as (...args: unknown[]) => Promise<import("node:fs/promises").FileHandle>)(path, ...rest);
+    const sync = handle.sync.bind(handle);
+    handle.sync = async () => { fsEvents.push(["sync", String(path)]); return sync(); };
+    return handle;
+  }) as typeof actual.open;
+  const mocked = { ...actual, rm, chmod, rename, open };
+  return { ...mocked, default: mocked };
+});
+afterEach(() => { delete faults.rm; delete faults.chmod; delete faults.openSync; fsEvents.length = 0; });
 
 const roots: string[] = [];
 afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
@@ -418,4 +448,22 @@ it("journals each promotion step durably with pre-image backups so a crash mid-d
     expect((await next.finish({ rows, contract, signal, runChecks: async () => ({ ok: true, results: [{ ok: true }] }) })).status).toBe("promoted");
   } finally { await next.cleanup(); }
   expect(await promotionFiles(root)).toEqual([]);
+});
+
+it("marks a delivered promotion committed before removing its journal and reports a journal it could not remove", async () => {
+  const root = await project();
+  faults.rm = path => path.endsWith(".promotion.json");
+  const candidate = await createCandidateIntegration(root);
+  try {
+    await writeFile(join(candidate.dir, "api.json"), "promoted api");
+    const report = await candidate.finish({ rows, contract, signal, runChecks: pass });
+    expect(report.status).toBe("promoted");
+    expect(await readFile(join(root, "api.json"), "utf8")).toBe("promoted api");
+    // The stale journal must not read as a crashed delivery a user would revert.
+    expect(report.promotionJournal).toMatch(/\.promotion\.json$/);
+    expect(report.promotionJournalNote).toMatch(/committed/);
+    const journal = JSON.parse(await readFile(join(root, report.promotionJournal!), "utf8"));
+    expect(journal.state).toBe("committed");
+    expect(journal.steps.map((step: { status: string }) => step.status)).toEqual(["applied"]);
+  } finally { await candidate.cleanup(); }
 });
