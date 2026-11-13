@@ -139,6 +139,15 @@ export type UserLlmFusionConfig = {
    */
   maxTasksPerTurn?: number;
   /**
+   * Most tasks one fusion turn may send to `model: "orchestrator"` (a
+   * worker turn on the orchestrator leg). Counted rather than priced,
+   * because that leg is often a subscription whose turns have no price
+   * to cap. Unset: `DEFAULT_FUSION_MAX_ORCHESTRATOR_TASKS_PER_TURN`;
+   * `0` turns the target off (unlike the caps above, where `0` lifts
+   * the cap).
+   */
+  maxOrchestratorTasksPerTurn?: number;
+  /**
    * Automatic escalation of a stuck worker (ATO-942). `"advisor"`: when a
    * worker stalls (same result 3x, read-only for 6 steps) or its first
    * answer is cut by its time limit, the escalation model reads a
@@ -334,6 +343,13 @@ export const DEFAULT_FUSION_MAX_ROUNDS_PER_TURN = 6;
 export const DEFAULT_FUSION_MAX_TASKS_PER_TURN = 48;
 export const FUSION_MAX_ROUNDS_PER_TURN_MAX = 100;
 export const FUSION_MAX_TASKS_PER_TURN_MAX = 1000;
+/**
+ * Default cap on `model: "orchestrator"` tasks per fusion turn. Small on
+ * purpose: each is a full worker turn on the strong (and often flat-rate
+ * subscription) leg, meant for the few hard parts, not the bulk.
+ */
+export const DEFAULT_FUSION_MAX_ORCHESTRATOR_TASKS_PER_TURN = 4;
+export const FUSION_MAX_ORCHESTRATOR_TASKS_PER_TURN_MAX = 100;
 /** Upper bound on `turnBudgetUsd`; anything larger is a typo. */
 export const FUSION_TURN_BUDGET_USD_MAX = 10_000;
 
@@ -606,6 +622,14 @@ function parseFusion(
       `${field}.maxTasksPerTurn`,
       0,
       FUSION_MAX_TASKS_PER_TURN_MAX,
+    );
+  }
+  if (obj.maxOrchestratorTasksPerTurn !== undefined) {
+    out.maxOrchestratorTasksPerTurn = parseBoundedInt(
+      obj.maxOrchestratorTasksPerTurn,
+      `${field}.maxOrchestratorTasksPerTurn`,
+      0,
+      FUSION_MAX_ORCHESTRATOR_TASKS_PER_TURN_MAX,
     );
   }
   if (obj.turnTimeBudgetMs !== undefined) {

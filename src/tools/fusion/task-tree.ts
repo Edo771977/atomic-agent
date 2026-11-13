@@ -683,6 +683,7 @@ async function closeParent(
     durationMs: Math.max(row.durationMs, Date.now() - startedAt),
     tools,
     ...(changes.length === 0 ? {} : { changes }),
+    ...([row, ...children].some((r) => r.shellRan === true) ? { shellRan: true as const } : {}),
     ...(usage === undefined ? {} : { usage }),
     ...(billing === undefined ? {} : { billing }),
     notes: [

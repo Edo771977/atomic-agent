@@ -34,7 +34,10 @@ export interface CheckerRun {
   readonly stderr: string;
   /** The binary is not installed (ENOENT). */
   readonly missing: boolean;
+  /** Killed at its time limit, or (with `aborted`) on its signal. */
   readonly timedOut: boolean;
+  /** Killed, or never started, because `signal` aborted. */
+  readonly aborted?: boolean;
 }
 
 const CHECKER_TIMEOUT_MS = 60_000;
@@ -47,7 +50,9 @@ function isMissingBinary(err: unknown): boolean {
 /**
  * Run one checker process and collect its output. Never rejects: a
  * missing binary comes back as `missing: true`, so the caller can say
- * "no checker" instead of throwing at the model.
+ * "no checker" instead of throwing at the model. An aborted `signal`
+ * kills the child (or starts none) and comes back `timedOut` and
+ * `aborted`: no verdict, the same as a timeout.
  */
 export function runChecker(
   cmd: string,
@@ -57,8 +62,20 @@ export function runChecker(
     timeoutMs?: number;
     /** Merged over the inherited env; an `undefined` value unsets the variable. */
     env?: Readonly<Record<string, string | undefined>>;
+    signal?: AbortSignal;
   } = {},
 ): Promise<CheckerRun> {
+  const signal = options.signal;
+  if (signal?.aborted === true) {
+    return Promise.resolve({
+      exitCode: null,
+      stdout: "",
+      stderr: "",
+      missing: false,
+      timedOut: true,
+      aborted: true,
+    });
+  }
   return new Promise((resolve) => {
     // Belt and braces for any interpreter that caches bytecode.
     const env: NodeJS.ProcessEnv = { ...process.env, PYTHONDONTWRITEBYTECODE: "1" };
@@ -75,20 +92,31 @@ export function runChecker(
     let stdout = "";
     let stderr = "";
     let timedOut = false;
+    let aborted = false;
     let settled = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
+    const kill = (): void => {
       try {
         child.kill("SIGKILL");
       } catch {
         // already gone
       }
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      kill();
     }, options.timeoutMs ?? CHECKER_TIMEOUT_MS);
+    const onAbort = (): void => {
+      aborted = true;
+      timedOut = true;
+      kill();
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
     const finish = (run: CheckerRun): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      resolve(run);
+      signal?.removeEventListener("abort", onAbort);
+      resolve(aborted ? { ...run, aborted: true } : run);
     };
     child.stdout.on("data", (chunk: Buffer) => {
       if (stdout.length < CHECKER_OUTPUT_CAP) stdout += chunk.toString("utf8");
@@ -139,8 +167,9 @@ export async function nodeCheck(
   file: string,
   pathToCheck: string,
   node: string = nodeForSyntaxCheck(),
+  signal?: AbortSignal,
 ): Promise<SyntaxFileResult> {
-  const run = await runChecker(node, ["--check", pathToCheck]);
+  const run = await runChecker(node, ["--check", pathToCheck], signal === undefined ? {} : { signal });
   if (run.missing) {
     return { file, ok: null, checker: "none", error: NO_NODE_FOR_CHECK };
   }
@@ -174,6 +203,7 @@ export async function nodeCheck(
 export async function checkJavaScriptFile(
   file: string,
   content: string,
+  signal?: AbortSignal,
 ): Promise<SyntaxFileResult> {
   const parsed = checkFileParses(file, content);
   if (parsed.kind === "ok") return { file, ok: true, checker: "node-vm" };
@@ -188,7 +218,7 @@ export async function checkJavaScriptFile(
       error: "too large to parse in-process",
     };
   }
-  return nodeCheck(file, file);
+  return nodeCheck(file, file, nodeForSyntaxCheck(), signal);
 }
 
 /**
@@ -225,6 +255,8 @@ export type CheckerRunner = typeof runChecker;
 export interface InterpreterOptions {
   readonly run?: CheckerRunner;
   readonly platform?: NodeJS.Platform;
+  /** Kills the probe or the check when it aborts (no verdict). */
+  readonly signal?: AbortSignal;
 }
 
 interface Interpreter {
@@ -398,6 +430,9 @@ async function checkWithInterpreter(
 ): Promise<SyntaxFileResult> {
   const run = options.run ?? runChecker;
   const platform = options.platform ?? process.platform;
+  const signal = options.signal === undefined ? {} : { signal: options.signal };
+  // The probe is not tied to the signal: its short timeout bounds it,
+  // and an aborted probe must not be cached as "none found" for others.
   const interpreter = await resolveInterpreter(spec.kind, run, platform);
   if (interpreter === null) {
     return { file, ok: null, checker: "none", error: spec.noneFound };
@@ -405,6 +440,7 @@ async function checkWithInterpreter(
   const checker = `${interpreter.label} ${spec.suffix}`;
   const out = await run(interpreter.cmd, [...interpreter.args, ...spec.args(file)], {
     env: spec.kind.env,
+    ...signal,
   });
   if (out.missing) {
     // Uninstalled since it was probed: resolve afresh next time.

@@ -12,7 +12,10 @@ import type { ResolvedRunMode } from "../../llm/run-mode/index.js";
 import type { SlotManager } from "../../llm/slot-manager.js";
 import type { StructuredLogger } from "../../tracing/index.js";
 import { isFusionWorkerSessionId } from "../../session/fusion-worker-session.js";
-import { DEFAULT_FUSION_CLOUD_WORKERS } from "../../config/llm-run-mode-config.js";
+import {
+  DEFAULT_FUSION_CLOUD_WORKERS,
+  DEFAULT_FUSION_MAX_ORCHESTRATOR_TASKS_PER_TURN,
+} from "../../config/llm-run-mode-config.js";
 import { getConfig } from "../../config/index.js";
 import { workerReplyAllowance } from "../../local-llm/server/worker-slots.js";
 import type { ToolDefinition } from "../tool-registry.js";
@@ -43,7 +46,7 @@ import {
   runWorkerTasks,
   type WorkerRunnerDeps,
 } from "./worker-runner.js";
-import { describeReplan, renderReplanBlock } from "./replan.js";
+import { describeReplan, isOpenResult, renderReplanBlock } from "./replan.js";
 import { LocalLegHealth } from "./local-leg-health.js";
 import {
   renderMergeBlock,
@@ -79,14 +82,21 @@ import {
   type JudgeVerdict,
 } from "./judge.js";
 import type { DelegateTask } from "./delegate-args.js";
-import { resolveTaskLegs, unknownModels, type TaskLeg } from "./role-models.js";
+import {
+  ORCHESTRATOR_TASK_MODEL,
+  resolveTaskLegs,
+  unknownModels,
+  type TaskLeg,
+} from "./role-models.js";
 import type { DelegateContract } from "./contract.js";
 import { completionCostUsd, estimateUsageCostUsd } from "../../llm/provider/usage-cost.js";
 import {
   FusionTurnBudget,
+  ORCHESTRATOR_TASK_CAP_INSTRUCTION,
   TURN_BUDGET_INSTRUCTION,
   TURN_COUNT_INSTRUCTION,
   formatUsd,
+  orchestratorCapMessage,
   type TurnBudgetLimits,
   type TurnBudgetStop,
   type TurnCountLimits,
@@ -109,6 +119,12 @@ import {
 import { runSyntaxPass, type SyntaxCheckRunner } from "./syntax-pass.js";
 
 export const FUSION_DELEGATE_TOOL = "fusion.delegate";
+
+/**
+ * How many `model: "orchestrator"` tasks run at once, at most (still
+ * under `cloudWorkers`): each is a full turn on the strong leg.
+ */
+export const ORCHESTRATOR_TASK_MAX_WIDTH = 2;
 
 export interface FusionDelegateDeps extends WorkerRunnerDeps {
   /**
@@ -179,6 +195,13 @@ export interface FusionDelegateDeps extends WorkerRunnerDeps {
    * for itself. Absent (tests, embedders), no such check.
    */
   agentStateDir?: string;
+  /**
+   * Whether `providerId` is a subscription CLI whose own tools are only
+   * confined, not off: the Codex CLI runs `-s read-only`, and its shell
+   * can still read outside a worker's read scope. Such an orchestrator
+   * leg is refused as a `model: "orchestrator"` target. Absent: none is.
+   */
+  cliToolsStayOn?: (providerId: string) => boolean;
 }
 
 /**
@@ -348,9 +371,38 @@ export function buildFusionDelegateTool(
       // leg, as before.
       const workerLegRef = { providerId: workerProviderId, model: workerModel };
       // `model: "orchestrator"`: a worker turn on the orchestrator's own
-      // leg, under every worker rule, priced and capped like a role leg.
+      // leg, under every worker rule. Counted against its own per-turn
+      // cap (`maxOrchestratorTasksPerTurn`), since that leg is often an
+      // unpriced subscription; `0` turns the target off.
+      const orchestratorCap =
+        mode.maxOrchestratorTasksPerTurn ??
+        DEFAULT_FUSION_MAX_ORCHESTRATOR_TASKS_PER_TURN;
+      if (
+        orchestratorCap === 0 &&
+        parsed.tasks.some((t) => t.model === ORCHESTRATOR_TASK_MODEL)
+      ) {
+        return error(
+          `validation: \`model: "orchestrator"\` is turned off here (llm.runMode.fusion.maxOrchestratorTasksPerTurn is 0). Send those tasks to a worker model: leave \`model\` out or name one from the \`### fusion\` list.`,
+          { field: "tasks", reason: "orchestrator-target-off" },
+        );
+      }
+      // A CLI leg whose own shell stays on (Codex: `-s read-only`) can
+      // read past the worker's read scope; as a worker or role leg that
+      // is the operator's pick, but this target is the planner's.
+      const orchestratorCliToolsOn =
+        mode.orchestratorProviderId !== null &&
+        deps.cliToolsStayOn?.(mode.orchestratorProviderId) === true;
+      if (
+        orchestratorCliToolsOn &&
+        parsed.tasks.some((t) => t.model === ORCHESTRATOR_TASK_MODEL)
+      ) {
+        return error(
+          `validation: \`model: "orchestrator"\` is not available here: the orchestrator runs on a command-line agent whose own shell stays on (read-only, but not limited to the worker's read scope), so it cannot run a worker turn under the worker's rules. Send those tasks to a worker model: leave \`model\` out or name one from the \`### fusion\` list.`,
+          { field: "tasks", reason: "orchestrator-target-cli-tools" },
+        );
+      }
       const orchestratorLegRef =
-        mode.orchestratorProviderId === null
+        mode.orchestratorProviderId === null || orchestratorCliToolsOn
           ? undefined
           : {
               providerId: mode.orchestratorProviderId,
@@ -375,6 +427,9 @@ export function buildFusionDelegateTool(
       // asked, never refused. Said on the approval line (before any
       // worker starts, when a person is asked) and on the result (the
       // orchestrator reads nothing in between).
+      const orchestratorTaskIds = parsed.tasks
+        .filter((t) => taskLegs.get(t.id)?.orchestrator === true)
+        .map((t) => t.id);
       const taskIsLocal = (t: DelegateTask): boolean =>
         deps.workerSupportsSlotAffinity(
           taskLegs.get(t.id)?.providerId ?? workerProviderId,
@@ -450,15 +505,28 @@ export function buildFusionDelegateTool(
         };
         const countStop = turnBudget.checkCounts(
           ctx.sessionId,
-          countLimits,
+          { ...countLimits, orchestratorTasks: orchestratorCap },
           parsed.tasks.length,
+          orchestratorTaskIds.length,
         );
+        if (countStop?.kind === "orchestrator-tasks") {
+          return error(
+            `fusion.delegate did not run: ${countStop.message}. ${ORCHESTRATOR_TASK_CAP_INSTRUCTION}`,
+            { reason: "turn-count", kind: countStop.kind, cap: orchestratorCap },
+          );
+        }
         if (countStop !== undefined) {
           return error(
             `fusion.delegate did not run: ${countStop.message}. ${TURN_COUNT_INSTRUCTION}`,
             { reason: "turn-count", kind: countStop.kind },
           );
         }
+      } else if (orchestratorTaskIds.length > orchestratorCap) {
+        // No turn state to count across calls: the cap still holds per call.
+        return error(
+          `fusion.delegate did not run: ${orchestratorCapMessage(orchestratorTaskIds.length, 0, orchestratorCap)}. ${ORCHESTRATOR_TASK_CAP_INSTRUCTION}`,
+          { reason: "turn-count", kind: "orchestrator-tasks", cap: orchestratorCap },
+        );
       }
 
       // Before the pool is measured: warming replays the probes a cloud
@@ -1157,6 +1225,11 @@ export function buildFusionDelegateTool(
                   Math.min(
                     tasks.length,
                     mode.cloudWorkers ?? DEFAULT_FUSION_CLOUD_WORKERS,
+                    // The strong leg's turns are the costly ones (or a
+                    // subscription's request quota): a modest width.
+                    leg.orchestrator === true
+                      ? ORCHESTRATOR_TASK_MAX_WIDTH
+                      : Number.POSITIVE_INFINITY,
                   ),
                 ),
             providerId: leg.providerId,
@@ -1175,7 +1248,11 @@ export function buildFusionDelegateTool(
             writeScope,
             signal: runSignal,
             ...guardOptionsFor(leg.providerId, pricing),
-            ...(escalationTarget?.providerId === leg.providerId
+            // An orchestrator task already runs on the strongest model
+            // the session holds: whichever escalation provider is
+            // configured, it can only be the same or a weaker one.
+            ...(escalationTarget?.providerId === leg.providerId ||
+            leg.orchestrator === true
               ? {}
               : escalationOptions),
             ...(briefSuffix === undefined ? {} : { briefSuffix }),
@@ -1320,6 +1397,7 @@ export function buildFusionDelegateTool(
             turnBudget.noteRound(
               ctx.sessionId,
               parsed.tasks.filter((t) => !finished.has(t.id)).length,
+            orchestratorTaskIds.filter((id) => !finished.has(id)).length,
             );
           }
           for (const [waveIndex, wave] of plan.waves.entries()) {
@@ -1399,19 +1477,22 @@ export function buildFusionDelegateTool(
         // Each task this call actually started is one attempt at it this
         // turn; the replan bound (ATO-941) is counted against these. A task
         // held or kept from starting has not been tried.
+      const ranNow = new Set<string>();
         if (autoReplan > 0) {
           // Rows carried from before a restart (ATO-617) were not run now.
           const carried = new Set(resume?.carried.map((r) => r.id) ?? []);
+        for (const r of results) {
+          if (!(r.error ?? "").startsWith("not started:") && !carried.has(r.id)) {
+            ranNow.add(r.id);
+          }
+        }
           // One round per family: a split's continuations (`t3.a`, `t3.b`)
           // count once, on the task they continue.
-          turnBudget.noteRoundAttempts(
+        turnBudget.noteRoundAttempts(ctx.sessionId, [...ranNow]);
+        // Across rounds: a task that ran there once is not steered back.
+        turnBudget.noteOrchestratorRuns(
             ctx.sessionId,
-            results
-              .filter(
-                (r) =>
-                  !(r.error ?? "").startsWith("not started:") && !carried.has(r.id),
-              )
-              .map((r) => r.id),
+          [...ranNow].filter((id) => taskLegs.get(id)?.orchestrator === true),
           );
         }
         // What the failure breakers saw (ATO-1406): remembered for the
@@ -1705,9 +1786,24 @@ export function buildFusionDelegateTool(
                 results.filter((r) => !awaitingYes.has(r.id)),
                 (id) => turnBudget.attempts(ctx.sessionId, id),
                 autoReplan,
-                (id) => taskLegs.get(id)?.orchestrator === true,
+              (id) => turnBudget.ranOnOrchestrator(ctx.sessionId, id),
+              // Only steer there while the target is on and under its cap.
+              orchestratorLegRef !== undefined &&
+                orchestratorCap > 0 &&
+                (!tracksTurn ||
+                  turnBudget.orchestratorTasks(ctx.sessionId) < orchestratorCap),
               )
             : undefined;
+      // How this round's families ended, judged rows included: a family
+      // that closed green is no longer one a dotted id can continue.
+      if (ranNow.size > 0) {
+        turnBudget.noteRoundOutcomes(
+          ctx.sessionId,
+          results
+            .filter((r) => ranNow.has(r.id))
+            .map((r) => ({ id: r.id, open: isOpenResult(r) })),
+        );
+      }
         const contractLine =
           contract === undefined ? undefined : renderContractLine(contract);
         // The run ended here. Stopped by the person or by a quit, its file
@@ -1742,6 +1838,14 @@ export function buildFusionDelegateTool(
                 : [
                     `ran on ${leg.model}${leg.orchestrator === true ? " (the orchestrator's model)" : leg.role === undefined ? "" : ` (role ${leg.role})`}`,
                   ]),
+            // A subscription leg has no price: turnBudgetUsd cannot see
+            // these turns, only the count cap does.
+            ...(leg.orchestrator === true &&
+            rolePricing.get(leg.providerId) === undefined
+              ? [
+                  "unpriced: counted against llm.runMode.fusion.maxOrchestratorTasksPerTurn, not turnBudgetUsd",
+                ]
+              : []),
             ];
             return {
               ...r,
@@ -1873,7 +1977,9 @@ export function buildFusionDelegateTool(
               ...(roleSpendUsd > 0 ? { roleSpendUsd } : {}),
               ...(merges.length === 0 ? {} : { merges }),
               ...(replan === undefined ||
-              (replan.pending.length === 0 && replan.exhausted.length === 0)
+            (replan.pending.length === 0 &&
+              replan.exhausted.length === 0 &&
+              replan.failedOnOrchestrator.length === 0)
                 ? {}
                 : { replan }),
               ...(treeReport === undefined ? {} : { taskTree: treeReport }),

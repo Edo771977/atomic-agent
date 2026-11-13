@@ -727,6 +727,12 @@ export function registerRuntimeFusionAndReadScope(input: {
       createEphemeralSession,
       resolveOriginalRequest: resolveOriginalRequest,
       declaredInputs,
+      // The Codex CLI confines its own shell (`-s read-only`) rather than
+      // turning it off, so it is no `model: "orchestrator"` target.
+      cliToolsStayOn: (providerId) => {
+        const entry = resolveLlmConfig(getConfig()).providers.find((p) => p.id === providerId);
+        return entry?.kind === "subscription-cli" && entry.subscriptionCli?.cli === "codex";
+      },
       // The worker leg's pricing, when the catalogue or a hand-priced
       // entry knows it — the status table's spend line.
       resolveWorkerPricing: (providerId, modelId) =>
@@ -846,7 +852,7 @@ export function registerRuntimeFusionAndReadScope(input: {
       // `verify.syntax`'s own checker: the delegate syntax-checks every
       // green row's changed files itself, so the orchestrator does not
       // spend a step (and its context) on it after each fan-out.
-      syntaxCheck: (files, dir) => verifySyntax(files, dir),
+      syntaxCheck: (files, dir, options) => verifySyntax(files, dir, options),
       // Check output reaches workers outside the registry: masked with
       // the same keys the registry masks tool results with (ATO-1077).
       knownSecrets: () => runtimeKnownSecrets(getConfig()),

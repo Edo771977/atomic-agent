@@ -192,6 +192,45 @@ describe("a replan may split a failed task into continuation ids", () => {
     budget.begin("s");
     expect(budget.attempts("s", "parse.dates.iso")).toBe(0);
   });
+
+  it("continues only a task that is still open: a dotted id after a closed one is new work", () => {
+    const budget = new FusionTurnBudget();
+    budget.begin("s");
+    budget.noteRoundAttempts("s", ["parse", "lex"]);
+    budget.noteRoundOutcomes("s", [
+      { id: "parse", open: false },
+      { id: "lex", open: true },
+    ]);
+    budget.noteRoundAttempts("s", ["parse.dates", "lex.a"]);
+    // `parse` closed green: `parse.dates` is its own family, one run.
+    expect(budget.attempts("s", "parse.dates")).toBe(1);
+    expect(budget.attempts("s", "parse")).toBe(1);
+    // `lex` is still open: `lex.a` continues it.
+    expect(budget.attempts("s", "lex.a")).toBe(2);
+    expect(budget.attempts("s", "lex")).toBe(2);
+  });
+
+  it("gives a new dotted id after a closed task its own replans, through the delegate", async () => {
+    const budget = new FusionTurnBudget();
+    budget.begin("s-p");
+    const { d, ran } = deps(new Set(["parse.dates"]), { turnBudget: budget });
+    const tool = buildFusionDelegateTool(d);
+    const first = await tool.run({ tasks: [{ id: "parse", instructions: "the parser" }] }, ctx());
+    expect(first.details.replan).toBeUndefined();
+    const second = await tool.run(
+      { tasks: [{ id: "parse.dates", instructions: "now dates, new work" }] },
+      ctx(),
+    );
+    const report = second.details.replan as Report;
+    // One run, not two: the full replans, and no "failed twice" steer.
+    expect(report.exhausted).toEqual([]);
+    expect(report.pending).toEqual([
+      expect.objectContaining({ id: "parse.dates", replansLeft: 1 }),
+    ]);
+    expect(report.pending[0]!.fix).toBeUndefined();
+    expect(budget.attempts("s-p", "parse.dates")).toBe(1);
+    expect(ran).toEqual(["parse", "parse.dates"]);
+  });
 });
 
 describe("the fix each status calls for", () => {
@@ -222,13 +261,56 @@ describe("the fix each status calls for", () => {
   });
 
   it("does not send a task back to the orchestrator's model that already ran there", () => {
+    const once = describeReplan([row("hard", "max_steps")], () => 1, 3, () => true);
+    expect(once.pending[0]!.fix).toContain("split it into smaller tasks");
+    // Twice, once there: reported to the person, not sent anywhere.
     const report = describeReplan(
       [row("hard", "max_steps")],
       () => 2,
       3,
       (id) => id === "hard",
     );
-    expect(report.pending[0]!.fix).toContain("split it into smaller tasks");
+    expect(report.pending).toEqual([]);
+    expect(report.failedOnOrchestrator.map((t) => t.id)).toEqual(["hard"]);
+    expect(renderReplanBlock(report)).toContain(
+      "FAILED ON THE ORCHESTRATOR'S MODEL TOO",
+    );
+  });
+
+  it("names no orchestrator fix while the target is off or its cap is used", () => {
+    const report = describeReplan([row("twice", "failed")], () => 2, 3, () => false, false);
+    expect(report.pending[0]!.fix).toBeUndefined();
+  });
+
+  it("remembers across rounds that a task ran on the orchestrator's model", async () => {
+    const budget = new FusionTurnBudget();
+    budget.begin("s-p");
+    const { d, ran } = deps(new Set(["hard"]), { turnBudget: budget });
+    const tool = buildFusionDelegateTool(d);
+    const first = await tool.run(
+      { tasks: [{ id: "hard", instructions: "the hard part", model: "orchestrator" }] },
+      ctx(),
+    );
+    const one = first.details.replan as {
+      pending: Array<{ id: string; fix?: string }>;
+    };
+    expect(one.pending.map((t) => t.id)).toEqual(["hard"]);
+    expect(one.pending[0]!.fix).toBeUndefined();
+    // Round two on a worker: this call's legs say worker, the turn
+    // remembers the orchestrator run, so it is not steered back there.
+    const second = await tool.run(
+      { tasks: [{ id: "hard", instructions: "the hard part, rebriefed" }] },
+      ctx(),
+    );
+    const two = second.details.replan as {
+      pending: unknown[];
+      failedOnOrchestrator: Array<{ id: string }>;
+    };
+    expect(two.pending).toEqual([]);
+    expect(two.failedOnOrchestrator.map((t) => t.id)).toEqual(["hard"]);
+    expect(second.summary).not.toContain('send it with `model: "orchestrator"`');
+    expect(second.summary).toContain("tell the person plainly what failed");
+    expect(ran).toEqual(["hard", "hard"]);
   });
 
   it("names the fix on a row cut at its step or time limit", () => {

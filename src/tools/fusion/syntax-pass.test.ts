@@ -1,6 +1,6 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { verifySyntax } from "../verify/verify-syntax.js";
@@ -25,7 +25,25 @@ function row(overrides: Partial<WorkerTaskResult> = {}): WorkerTaskResult {
   };
 }
 
-const realRunner: SyntaxCheckRunner = (files, dir) => verifySyntax(files, dir);
+const realRunner: SyntaxCheckRunner = (files, dir, options) => verifySyntax(files, dir, options);
+
+/** This repository's own tsc, resolved through the `.bin` symlink. */
+const REAL_TSC = realpathSync(resolve(process.cwd(), "node_modules/.bin/tsc"));
+
+/** A strict TypeScript project in `dir` with its own `node_modules/.bin/tsc`. */
+function tsProject(dir: string): void {
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    join(dir, "tsconfig.json"),
+    JSON.stringify({
+      compilerOptions: { strict: true, noEmit: true, target: "ES2022", types: [] },
+      include: ["src/**/*.ts"],
+    }),
+  );
+  mkdirSync(join(dir, "src"));
+  mkdirSync(join(dir, "node_modules", ".bin"), { recursive: true });
+  symlinkSync(REAL_TSC, join(dir, "node_modules", ".bin", "tsc"));
+}
 
 describe("runSyntaxPass", () => {
   let dir: string;
@@ -95,6 +113,18 @@ describe("runSyntaxPass", () => {
     expect(runner.mock.calls[0]![0]).toEqual([join(dir, "bad.js")]);
   });
 
+  it("checks the declared files as well as the changed ones (a shell may have written them)", async () => {
+    const runner = vi.fn(realRunner);
+    const [out] = await runSyntaxPass(
+      [row({ shellRan: true, changes: [{ path: "good.js", kind: "modified", addedLines: 1, removedLines: 0 }] })],
+      [{ id: "t1", title: "Task", instructions: "x", files: ["good.js", "bad.js", "missing.js"] }],
+      { runner, workingDir: dir, roots: [dir], signal },
+    );
+    expect(runner.mock.calls[0]![0]).toEqual([join(dir, "good.js"), join(dir, "bad.js")]);
+    expect(out!.status).toBe("failed");
+    expect(out!.syntax).toMatchObject({ checked: 2, failedFiles: ["bad.js"] });
+  });
+
   it("does not read outside the read scope, and counts files with no checker as unchecked", async () => {
     const outside = mkdtempSync(join(tmpdir(), "fusion-syntax-outside-"));
     try {
@@ -162,6 +192,80 @@ describe("runSyntaxPass", () => {
     );
     expect(out!.status).toBe("ok");
     expect(describeSyntax(out!.syntax!)).toBe("the syntax pass did not run: boom");
+  });
+
+  it("notes a type error in a TypeScript file without demoting the row; a parse error demotes", async () => {
+    // Two projects: tsc withholds every semantic diagnostic in a program
+    // once any of its files has a parse error.
+    tsProject(join(dir, "a"));
+    tsProject(join(dir, "b"));
+    // A missing module and a pre-existing type error: not the worker's syntax.
+    writeFileSync(
+      join(dir, "a", "src", "typed.ts"),
+      'import { x } from "not-installed";\nexport const n: number = "no";\nexport const y = x;\n',
+    );
+    writeFileSync(join(dir, "b", "src", "broken.ts"), "export const c = ;\n");
+    const rows = await runSyntaxPass(
+      [
+        row({ changes: [{ path: "a/src/typed.ts", kind: "modified", addedLines: 1, removedLines: 0 }] }),
+        row({ id: "t2", changes: [{ path: "b/src/broken.ts", kind: "new", addedLines: 1, removedLines: 0 }] }),
+      ],
+      [
+        { id: "t1", title: "Task", instructions: "x" },
+        { id: "t2", title: "Two", instructions: "x" },
+      ],
+      { runner: realRunner, workingDir: dir, roots: [dir], signal },
+    );
+    expect(rows[0]!.status).toBe("ok");
+    expect(rows[0]!.syntax).toMatchObject({ checked: 1, failedFiles: [], typeErrors: 2 });
+    expect(rows[0]!.syntax!.typeOutput).toMatch(/^a\/src\/typed\.ts: line 1: error TS2\d{3}: Cannot find module/);
+    expect(rows[1]!.status).toBe("failed");
+    expect(rows[1]!.error).toBe("syntax: 1 file failed (b/src/broken.ts)");
+    expect(rows[1]!.syntax!.output).toMatch(/TS1109/);
+    const rendered = formatDelegateOutput(rows, 8000);
+    const table = rendered.split("\n\n")[0]!;
+    expect(table).toContain("- [t1] ok — Task — syntax ok (1 file); types: 2 errors (not demoted)");
+    expect(rendered).toContain("type errors:\na/src/typed.ts: line 1: error TS2");
+  }, 60_000);
+
+  it("gives up at its budget without demoting, and aborts the runner's signal", async () => {
+    let seen: AbortSignal | undefined;
+    const runner: SyntaxCheckRunner = (_files, _dir, options) => {
+      seen = options.signal;
+      return new Promise(() => {}); // a checker that never answers
+    };
+    const started = Date.now();
+    const [out] = await runSyntaxPass(
+      [row({ changes: [{ path: "bad.js", kind: "new" }] })],
+      [{ id: "t1", title: "Task", instructions: "x" }],
+      { runner, workingDir: dir, roots: [dir], signal, budgetMs: 50 },
+    );
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(out!.status).toBe("ok");
+    expect(out!.syntax).toMatchObject({ checked: 0, unchecked: 1 });
+    expect(describeSyntax(out!.syntax!)).toBe(
+      "syntax: not checked, the pass ran out of its 50 ms budget",
+    );
+    expect(seen?.aborted).toBe(true);
+  });
+
+  it("returns at once when the delegate is cancelled mid-pass, claiming nothing", async () => {
+    const controller = new AbortController();
+    let seen: AbortSignal | undefined;
+    const runner: SyntaxCheckRunner = (_files, _dir, options) => {
+      seen = options.signal;
+      setTimeout(() => controller.abort(), 20);
+      return new Promise(() => {});
+    };
+    const rows = [row({ changes: [{ path: "bad.js", kind: "new" }] })];
+    const out = await runSyntaxPass(rows, [{ id: "t1", title: "Task", instructions: "x" }], {
+      runner,
+      workingDir: dir,
+      roots: [dir],
+      signal: controller.signal,
+    });
+    expect(out).toEqual(rows);
+    expect(seen?.aborted).toBe(true);
   });
 
   it("does nothing without a runner", async () => {

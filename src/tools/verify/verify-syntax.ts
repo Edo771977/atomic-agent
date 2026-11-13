@@ -69,21 +69,23 @@ export function parseVerifySyntaxArgs(raw: Record<string, unknown>): string[] {
 async function checkOne(
   file: string,
   absolute: string,
+  signal: AbortSignal | undefined,
 ): Promise<SyntaxFileResult> {
   const ext = extname(absolute).toLowerCase();
+  const withSignal = signal === undefined ? {} : { signal };
   if (JS_EXTENSIONS.has(ext)) {
-    return checkJavaScriptFile(absolute, await readFile(absolute, "utf8")).then(
+    return checkJavaScriptFile(absolute, await readFile(absolute, "utf8"), signal).then(
       (r) => ({ ...r, file }),
     );
   }
-  if (ext === ".py") return { ...(await checkPythonFile(absolute)), file };
-  if (SHELL_EXTENSIONS.has(ext)) return { ...(await checkShellFile(absolute)), file };
+  if (ext === ".py") return { ...(await checkPythonFile(absolute, withSignal)), file };
+  if (SHELL_EXTENSIONS.has(ext)) return { ...(await checkShellFile(absolute, withSignal)), file };
   if (ext === ".html" || ext === ".htm") {
     return { ...(await checkHtmlSource(file, await readFile(absolute, "utf8"))) };
   }
   if (ext === ".css") return checkCssSource(file, await readFile(absolute, "utf8"));
   if (LANGUAGE_SYNTAX_EXTENSIONS.has(ext)) {
-    return { ...(await checkLanguageFile(absolute, ext)), file };
+    return { ...(await checkLanguageFile(absolute, ext, withSignal)), file };
   }
   return {
     file,
@@ -93,14 +95,36 @@ async function checkOne(
   };
 }
 
+export interface VerifySyntaxOptions {
+  /**
+   * `"all"` (the tool's own): any tsc diagnostic in a file fails it.
+   * `"parse"` (the fusion delegate's pass): only a parse diagnostic
+   * does; the rest come back as the result's `typeErrors`.
+   */
+  readonly typescript?: "all" | "parse";
+  /**
+   * Kills the running checker when it aborts; every file not yet judged
+   * comes back unchecked (`not checked: cancelled`), never passing.
+   */
+  readonly signal?: AbortSignal;
+}
+
+const CANCELLED = "not checked: cancelled";
+
 /** Check every file and render the report. Never throws for a bad file. */
 export async function verifySyntax(
   files: readonly string[],
   workingDir: string,
+  options: VerifySyntaxOptions = {},
 ): Promise<VerifySyntaxReport> {
   const results: SyntaxFileResult[] = new Array<SyntaxFileResult>(files.length);
   const typescript: { index: number; file: string; absolute: string }[] = [];
+  const signal = options.signal;
   for (const [index, file] of files.entries()) {
+    if (signal?.aborted === true) {
+      results[index] = { file, ok: null, checker: "none", error: CANCELLED };
+      continue;
+    }
     const absolute = resolveUserPath(file, workingDir);
     try {
       const info = await stat(absolute);
@@ -116,10 +140,14 @@ export async function verifySyntax(
       typescript.push({ index, file, absolute });
       continue;
     }
-    results[index] = await checkOne(file, absolute);
+    // A checker the abort killed comes back timed out: no verdict.
+    results[index] = await checkOne(file, absolute, signal);
   }
   if (typescript.length > 0) {
-    const verdicts = await checkTypeScriptFiles(typescript);
+    const verdicts = await checkTypeScriptFiles(typescript, {
+      parseOnly: options.typescript === "parse",
+      ...(signal === undefined ? {} : { signal }),
+    });
     for (const [i, entry] of typescript.entries()) {
       results[entry.index] = { ...verdicts[i]!, file: entry.file };
     }

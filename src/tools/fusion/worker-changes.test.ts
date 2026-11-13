@@ -12,6 +12,7 @@ import {
 import {
   formatDelegateOutput,
   GREEN_REPLY_CHARS,
+  GREEN_REPLY_KEPT_CHARS,
   WorkerRunCollector,
   type WorkerTaskResult,
 } from "./worker-result.js";
@@ -97,6 +98,19 @@ describe("changed paths from the worker's tool events", () => {
     expect(presentChangedPaths(changes)).toEqual(["final.js", "data.csv", "big.json"]);
   });
 
+  it("moves the changed files under a moved directory with it", () => {
+    const log = new FileChangeLog("/w");
+    log.observe({ tool: "os.fs.write", status: "ok", summary: "", truncated: false, details: { path: "/w/lib/a.ts", existed: false, addedLines: 2, removedLines: 0 } });
+    log.observe({ tool: "os.fs.edit", status: "ok", summary: "", truncated: false, details: { path: "/w/lib/b.ts", addedLines: 1, removedLines: 0 } });
+    log.observe({ tool: "os.fs.edit", status: "ok", summary: "", truncated: false, details: { path: "/w/library.ts", addedLines: 1, removedLines: 1 } });
+    log.observe({ tool: "os.fs.move", status: "ok", summary: "", truncated: false, details: { moves: [{ from: "/w/lib", to: "/w/src" }] } });
+    const changes = log.list();
+    expect(describeChanges(changes)).toBe(
+      "changed: library.ts (+1/-1), src/a.ts (new, +2), src/b.ts (+1/-0, moved from lib/b.ts), src (moved from lib)",
+    );
+    expect(presentChangedPaths(changes)).not.toContain("lib/a.ts");
+  });
+
   it("names at most CHANGED_PATHS_SHOWN paths, then how many more", () => {
     const log = new FileChangeLog("/w");
     for (let i = 0; i < CHANGED_PATHS_SHOWN + 3; i += 1) {
@@ -114,6 +128,31 @@ describe("changed paths from the worker's tool events", () => {
     const r = c.finish({ id: "t1", title: "T", reason: "reply", stepCount: 1, durationMs: 10 });
     expect(r.changes).toBeUndefined();
     expect(describeChanges(r.changes)).toBeNull();
+  });
+
+  it("marks the line when a shell command ran, since its writes are not seen", () => {
+    const c = new WorkerRunCollector({ workingDir: "/w" });
+    c.observe(executed("os.fs.edit", { path: "/w/a.ts", addedLines: 1, removedLines: 0 }));
+    // A refused or blocked command ran nothing; a failing one did run.
+    c.observe(executed("os.shell.run", { cmd: "rm", guardVerdict: "block" }, "error"));
+    expect(c.finish({ id: "t1", title: "T", reason: "reply", stepCount: 2, durationMs: 10 }).shellRan).toBeUndefined();
+    c.observe(executed("os.shell.run", { cmd: "sh", exitCode: 1 }, "error"));
+    const r = c.finish({ id: "t1", title: "T", reason: "reply", stepCount: 3, durationMs: 10 });
+    expect(r.shellRan).toBe(true);
+    expect(describeChanges(r.changes, { shellRan: r.shellRan })).toBe(
+      "changed (file tools only; shell commands ran): a.ts (+1/-0)",
+    );
+    expect(describeChanges(undefined, { shellRan: true })).toBe(
+      "changed (file tools only; shell commands ran): nothing by the file tools",
+    );
+    // verify.run in its throwaway copy writes nothing back; in place it may.
+    const v = new WorkerRunCollector({ workingDir: "/w" });
+    v.observe(executed("verify.run", { isolated: true }));
+    expect(v.finish({ id: "t1", title: "T", reason: "reply", stepCount: 1, durationMs: 10 }).shellRan).toBeUndefined();
+    v.observe(executed("verify.run", { isolated: false }, "error"));
+    expect(v.finish({ id: "t1", title: "T", reason: "reply", stepCount: 2, durationMs: 10 }).shellRan).toBe(true);
+    const out = formatDelegateOutput([row({ shellRan: true, changes: [{ path: "a.ts", kind: "new", addedLines: 2, removedLines: 0 }] })], 20_000);
+    expect(out).toContain("changed (file tools only; shell commands ran): a.ts (new, +2)");
   });
 
   it("merges a split parent's and children's changes, last writer wins", () => {
@@ -143,6 +182,51 @@ describe("the delegate result: runtime changed line and compact green replies", 
     });
     expect(out).toContain("reply: STATUS: done, the parser is in place …");
     expect(out).not.toContain("long explanation");
+  });
+
+  it("keeps a green row's assumptions and contract deviations, bounded", () => {
+    const reply = [
+      "STATUS: done, parser in place",
+      "CHANGED: src/parse.ts",
+      "CHECKS RUN: npm test → pass",
+      "ASSUMPTIONS:",
+      "- input is UTF-8",
+      "- empty lines are skipped",
+      "PROVIDED:",
+      "function parseRows src/parse.ts",
+      "function parseAll provided differently: named parseEverything",
+      "could not provide function stream",
+      "long explanation ".repeat(50),
+    ].join("\n");
+    const out = formatDelegateOutput([row({ reply })], 20_000, { declaredFiles: new Set(["t1"]) });
+    expect(out).toContain(
+      [
+        "reply: STATUS: done, parser in place …",
+        "ASSUMPTIONS:",
+        "- input is UTF-8",
+        "- empty lines are skipped",
+        "function parseAll provided differently: named parseEverything",
+        "could not provide function stream",
+      ].join("\n"),
+    );
+    expect(out).not.toContain("parseRows");
+    expect(out).not.toContain("long explanation");
+    // "none" says nothing: only the status line is kept.
+    const plain = formatDelegateOutput(
+      [row({ reply: "STATUS: done\nCHANGED: a.ts\nASSUMPTIONS: none\n" })],
+      20_000,
+      { declaredFiles: new Set(["t1"]) },
+    );
+    expect(plain).toContain("reply: STATUS: done …");
+    expect(plain).not.toContain("ASSUMPTIONS");
+    // Bounded: a long assumptions section is cut.
+    const long = formatDelegateOutput(
+      [row({ reply: `STATUS: done\nASSUMPTIONS: ${"y".repeat(1000)}` })],
+      20_000,
+      { declaredFiles: new Set(["t1"]) },
+    );
+    const kept = long.slice(long.indexOf("reply: "));
+    expect(kept.length).toBeLessThanOrEqual(GREEN_REPLY_KEPT_CHARS + "reply: ".length + 2);
   });
 
   it("clips a long first line to GREEN_REPLY_CHARS", () => {
