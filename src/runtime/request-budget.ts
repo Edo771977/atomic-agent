@@ -2,7 +2,7 @@ import type { CompletionRequest, CompletionRequestBudget, CompletionResult, Comp
 import type { LlmProvider } from "../llm/provider/llm-provider.js";
 import type { LlmProviderConfigEntry } from "../llm/provider/registry/provider-types.js";
 import type { ResolvedModel } from "../llm/provider/model-resolver.js";
-import { completionCostUsd, reportedCostUsd } from "../llm/provider/usage-cost.js";
+import { completionCostUsd, longContextRates, reportedCostUsd } from "../llm/provider/usage-cost.js";
 import { readErrnoCode } from "../llm/errno-code.js";
 import { modelParamProfile } from "../llm/provider/openai/model-params.js";
 import type { FusionTurnBudget } from "../tools/fusion/turn-budget.js";
@@ -35,8 +35,24 @@ function addsProviderSideInput(body: Record<string, unknown>): boolean {
 
 type ModelPricing = NonNullable<ResolvedModel["pricing"]>;
 
-/** Tiers billed at the configured base rates. */
-const BASE_SERVICE_TIERS = new Set(["default", "auto"]);
+/**
+ * Tiers the configured base rates bound from above, lower-cased: the
+ * standard tier under its OpenAI (`default`) and Anthropic (`standard`,
+ * `standard_only`) names, the request-side `auto`, and the cheaper
+ * OpenAI `flex`.
+ */
+const BASE_SERVICE_TIERS = new Set(["default", "auto", "standard", "standard_only", "flex"]);
+
+/** The configured multiplier for `tier`, matched without regard to case. */
+function configuredTierMultiplier(tier: string, pricing: ModelPricing): number | undefined {
+  const tiers = pricing.serviceTierMultipliers;
+  if (tiers === undefined) return undefined;
+  const wanted = tier.toLowerCase();
+  for (const [name, multiplier] of Object.entries(tiers)) {
+    if (name.toLowerCase() === wanted) return multiplier;
+  }
+  return undefined;
+}
 
 function validRate(rate: unknown): boolean {
   return typeof rate === "number" && Number.isFinite(rate) && rate >= 0;
@@ -53,18 +69,35 @@ function verifiablePricing(pricing: ModelPricing | undefined): pricing is ModelP
 }
 
 /**
- * Price multiplier of the body's `service_tier`. Absent, `null`,
- * `default` and `auto` are the base rates; any other tier (OpenAI
+ * Price multiplier of the body's `service_tier`, matched without regard
+ * to case. A configured multiplier wins; otherwise absent, `null` and
+ * the `BASE_SERVICE_TIERS` are the base rates; any other tier (OpenAI
  * `priority` bills about 2x) needs a configured multiplier, so an
  * unknown modifier refuses instead of being under-reserved.
  */
 function serviceTierMultiplier(body: Record<string, unknown>, pricing: ModelPricing): number {
   const tier = body.service_tier;
   if (tier === undefined || tier === null) return 1;
-  if (typeof tier === "string" && BASE_SERVICE_TIERS.has(tier)) return 1;
-  const tiers = pricing.serviceTierMultipliers;
-  if (typeof tier === "string" && tiers !== undefined && Object.hasOwn(tiers, tier)) return tiers[tier]!;
+  if (typeof tier === "string") {
+    const configured = configuredTierMultiplier(tier, pricing);
+    if (configured !== undefined) return configured;
+    if (BASE_SERVICE_TIERS.has(tier.toLowerCase())) return 1;
+  }
   throw new Error(`turn budget cannot price service_tier ${JSON.stringify(tier)}; declare it in the model's pricing.serviceTierMultipliers or remove it`);
+}
+
+/**
+ * Settlement multiplier for a completion the service says was served at
+ * `served`: its configured multiplier, `1` for a `BASE_SERVICE_TIERS`
+ * name, and `undefined` for a tier with no known price (the caller then
+ * charges the whole hold). A response that names no tier keeps the
+ * requested multiplier.
+ */
+function servedTierMultiplier(served: string | undefined, requested: number, pricing: ModelPricing): number | undefined {
+  if (served === undefined) return requested;
+  const configured = configuredTierMultiplier(served, pricing);
+  if (configured !== undefined) return configured;
+  return BASE_SERVICE_TIERS.has(served.toLowerCase()) ? 1 : undefined;
 }
 
 export interface RequestBudgetScope extends CompletionRequestBudget {
@@ -149,9 +182,10 @@ export function createRequestBudgetScope(
       const multiplier = serviceTierMultiplier(body, pricing!);
       // The bound can cross a long-context threshold the real prompt does
       // not: reserving the higher tier then only overestimates.
-      const long = pricing!.longContext !== undefined && inputTokens > pricing!.longContext.thresholdTokens ? pricing!.longContext : undefined;
+      const long = pricing!.longContext !== undefined && inputTokens > pricing!.longContext.thresholdTokens ? longContextRates(pricing!) : undefined;
       const inputRates = [pricing!.input, pricing!.cacheWrite ?? pricing!.input, pricing!.cacheRead ?? pricing!.input];
-      if (long !== undefined) inputRates.push(long.input, long.cacheWrite ?? long.input, long.cacheRead ?? long.input);
+      // Missing long cache rates are derived exactly as settlement derives them.
+      if (long !== undefined) inputRates.push(long.input, long.cacheWrite, long.cacheRead);
       const inputRate = Math.max(...inputRates);
       const outputRate = long === undefined ? pricing!.output : Math.max(pricing!.output, long.output);
       const copies = [body.n, body.best_of].filter(value => value !== undefined);
@@ -176,10 +210,14 @@ export function createRequestBudgetScope(
       }
     },
     finish(result) {
-      // Reported cost has already won above; only the estimate takes the tier.
+      // Reported cost has already won above; only the estimate takes the
+      // tier, the one the response says served the request when it names
+      // one (an `auto` request can be served at a project's priority tier).
+      // A served tier with no known price settles at the whole hold.
       const estimatedCostUsd = (usage: CompletionUsage): number | undefined => {
+        const multiplier = servedTierMultiplier(usage.serviceTier, tierMultiplier, pricing!);
         const usd = completionCostUsd(usage, pricing);
-        return usd === undefined ? undefined : usd * tierMultiplier;
+        return usd === undefined || multiplier === undefined ? undefined : usd * multiplier;
       };
       if (done) return;
       done = true;

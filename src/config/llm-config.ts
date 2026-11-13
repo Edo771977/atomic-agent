@@ -187,8 +187,9 @@ export type UserModelEntry = {
     /**
      * Rates above a prompt-size threshold (some vendors charge more once
      * the prompt exceeds e.g. 200k tokens). Applied when the prompt is
-     * strictly larger than `thresholdTokens`; missing cache rates fall
-     * back to this block's `input`.
+     * strictly larger than `thresholdTokens` (per completion); a missing
+     * cache rate keeps the base rate's ratio to `input`, else this
+     * block's `input` (`longContextRates` in usage-cost.ts).
      */
     longContext?: {
       thresholdTokens: number;
@@ -199,8 +200,10 @@ export type UserModelEntry = {
     };
     /**
      * Price multiplier per request `service_tier` (e.g. `{ priority: 2 }`).
-     * A USD turn cap refuses a body with any other tier than
-     * `default`/`auto` unless its multiplier is declared here.
+     * Matched without regard to case. A USD turn cap refuses a body with
+     * any other tier than `default`/`auto`/`standard`/`standard_only`/
+     * `flex` (priced at most at the base rates) unless its multiplier is
+     * declared here.
      */
     serviceTierMultipliers?: Record<string, number>;
   };

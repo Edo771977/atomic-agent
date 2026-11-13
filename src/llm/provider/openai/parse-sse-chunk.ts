@@ -46,6 +46,8 @@ export function parseOpenAiSseEvent(
    */
   nativeFinishReason: string | null;
   modelId: string | null;
+  /** The chunk's `service_tier`: the tier that served the request (OpenAI). */
+  serviceTier?: string;
   usage: Record<string, unknown> | null;
   toolCallDeltas: OpenAiToolCallDelta[];
   /** The provider's generation id (`id` on the chunk), when it sends one. */
@@ -121,6 +123,7 @@ export function parseOpenAiSseEvent(
         ? choice.native_finish_reason
         : null;
     const modelId = typeof payload.model === "string" ? payload.model : null;
+    const served = readServiceTier(payload.service_tier);
     const id = typeof payload.id === "string" && payload.id.length > 0 ? payload.id : null;
     const error = readStreamError(payload.error);
     const usage =
@@ -154,6 +157,7 @@ export function parseOpenAiSseEvent(
         finishReason,
         nativeFinishReason,
         modelId,
+        ...served,
         usage,
         id,
         error,
@@ -188,6 +192,7 @@ export function parseOpenAiSseEvent(
       finishReason,
       nativeFinishReason,
       modelId,
+      ...served,
       usage,
       id,
       error,
@@ -250,4 +255,9 @@ function readArgumentsFragment(
     }
   }
   return {};
+}
+
+/** `{ serviceTier }` when the payload names a served tier, else nothing. */
+export function readServiceTier(raw: unknown): { serviceTier?: string } {
+  return typeof raw === "string" && raw.length > 0 ? { serviceTier: raw } : {};
 }

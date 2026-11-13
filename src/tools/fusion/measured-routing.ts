@@ -50,8 +50,20 @@ export interface RoutingDecision {
 
 interface Candidate { leg: TaskLeg; local: boolean }
 
-/** How long a leg's latest blocking (non-quality) failure keeps it out of automatic routing. */
+/**
+ * How long a leg's latest transient blocking (non-quality) failure keeps
+ * it out of automatic routing: a timeout, a cancellation, an overloaded
+ * or unreachable server (`error`), and the like.
+ */
 export const ROUTING_BLOCK_COOLDOWN_MS = 24 * 3_600_000;
+
+/**
+ * Failure classes that do not heal on their own (rejected credentials,
+ * no credit, a missing CLI, a tool-protocol mismatch). They block for
+ * the whole history window: an expiring block would hand the broken leg
+ * one real task per cooldown.
+ */
+const PERSISTENT_BLOCKERS: ReadonlySet<string> = new Set(["not-signed-in", "out-of-credit", "cli-missing", "tool-protocol"]);
 
 function median(values: number[]): number | null {
   if (values.length === 0) return null;
@@ -95,8 +107,9 @@ function evidence(records: readonly OutcomeRecord[], leg: TaskLeg, task: Delegat
   // quality evidence, and a default blocker must not trigger a different route.
   // The block expires: an excluded alternative never runs again, so its bad
   // row would otherwise stay the latest for the whole history window.
-  const blocked = latest !== undefined && latest.status !== "ok" &&
-    latest.failure !== "checks" && now - Date.parse(latest.ts) < ROUTING_BLOCK_COOLDOWN_MS;
+  // Credential and configuration failures do not expire inside the window.
+  const blocked = latest !== undefined && latest.status !== "ok" && latest.failure !== "checks" &&
+    ((latest.failure !== null && PERSISTENT_BLOCKERS.has(latest.failure)) || now - Date.parse(latest.ts) < ROUTING_BLOCK_COOLDOWN_MS);
   return { provider: leg.providerId, model: leg.model, samples: rows.length, verifiedSamples: verified.length, passed,
     passRate: verified.length === 0 ? null : passed / verified.length,
     selfReportedSuccesses: rows.filter((r) => r.status === "ok" && !verifiedRows.has(r)).length,

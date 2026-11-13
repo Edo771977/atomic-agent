@@ -49,7 +49,12 @@ export function completionCostUsd(
  * in its total (`unreportedOutputTokens`) are billed at the output rate.
  *
  * When `pricing.longContext` is set and the prompt is strictly larger
- * than its `thresholdTokens`, every share uses that block's rates.
+ * than its `thresholdTokens`, every share uses that block's rates. The
+ * usage must be ONE completion's: a sum goes to
+ * `estimateSummedUsageCostUsd`.
+ * The threshold is compared with `promptTokens`, the whole prompt: the
+ * OpenAI-compatible normaliser folds Anthropic-shaped cache counts
+ * reported outside `prompt_tokens` into it (`normaliseOpenAiUsage`).
  * `serviceTierMultipliers` are not applied here: the usage does not say
  * which tier was requested (the request budget applies them).
  */
@@ -57,15 +62,80 @@ export function estimateUsageCostUsd(
   usage: CompletionUsage,
   pricing: NonNullable<ResolvedModel["pricing"]> | undefined,
 ): number {
+  return estimate(usage, pricing, true);
+}
+
+/**
+ * `estimateUsageCostUsd` for a SUM of completions (a worker's steps, a
+ * split task's rows). The long-context threshold is per request: a sum
+ * above it says nothing about any one prompt, so the sum is priced at
+ * the base rates. A caller that may hold long-context completions
+ * prices those per call before summing (`WorkerRunCollector`) and
+ * passes only the rest here.
+ */
+export function estimateSummedUsageCostUsd(
+  usage: CompletionUsage,
+  pricing: NonNullable<ResolvedModel["pricing"]> | undefined,
+): number {
+  return estimate(usage, pricing, false);
+}
+
+/** True when one completion's prompt is billed at `pricing.longContext`. */
+export function isLongContextUsage(
+  usage: CompletionUsage,
+  pricing: NonNullable<ResolvedModel["pricing"]> | undefined,
+): boolean {
+  const long = pricing?.longContext;
+  return long !== undefined && usage.promptTokens > long.thresholdTokens;
+}
+
+/** Every rate of one share of a completion, USD per million tokens. */
+export interface UsageRates {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+}
+
+/**
+ * The long-context block's rates, or `undefined` without one. A cache
+ * rate the block leaves out keeps the base model's ratio to its input
+ * (`long.input x base.cacheWrite / base.input`): vendors scale the cache
+ * rates with the input rate. With no base cache rate (or a free base
+ * input, where no ratio exists) it is the long input rate, or the base
+ * cache rate when that is higher.
+ */
+export function longContextRates(
+  pricing: NonNullable<ResolvedModel["pricing"]>,
+): UsageRates | undefined {
+  const long = pricing.longContext;
+  if (long === undefined) return undefined;
+  const scaled = (base: number | undefined): number => {
+    if (base === undefined) return long.input;
+    return pricing.input > 0 ? (long.input * base) / pricing.input : Math.max(long.input, base);
+  };
+  return {
+    input: long.input,
+    output: long.output,
+    cacheRead: long.cacheRead ?? scaled(pricing.cacheRead),
+    cacheWrite: long.cacheWrite ?? scaled(pricing.cacheWrite),
+  };
+}
+
+function estimate(
+  usage: CompletionUsage,
+  pricing: NonNullable<ResolvedModel["pricing"]> | undefined,
+  oneCompletion: boolean,
+): number {
   const reported = reportedCostUsd(usage);
   if (reported !== undefined) return reported;
   if (pricing === undefined) return 0;
   // A prompt above the long-context threshold is billed entirely at the
-  // long-context rates; unknown cache rates there fall back to its input.
-  const long = pricing.longContext;
+  // long-context rates (`longContextRates`).
+  const long = longContextRates(pricing);
   const rates =
-    long !== undefined && usage.promptTokens > long.thresholdTokens
-      ? { input: long.input, output: long.output, cacheRead: long.cacheRead ?? long.input, cacheWrite: long.cacheWrite ?? long.input }
+    long !== undefined && oneCompletion && isLongContextUsage(usage, pricing)
+      ? long
       : { input: pricing.input, output: pricing.output, cacheRead: pricing.cacheRead ?? pricing.input, cacheWrite: pricing.cacheWrite ?? pricing.input };
   const cached = Math.min(
     Math.max(0, usage.cachedTokens ?? 0),

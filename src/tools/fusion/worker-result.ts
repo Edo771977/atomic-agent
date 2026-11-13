@@ -1,6 +1,12 @@
 import type { FusionRole } from "../../config/llm-run-mode-config.js";
 import type { CompletionUsage } from "../../llm/provider/completion-types.js";
-import { estimateUsageCostUsd, reportedCostUsd } from "../../llm/provider/usage-cost.js";
+import type { ResolvedModel } from "../../llm/provider/model-resolver.js";
+import {
+  estimateSummedUsageCostUsd,
+  estimateUsageCostUsd,
+  isLongContextUsage,
+  reportedCostUsd,
+} from "../../llm/provider/usage-cost.js";
 import type {
   AgentLoopEvent,
   AgentLoopReason,
@@ -297,11 +303,17 @@ export class WorkerRunCollector {
   private writes = 0;
   private readonly byTool: Record<string, number> = {};
   private usage: CompletionUsage | undefined;
-  /** The service's bill over the completions that reported one. */
+  /**
+   * Priced one completion at a time: the service's bill over the
+   * completions that reported one, plus the estimate of each unbilled
+   * completion above the long-context threshold (a per-request rate a
+   * sum cannot apply).
+   */
   private billedUsd = 0;
   private anyBilled = false;
-  /** Σ usage of the completions that reported no bill. */
+  /** Σ usage of the remaining completions (base rates apply to the sum). */
   private unbilled: CompletionUsage | undefined;
+  private readonly pricing: WorkerPricing | undefined;
   private lastLoopError: string | undefined;
   private lastWaitReason: string | undefined;
   /** The last few tool results, one line each — what a hand-back reports. */
@@ -313,8 +325,9 @@ export class WorkerRunCollector {
    * `workingDir` is the worker's own (its workspace under isolation):
    * changed paths inside it are recorded relative to it.
    */
-  constructor(options: { workingDir?: string } = {}) {
+  constructor(options: { workingDir?: string; pricing?: WorkerPricing } = {}) {
     this.changes = new FileChangeLog(options.workingDir);
+    this.pricing = options.pricing;
   }
 
   /** Feed one `AgentLoopEvent` from the worker turn's hook. */
@@ -384,6 +397,9 @@ export class WorkerRunCollector {
       const billed = reportedCostUsd(next);
       if (billed !== undefined) {
         this.billedUsd += billed;
+        this.anyBilled = true;
+      } else if (isLongContextUsage(next, this.pricing)) {
+        this.billedUsd += estimateUsageCostUsd(next, this.pricing);
         this.anyBilled = true;
       } else {
         this.unbilled = addCompletionUsage(this.unbilled, next);
@@ -476,8 +492,10 @@ export class WorkerRunCollector {
         byTool: { ...this.byTool },
       },
       ...(this.usage ? { usage: this.usage } : {}),
-      ...(this.anyBilled && this.unbilled !== undefined
-        ? { billing: { billedUsd: this.billedUsd, unbilled: this.unbilled } }
+      // A sum that still carries the whole bill (`usage.costUsd`) needs
+      // no split.
+      ...(this.anyBilled && this.usage !== undefined && this.usage.costUsd === undefined
+        ? { billing: { billedUsd: this.billedUsd, unbilled: this.unbilled ?? NO_USAGE } }
         : {}),
       ...(error === undefined ? {} : { error }),
       ...(hint === undefined ? {} : { hint }),
@@ -890,7 +908,12 @@ export interface WorkerPricing {
   output: number;
   /** Cached prompt tokens' rate; absent, they are billed at `input`. */
   cacheRead?: number;
+  cacheWrite?: number;
+  /** Per-request long-context rates; applied per completion, never to a sum. */
+  longContext?: NonNullable<ResolvedModel["pricing"]>["longContext"];
 }
+
+const NO_USAGE: CompletionUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
 
 /** What a fan-out cost on its worker leg, for the status table header. */
 export interface FanoutSpend {
@@ -903,8 +926,11 @@ export interface FanoutSpend {
 }
 
 /**
- * A worker's spend split for pricing when only some completions carried
- * the service's bill: the billed sum, and the usage of the rest.
+ * A worker's spend split for pricing when some completions were priced
+ * one at a time and the summed usage no longer carries the bill:
+ * `billedUsd` is the service's bill where a completion carried one plus
+ * the per-call estimate of each unbilled long-context completion;
+ * `unbilled` is the usage of the rest, priced as a sum at base rates.
  */
 export interface WorkerBilling {
   billedUsd: number;
@@ -916,7 +942,9 @@ export interface WorkerBilling {
  * (`estimateUsageCostUsd`). Priced per call as the turn budget counts
  * it: the service's bill where a completion carried one, the estimate
  * for the others (`billing`), so a checkpoint's spend and a resume's
- * carried spend agree with what the turn's cap was charged.
+ * carried spend agree with what the turn's cap was charged. The summed
+ * usage is priced at base rates (`estimateSummedUsageCostUsd`): long-
+ * context completions were priced per call into `billing.billedUsd`.
  */
 export function taskSpendUsd(
   result: Pick<WorkerTaskResult, "usage" | "billing">,
@@ -924,9 +952,9 @@ export function taskSpendUsd(
 ): number {
   if (result.usage === undefined) return 0;
   if (result.billing !== undefined) {
-    return result.billing.billedUsd + estimateUsageCostUsd(result.billing.unbilled, pricing);
+    return result.billing.billedUsd + estimateSummedUsageCostUsd(result.billing.unbilled, pricing);
   }
-  return estimateUsageCostUsd(result.usage, pricing);
+  return estimateSummedUsageCostUsd(result.usage, pricing);
 }
 
 /**
@@ -956,17 +984,19 @@ export function addCompletionUsage(
 /**
  * The billing split of several rows summed (a split task's parent and
  * its children): `undefined` unless some of their completions were
- * billed and some were not.
+ * priced one at a time (billed, or long-context) and the sum lost it.
  */
 export function sumWorkerBilling(
   rows: readonly Pick<WorkerTaskResult, "usage" | "billing">[],
 ): WorkerBilling | undefined {
   let billedUsd = 0;
   let anyBilled = false;
+  let anySplit = false;
   let unbilled: CompletionUsage | undefined;
   for (const r of rows) {
     if (r.usage === undefined) continue;
     if (r.billing !== undefined) {
+      anySplit = true;
       billedUsd += r.billing.billedUsd;
       anyBilled = true;
       unbilled = addCompletionUsage(unbilled, r.billing.unbilled);
@@ -980,7 +1010,10 @@ export function sumWorkerBilling(
       unbilled = addCompletionUsage(unbilled, r.usage);
     }
   }
-  return anyBilled && unbilled !== undefined ? { billedUsd, unbilled } : undefined;
+  // A row's split means the summed usage lost the bill: keep the split.
+  return anyBilled && (unbilled !== undefined || anySplit)
+    ? { billedUsd, unbilled: unbilled ?? NO_USAGE }
+    : undefined;
 }
 
 /**

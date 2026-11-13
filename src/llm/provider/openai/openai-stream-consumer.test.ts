@@ -137,6 +137,19 @@ describe("openai stream consumer usage", () => {
   });
 });
 
+describe("openai stream consumer served service tier", () => {
+  it("carries the chunk's service_tier on the final usage", async () => {
+    // OpenAI reports the tier that actually served the request (an
+    // `auto` request can be served at the project's priority tier).
+    const result = await drain(
+      sseFrame({ model: "m", service_tier: "priority", choices: [{ index: 0, delta: { content: "hi" }, finish_reason: "stop" }] }) +
+        sseFrame({ model: "m", service_tier: "priority", choices: [], usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 } }) +
+        "data: [DONE]\n\n",
+    );
+    expect(result.usage?.serviceTier).toBe("priority");
+  });
+});
+
 describe("openai stream consumer tool-call assembly", () => {
   it("keeps unindexed calls with distinct ids apart", async () => {
     const result = await drain(

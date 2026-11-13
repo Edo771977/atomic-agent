@@ -69,6 +69,19 @@ describe("measured routing evidence and admission", () => {
     expect(expired.legs.get("a")?.providerId).toBe("strong");
     expect(expired.decisions[0]?.candidates[1]?.blocked).toBe(false);
   });
+  it.each(["not-signed-in", "out-of-credit", "cli-missing", "tool-protocol"] as const)("keeps a leg whose latest row is %s blocked past the cooldown", (failure) => {
+    // Credentials, credit, a missing CLI and a protocol mismatch do not
+    // heal on their own: expiring them would hand the broken leg one real
+    // task a day. They stay blocked for the history window.
+    const older = samples("strong", true).map((r) => ({ ...r, ts: new Date(now - 72 * 3_600_000).toISOString() }));
+    const blocker = record("strong", false, { failure, ts: new Date(now - 25 * 3_600_000).toISOString() });
+    const result = select([...samples("worker", false), ...older, blocker]);
+    expect(result.legs.get("a")?.providerId).toBe("worker");
+    expect(result.decisions[0]?.excluded).toContainEqual({ provider: "strong", reason: "blocking-history" });
+    // A newer run on the leg (it was fixed and used by a pin) clears it.
+    const fixed = select([...samples("worker", false), blocker, ...samples("strong", true)]);
+    expect(fixed.legs.get("a")?.providerId).toBe("strong");
+  });
   it("requires objective acceptance, first attempts and enough samples on each side", () => {
     for (const over of [{ acceptance: undefined }, { attempt: 2 }, { escalations: 1 }, { judgeRetried: true }, { judgeRetried: undefined }, { merge: "held" as const }, { ts: "bad" }, { ts: new Date(now + 1).toISOString() }, { v: 99 }, { durationMs: NaN }]) {
       expect(select([...samples("worker", false), ...samples("strong", true, over)]).legs.get("a")?.providerId).toBe("worker");
