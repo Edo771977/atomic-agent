@@ -128,6 +128,15 @@ describe("fusion turn receipt", () => {
     );
   });
 
+  it("writes an orchestrator model set to a local path as its base name", () => {
+    const ledger = new FusionTurnLedger();
+    ledger.begin("s1", { providerId: "local-llama", model: "/home/alice/models/big.gguf" });
+    ledger.noteCompletion("s1", { usage: usage(100, 10) });
+    const record = ledger.finish("s1")!.record;
+    expect(record.orchestrator.model).toBe("big");
+    expect(JSON.stringify(record)).not.toContain("alice");
+  });
+
   it("gives no receipt for a turn in which nothing ran", () => {
     const ledger = new FusionTurnLedger();
     ledger.begin("s1", { providerId: "cli", model: "strong" });

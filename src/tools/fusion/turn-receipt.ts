@@ -1,6 +1,7 @@
 import type { CompletionUsage } from "../../llm/provider/completion-types.js";
 import {
   OUTCOME_RECORD_VERSION,
+  outcomeLabel,
   roundUsd,
   TURN_STEPS_RECORDED,
   sessionTag,
@@ -183,8 +184,8 @@ export class FusionTurnLedger {
       ts: now.toISOString(),
       session: sessionTag(sessionId),
       orchestrator: {
-        provider: turn.servedProvider ?? turn.orchestratorProvider,
-        model: turn.orchestratorModel,
+        provider: outcomeLabel(turn.servedProvider ?? turn.orchestratorProvider),
+        model: outcomeLabel(turn.orchestratorModel),
         requests: turn.requests,
         tokensIn: turn.tokensIn,
         tokensOut: turn.tokensOut,

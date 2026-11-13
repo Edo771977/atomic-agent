@@ -96,6 +96,24 @@ describe("fusion outcome records", () => {
     }
   });
 
+  it("writes a model set to a local file path as its file's base name only", () => {
+    const at = (model: string, provider = "local-llama") =>
+      taskOutcomeRecord(row(), { ...CONTEXT, model, provider }, "s", new Date(0));
+    expect(at("/home/alice/models/Qwen3-Coder-30B.Q4_K_M.gguf").model).toBe("qwen3-coder-30b.q4_k_m");
+    expect(at("C:\\Users\\alice\\models\\small.gguf").model).toBe("small");
+    expect(at("~/models/small").model).toBe("small");
+    expect(at("./small.gguf").model).toBe("small");
+    expect(at("models/x/small.bin").model).toBe("small");
+    // Model ids are kept as configured, a vendor/model id included.
+    expect(at("Qwen3-Coder-30B").model).toBe("Qwen3-Coder-30B");
+    expect(at("vendor/model-2.5:free").model).toBe("vendor/model-2.5:free");
+    // A provider id that is a path is cut down the same way.
+    expect(at("small", "/home/alice/bin/llama-server").provider).toBe("llama-server");
+    for (const r of [at("/home/alice/models/x.gguf"), at("small", "/home/alice/p")]) {
+      expect(JSON.stringify(r)).not.toContain("alice");
+    }
+  });
+
   it("hashes the session id one way, short and stable", () => {
     expect(sessionTag("s-1")).toMatch(/^[0-9a-f]{12}$/);
     expect(sessionTag("s-1")).toBe(sessionTag("s-1"));

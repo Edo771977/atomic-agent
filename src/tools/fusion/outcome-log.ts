@@ -11,6 +11,7 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 
+import { sanitizeModelAlias } from "../../analytics/sanitize-model-alias.js";
 import { reportedCostUsd } from "../../llm/provider/usage-cost.js";
 import { classifyWorkerFailure } from "./failure-breaker.js";
 import { tryAcquireOutcomeLock } from "./outcome-log-lock.js";
@@ -30,7 +31,8 @@ import {
  * Counts and categories only. No prompt, reply, instruction, title, task
  * id, path or error text is written: a failure is a category from a
  * fixed list (`failureCategory`), a session is a short one-way hash
- * (`sessionTag`), a model is the configured provider id and model label.
+ * (`sessionTag`), a model is the configured provider id and model label
+ * (a local file path cut to its base name, `outcomeLabel`).
  * The file is bounded (`OUTCOME_LOG_MAX_BYTES`, `OUTCOME_LOG_KEEP`
  * rotated files) and a failed write is logged and dropped: the log never
  * fails a fan-out or a turn.
@@ -159,6 +161,28 @@ export function sessionTag(sessionId: string): string {
   return createHash("sha256").update(sessionId).digest("hex").slice(0, 12);
 }
 
+const MODEL_FILE_EXTENSION = /\.(?:gguf|ggml|bin|safetensors|onnx|pt|pth)$/i;
+
+/**
+ * A model or provider label safe to write: configured text kept as is,
+ * unless it reads as a local file path (a llama-server model set to
+ * `/home/alice/models/x.gguf`), which keeps only the file's base name,
+ * without its model-file extension, normalised by `sanitizeModelAlias`.
+ * Path-like: a backslash; a leading `/`, `~`, `.` or drive letter; more
+ * than one `/`; or a model-file extension. A single-slash `vendor/model`
+ * id is a model id, not a path.
+ */
+export function outcomeLabel(value: string): string {
+  const pathLike =
+    value.includes("\\") ||
+    /^(?:[/~.]|[A-Za-z]:)/.test(value) ||
+    value.split("/").length > 2 ||
+    MODEL_FILE_EXTENSION.test(value);
+  if (!pathLike) return value;
+  const base = value.split(/[/\\]/).filter((part) => part.length > 0).pop() ?? "";
+  return sanitizeModelAlias(base.replace(MODEL_FILE_EXTENSION, "")) ?? "local-model";
+}
+
 /** The category a non-green row is counted under; null for `ok`. */
 export function failureCategory(
   row: Pick<WorkerTaskResult, "status" | "error" | "syntax" | "checks" | "judge">,
@@ -228,8 +252,8 @@ export function taskOutcomeRecord(
     type: "task",
     ts: now.toISOString(),
     session: sessionTag(sessionId),
-    provider: context.provider,
-    model: context.model,
+    provider: outcomeLabel(context.provider),
+    model: outcomeLabel(context.model),
     leg: context.leg,
     role: context.role,
     status: row.status,
