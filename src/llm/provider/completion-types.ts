@@ -52,6 +52,13 @@ export interface CompletionUsage {
    * nothing (ATO-569).
    */
   costUsd?: number;
+  /**
+   * The tier the service says served this completion (the response's or
+   * stream chunk's top-level `service_tier`, e.g. OpenAI `default` or
+   * `priority`), as sent. One completion's: a sum of usages drops it.
+   * The request budget settles at this tier's multiplier.
+   */
+  serviceTier?: string;
 }
 
 /**

@@ -88,6 +88,9 @@ export function createOpenAiStreamConsumer(
       let finishReason: string | null = null;
       let modelId: string | null = null;
       let usage: CompletionUsage | undefined;
+      // The tier that served the request, from any chunk (OpenAI sends it
+      // on every one, the usage chunk included).
+      let serviceTier: string | undefined;
       let generationId: string | null = null;
       // A trustworthy terminal signal: an explicit provider finish_reason
       // on any chunk, or a parser-recognized terminal event (`[DONE]`).
@@ -223,6 +226,7 @@ export function createOpenAiStreamConsumer(
             finishReason = chunk.finishReason ?? finishReason;
             modelId = chunk.modelId ?? modelId;
             usage = normaliseUsage(chunk.usage) ?? usage;
+            serviceTier = chunk.serviceTier ?? serviceTier;
             applyToolCallDeltas(toolCalls, chunk.toolCallDeltas);
             if (chunk.done) {
               yield { delta: "", reasoningDelta: "", done: true };
@@ -231,7 +235,7 @@ export function createOpenAiStreamConsumer(
                 reasoningContent,
                 finishReason,
                 modelId,
-                usage,
+                usage: withServiceTier(usage, serviceTier),
                 generationId,
                 toolCalls,
                 terminalObserved: true,
@@ -319,7 +323,7 @@ export function createOpenAiStreamConsumer(
         reasoningContent,
         finishReason,
         modelId,
-        usage,
+        usage: withServiceTier(usage, serviceTier),
         generationId,
         toolCalls,
         terminalObserved,
@@ -500,6 +504,14 @@ function toOpenAiToolCall(call: MutableToolCall): OpenAiToolCall | null {
       arguments: call.function.arguments,
     },
   };
+}
+
+/** The usage with the served tier on it, when both are known. */
+function withServiceTier(
+  usage: CompletionUsage | undefined,
+  serviceTier: string | undefined,
+): CompletionUsage | undefined {
+  return usage === undefined || serviceTier === undefined ? usage : { ...usage, serviceTier };
 }
 
 function normaliseUsage(

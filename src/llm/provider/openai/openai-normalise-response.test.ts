@@ -125,3 +125,21 @@ describe("normaliseOpenAiUsage: output tokens missing from completion_tokens", (
     expect(usage.unreportedOutputTokens).toBeUndefined();
   });
 });
+
+describe("normaliseOpenAiChatResponse: served service tier", () => {
+  it("carries the response's service_tier on the usage", () => {
+    const result = normaliseOpenAiChatResponse(
+      { model: "m", service_tier: "priority", choices: [{ message: { content: "hi" }, finish_reason: "stop" }], usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 } },
+      "m",
+    );
+    expect(result.usage?.serviceTier).toBe("priority");
+  });
+
+  it("leaves the tier out when the response does not say", () => {
+    const result = normaliseOpenAiChatResponse(
+      { model: "m", choices: [{ message: { content: "hi" }, finish_reason: "stop" }], usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 } },
+      "m",
+    );
+    expect(result.usage).not.toHaveProperty("serviceTier");
+  });
+});

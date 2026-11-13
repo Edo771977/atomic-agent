@@ -1,6 +1,7 @@
 import type { CompletionResult, CompletionUsage } from "../completion-types.js";
 import type { ReasoningFormat } from "../llm-provider.js";
 import { createReasoningExtractor } from "./reasoning-extractor.js";
+import { readServiceTier } from "./parse-sse-chunk.js";
 
 export function normaliseOpenAiChatResponse(
   json: Record<string, unknown>,
@@ -20,9 +21,11 @@ export function normaliseOpenAiChatResponse(
   const reasoningContent = createReasoningExtractor(
     reasoningFormat,
   ).extractFromMessage(message);
-  const usage = normaliseOpenAiUsage(
-    json.usage as Record<string, unknown> | undefined,
-  );
+  // The tier that served the request rides on the usage it priced.
+  const usage = {
+    ...normaliseOpenAiUsage(json.usage as Record<string, unknown> | undefined),
+    ...readServiceTier(json.service_tier),
+  };
   return {
     content,
     reasoningContent,

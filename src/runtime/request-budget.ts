@@ -86,6 +86,20 @@ function serviceTierMultiplier(body: Record<string, unknown>, pricing: ModelPric
   throw new Error(`turn budget cannot price service_tier ${JSON.stringify(tier)}; declare it in the model's pricing.serviceTierMultipliers or remove it`);
 }
 
+/**
+ * Settlement multiplier for a completion the service says was served at
+ * `served`: its configured multiplier, `1` for a `BASE_SERVICE_TIERS`
+ * name, and `undefined` for a tier with no known price (the caller then
+ * charges the whole hold). A response that names no tier keeps the
+ * requested multiplier.
+ */
+function servedTierMultiplier(served: string | undefined, requested: number, pricing: ModelPricing): number | undefined {
+  if (served === undefined) return requested;
+  const configured = configuredTierMultiplier(served, pricing);
+  if (configured !== undefined) return configured;
+  return BASE_SERVICE_TIERS.has(served.toLowerCase()) ? 1 : undefined;
+}
+
 export interface RequestBudgetScope extends CompletionRequestBudget {
   signal?: AbortSignal;
   finish(result?: CompletionResult): void;
@@ -196,10 +210,14 @@ export function createRequestBudgetScope(
       }
     },
     finish(result) {
-      // Reported cost has already won above; only the estimate takes the tier.
+      // Reported cost has already won above; only the estimate takes the
+      // tier, the one the response says served the request when it names
+      // one (an `auto` request can be served at a project's priority tier).
+      // A served tier with no known price settles at the whole hold.
       const estimatedCostUsd = (usage: CompletionUsage): number | undefined => {
+        const multiplier = servedTierMultiplier(usage.serviceTier, tierMultiplier, pricing!);
         const usd = completionCostUsd(usage, pricing);
-        return usd === undefined ? undefined : usd * tierMultiplier;
+        return usd === undefined || multiplier === undefined ? undefined : usd * multiplier;
       };
       if (done) return;
       done = true;

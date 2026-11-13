@@ -215,6 +215,46 @@ describe("request budget scope", () => {
       expect(spent(budget)).toBeCloseTo(2 * (1_000 * 3 + 1_000 * 15) / 1_000_000, 9);
     });
 
+    describe("settles at the tier the response says served the request", () => {
+      const usage = (serviceTier?: string) => ({ promptTokens: 1_000, completionTokens: 1_000, totalTokens: 2_000, ...(serviceTier === undefined ? {} : { serviceTier }) });
+      const base = (1_000 * 3 + 1_000 * 15) / 1_000_000;
+      const priced = { ...model, pricing: { ...model.pricing!, serviceTierMultipliers: { priority: 2 } } } as ResolvedModel;
+
+      it("charges the configured multiplier of a served priority tier for an auto request", () => {
+        const { budget, scope } = scoped(10, priced);
+        const s = scope();
+        s.beforeSend({ model: "m", messages: [], service_tier: "auto" });
+        s.finish({ usage: usage("priority") } as never);
+        expect(spent(budget)).toBeCloseTo(2 * base, 9);
+      });
+
+      it("charges the base rates when a priority request was served at default", () => {
+        const { budget, scope } = scoped(10, priced);
+        const s = scope();
+        s.beforeSend({ model: "m", messages: [], service_tier: "priority" });
+        s.finish({ usage: usage("default") } as never);
+        expect(spent(budget)).toBeCloseTo(base, 9);
+      });
+
+      it("keeps the whole hold when the served tier has no known price", () => {
+        const { budget, scope } = scoped(10, model);
+        const s = scope();
+        s.beforeSend({ model: "m", messages: [] });
+        s.finish({ usage: usage("priority") } as never);
+        const stop = budget.check("p", { usd: 0 })!;
+        expect(stop.spentUsd).toBeGreaterThan(2 * base);
+        expect(stop.conservativeUsd).toBeCloseTo(stop.spentUsd, 9);
+      });
+
+      it("lets a reported cost win whatever tier served", () => {
+        const { budget, scope } = scoped(10, model);
+        const s = scope();
+        s.beforeSend({ model: "m", messages: [] });
+        s.finish({ usage: { ...usage("priority"), costUsd: 0.01 } } as never);
+        expect(spent(budget)).toBeCloseTo(0.01, 9);
+      });
+    });
+
     it("reserves a long-context cache-write rate derived from the base ratio", () => {
       // No long cacheWrite: 6 x (3.75 / 3) = $7.50, above the long input rate.
       const priced = { ...model, pricing: { ...model.pricing!, longContext: { thresholdTokens: 100_000, input: 6, output: 22.5 } } } as ResolvedModel;
