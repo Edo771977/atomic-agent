@@ -45,6 +45,23 @@ export const ORIGINAL_REQUEST_BEGIN_MARKER = "----- BEGIN ORIGINAL REQUEST -----
 export const ORIGINAL_REQUEST_END_MARKER = "----- END ORIGINAL REQUEST -----";
 
 /**
+ * `text` with every copy of the two markers defused, for anything a
+ * brief carries other than the markers themselves: the orchestrator's
+ * task, instructions, contract (a `shape`), and the quoted request. The
+ * brief's own markers are then the only ones in it, so the first BEGIN
+ * and the first END after it (`quotedRequestText`, the `### request`
+ * clip) are the real quote's. Otherwise a marker in the instructions,
+ * which come before the quote, would move the block's start: the
+ * orchestrator's words read as the operator's (consent to replace an
+ * input), and a clip cutting the rules instead of the quote.
+ */
+export function neutraliseRequestMarkers(text: string): string {
+  return text
+    .replaceAll(ORIGINAL_REQUEST_BEGIN_MARKER, "[begin original request]")
+    .replaceAll(ORIGINAL_REQUEST_END_MARKER, "[end original request]");
+}
+
+/**
  * The operator's words in a pinned request: the quoted block when the
  * text is a worker's brief, the text itself otherwise. What the input
  * guard (`fs-input-guard.ts`) reads, so a file a task's instructions
@@ -84,7 +101,7 @@ export function workerRequestRecord(
 ): string {
   const begin = brief.indexOf(ORIGINAL_REQUEST_BEGIN_MARKER);
   if (begin === -1) return `${NO_OPERATOR_WORDS_MARKER}\n${brief}`;
-  const full = operatorRequest?.trim() ?? "";
+  const full = neutraliseRequestMarkers(operatorRequest?.trim() ?? "");
   if (full.length === 0) return brief;
   const start = begin + ORIGINAL_REQUEST_BEGIN_MARKER.length;
   const end = brief.indexOf(ORIGINAL_REQUEST_END_MARKER, start);

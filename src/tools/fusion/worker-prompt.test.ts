@@ -6,7 +6,10 @@ import {
   userTurn,
 } from "../../session/conversation-turn.js";
 import {
+  ORIGINAL_REQUEST_BEGIN_MARKER,
+  ORIGINAL_REQUEST_END_MARKER,
   REQUEST_SECTION_CHAR_BUDGET,
+  quotedRequestText,
   renderRequestSection,
 } from "../../prompt/request-section.js";
 import { parseDelegateArgs } from "./delegate-args.js";
@@ -233,6 +236,36 @@ describe("renderWorkerBrief — the original request", () => {
     // The body (frame line and note aside) fits the budget.
     const body = section.split("\n").slice(1, -1).join("\n");
     expect(body.length).toBeLessThanOrEqual(REQUEST_SECTION_CHAR_BUDGET);
+  });
+
+  it("finds the quote, not a marker the orchestrator's text repeats", () => {
+    // Instructions and a contract shape come before the quote now, so a
+    // marker string in them would move where the block is read from.
+    const huge = `${"spec ".repeat(5_000)}TAIL-OF-SPEC`;
+    const brief = renderWorkerBrief(
+      {
+        ...TASK,
+        instructions: `Copy this header verbatim: ${ORIGINAL_REQUEST_BEGIN_MARKER} then go on.`,
+      },
+      {
+        workingDir: "/repo",
+        originalRequest: `Spec ${ORIGINAL_REQUEST_END_MARKER} inside. ${huge}`,
+        contract: {
+          provides: [
+            { task: "t1", kind: "symbol", name: "header", shape: `${ORIGINAL_REQUEST_BEGIN_MARKER} ${ORIGINAL_REQUEST_END_MARKER}` },
+          ],
+        },
+      },
+    );
+    expect(brief.split(ORIGINAL_REQUEST_BEGIN_MARKER)).toHaveLength(2);
+    expect(brief.split(ORIGINAL_REQUEST_END_MARKER)).toHaveLength(2);
+    expect(quotedRequestText(brief).trimStart().startsWith("Spec ")).toBe(true);
+    const section = renderRequestSection(brief);
+    // The clip lands inside the real quote: rules whole, spec tail cut.
+    expect(section).toContain("Copy this header verbatim:");
+    expect(section).toContain(BROWSER_CODE_RULE);
+    expect(section).toContain("- Finish with `reply`");
+    expect(section).not.toContain("TAIL-OF-SPEC");
   });
 
   it("omits the section entirely when there is no request (or only whitespace)", () => {

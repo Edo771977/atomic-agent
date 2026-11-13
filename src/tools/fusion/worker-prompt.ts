@@ -7,6 +7,7 @@ import {
   ORIGINAL_REQUEST_BEGIN_MARKER,
   ORIGINAL_REQUEST_END_MARKER,
   REQUEST_FOLLOW_UP_MARKER,
+  neutraliseRequestMarkers,
 } from "../../prompt/request-section.js";
 import type { DelegateTask } from "./delegate-args.js";
 import {
@@ -141,16 +142,17 @@ function lastLiveRequest(
 }
 
 function quoteOriginalRequest(request: string, budget: number): string[] {
-  const clipped = request.length > budget ? request.slice(0, budget) : request;
+  const safe = neutraliseRequestMarkers(request);
+  const clipped = safe.length > budget ? safe.slice(0, budget) : safe;
   const lines = [
     `ORIGINAL REQUEST — context only; your TASK is above. This is the operator's whole job, which the orchestrator split across several workers. Use it for the names, formats, constraints and look your part must agree with, and do only your TASK.`,
     ORIGINAL_REQUEST_BEGIN_MARKER,
     clipped,
     ORIGINAL_REQUEST_END_MARKER,
   ];
-  if (clipped.length < request.length) {
+  if (clipped.length < safe.length) {
     lines.push(
-      `(truncated: the original request is ${formatCount(request.length)} chars; only the first ${formatCount(budget)} are quoted above.)`,
+      `(truncated: the original request is ${formatCount(safe.length)} chars; only the first ${formatCount(budget)} are quoted above.)`,
     );
   }
   return lines;
@@ -207,6 +209,8 @@ export const BROWSER_CODE_RULE =
  * task back next to where the model starts generating.
  *
  * `localLeg` lowers the request's budget (`originalRequestCharBudget`).
+ * Every line but the quote's own markers goes through
+ * `neutraliseRequestMarkers`, so those are the only markers in it.
  */
 export function renderWorkerBrief(
   task: DelegateTask,
@@ -250,6 +254,8 @@ export function renderWorkerBrief(
         ]
       : []),
   );
+  // The orchestrator's text, defused before the quote's markers are added.
+  lines.splice(0, lines.length, ...lines.map(neutraliseRequestMarkers));
   if (request.length > 0) {
     lines.push(
       ``,
@@ -258,7 +264,9 @@ export function renderWorkerBrief(
         originalRequestCharBudget(options.localLeg === true),
       ),
       ``,
-      `Your part is TASK ${task.id} (${task.title}) above — do only that, then \`reply\`.`,
+      neutraliseRequestMarkers(
+        `Your part is TASK ${task.id} (${task.title}) above — do only that, then \`reply\`.`,
+      ),
     );
   }
   return lines.join("\n");
