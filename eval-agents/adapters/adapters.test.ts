@@ -8,6 +8,12 @@ describe("agent adapters", () => {
     expect(ids).toEqual(["atomic-agent", "hermes", "openclaw"]);
   });
 
+  it("keeps an explicit empty or unknown selection empty", () => {
+    expect(listAgentAdapters([])).toEqual([]);
+    expect(listAgentAdapters(["does-not-exist"])).toEqual([]);
+    expect(listAgentAdapters([" "])).toEqual([]);
+  });
+
   it("atomic-agent reports missing llama URL when unset", () => {
     const prev = process.env.ATOMIC_AGENT_EVAL_LLAMA_URL;
     delete process.env.ATOMIC_AGENT_EVAL_LLAMA_URL;

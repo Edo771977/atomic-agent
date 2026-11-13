@@ -7,9 +7,7 @@ vi.mock("../harness/load-env.js", () => ({ loadEvalAgentsEnvFile() {} }));
 vi.mock("../harness/environment-lock.js", () => ({
   captureEnvironmentSnapshot: async () => ({ hermeticFixture: true }),
 }));
-vi.mock("../adapters/index.js", () => ({
-  listAgentAdapters(filter?: string[]): AgentAdapter[] {
-    const adapters: AgentAdapter[] = ["ready", "missing"].map((id) => ({
+const fixtureAdapter = vi.hoisted(() => (id: string): AgentAdapter => ({
       id, label: id,
       probeRequirements: () => id === "missing" ? ["fixture executable unavailable"] : [],
       runQuestion: async ({ row }) => ({
@@ -18,9 +16,9 @@ vi.mock("../adapters/index.js", () => ({
           toolErrors: 0, wallClockMs: 1, timedOut: false, exitCode: 0 },
         exitCode: 0, timedOut: false, error: null,
       }),
-    }));
-    return adapters.filter((adapter) => !filter || filter.includes(adapter.id));
-  },
 }));
+vi.mock("../adapters/atomic-agent-adapter.js", () => ({ createAtomicAgentAdapter: () => fixtureAdapter("ready") }));
+vi.mock("../adapters/hermes-adapter.js", () => ({ createHermesAdapter: () => fixtureAdapter("missing") }));
+vi.mock("../adapters/openclaw-adapter.js", () => ({ createOpenclawAdapter: () => fixtureAdapter("other") }));
 
 await import("../gaia.eval.js");

@@ -43,6 +43,12 @@ describe("actual GAIA campaign wiring (hermetic child Vitest)", () => {
     expect(result.output).toContain("no agent adapters selected");
   });
 
+  it("does not expand an explicitly empty adapter filter into every agent", () => {
+    const result = campaign("empty-filter", { ATOMIC_AGENT_EVAL_AGENTS: " , " });
+    expect(result.status, result.output).toBe(1);
+    expect(result.output).toContain("no agent adapters selected");
+  });
+
   it("fails when every selected case is unavailable and reports real skips", () => {
     const result = campaign("all-skipped", { ATOMIC_AGENT_EVAL_AGENTS: "missing" });
     expect(result.status, result.output).toBe(1);
