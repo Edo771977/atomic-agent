@@ -27,6 +27,7 @@ import { CHECK_OUTPUT_CHARS, tailClip } from "./contract-checks.js";
 import { describeChanges, FileChangeLog, type FileChange } from "./worker-changes.js";
 import { describeSyntax, type TaskSyntaxSummary } from "./syntax-pass.js";
 import type { ArtifactManifest } from "./artifact-manifest-types.js";
+import { MAX_WORKER_QUESTION_CHARS } from "./worker-question.js";
 
 /**
  * The note on a task a worker could not finish because a step needs the
@@ -54,6 +55,12 @@ export type WorkerTaskStatus =
   | "failed"
   | "cancelled"
   | "needs_orchestrator"
+  /**
+   * The worker stopped to ask the orchestrator a question it could not
+   * answer itself (`worker-question.ts`, ATO-945); `question` carries it.
+   * Not a failure: the remedy is an answer in the next brief.
+   */
+  | "needs_input"
   | "max_steps"
   /**
    * The worker ran out of WALL TIME rather than steps. Set by
@@ -84,6 +91,7 @@ export const WORKER_STATUS_ORDER: readonly WorkerTaskStatus[] = [
   "ok",
   "no_changes",
   "needs_orchestrator",
+  "needs_input",
   "max_steps",
   "timeout",
   "queued",
@@ -262,6 +270,11 @@ export interface WorkerTaskResult {
   selfCheckNotice?: true;
   /** Escalations that reached the worker (advisor hints, a re-run), for the outcome log. */
   escalations?: number;
+  /**
+   * The worker's question to the orchestrator, on a `needs_input` row
+   * (ATO-945); at most `MAX_WORKER_QUESTION_CHARS`.
+   */
+  question?: string;
 }
 
 export interface TaskCheckSummary {
@@ -1240,6 +1253,9 @@ function renderStatusTable(
         oneLine(describeReplacedInput(input), TABLE_DETAIL_CHARS),
       ),
       ...(r.error ? [`error: ${oneLine(r.error, TABLE_DETAIL_CHARS)}`] : []),
+      // The question in full (it is already bounded): the orchestrator
+      // answers it from this line, so a clipped one is a worse brief.
+      ...(r.question ? [`question: ${oneLine(r.question, MAX_WORKER_QUESTION_CHARS)}`] : []),
       ...(r.checks
         ? [describeChecks(r.checks, TABLE_DETAIL_CHARS, r.error)]
         : []),
@@ -1295,6 +1311,7 @@ function renderBlock(
     ]),
     ...(result.replacedInputs ?? []).map(describeReplacedInput),
     ...(result.hint ? [`hint: ${result.hint}`] : []),
+    ...(result.question ? [`question: ${result.question}`] : []),
     ...(result.checks
       ? [describeChecks(result.checks, ERROR_HEAD_CHARS, result.error)]
       : []),
