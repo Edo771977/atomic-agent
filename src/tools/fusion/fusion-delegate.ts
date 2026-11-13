@@ -3,7 +3,7 @@ import {
   ApprovalDeniedError,
   requireApproval,
 } from "../../approval/dangerous-tool.js";
-import { resolve as resolvePath } from "node:path";
+import { isAbsolute, relative, resolve as resolvePath } from "node:path";
 import { isInside } from "../../approval/fanout-scope.js";
 import { resolveFanoutScope } from "./fanout-paths.js";
 import { compressToolResult } from "../../compressor/result-compressor.js";
@@ -1045,6 +1045,19 @@ export function buildFusionDelegateTool(
           ...(kept.size === 0 ? {} : { kept }),
         });
         for (const [id, branch] of wave.kept ?? []) keptBranches.set(id, branch);
+        // What reached the folder after a gate ruled: a later merge into a
+        // gated task's files makes its verdict stale (re-run after the waves).
+        for (const outcome of wave.outcomes) {
+          const task = tasks.find((t) => t.id === outcome.taskId);
+          gateState.noteMerge(
+            outcome,
+            (task?.files ?? []).flatMap((f) => {
+              const rel = relative(ctx.workingDir, resolvePath(ctx.workingDir, f));
+              return rel.length === 0 || rel.startsWith("..") || isAbsolute(rel) ? [] : [rel];
+            }),
+          );
+        }
+        if (wave.inPlace !== undefined) gateState.noteInPlace();
         merges.push(...wave.merges);
         run?.recordMerges(wave.merges);
         for (const row of wave.results) {
@@ -1456,10 +1469,14 @@ export function buildFusionDelegateTool(
         );
         let out = applyContractFindings(rows, provides.findings);
         // A check a gate already ran in its task's workspace (isolation)
-        // is not run again; the rest run here, on the merged folder.
+        // is not run again unless what reached the folder since differs
+        // (`MergeGateState`: a three-way merge, a later merge into the
+        // task's files, a wave in place); the rest run here, on the
+        // merged folder.
         const allChecks = parsed.contract.checks ?? [];
+        const stale = gateState.staleCheckIndices();
         const pending = allChecks.flatMap((check, index) =>
-          gateState.checkOutcomes.has(index) ? [] : [{ check, index }],
+          gateState.checkOutcomes.has(index) && !stale.has(index) ? [] : [{ check, index }],
         );
         const checks = await runContractChecks(
           pending.map((p) => p.check),
@@ -1472,10 +1489,31 @@ export function buildFusionDelegateTool(
               : { knownSecrets: deps.knownSecrets() }),
           },
         );
-        out = applyPostMergeChecks(out, checks.outcomes);
+        const ran = checks.outcomes.length === pending.length;
+        out = applyPostMergeChecks(
+          out,
+          checks.outcomes,
+          ran
+            ? pending.flatMap((p) =>
+                stale.has(p.index) ? [gateState.checkOutcomes.get(p.index)!] : [],
+              )
+            : [],
+        );
         const byIndex = new Map(gateState.checkOutcomes);
-        if (checks.outcomes.length === pending.length) {
-          pending.forEach((p, i) => byIndex.set(p.index, checks.outcomes[i]!));
+        if (ran) {
+          pending.forEach((p, i) => {
+            const outcome = checks.outcomes[i]!;
+            byIndex.set(p.index, outcome);
+            if (!stale.has(p.index)) return;
+            gateState.checkOutcomes.set(p.index, outcome);
+            // Its gate verdict was green on files the folder no longer has.
+            if (!outcome.ok && outcome.task !== undefined) {
+              gateState.verdicts.delete(outcome.task);
+            }
+          });
+        } else {
+          // A stale verdict is no verdict.
+          for (const index of stale) byIndex.delete(index);
         }
         const allOutcomes = allChecks.flatMap((_, i) => {
           const outcome = byIndex.get(i);
@@ -1512,7 +1550,11 @@ export function buildFusionDelegateTool(
       const syntaxPass = async (
         rows: readonly WorkerTaskResult[],
       ): Promise<WorkerTaskResult[]> => {
-        const pending = rows.filter((r) => !gateState.syntaxGated.has(r.id));
+        const pending = rows.filter(
+          (r) => !gateState.syntaxGated.has(r.id) || gateState.isStale(r.id),
+        );
+        // Re-checked on the folder from here on.
+        gateState.settle(rows.map((r) => r.id));
         if (pending.length === 0) return [...rows];
         const checked = await runSyntaxPass(pending, parsed.tasks, {
           runner: deps.syntaxCheck,
@@ -1523,6 +1565,11 @@ export function buildFusionDelegateTool(
             ? {}
             : { knownSecrets: deps.knownSecrets() }),
         });
+        for (const row of checked) {
+          if (row.status === "failed" && gateState.syntaxGated.has(row.id)) {
+            gateState.verdicts.delete(row.id);
+          }
+        }
         return rows.map((r) => checked.find((c) => c.id === r.id) ?? r);
       };
       results = await syntaxPass(await evaluateContract(results, results));
@@ -1604,9 +1651,10 @@ export function buildFusionDelegateTool(
           const merged = results.map(
             (r) => retried.find((x) => x.id === r.id) ?? r,
           );
+          // The retried rows, and any task the retry's merges made stale.
           const evaluated = await syntaxPass(
             await evaluateContract(
-              merged.filter((r) => retryIds.has(r.id)),
+              merged.filter((r) => retryIds.has(r.id) || gateState.isStale(r.id)),
               merged,
             ),
           );

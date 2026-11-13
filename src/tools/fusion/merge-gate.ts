@@ -28,6 +28,7 @@ import {
   type MergeGate,
 } from "./branch-merge.js";
 import type { WorkspaceChange } from "./branch-diff.js";
+import type { BranchMergeOutcome } from "./branch-merge.js";
 import {
   applyCheckOutcomes,
   inspectContractProvides,
@@ -43,7 +44,17 @@ import { runSyntaxPass, type SyntaxCheckRunner } from "./syntax-pass.js";
 import { concurrentPaths, mentionsPath } from "./worker-self-check.js";
 import type { WorkerTaskResult } from "./worker-result.js";
 
-/** What the gates of one fan-out decided, for the passes after the waves. */
+/**
+ * What the gates of one fan-out decided, for the passes after the waves.
+ *
+ * A gate's verdict holds for the files as the gate saw them. It goes
+ * stale when what reached the folder differs: the task's own merge
+ * needed a three-way `merge-file` (or left a conflict), a task merged
+ * after it changed one of its files (its merged paths and its declared
+ * files), or a wave ran in place, writing who knows what. A stale
+ * task's gated checks and syntax pass run again on the merged folder;
+ * every other gate verdict is reused.
+ */
 export class MergeGateState {
   /** Own-check outcomes by index into `contract.checks`. */
   readonly checkOutcomes = new Map<number, ContractCheckOutcome>();
@@ -51,6 +62,58 @@ export class MergeGateState {
   readonly verdicts = new Map<string, JudgeVerdict>();
   /** Tasks whose syntax pass ran in their workspace and gave a verdict. */
   readonly syntaxGated = new Set<string>();
+  /** Merged tasks' files (relative to the working directory). */
+  private readonly mergedFiles = new Map<string, Set<string>>();
+  private readonly stale = new Set<string>();
+
+  /** The gate ruled on the task afresh (a retry): its old staleness is gone. */
+  gated(taskId: string): void {
+    this.stale.delete(taskId);
+  }
+
+  /**
+   * One merge reached the folder. `declared` are the task's declared
+   * files relative to the working directory.
+   */
+  noteMerge(outcome: BranchMergeOutcome, declared: readonly string[]): void {
+    for (const [other, files] of this.mergedFiles) {
+      if (other !== outcome.taskId && outcome.applied.some((p) => files.has(p))) {
+        this.stale.add(other);
+      }
+    }
+    if (
+      (outcome.threeWay?.length ?? 0) > 0 ||
+      outcome.conflicts.length > 0 ||
+      outcome.refused.length > 0 ||
+      (outcome.lost?.length ?? 0) > 0
+    ) {
+      this.stale.add(outcome.taskId);
+    }
+    this.mergedFiles.set(outcome.taskId, new Set([...outcome.applied, ...declared]));
+  }
+
+  /** A wave ran in the folder itself: no earlier verdict can be trusted. */
+  noteInPlace(): void {
+    for (const id of this.mergedFiles.keys()) this.stale.add(id);
+  }
+
+  isStale(taskId: string): boolean {
+    return this.stale.has(taskId);
+  }
+
+  /** Gated checks whose task went stale: re-run them on the folder. */
+  staleCheckIndices(): Set<number> {
+    const out = new Set<number>();
+    for (const [index, outcome] of this.checkOutcomes) {
+      if (outcome.task !== undefined && this.stale.has(outcome.task)) out.add(index);
+    }
+    return out;
+  }
+
+  /** The stale tasks were re-checked on the folder. */
+  settle(taskIds: Iterable<string>): void {
+    for (const id of taskIds) this.stale.delete(id);
+  }
 }
 
 /** The judge as the gate calls it: spend accounting is the caller's. */
@@ -137,6 +200,7 @@ export function buildMergeGate(input: MergeGateInput): MergeGate {
       // Not run (no runner, a cancelled turn): the pass after the merge
       // says so, as it always did.
       if (checks.outcomes.length === own.length) {
+        input.state.gated(row.id);
         own.forEach(({ index }, i) => {
           input.state.checkOutcomes.set(index, checks.outcomes[i]!);
           ran.add(index);
@@ -242,11 +306,23 @@ export function buildMergeGate(input: MergeGateInput): MergeGate {
 export function applyPostMergeChecks(
   rows: readonly WorkerTaskResult[],
   outcomes: readonly ContractCheckOutcome[],
+  /** Gate outcomes the later run supersedes (a stale task's re-run). */
+  replaced: readonly ContractCheckOutcome[] = [],
 ): WorkerTaskResult[] {
   return rows.map((row) => {
-    const prev = row.checks;
     const next = applyCheckOutcomes([row], outcomes)[0]!;
-    if (prev === undefined || next.checks === undefined || next === row) return next;
+    const gone = replaced.filter((o) => o.task === row.id);
+    const prev =
+      row.checks === undefined || gone.length === 0
+        ? row.checks
+        : {
+            ...row.checks,
+            total: row.checks.total - gone.length,
+            failed: row.checks.failed - gone.filter((o) => !o.ok).length,
+          };
+    if (prev === undefined || prev.total <= 0 || next.checks === undefined || next === row) {
+      return next;
+    }
     const detail = [prev.detail, next.checks.detail]
       .filter((d): d is string => d !== undefined)
       .join("; ");

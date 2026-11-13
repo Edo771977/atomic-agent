@@ -333,6 +333,75 @@ describe("merge only green tasks (isolation)", () => {
     expect(syntaxDirs).not.toContain(repo);
   });
 
+  it("re-runs a gated check on the merged folder when a later wave changed the task's file", async () => {
+    const repo = await gitRepo({ "a.txt": "a\n" });
+    const seen: Array<{ file: string; dir: string; ok: boolean }> = [];
+    const d = deps(
+      repo,
+      async (id, _n, dir) => {
+        if (id === "one") await writeFile(join(dir, "shared.txt"), "good\n");
+        // A later wave breaks the file the first task's check passed on.
+        else await writeFile(join(dir, "shared.txt"), "good\nbad\n");
+      },
+      { runChecks: fileChecks(seen) },
+    );
+    const result = await buildFusionDelegateTool(d).run(
+      {
+        tasks: [
+          { id: "one", title: "One", instructions: "write shared.txt", files: ["shared.txt"] },
+          { id: "two", title: "Two", instructions: "extend shared.txt", files: ["shared.txt"] },
+        ],
+        contract: {
+          provides: [{ task: "one", kind: "file", name: "shared.txt", file: "shared.txt" }],
+          requires: [{ task: "two", name: "shared.txt" }],
+          checks: [{ task: "one", kind: "command", file: "shared.txt" }],
+        },
+      },
+      ctx(repo),
+    );
+    const rows = result.details.tasks as WorkerTaskResult[];
+    // Green in its workspace, re-run on the folder after the later merge.
+    const inWorkspace = seen.filter((s) => s.dir !== repo);
+    expect(inWorkspace.length).toBeGreaterThan(0);
+    expect(inWorkspace.every((s) => s.ok)).toBe(true);
+    expect(seen.filter((s) => s.dir === repo)).toEqual([{ file: "shared.txt", dir: repo, ok: false }]);
+    expect(rows[0]!.status).toBe("failed");
+    expect(rows[0]!.checks).toMatchObject({ total: 1, failed: 1 });
+  });
+
+  it("re-runs both tasks' gated checks after a three-way merge of the same file", async () => {
+    const base = "l1\nl2\nl3\nl4\nl5\nl6\n";
+    const repo = await gitRepo({ "a.txt": base });
+    const seen: Array<{ file: string; dir: string; ok: boolean }> = [];
+    const d = deps(
+      repo,
+      async (id, _n, dir) => {
+        if (id === "one") return writeFile(join(dir, "a.txt"), base.replace("l1", "L1"));
+        await writeFile(join(dir, "a.txt"), base.replace("l6", "bad"));
+        await writeFile(join(dir, "two.txt"), "good\n");
+      },
+      { runChecks: fileChecks(seen) },
+    );
+    const result = await buildFusionDelegateTool(d).run(
+      {
+        tasks: TASKS,
+        contract: {
+          checks: [
+            { task: "one", kind: "command", file: "a.txt", name: "one" },
+            { task: "two", kind: "command", file: "two.txt", name: "two" },
+          ],
+        },
+      },
+      ctx(repo),
+    );
+    expect(await readFile(join(repo, "a.txt"), "utf8")).toBe(base.replace("l1", "L1").replace("l6", "bad"));
+    const rows = result.details.tasks as WorkerTaskResult[];
+    const post = seen.filter((s) => s.dir === repo).map((s) => s.file).sort();
+    expect(post).toEqual(["a.txt", "two.txt"]);
+    expect(rows[0]!.status).toBe("failed");
+    expect(rows[0]!.checks).toMatchObject({ total: 1, failed: 1 });
+  });
+
   it("off: a task whose check fails still wrote into the folder, as before", async () => {
     const repo = await gitRepo({ "a.txt": "a\n" });
     const seen: Array<{ file: string; dir: string; ok: boolean }> = [];

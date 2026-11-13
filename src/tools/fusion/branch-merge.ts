@@ -105,6 +105,11 @@ export interface BranchMergeOutcome {
   taskId: string;
   /** Paths written into (or removed from) the working directory. */
   applied: string[];
+  /**
+   * Of `applied`, those merged with `merge-file` because the folder had
+   * moved too: what landed is not what the task's gate checked.
+   */
+  threeWay?: string[];
   /** Paths left as the folder has them, sides saved under `savedDir`. */
   conflicts: string[];
   /** Declared inputs the task would have removed or cut down. */
@@ -238,6 +243,7 @@ export async function mergeBranch(
         if (merged.clean) {
           await writeBuffer(realPath, Buffer.from(merged.merged, "utf8"));
           outcome.applied.push(rel);
+          (outcome.threeWay ??= []).push(rel);
           continue;
         }
       }
@@ -454,6 +460,8 @@ export interface IsolatedWaveInput {
 export interface IsolatedWaveResult {
   results: WorkerTaskResult[];
   merges: MergeTaskSuggestion[];
+  /** Every merge that ran, in the order it reached the folder. */
+  outcomes: BranchMergeOutcome[];
   /** Set when the wave ran in place: why it could not be isolated. */
   inPlace?: string;
   /** Workspaces a gate asked to keep; the caller removes them. */
@@ -489,7 +497,7 @@ export async function runIsolatedWave(
   input: IsolatedWaveInput,
 ): Promise<IsolatedWaveResult> {
   if (input.tasks.length === 0) {
-    return { results: await input.run(input.tasks, undefined), merges: [] };
+    return { results: await input.run(input.tasks, undefined), merges: [], outcomes: [] };
   }
   const kept = input.kept ?? new Map<string, KeptBranch>();
   const fresh = input.tasks.filter((t) => !kept.has(t.id));
@@ -515,6 +523,7 @@ export async function runIsolatedWave(
     return {
       results: results.map((r) => ({ ...r, notes: [...(r.notes ?? []), note] })),
       merges: [],
+      outcomes: [],
       inPlace: reason,
     };
   }
@@ -555,6 +564,7 @@ export async function runIsolatedWave(
     }
     const inPlaceNote = `ran in the folder itself, not in a workspace of its own: ${reason}`;
     const merges: MergeTaskSuggestion[] = [];
+    const outcomes: BranchMergeOutcome[] = [];
     const out: WorkerTaskResult[] = [];
     for (const raw of results) {
       const branch = lookup(raw.id);
@@ -634,6 +644,7 @@ export async function runIsolatedWave(
         protectedPaths,
         input.options?.mergeFile,
       );
+      outcomes.push(outcome);
       out.push(applyMergeOutcome(row, outcome));
       const task = input.tasks.find((t) => t.id === row.id);
       const suggestion =
@@ -643,6 +654,7 @@ export async function runIsolatedWave(
     return {
       results: out,
       merges,
+      outcomes,
       ...(inPlace ? { inPlace: reason } : {}),
       ...(newlyKept.size === 0 ? {} : { kept: newlyKept }),
     };
