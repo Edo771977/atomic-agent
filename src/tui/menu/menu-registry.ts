@@ -650,7 +650,7 @@ export const MENU: readonly MenuNode[] = [
     slash: {
       name: "fusion",
       description:
-        "a fusion run cut off by a restart: `/fusion` lists them · `/fusion resume [id]` continues from the unfinished wave · `/fusion discard [id]` drops it",
+        "a fusion run cut off by a restart: `/fusion` lists them · `/fusion resume [id]` continues from the unfinished wave · `/fusion discard [id]` drops it · `/fusion report` shows how the workers did and what the strong side cost",
       rank: 47,
     },
   },

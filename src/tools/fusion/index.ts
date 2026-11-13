@@ -173,5 +173,13 @@ export type {
   TaskOutcomeRecord,
   TurnOutcomeRecord,
 } from "./outcome-log.js";
+export {
+  aggregateOutcomes,
+  formatFusionReport,
+  parseReportArgs,
+  readOutcomeRecords,
+  renderOutcomeReport,
+} from "./outcome-report.js";
+export type { FusionReport, ReportOptions } from "./outcome-report.js";
 export { FUSION_TURN_RECEIPT_TASK_ID, FusionTurnLedger, formatTurnReceipt } from "./turn-receipt.js";
 export type { FusionTurnReceipt } from "./turn-receipt.js";

@@ -27,6 +27,14 @@ describe("/fusion (ATO-617)", () => {
     });
   });
 
+  it("hands /fusion report its flags", () => {
+    expect(dispatchSlashCommand("/fusion report").fusionReport).toEqual({ args: [] });
+    expect(dispatchSlashCommand("/fusion report --days 7 --model small").fusionReport).toEqual({
+      args: ["--days", "7", "--model", "small"],
+    });
+    expect(dispatchSlashCommand("/fusion report").fusionRunAction).toBeUndefined();
+  });
+
   it("answers a malformed call with its usage", () => {
     for (const buffer of ["/fusion go", "/fusion resume a b", "/fusion fr-1"]) {
       const result = dispatchSlashCommand(buffer);

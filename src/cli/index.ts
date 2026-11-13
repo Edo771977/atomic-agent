@@ -16,6 +16,7 @@ import { serveCommand } from "./serve-command.js";
 import { traceCommand } from "./trace-command.js";
 import { taskCommand } from "./task-command.js";
 import { overnightCommand } from "./overnight-command.js";
+import { fusionCommand } from "./fusion-command.js";
 import { memoryCommand } from "./memory-command.js";
 import { modelsCommand } from "./models-command.js";
 import { importCommand } from "./import-command.js";
@@ -120,6 +121,11 @@ const COMMANDS: CommandDescriptor[] = [
     name: "overnight",
     summary: "Run one long task unattended with a money and a time cap (--budget, --hours, --detach)",
     run: overnightCommand,
+  },
+  {
+    name: "fusion",
+    summary: "Report how fusion workers did and what the strong side cost (report [--days N] [--model X] [--json])",
+    run: (args) => fusionCommand(args),
   },
   {
     name: "memory",
