@@ -7,6 +7,7 @@ import type {
   ContractCheckOutcome,
   ContractFinding,
 } from "./contract-checks.js";
+import { CHECK_OUTPUT_CHARS, tailClip } from "./contract-checks.js";
 import type { EscalationComplete } from "./escalation.js";
 import type { WorkerPricing, WorkerTaskResult } from "./worker-result.js";
 
@@ -136,6 +137,11 @@ export interface ItemVerdict {
    * (the list cannot be green either way; asking would only cost).
    */
   by: "fact" | "judge" | "skipped";
+  /**
+   * A failed check's output tail (`ContractCheckOutcome.output`), for
+   * the retried worker's brief: the assertion, not just "exit 1".
+   */
+  output?: string;
 }
 
 export interface JudgeVerdict {
@@ -164,7 +170,13 @@ async function factVerdict(
     if (outcome === undefined) {
       return { id: item.id, pass: false, why: "the check did not run", by: "fact" };
     }
-    return { id: item.id, pass: outcome.ok, why: outcome.detail, by: "fact" };
+    return {
+      id: item.id,
+      pass: outcome.ok,
+      why: outcome.detail,
+      by: "fact",
+      ...(outcome.ok || outcome.output === undefined ? {} : { output: outcome.output }),
+    };
   }
   if (item.kind === "provide") {
     const finding = facts.findings.find((f) => f.name === item.provideName);
@@ -413,16 +425,30 @@ export function redItems(verdict: JudgeVerdict): ItemVerdict[] {
   return verdict.items.filter((v) => !v.pass && v.by !== "skipped");
 }
 
+/** All failing-check output one retry brief carries. */
+export const RETRY_OUTPUT_CHARS = 2 * CHECK_OUTPUT_CHARS;
+
 /** The findings a retried worker is briefed with. */
 export function renderRetryFindings(
   items: readonly AcceptanceItem[],
   verdict: JudgeVerdict,
 ): string {
+  const red = redItems(verdict);
+  // The failing checks' output, inside one task's share however many
+  // failed (`RETRY_OUTPUT_CHARS`), each keeping its own tail.
+  const withOutput = red.filter((v) => v.output !== undefined).length;
+  const share =
+    withOutput === 0
+      ? 0
+      : Math.min(CHECK_OUTPUT_CHARS, Math.floor(RETRY_OUTPUT_CHARS / withOutput));
   return [
     "## A judge found these acceptance items NOT met in your previous attempt",
-    ...redItems(verdict).map((v) => {
+    ...red.map((v) => {
       const item = items.find((i) => i.id === v.id);
-      return `- [${v.id}] ${item?.text ?? ""} — ${v.why}`;
+      const line = `- [${v.id}] ${item?.text ?? ""} — ${v.why}`;
+      return v.output === undefined
+        ? line
+        : `${line}\n  output:\n${tailClip(v.output, share).replace(/^/gm, "    ")}`;
     }),
     "Fix exactly these. The files from the previous attempt are on disk; change them rather than starting over.",
   ].join("\n");

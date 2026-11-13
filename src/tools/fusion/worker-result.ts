@@ -17,6 +17,7 @@ import {
   FUSION_WORKER_OPERATOR_ONLY_MARKER,
 } from "./worker-tool-policy.js";
 import type { JudgeSummary } from "./judge.js";
+import { CHECK_OUTPUT_CHARS, tailClip } from "./contract-checks.js";
 
 /**
  * The note on a task a worker could not finish because a step needs the
@@ -219,6 +220,12 @@ export interface TaskCheckSummary {
   failed: number;
   /** The failing checks' verdicts, joined; absent when all passed. */
   detail?: string;
+  /**
+   * The failing checks' output tails (`taskCheckOutput`), whitespace
+   * kept, at most `CHECK_OUTPUT_CHARS`; absent when all passed or the
+   * runner kept none. Rendered in the row's block, never the table.
+   */
+  output?: string;
 }
 
 /**
@@ -746,6 +753,8 @@ const FINDING_CHARS = 160;
 
 /** How much of an error the head line carries; the rest is noise. */
 const ERROR_HEAD_CHARS = 400;
+/** All rows' failing-check output together, in one delegate result. */
+export const FANOUT_CHECK_OUTPUT_CHARS = 6_000;
 
 /**
  * Render the results as the tool's `summary`.
@@ -773,7 +782,21 @@ export function formatDelegateOutput(
   const table = renderStatusTable(results, extra);
   const room = Math.max(0, charCap - table.length - 4);
   const perTask = Math.max(200, Math.floor(room / results.length));
-  const blocks = results.map((r) => renderBlock(r, perTask));
+  // The failing checks' output is the most useful text a failed row
+  // carries, and the largest: a share of each block, and a budget for
+  // the fan-out, spent in task order, so eight red rows cannot crowd
+  // out the replies.
+  let outputLeft = FANOUT_CHECK_OUTPUT_CHARS;
+  const blocks = results.map((r) => {
+    const allowance = Math.min(
+      CHECK_OUTPUT_CHARS,
+      outputLeft,
+      Math.floor(perTask / 2),
+    );
+    const block = renderBlock(r, perTask, allowance);
+    outputLeft -= Math.min(allowance, r.checks?.output?.length ?? 0);
+    return block;
+  });
   const joined = [table, ...blocks].join("\n\n");
   if (joined.length <= charCap) return joined;
   return `${joined.slice(0, Math.max(0, charCap - 15))}\n… [truncated]`;
@@ -1062,7 +1085,11 @@ function oneLine(text: string, cap: number): string {
  * provider has no reply worth the space, and one that claimed work it
  * did not do has a reply that must not be read first.
  */
-function renderBlock(result: WorkerTaskResult, perTaskCap: number): string {
+function renderBlock(
+  result: WorkerTaskResult,
+  perTaskCap: number,
+  outputCap: number,
+): string {
   const head =
     `[${result.id}] ${result.status} — ${result.title} ` +
     `(${result.stepCount} steps, ${Math.round(result.durationMs / 1000)}s, ` +
@@ -1075,6 +1102,9 @@ function renderBlock(result: WorkerTaskResult, perTaskCap: number): string {
     ...(result.hint ? [`hint: ${result.hint}`] : []),
     ...(result.checks
       ? [describeChecks(result.checks, ERROR_HEAD_CHARS, result.error)]
+      : []),
+    ...(result.checks?.output !== undefined && outputCap > 40
+      ? [`check output:\n${tailClip(result.checks.output, outputCap)}`]
       : []),
     ...(result.notes ?? []).map((note) => `note: ${note}`),
   ];

@@ -11,6 +11,8 @@ import {
   inspectContractProvides,
   renderContractLine,
   runContractChecks,
+  CHECK_OUTPUT_CHARS,
+  tailClip,
   type ContractCheckRunner,
   type ContractFinding,
 } from "./contract-checks.js";
@@ -394,5 +396,70 @@ describe("renderContractLine", () => {
   it("is absent when there was nothing to report", () => {
     expect(renderContractLine({ findings: [], checks: [] })).toBeUndefined();
     expect(renderContractLine({ findings: [], checks: [], warnings: [] })).toBeUndefined();
+  });
+});
+
+describe("a failing check's output (the assertion, not the boilerplate)", () => {
+  const ctx = { workingDir: "/repo", signal: new AbortController().signal };
+  const boiler = "verify.run command: FAILED\nFAIL check `exit 0` — exit 1\nexit 1 after 812 ms";
+
+  it("keeps the head on one line and the stderr/stdout tail, whitespace kept, in `output`", async () => {
+    const noise = Array.from({ length: 200 }, (_, i) => `  ok ${i} setup step`).join("\n");
+    const stderr = `${noise}\nAssertionError: expected 3 to equal 4\n    at Object.<anonymous> (test/score.test.js:12:5)`;
+    const runner: ContractCheckRunner = async () => ({
+      ok: false,
+      results: [
+        {
+          ok: false,
+          summary: `${boiler}\nstderr (tail):\n${stderr.slice(-1500)}`,
+          stderrTail: stderr,
+          stdoutTail: "1 failing",
+        },
+      ],
+    });
+    const out = await runContractChecks([{ task: "t1", kind: "command", cmd: "npm test" }], runner, ctx);
+    const outcome = out.outcomes[0]!;
+    expect(outcome.detail).toBe("verify.run command: FAILED FAIL check `exit 0` — exit 1 exit 1 after 812 ms");
+    expect(outcome.output).toBeDefined();
+    expect(outcome.output!.length).toBeLessThanOrEqual(CHECK_OUTPUT_CHARS);
+    expect(outcome.output).toContain("AssertionError: expected 3 to equal 4\n    at Object.<anonymous> (test/score.test.js:12:5)");
+    expect(outcome.output).toMatch(/^stderr \(tail\):\n…/);
+    expect(outcome.output).toContain("stdout (tail):\n1 failing");
+    // The start of the noise is what was cut.
+    expect(outcome.output).not.toContain("ok 0 setup step");
+  });
+
+  it("falls back to the summary's own tail blocks, and carries no output on a pass or a short verdict", async () => {
+    const runner: ContractCheckRunner = async () => ({
+      ok: false,
+      results: [
+        { ok: false, summary: `${boiler}\nstdout (tail):\nTypeError: x is not a function` },
+        { ok: true, summary: "verify.run command: ok\nstdout (tail):\nall good" },
+        { ok: false, summary: "exit code 1" },
+      ],
+    });
+    const out = await runContractChecks([{ cmd: "a" }, { cmd: "b" }, { cmd: "c" }], runner, ctx);
+    expect(out.outcomes[0]).toMatchObject({
+      detail: "verify.run command: FAILED FAIL check `exit 0` — exit 1 exit 1 after 812 ms",
+      output: "stdout (tail):\nTypeError: x is not a function",
+    });
+    expect(out.outcomes[1]).not.toHaveProperty("output");
+    expect(out.outcomes[2]).toEqual({ ok: false, detail: "exit code 1" });
+  });
+
+  it("puts the failing checks' output on the row, inside one task's share however many failed", () => {
+    const long = (tag: string) => `${"x".repeat(3000)}\n${tag}`;
+    const [r] = applyCheckOutcomes(
+      [row()],
+      [
+        { task: "t1", ok: false, detail: "a failed", output: long("END-A") },
+        { task: "t1", ok: false, detail: "b failed", output: long("END-B") },
+        { task: "t1", ok: true, detail: "passed" },
+      ],
+    );
+    expect(r!.checks!.output!.length).toBeLessThanOrEqual(CHECK_OUTPUT_CHARS);
+    expect(r!.checks!.output).toContain("END-A");
+    expect(r!.checks!.output).toContain("END-B");
+    expect(tailClip("abcdef", 4)).toBe("…def");
   });
 });

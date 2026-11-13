@@ -12,6 +12,8 @@ import {
   buildAcceptanceChecklist,
   judgeTask,
   parseJudgeAnswer,
+  renderRetryFindings,
+  RETRY_OUTPUT_CHARS,
   type AcceptanceItem,
 } from "./judge.js";
 import {
@@ -347,6 +349,58 @@ describe("a node closes only on a green list (ATO-944)", () => {
     expect(d.briefs).toHaveLength(1);
     expect(d.briefs[0]).not.toContain("ACCEPTANCE CHECKLIST");
     expect((result.details.tasks as Array<{ status: string }>)[0]!.status).toBe("ok");
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe("the retry brief carries a failing check's output", () => {
+  it("quotes the output tail under the red check item, bounded", () => {
+    const items: AcceptanceItem[] = [
+      { id: "a1", kind: "check", text: "the check passes: {\"cmd\":\"npm test\"}", checkIndex: 0, judged: false },
+    ];
+    const text = renderRetryFindings(items, {
+      green: false,
+      costUsd: null,
+      items: [
+        {
+          id: "a1",
+          pass: false,
+          why: "verify.run command: FAILED exit 1 after 9 ms",
+          by: "fact",
+          output: `${"z".repeat(5000)}\nAssertionError: expected 3 to equal 4`,
+        },
+      ],
+    });
+    expect(text).toContain("[a1] the check passes");
+    expect(text).toContain("  output:\n");
+    expect(text).toContain("    AssertionError: expected 3 to equal 4");
+    expect((text.match(/z/g) ?? []).length).toBeLessThanOrEqual(RETRY_OUTPUT_CHARS);
+  });
+
+  it("reaches the retried worker's brief from a real failing check", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "judge-out-"));
+    const d = deps(dir, answer([{ id: "a3", pass: true }]), {
+      runChecks: async () => ({
+        ok: false,
+        results: [
+          {
+            ok: false,
+            summary: "verify.run command: FAILED\nexit 1 after 5 ms\nstderr (tail):\nError: score is NaN\n    at hud.js:3:9",
+            stderrTail: "Error: score is NaN\n    at hud.js:3:9",
+          },
+        ],
+      }),
+    });
+    await buildFusionDelegateTool(d).run(
+      {
+        tasks: TASK,
+        contract: { checks: [{ task: "t", kind: "command", cmd: "node hud.js" }] },
+      },
+      { workingDir: dir, sessionId: "s-p", stepIndex: 0, signal: new AbortController().signal },
+    );
+    const retry = d.briefs.find((b) => b.includes("A judge found these acceptance items NOT met"));
+    expect(retry).toBeDefined();
+    expect(retry).toContain("    Error: score is NaN\n        at hud.js:3:9");
     rmSync(dir, { recursive: true, force: true });
   });
 });

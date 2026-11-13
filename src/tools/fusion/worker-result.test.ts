@@ -16,6 +16,7 @@ import {
   deliveredNothing,
   fanoutSpend,
   formatDelegateOutput,
+  FANOUT_CHECK_OUTPUT_CHARS,
   formatWaitMs,
   queuedWorkerHint,
   readSlotOccupancy,
@@ -1105,5 +1106,36 @@ describe("unservedWorkerHint", () => {
     expect(
       unservedWorkerHint(unserved({ status: "queued" }), true),
     ).toBeUndefined();
+  });
+});
+
+describe("formatDelegateOutput — a failing check's output", () => {
+  const failed = (id: string, output: string) =>
+    row({
+      id,
+      status: "failed",
+      error: "checks: verify.run command: FAILED",
+      checks: { total: 1, failed: 1, detail: "verify.run command: FAILED", output },
+    });
+
+  it("puts the output in the row's block, whitespace kept, and keeps the table line to one line", () => {
+    const out = formatDelegateOutput(
+      [failed("t1", "stderr (tail):\nAssertionError: 3 !== 4\n    at score.test.js:12:5")],
+      8000,
+    );
+    const table = out.split("\n\n")[0]!;
+    expect(table).not.toContain("AssertionError");
+    expect(out).toContain("check output:\nstderr (tail):\nAssertionError: 3 !== 4\n    at score.test.js:12:5");
+  });
+
+  it("bounds the output per task and across the fan-out", () => {
+    const rows = Array.from({ length: 8 }, (_, i) => failed(`t${i}`, `${"y".repeat(1400)}\nEND-${i}`));
+    const out = formatDelegateOutput(rows, 200_000);
+    const shown = out.split("check output:\n").length - 1;
+    const ys = (out.match(/y/g) ?? []).length;
+    expect(ys).toBeLessThanOrEqual(FANOUT_CHECK_OUTPUT_CHARS);
+    // The first rows keep their tails; the budget runs out before the last.
+    expect(out).toContain("END-0");
+    expect(shown).toBeLessThan(8);
   });
 });

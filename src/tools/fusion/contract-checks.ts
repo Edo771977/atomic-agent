@@ -40,6 +40,13 @@ export interface ContractCheckResult {
   ok: boolean;
   summary?: string;
   error?: string;
+  /**
+   * The command's output tails, as `verify.run` keeps them. Where the
+   * assertion and the stack trace are; the summary's head is
+   * boilerplate ("verify.run command: FAILED", "exit 1 after N ms").
+   */
+  stderrTail?: string;
+  stdoutTail?: string;
 }
 
 /**
@@ -56,8 +63,14 @@ export interface ContractCheckOutcome {
   /** The task the check was attributed to; absent for a call-level check. */
   task?: string;
   ok: boolean;
-  /** The runner's summary or error, head only. */
+  /** The runner's summary or error, head only, on one line. */
   detail: string;
+  /**
+   * A failing check's output tail (stderr, then stdout), whitespace
+   * kept, at most `CHECK_OUTPUT_CHARS` — what a worker fixes from.
+   * Absent on a pass and when the head already said everything.
+   */
+  output?: string;
 }
 
 /**
@@ -91,6 +104,14 @@ export interface ContractReport {
 const MAX_SEARCHED_FILE_BYTES = 8 * 1024 * 1024;
 /** How much of a check's verdict a row carries. */
 const CHECK_DETAIL_CHARS = 400;
+/**
+ * How much of a failing check's output travels with it, and with each
+ * task's row: enough for an assertion and the top of a stack trace.
+ * Tail-biased — the end of a test run is where the failure is.
+ */
+export const CHECK_OUTPUT_CHARS = 1_500;
+/** Where `verify.run`'s summary starts its output tails. */
+const TAIL_MARKER = /\n(?:stderr|stdout) \(tail\):\n/;
 /** Bound on the `contract:` line of the status table. */
 const CONTRACT_LINE_CHARS = 1200;
 
@@ -285,6 +306,44 @@ function head(text: string, cap: number): string {
   return flat.length > cap ? `${flat.slice(0, cap)}…` : flat;
 }
 
+/** The last `cap` chars of `text`, marked when cut; whitespace kept. */
+export function tailClip(text: string, cap: number): string {
+  if (text.length <= cap) return text;
+  if (cap <= 1) return "…";
+  return `…${text.slice(-(cap - 1))}`;
+}
+
+function labelled(label: string, text: string, cap: number): string {
+  const prefix = `${label} (tail):\n`;
+  return `${prefix}${tailClip(text, Math.max(1, cap - prefix.length))}`;
+}
+
+/**
+ * A failing check's output, bounded: the runner's stderr and stdout
+ * tails when it kept them (stderr gets the larger share — it is where a
+ * runtime puts the failure), else whatever of its summary the one-line
+ * head could not hold.
+ */
+function checkOutput(result: ContractCheckResult, headText: string): string | undefined {
+  const stderr = result.stderrTail?.trim() ? result.stderrTail.trimEnd() : undefined;
+  const stdout = result.stdoutTail?.trim() ? result.stdoutTail.trimEnd() : undefined;
+  if (stderr !== undefined || stdout !== undefined) {
+    if (stderr === undefined) return labelled("stdout", stdout!, CHECK_OUTPUT_CHARS);
+    if (stdout === undefined) return labelled("stderr", stderr, CHECK_OUTPUT_CHARS);
+    const outCap = Math.min(stdout.length + 20, Math.floor(CHECK_OUTPUT_CHARS / 3));
+    const errBlock = labelled("stderr", stderr, CHECK_OUTPUT_CHARS - outCap - 1);
+    const outBlock = labelled("stdout", stdout, CHECK_OUTPUT_CHARS - errBlock.length - 1);
+    return `${errBlock}\n${outBlock}`;
+  }
+  const text = result.error ?? result.summary;
+  if (text === undefined) return undefined;
+  const at = text.search(TAIL_MARKER);
+  if (at >= 0) return tailClip(text.slice(at + 1).trimEnd(), CHECK_OUTPUT_CHARS);
+  // No tails: only what the head had to cut is worth repeating.
+  if (headText.replace(/\s+/g, " ").trim().length <= CHECK_DETAIL_CHARS) return undefined;
+  return tailClip(text.trim(), CHECK_OUTPUT_CHARS);
+}
+
 /**
  * Run the contract's checks through the wired runner. Never throws and
  * never invents a pass: no runner, an aborted turn or a runner that
@@ -322,13 +381,31 @@ export async function runContractChecks(
     if (result === undefined) {
       return { ...task, ok: false, detail: "the runner returned no result" };
     }
-    const detail = head(
-      result.error ?? result.summary ?? (result.ok ? "passed" : "failed"),
-      CHECK_DETAIL_CHARS,
-    );
-    return { ...task, ok: result.ok, detail };
+    // The head is the summary before its output tails, on one line;
+    // the tails ride separately, whitespace kept, so the assertion is
+    // not lost behind "verify.run command: FAILED … exit 1 after N ms".
+    const text = result.error ?? result.summary ?? (result.ok ? "passed" : "failed");
+    const at = text.search(TAIL_MARKER);
+    const headText = at >= 0 ? text.slice(0, at) : text;
+    const detail = head(headText, CHECK_DETAIL_CHARS);
+    const output = result.ok ? undefined : checkOutput(result, headText);
+    return { ...task, ok: result.ok, detail, ...(output === undefined ? {} : { output }) };
   });
   return { outcomes };
+}
+
+/**
+ * The failing checks' output for one task, inside `CHECK_OUTPUT_CHARS`
+ * however many failed: each gets an equal share, its own tail kept.
+ */
+export function taskCheckOutput(
+  failed: readonly ContractCheckOutcome[],
+): string | undefined {
+  const outputs = failed.flatMap((o) => (o.output === undefined ? [] : [o.output]));
+  if (outputs.length === 0) return undefined;
+  if (outputs.length === 1) return tailClip(outputs[0]!, CHECK_OUTPUT_CHARS);
+  const share = Math.floor(CHECK_OUTPUT_CHARS / outputs.length) - 1;
+  return outputs.map((o) => tailClip(o, share)).join("\n");
 }
 
 /**
@@ -348,10 +425,12 @@ export function applyCheckOutcomes(
     const failed = own.filter((o) => !o.ok);
     const detail =
       failed.length > 0 ? failed.map((o) => o.detail).join("; ") : undefined;
+    const output = taskCheckOutput(failed);
     const checks = {
       total: own.length,
       failed: failed.length,
       ...(detail === undefined ? {} : { detail }),
+      ...(output === undefined ? {} : { output }),
     };
     if (failed.length === 0 || result.status === "cancelled") {
       return { ...result, checks };
