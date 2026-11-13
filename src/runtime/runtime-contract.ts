@@ -459,6 +459,8 @@ export interface AgentRuntime {
       reasoningEffort?: ReasoningEffort;
       /** See `RunTurnOptions.maxOutputTokens` — a fusion worker's cap. */
       maxOutputTokens?: number;
+      /** See `RunTurnOptions.reasoningBudgetTokens` — a local fusion worker's bound. */
+      reasoningBudgetTokens?: number;
       /**
        * A person is watching this chat and can answer a question (the
        * TUI's chat, the desktop's): the turn asks before restarting a
@@ -523,6 +525,7 @@ export interface AgentRuntime {
       toolRole?: ToolRole;
       reasoningEffort?: ReasoningEffort;
       maxOutputTokens?: number;
+      reasoningBudgetTokens?: number;
       /** See `runTurn`'s `interactive`. */
       interactive?: boolean;
       /** See `runTurn`'s `checkpoint`. */

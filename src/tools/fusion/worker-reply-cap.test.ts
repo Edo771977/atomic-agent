@@ -67,12 +67,17 @@ const SERVED: AgentLoopEvent = {
   event: { type: "reasoning_delta", stepIndex: 0, text: "…" },
 };
 
-/** A finished completion that generated `predictedTokens`. */
-function completed(predictedTokens: number): AgentLoopEvent {
+/**
+ * A finished completion that generated `predictedTokens`; with
+ * `reasoningBoundTokens`, as the step reports one whose request carried
+ * the turn's think-block bound.
+ */
+function completed(predictedTokens: number, reasoningBoundTokens?: number): AgentLoopEvent {
   return {
     type: "llm_event",
     event: {
       type: "llm_completed",
+      ...(reasoningBoundTokens === undefined ? {} : { reasoningBoundTokens }),
       completion: {
         content: "",
         reasoningContent: "",
@@ -248,6 +253,51 @@ describe("a local worker's reply cap follows its time limit (ATO-214)", () => {
     // The loop's own time-limit note is still there, after it.
     expect(result!.notes?.slice(1).join(" ")).toMatch(/time limit/);
     expect(result!.hint).toMatch(/longer timeoutMs/);
+    expect(result!.hint).toMatch(/lower the worker reasoning effort$/);
+  });
+
+  /** A local worker whose first answer is cut; `bound` is what the step reported. */
+  async function cutOnLocalLeg(bound: number | undefined) {
+    const { deps, calls } = harness(
+      (options) =>
+        new Promise<RunTurnResult>((resolve) => {
+          options.eventHook?.({ type: "turn_started", turnIndex: 0 });
+          options.eventHook?.(SERVED);
+          options.eventHook?.(completed(WORKER_REPLY_CAP_FLOOR_TOKENS, bound));
+          options.signal!.addEventListener(
+            "abort",
+            () => resolve(turnResult({ reason: "cancelled", stepCount: 0 })),
+            { once: true },
+          );
+        }),
+    );
+    const [result] = await runWorkerTasks(deps, {
+      ...BASE,
+      workerTimeoutMs: 40,
+      localTokensPerSecond: 4,
+      localLeg: true,
+      workerReasoning: "high",
+      workerMaxOutputTokens: 16_384,
+      signal: new AbortController().signal,
+    });
+    expect(calls[0]!.options.reasoningBudgetTokens).toBe(4096);
+    expect(result).toMatchObject({ status: "timeout", stepCount: 0 });
+    return result!;
+  }
+
+  it("names the setting that bounds the worker's thinking, and the bound, when the step applied it", async () => {
+    const result = await cutOnLocalLeg(4096);
+    expect(result.hint).toMatch(
+      /or lower llm\.runMode\.fusion\.workerReasoning \(here it bounds each step's thinking, now 4096 tokens\)$/,
+    );
+  });
+
+  it("keeps the generic wording on a local leg whose request carried no bound (no think prelude)", async () => {
+    // A plain-instruct profile, a native-tools local link or a fallback to
+    // a cloud link: the turn asked for 4,096 but nothing was bounded.
+    const result = await cutOnLocalLeg(undefined);
+    expect(result.hint).toMatch(/lower the worker reasoning effort$/);
+    expect(result.hint).not.toMatch(/bounds each step's thinking/);
   });
 
   it("adds the same account beside the error when the cut answer fails the turn", async () => {

@@ -129,10 +129,10 @@ describe("runtime turn ownership recipes", () => {
     fixture.config.agent.maxSteps = 10;
     const abort = new AbortController();
     const filter = () => true;
-    await fixture.service.executeTurn(session(), "request", { maxSteps: 17, taskMaxDurationMs: 200, reasoningEffort: "high", maxOutputTokens: 99, toolFilter: filter, signal: abort.signal });
+    await fixture.service.executeTurn(session(), "request", { maxSteps: 17, taskMaxDurationMs: 200, reasoningEffort: "high", maxOutputTokens: 99, reasoningBudgetTokens: 512, toolFilter: filter, signal: abort.signal });
     const options = fixture.loop.runTurn.mock.calls[0]?.[1];
-    expect(options).toMatchObject({ maxSteps: 10, taskMaxSteps: 17, taskMaxDurationMs: 200, reasoningEffort: "high", maxOutputTokens: 99, toolFilter: filter, signal: abort.signal });
-    expect(Object.keys(options ?? {})).toEqual(["userMessage", "modelModePolicy", "originalRequest", "reasoningEffort", "maxOutputTokens", "maxSteps", "taskMaxSteps", "taskMaxDurationMs", "toolFilter", "signal", "onStepCheckpoint"]);
+    expect(options).toMatchObject({ maxSteps: 10, taskMaxSteps: 17, taskMaxDurationMs: 200, reasoningEffort: "high", maxOutputTokens: 99, reasoningBudgetTokens: 512, toolFilter: filter, signal: abort.signal });
+    expect(Object.keys(options ?? {})).toEqual(["userMessage", "modelModePolicy", "originalRequest", "reasoningEffort", "maxOutputTokens", "reasoningBudgetTokens", "maxSteps", "taskMaxSteps", "taskMaxDurationMs", "toolFilter", "signal", "onStepCheckpoint"]);
     await fixture.service.executeTurn(session("other"), "request");
     expect(fixture.loop.runTurn.mock.calls[1]?.[1]).not.toHaveProperty("taskMaxSteps");
   });
