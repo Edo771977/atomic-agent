@@ -199,12 +199,14 @@ function orchestratorStats(turns: TurnOutcomeRecord[]): OrchestratorStats {
   const priced = turns.filter((t) => t.orchestrator.costUsd !== null);
   // A turn whose requests were unpriced is unpriced, even when its judge
   // or escalation calls were priced.
-  const unpriced = turns.filter(
-    (t) =>
+  const unpriced = turns.filter((t) => {
+    // A record without the split field: its total is all it has.
+    const requests = (t.orchestrator as { requestCostUsd?: number | null }).requestCostUsd;
+    return (
       t.orchestrator.requests > 0 &&
-      // A record without the split field: its total is all it has.
-      ("requestCostUsd" in t.orchestrator ? t.orchestrator.requestCostUsd : t.orchestrator.costUsd) === null,
-  );
+      (requests === undefined ? t.orchestrator.costUsd : requests) === null
+    );
+  });
   return {
     provider: turns[0]!.orchestrator.provider,
     models: [...new Set(turns.map((t) => t.orchestrator.model))],
