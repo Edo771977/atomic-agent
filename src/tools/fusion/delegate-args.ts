@@ -160,6 +160,37 @@ export const MAX_TASK_FILES = 32;
  */
 export const MAX_REPORTED_PROBLEMS = 32;
 
+/**
+ * Output files past which a task on a local worker draws a warning
+ * (`localTaskSizeWarnings`). A small local model with a small context
+ * does one file or one function well; a task declaring four or more is
+ * where such workers ran out of cap, context or steps halfway through.
+ * A warning, never a refusal: the orchestrator may know the files are
+ * tiny, and a refused call costs a whole regeneration.
+ */
+export const LOCAL_TASK_FILES_WARN_ABOVE = 3;
+
+/**
+ * One line per task that will run on a local worker and declares more
+ * than {@link LOCAL_TASK_FILES_WARN_ABOVE} files, for the tool result.
+ * `isLocal` says which leg a task runs on (a role model may move it off
+ * the worker leg), so the caller decides after resolving the legs.
+ */
+export function localTaskSizeWarnings(
+  tasks: readonly DelegateTask[],
+  isLocal: (task: DelegateTask) => boolean,
+): string[] {
+  const out: string[] = [];
+  for (const task of tasks) {
+    const files = task.files?.length ?? 0;
+    if (files <= LOCAL_TASK_FILES_WARN_ABOVE || !isLocal(task)) continue;
+    out.push(
+      `task "${task.id}" declares ${files} files for a local worker; a small local model does best with one file or one function per task — split it next time if it stalls or comes back half done`,
+    );
+  }
+  return out;
+}
+
 /** `8436` → `"8,436"`: the number the orchestrator has to act on, readable. */
 function formatCount(n: number): string {
   return n.toLocaleString("en-US");

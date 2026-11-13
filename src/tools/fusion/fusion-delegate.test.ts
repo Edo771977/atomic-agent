@@ -1992,3 +1992,31 @@ describe("scopeInsideStateDir (ATO-1267)", () => {
     expect(scopeInsideStateDir(["/home/u/.atomic-agent"], undefined)).toEqual([]);
   });
 });
+
+describe("fusion.delegate — task size on a local leg", () => {
+  const BIG = {
+    id: "big",
+    instructions: "Write the four modules.",
+    files: ["src/a.ts", "src/b.ts", "src/c.ts", "src/d.ts"],
+  };
+
+  it("warns, never refuses, when a local task declares more than three files", async () => {
+    const result = await buildFusionDelegateTool(deps()).run(
+      { tasks: [BIG, { id: "small", instructions: "x", files: ["src/e.ts"] }] },
+      ctx(),
+    );
+    expect(result.details.tasks).toHaveLength(2);
+    expect(result.details.sizeWarnings).toEqual([
+      'task "big" declares 4 files for a local worker; a small local model does best with one file or one function per task — split it next time if it stalls or comes back half done',
+    ]);
+    expect(result.summary).toContain('Warning: task "big" declares 4 files for a local worker');
+  });
+
+  it("says nothing on a cloud leg", async () => {
+    const result = await buildFusionDelegateTool(
+      deps({ workerSupportsSlotAffinity: () => false }),
+    ).run({ tasks: [BIG] }, ctx());
+    expect(result.details.sizeWarnings).toBeUndefined();
+    expect(result.summary).not.toContain("for a local worker");
+  });
+});

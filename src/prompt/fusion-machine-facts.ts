@@ -37,6 +37,7 @@ import {
 } from "../config/llm-run-mode-config.js";
 import {
   resolveWorkerSlots,
+  workerReplyAllowance,
   workerSlotFootprint,
 } from "../local-llm/server/worker-slots.js";
 
@@ -83,6 +84,38 @@ export interface FusionMachineFacts {
    * only, like every other field here: stable for the prefix.
    */
   roleModels?: readonly { role: FusionRole; model: string }[];
+  /**
+   * How many new lines one local worker's answer can hold
+   * (`workerMaxNewLines`), the size the `### fusion` block tells the
+   * orchestrator to cut local tasks to. Local leg only; absent for a
+   * cloud leg or an unknown one, which keep the "a big one per worker"
+   * line byte for byte.
+   */
+  workerMaxNewLines?: number;
+}
+
+/**
+ * Completion tokens one new line of a worker's output costs, on the
+ * worker's own cap: ~12 tokens for a line of code, doubled for the
+ * reasoning, JSON escaping and tool-call framing the same completion
+ * carries. A small model writing a whole file in one `os.fs.write`
+ * that runs past its cap loses the file, not just its tail.
+ */
+export const WORKER_TOKENS_PER_NEW_LINE = 25;
+
+/** The least a task is ever sized to: below it the guidance says nothing useful. */
+export const MIN_WORKER_NEW_LINES = 50;
+
+/**
+ * The new lines one local worker can write in one answer: its
+ * completion cap over {@link WORKER_TOKENS_PER_NEW_LINE}, rounded down
+ * to a multiple of 50 so the stated number reads as the estimate it is
+ * (16,384 tokens → 650 lines, 8,192 → 300, 4,096 → 150), never below
+ * {@link MIN_WORKER_NEW_LINES}.
+ */
+export function workerMaxNewLines(completionCapTokens: number): number {
+  const lines = Math.floor(completionCapTokens / WORKER_TOKENS_PER_NEW_LINE);
+  return Math.max(MIN_WORKER_NEW_LINES, Math.floor(lines / 50) * 50);
 }
 
 /** Nothing known — the block renders its behavioural lines only. */
@@ -266,6 +299,15 @@ export function resolveFusionMachineFacts(
   const workerTokenBudget = workersAreLocal
     ? workerSlotFootprint(local.completionMaxTokens)
     : null;
+  // The cap a local worker is actually sent (`fusion-delegate.ts`): the
+  // operator's `workerMaxOutputTokens`, else the reply allowance the
+  // pool was divided by. Config only, so stable for the prefix.
+  const newLines = workersAreLocal
+    ? workerMaxNewLines(
+        fusion?.workerMaxOutputTokens ??
+          workerReplyAllowance(local.completionMaxTokens),
+      )
+    : null;
 
   // Same chain `resolveRunMode` uses for its worker label, minus the
   // resolver: the explicit pin, then — for a local leg — the managed
@@ -323,6 +365,7 @@ export function resolveFusionMachineFacts(
     workerModel,
     tokensPerSecond,
     ...(roleModels.length === 0 ? {} : { roleModels }),
+    ...(newLines === null ? {} : { workerMaxNewLines: newLines }),
   };
 }
 

@@ -16,7 +16,7 @@ import { DEFAULT_FUSION_CLOUD_WORKERS } from "../../config/llm-run-mode-config.j
 import { getConfig } from "../../config/index.js";
 import { workerReplyAllowance } from "../../local-llm/server/worker-slots.js";
 import type { ToolDefinition } from "../tool-registry.js";
-import { parseDelegateArgs } from "./delegate-args.js";
+import { localTaskSizeWarnings, parseDelegateArgs } from "./delegate-args.js";
 import {
   applyCheckOutcomes,
   applyContractFindings,
@@ -269,7 +269,7 @@ export function buildFusionDelegateTool(
   return {
     name: FUSION_DELEGATE_TOOL,
     description:
-      "Delegate independent parts of the work to local worker agents that run concurrently. You choose how many run at once with `maxWorkers`. A task that needs more room than the default can say so with `maxSteps` / `timeoutMs`; both are clamped to a multiple of the configured default and the result tells you when that happened. An optional `contract` (owners, provides, requires, checks) is prepended to every brief and checked after the fan-out. Give each `provides` entry a one-line `shape` (a signature, a return shape, what a field means): it is pasted into the brief of every worker that relies on it, and matching names is not matching meaning. Args: { tasks: [{ id, instructions, title?, deliverable?, files?, maxSteps?, timeoutMs? }], maxWorkers?, contract? }. To continue a run cut off by a restart: { resume: runId, confirm?: [taskId] } and nothing else.",
+      "Delegate independent parts of the work to worker agents that run concurrently. You choose how many run at once with `maxWorkers`. A task that needs more room than the default can say so with `maxSteps` / `timeoutMs`; both are clamped to a multiple of the configured default and the result tells you when that happened. An optional `contract` (owners, provides, requires, checks) is prepended to every brief and checked after the fan-out. Give each `provides` entry a one-line `shape` (a signature, a return shape, what a field means): it is pasted into the brief of every worker that relies on it, and matching names is not matching meaning. Args: { tasks: [{ id, instructions, title?, deliverable?, files?, etaSeconds?, maxSteps?, timeoutMs?, role?, model? }] (1..16), maxWorkers?, contract? }. To continue a run cut off by a restart: { resume: runId, confirm?: [taskId] } and nothing else.",
     readonly: false,
     async run(rawArgs, ctx): Promise<CompressedToolResult> {
       if (isFusionWorkerSessionId(ctx.sessionId)) {
@@ -333,6 +333,13 @@ export function buildFusionDelegateTool(
         return error(modelProblem, { field: "tasks", reason: "unknown-model" });
       }
       const taskLegs = resolveTaskLegs(parsed.tasks, workerLegRef, mode.roles);
+      // Tasks sized past what a small local worker does well: run as
+      // asked, and said so on the result, never refused.
+      const sizeWarnings = localTaskSizeWarnings(parsed.tasks, (t) =>
+        deps.workerSupportsSlotAffinity(
+          taskLegs.get(t.id)?.providerId ?? workerProviderId,
+        ),
+      );
       // The legs other than the worker leg, one per provider.
       const roleLegs = new Map<string, TaskLeg>();
       for (const leg of taskLegs.values()) {
@@ -1593,7 +1600,11 @@ export function buildFusionDelegateTool(
             roleSpendUsd > 0
               ? `\n\nRole models cost ${formatUsd(roleSpendUsd)} this fan-out.`
               : ""
-          }${treeNote}${replan === undefined ? "" : renderReplanBlock(replan)}${renderMergeBlock(merges)}${resumeNote}${budgetNote}${breakerNote}`,
+          }${treeNote}${replan === undefined ? "" : renderReplanBlock(replan)}${renderMergeBlock(merges)}${resumeNote}${budgetNote}${breakerNote}${
+            sizeWarnings.length === 0
+              ? ""
+              : `\n\nWarning: ${sizeWarnings.join("; ")}.`
+          }`,
           details: {
             tasks: results,
             outcome,
@@ -1614,6 +1625,7 @@ export function buildFusionDelegateTool(
               ? {}
               : { replan }),
             ...(treeReport === undefined ? {} : { taskTree: treeReport }),
+            ...(sizeWarnings.length === 0 ? {} : { sizeWarnings }),
             ...(run === undefined ? {} : { runId: run.runId }),
             ...(resume === undefined
               ? {}

@@ -661,6 +661,9 @@ const DEFAULT_TOOL_ARGS_SCHEMAS: ReadonlyMap<string, Schema> = new Map<
               instructions: stringSchema,
               deliverable: stringSchema,
               files: { ...stringArraySchema, maxItems: 32 },
+              // Advisory (`readEtaSeconds`): an unusable value is
+              // dropped by the parser, never refused, so no bounds.
+              etaSeconds: numberSchema,
               // Per-task budgets. No upper bound here: the runner
               // clamps them to a multiple of the configured default and
               // says so in the result, because a number too big is the
