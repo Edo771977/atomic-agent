@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, posix, win32 } from "node:path";
 import type { ToolDefinition } from "../../tool-registry.js";
 import { OS_FS_MOVE_CONTRACT, parseMoveArgs } from "./fs-move-contract.js";
 import {
@@ -11,6 +11,7 @@ import {
   type PlannedMove,
 } from "./fs-move-plan.js";
 import { formatBytes, readPriorFile } from "./fs-replace-guard.js";
+import { inputPathIdentity } from "./fs-input-path-identity.js";
 import { RESTORE_MAX_BYTES } from "./fs-restore-store.js";
 import {
   requireFsApproval,
@@ -57,14 +58,7 @@ export function buildOsFsMoveTool(
       // A worker's declared inputs are never replaced (`fs-input-guard.ts`);
       // moving one away or onto one would lose it just the same.
       const declared = options.declaredInputs?.inputsOf(ctx.sessionId) ?? [];
-      const touched = declared.find((input) =>
-        plan.some(
-          (m) =>
-            m.source === input ||
-            m.dest === input ||
-            (m.folder && isStrictlyInside(m.source, input)),
-        ),
-      );
+      const touched = declaredInputTouched(plan, declared);
       if (touched !== undefined) {
         throw new Error(
           `os.fs.move: \`${touched}\` is an input of this task; it is not moved or replaced — copy what you need with os.fs.write instead`,
@@ -120,6 +114,31 @@ export function buildOsFsMoveTool(
       return okResult(done, notes);
     },
   };
+}
+
+/** The first declared input a move takes away, lands on, or carries inside a moved folder. */
+export function declaredInputTouched(
+  plan: readonly Pick<PlannedMove, "source" | "dest" | "folder">[],
+  declared: readonly string[],
+  platform: NodeJS.Platform = process.platform,
+): string | undefined {
+  // The same lexical identity as os.fs.write's guard: on Windows a case or
+  // separator variant of an input names the same file.
+  const id = (path: string) => inputPathIdentity(path, platform);
+  const { relative, isAbsolute } = platform === "win32" ? win32 : posix;
+  const inside = (parent: string, child: string) => {
+    const rel = relative(parent, child);
+    return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
+  };
+  return declared.find((input) => {
+    const target = id(input);
+    return plan.some(
+      (m) =>
+        id(m.source) === target ||
+        id(m.dest) === target ||
+        (m.folder && inside(id(m.source), target)),
+    );
+  });
 }
 
 async function moveOne(move: PlannedMove, fs: MoveFs): Promise<Moved> {

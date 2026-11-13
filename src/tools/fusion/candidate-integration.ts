@@ -1,12 +1,12 @@
 import { createHash, randomBytes } from "node:crypto";
-import { createReadStream } from "node:fs";
+import { createReadStream, type Stats } from "node:fs";
 import { chmod, copyFile, lstat, mkdir, opendir, readlink, rename, rm, rmdir, symlink } from "node:fs/promises";
 import { dirname, join, relative, sep } from "node:path";
 import { isInside } from "../../approval/fanout-scope.js";
 import { resolveUserPath } from "../os/expand-home.js";
 import { inputPathIdentity } from "../os/fs/fs-input-path-identity.js";
 import { VERIFY_COPY_EXCLUDED, VERIFY_COPY_MAX_BYTES } from "../verify/verify-workspace-copy.js";
-import { createBranchSet, BRANCH_MERGE_DIR, ensureMergeDir, type BranchWorkspace, type CreateBranchSetOptions } from "./branch-workspace.js";
+import { createBranchSet, defaultGitExec, BRANCH_MERGE_DIR, ensureMergeDir, type BranchSet, type BranchWorkspace, type CreateBranchSetOptions, type GitExec } from "./branch-workspace.js";
 import { workspaceChanges, writeTaskPatch, type SavedTaskPatch } from "./branch-diff.js";
 import { resolveContractInputs } from "./contract-inputs.js";
 import { inspectContractProvides, runContractChecks, type ContractCheckRunner, type ContractReport } from "./contract-checks.js";
@@ -46,8 +46,27 @@ async function fileHash(path: string, bounds: InventoryBounds): Promise<string> 
   }
   return hash.digest("hex");
 }
-async function inventory(root: string, workspace: BranchWorkspace, bounds: InventoryBounds): Promise<Inventory> {
+/**
+ * Tracked paths of the snapshot and every ancestor directory. Git ignore
+ * rules and the dependency/build folder names never apply to these: the
+ * candidate copy carries every tracked file, so promotion must too.
+ */
+async function trackedPaths(set: BranchSet, git: GitExec): Promise<ReadonlySet<string>> {
+  if (set.method !== "worktree") return new Set();
+  const listed = await git(["ls-files", "--cached", "-z"], set.baseDir);
+  if (listed === null || listed.exitCode !== 0 || listed.timedOut || listed.truncated) throw new Error("Git could not list the candidate's tracked paths");
+  const out = new Set<string>();
+  for (const path of listed.stdout.split("\0").filter(Boolean)) {
+    for (let entry = path.split("/").join(sep); entry !== "." && !out.has(entry); entry = dirname(entry)) out.add(entry);
+  }
+  return out;
+}
+/** The project's own agent state (approval rules, merge artifacts): never promoted from a candidate. */
+const AGENT_STATE_DIR = dirname(BRANCH_MERGE_DIR);
+const isAgentState = (rel: string): boolean => rel === AGENT_STATE_DIR || rel.startsWith(`${AGENT_STATE_DIR}${sep}`);
+async function inventory(root: string, workspace: BranchWorkspace, tracked: ReadonlySet<string>, bounds: InventoryBounds): Promise<Inventory> {
   const out: Inventory = new Map();
+  const leaves: { rel: string; info: Stats }[] = [];
   const walk = async (dir: string): Promise<void> => {
     bounds.signal?.throwIfAborted();
     const entries = [];
@@ -60,21 +79,36 @@ async function inventory(root: string, workspace: BranchWorkspace, bounds: Inven
     const ignored = await workspace.directoryIgnorePolicy?.(dirs, bounds.signal);
     for (const item of entries) {
       const rel = join(dir, item.name);
-      if (VERIFY_COPY_EXCLUDED.has(item.name) || rel === BRANCH_MERGE_DIR || rel.startsWith(`${BRANCH_MERGE_DIR}${sep}`) || workspace.excludedDirectories?.has(rel) || ignored?.has(rel)) continue;
+      if (item.name === ".git" || rel === BRANCH_MERGE_DIR || rel.startsWith(`${BRANCH_MERGE_DIR}${sep}`)) continue;
+      // Disposable dependency/build/ignored folders, unless they hold tracked paths.
+      if ((VERIFY_COPY_EXCLUDED.has(item.name) || workspace.excludedDirectories?.has(rel) || ignored?.has(rel)) && !tracked.has(rel)) continue;
       bounds.signal?.throwIfAborted();
       if (--bounds.entries < 0) throw new Error("candidate inventory entry limit exceeded");
-      const path = join(root, rel); const info = await lstat(path);
-      if (info.isDirectory()) { out.set(rel, { kind: "directory", mode: info.mode & 0o777 }); await walk(rel); }
-      else if (info.isSymbolicLink()) out.set(rel, { kind: "symlink", mode: 0, hash: createHash("sha256").update(await readlink(path)).digest("hex") });
-      else if (info.isFile()) {
-        if (info.size > bounds.bytes) throw new Error("candidate inventory byte limit exceeded");
-        const hash = await fileHash(path, bounds); const after = await lstat(path);
-        if (!after.isFile() || after.size !== info.size || after.mtimeMs !== info.mtimeMs || after.ctimeMs !== info.ctimeMs) throw new Error(`file changed while snapshotting: ${rel}`);
-        out.set(rel, { kind: "file", mode: info.mode & 0o777, hash });
-      } else throw new Error(`unsupported candidate entry: ${rel}`);
+      const info = await lstat(join(root, rel));
+      if (info.isDirectory()) {
+        // The state folder itself may appear only to hold merge artifacts; its contents are inventoried.
+        if (rel !== AGENT_STATE_DIR) out.set(rel, { kind: "directory", mode: info.mode & 0o777 });
+        await walk(rel);
+      } else if (info.isSymbolicLink() || info.isFile()) leaves.push({ rel, info });
+      else throw new Error(`unsupported candidate entry: ${rel}`);
     }
   };
-  await walk(""); return out;
+  await walk("");
+  // Ignored standalone files (.env, logs) are private to the candidate: never
+  // compared or promoted. Ignore rules never apply to tracked paths.
+  const untracked = leaves.filter(leaf => !tracked.has(leaf.rel)).map(leaf => leaf.rel);
+  const ignoredFiles = untracked.length === 0 ? undefined : await workspace.directoryIgnorePolicy?.(untracked, bounds.signal);
+  for (const { rel, info } of leaves) {
+    if (ignoredFiles?.has(rel) === true) continue;
+    bounds.signal?.throwIfAborted();
+    const path = join(root, rel);
+    if (info.isSymbolicLink()) { out.set(rel, { kind: "symlink", mode: 0, hash: createHash("sha256").update(await readlink(path)).digest("hex") }); continue; }
+    if (info.size > bounds.bytes) throw new Error("candidate inventory byte limit exceeded");
+    const hash = await fileHash(path, bounds); const after = await lstat(path);
+    if (!after.isFile() || after.size !== info.size || after.mtimeMs !== info.mtimeMs || after.ctimeMs !== info.ctimeMs) throw new Error(`file changed while snapshotting: ${rel}`);
+    out.set(rel, { kind: "file", mode: info.mode & 0o777, hash });
+  }
+  return out;
 }
 function differences(a: Inventory, b: Inventory): string[] {
   return [...new Set([...a.keys(), ...b.keys()])].filter(path => !equal(a.get(path), b.get(path))).sort();
@@ -123,7 +157,9 @@ export async function createCandidateIntegration(
   const set = await createBranchSet(realDir, [id], { ...options, signal: setupSignal });
   if (set === null) throw new Error("candidate workspace unavailable: private copies exceed the copy limit");
   const workspace = set.workspaces.get(id)!;
-  const snapshot = (root: string, signal?: AbortSignal): Promise<Inventory> => inventory(root, workspace, { bytes: options.maxInventoryBytes ?? options.maxCopyBytes ?? VERIFY_COPY_MAX_BYTES, entries: options.maxInventoryEntries ?? 100_000, signal: signal === undefined ? AbortSignal.timeout(options.maxInventoryMs ?? 30_000) : AbortSignal.any([signal, AbortSignal.timeout(options.maxInventoryMs ?? 30_000)]) });
+  let tracked: ReadonlySet<string>;
+  try { tracked = await trackedPaths(set, options.git ?? defaultGitExec); } catch (err) { await set.cleanup(); throw err; }
+  const snapshot = (root: string, signal?: AbortSignal): Promise<Inventory> => inventory(root, workspace, tracked, { bytes: options.maxInventoryBytes ?? options.maxCopyBytes ?? VERIFY_COPY_MAX_BYTES, entries: options.maxInventoryEntries ?? 100_000, signal: signal === undefined ? AbortSignal.timeout(options.maxInventoryMs ?? 30_000) : AbortSignal.any([signal, AbortSignal.timeout(options.maxInventoryMs ?? 30_000)]) });
   let retain = false;
   let base: Inventory;
   try {
@@ -226,6 +262,10 @@ export async function createCandidateIntegration(
         input.signal.throwIfAborted();
         final = await snapshot(workspace.dir, input.signal);
         const changed = differences(base, final);
+        // Approval rules and other project agent state are operator-owned: a
+        // worker cannot loosen or remove them by way of a promoted candidate.
+        const agentState = changed.filter(isAgentState);
+        if (agentState.length > 0) return await reject(`candidate not promoted: it changes the project's agent state directory ${AGENT_STATE_DIR}/ (${agentState.map(p => p.split(sep).join("/")).join(", ")}); only the operator may change it`, { contract: evidence });
         const artifacts: ArtifactObservation[] = changed.map(path => ({ path, source: "snapshot", change: !final!.has(path) ? "deleted" : !base.has(path) ? "new" : base.get(path)?.hash === final!.get(path)?.hash ? "mode" : "modified" }));
         const dependencies = (input.contract?.requires ?? []).flatMap<ArtifactManifestDependency>((requirement, requirementIndex) => {
           const providers = (input.contract?.provides ?? []).filter(provide => provide.name === requirement.name && provide.task !== requirement.task);
