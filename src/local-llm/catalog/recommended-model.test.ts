@@ -182,6 +182,23 @@ describe("fusion-worker ratings (catalog data)", () => {
     }
   });
 
+  it("says what each rating's evidence is and is not", () => {
+    for (const m of LOCAL_MODELS_CATALOG) {
+      const note = m.fusionWorker?.note;
+      if (note === undefined) continue;
+      // A GAIA run measured the model alone, not as a fusion worker.
+      if (note.includes("GAIA")) {
+        expect(note, m.id).toMatch(/^single-agent GAIA L1, not a fusion-worker measurement: /);
+      }
+      // A field case predates the guard it produced; it says so, and its date.
+      if (note.includes("guard.ts")) {
+        expect(note, m.id).toMatch(/^pre-guard field incidents on \d{4}-\d{2}-\d{2}, guards added since/);
+      }
+      // `replaced-inputs.ts` names no model size: it is no model's evidence.
+      expect(note, m.id).not.toContain("replaced-inputs");
+    }
+  });
+
   it("parses a rating and refuses anything else", () => {
     expect(parseFusionWorkerFit(undefined)).toBeUndefined();
     expect(parseFusionWorkerFit({ rating: "good", note: " measured " })).toEqual({
@@ -252,7 +269,7 @@ describe("recommendedModelFor (role worker)", () => {
     expect(pick!.why[1]).toMatch(/fits 1 of 4 worker slots in 21 GB/);
     expect(pick!.why[2]).toBe("catalog rank 1");
     const rated = recommendWorkerModel(64, { parallel: 2 });
-    expect(rated!.why[0]).toMatch(/^rated good as a fusion worker: GAIA L1/);
+    expect(rated!.why[0]).toMatch(/^rated good as a fusion worker: single-agent GAIA L1, not a fusion-worker measurement/);
     expect(rated!.why[1]).toMatch(/^fits 2 worker slots: needs about [\d.]+ GB of 64 GB RAM$/);
   });
 

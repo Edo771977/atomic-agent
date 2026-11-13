@@ -91,7 +91,7 @@ describe("models recommend --role worker", () => {
     expect(text).toContain("32 GB RAM");
     expect(text).toContain("worker model for fusion (2 worker slots):");
     expect(text).toMatch(/qwen-3\.5-9b\s+5\.3 GB/);
-    expect(text).toMatch(/why: rated ok as a fusion worker: GAIA L1 52\.8%/);
+    expect(text).toMatch(/why: rated ok as a fusion worker: single-agent GAIA L1, not a fusion-worker measurement: 52\.8%/);
     expect(text).toMatch(/fits 2 worker slots: needs about [\d.]+ GB of 32 GB/);
     expect(text).toContain("catalog rank 7");
     expect(text).toContain("models pull qwen-3.5-9b");

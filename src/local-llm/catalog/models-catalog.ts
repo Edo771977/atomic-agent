@@ -144,11 +144,15 @@ export interface LocalModelDef {
    *
    * - `eval-agents/docs/GAIA-L1-EXPERIMENT.md` §7.3 (also the root
    *   README): GAIA L1 through the agent's own tool loop, one full
-   *   53-task run per model.
-   * - Field cases recorded beside the guards they produced
-   *   (`src/tools/control-marker-guard.ts`,
-   *   `src/tools/unknown-argument-guard.ts`,
-   *   `src/tools/fusion/replaced-inputs.ts`).
+   *   53-task run per model. Single-agent runs on agent versions
+   *   0.1.36–0.1.47 (the doc's own cross-version caveat), not a
+   *   fusion-worker measurement; the note says so.
+   * - Field cases recorded beside the guards they produced, where the
+   *   guard names this model (`src/tools/control-marker-guard.ts`,
+   *   `src/tools/unknown-argument-guard.ts`). They predate those guards,
+   *   which refuse such calls since; the note says that and the date.
+   *   (`src/tools/fusion/replaced-inputs.ts` says "Gemma worker", no
+   *   size, so it rates no model.)
    *
    * Everything else stays unrated, which ranks between `ok` and `poor`:
    * no evidence is not bad evidence. A user-added model is never rated.
@@ -225,7 +229,7 @@ export const LOCAL_MODELS_CATALOG: readonly LocalModelDef[] = [
     recommendRank: 9,
     fusionWorker: {
       rating: "ok",
-      note: "GAIA L1 45.3% through the agent's tool loop, but it bails early on many tasks (~3 steps, many empty answers) (eval-agents/docs/GAIA-L1-EXPERIMENT.md)",
+      note: "single-agent GAIA L1, not a fusion-worker measurement: 45.3% through the agent's tool loop, but it bails early on many tasks (~3 steps, many empty answers) (eval-agents/docs/GAIA-L1-EXPERIMENT.md)",
     },
     maxContextLength: 262_144,
     contextLabel: "256K",
@@ -272,7 +276,7 @@ export const LOCAL_MODELS_CATALOG: readonly LocalModelDef[] = [
     recommendRank: 6,
     fusionWorker: {
       rating: "poor",
-      note: "live fusion workers wrote control markers into call arguments and flags as argument keys, and one overwrote an input file (2026-09-15; control-marker-guard.ts, unknown-argument-guard.ts)",
+      note: "pre-guard field incidents on 2026-09-15, guards added since: live fusion workers on this model wrote control markers into call arguments and flags as argument keys (control-marker-guard.ts, unknown-argument-guard.ts, which now refuse such calls); not measured since",
     },
     maxContextLength: 262_144,
     contextLabel: "256K",
@@ -341,7 +345,7 @@ export const LOCAL_MODELS_CATALOG: readonly LocalModelDef[] = [
     recommendRank: 1,
     fusionWorker: {
       rating: "good",
-      note: "GAIA L1 69.8% through the agent's tool loop, the best measured local model (eval-agents/docs/GAIA-L1-EXPERIMENT.md)",
+      note: "single-agent GAIA L1, not a fusion-worker measurement: 69.8% through the agent's tool loop, the best measured local model (eval-agents/docs/GAIA-L1-EXPERIMENT.md)",
     },
     maxContextLength: 262_144,
     contextLabel: "256K",
@@ -407,7 +411,7 @@ export const LOCAL_MODELS_CATALOG: readonly LocalModelDef[] = [
     recommendRank: 7,
     fusionWorker: {
       rating: "ok",
-      note: "GAIA L1 52.8% through the agent's tool loop and stays on task, though it can send a number where reply text belongs (eval-agents/docs/GAIA-L1-EXPERIMENT.md, conversation/reply.ts)",
+      note: "single-agent GAIA L1, not a fusion-worker measurement: 52.8% through the agent's tool loop and stays on task, though it can send a number where reply text belongs (eval-agents/docs/GAIA-L1-EXPERIMENT.md, conversation/reply.ts)",
     },
     maxContextLength: 262_144,
     contextLabel: "256K",
