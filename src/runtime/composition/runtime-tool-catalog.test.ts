@@ -300,6 +300,12 @@ describe("runtime tool assembly phases and live MCP catalog", () => {
     expect(wired.resolveOriginalRequest?.("session")).toBe("current request");
     expect(resolveOriginalRequest).toHaveBeenCalledWith("session");
     expect(wired.workerSupportsSlotAffinity("missing")).toBe(false);
+    config.llm = { providers: [{ id: "remote", kind: "openai-compatible", baseUrl: "https://example.test/v1", defaultChatModel: "actual-a" }],
+      activeTextProvider: "remote", activeEmbeddingProvider: "remote", toolTransport: "auto" };
+    expect(wired.resolveRoutingIdentity?.("remote")).toBeUndefined();
+    config.llm.providers[0]!.defaultChatModel = "actual-b";
+    expect(wired.resolveRoutingIdentity?.("remote")).toBeUndefined();
+    expect(wired.resolveRoutingIdentity?.("missing")).toBeUndefined();
     expect(protectedReads.approvals).toBe(dangerous);
     // The secret-file guard gets the state's own list (ATO-877).
     expect(protectedReads.stateSecrets).toEqual({ stateDir: config.paths.stateDir, files: getStateSecretPaths(config.paths) });

@@ -454,6 +454,10 @@ export function formatEarlyHandBack(input: {
 }
 
 export interface WorkerRunnerDeps {
+  /** Saved approval rules belong to this original project when cwd is a private candidate. */
+  ruleWorkdir?: string;
+  /** Runtime request-budget ownership, installed/cleared with the worker's approval policy. */
+  workerBudget?: { bindSession(sessionId: string, parentSessionId: string): void; unbindSession(sessionId: string): void };
   /** `runtime.runTurn`, unchanged. */
   runTurn: (
     session: SessionState,
@@ -969,6 +973,7 @@ async function runOneTask(
   // The worker's session is armed and disarmed the same way for the
   // local turn and, when it runs, the escalation model's re-run.
   const armWorkerSession = (id: string): void => {
+    deps.workerBudget?.bindSession(id, options.parentSessionId);
     // A worker has no operator: an approval prompt would park the turn
     // until process exit. Refuse instead, with the reason the brief told
     // the model to hand back up.
@@ -981,7 +986,9 @@ async function runOneTask(
       reasonFor: workerRefusalFor,
       // A throwaway worktree is still the parent's project: its saved
       // rules hold here too.
-      ...(isolated !== undefined ? { ruleWorkdir: deps.workingDir } : {}),
+      ...(deps.ruleWorkdir !== undefined || isolated !== undefined
+        ? { ruleWorkdir: deps.ruleWorkdir ?? deps.workingDir } : {}),
+      ...(deps.ruleWorkdir === undefined ? {} : { rulePathRoot: workingDir }),
     });
     // …and the half that lets it work at all. The operator answered one
     // question at the fan-out naming these directories; inside them this
@@ -1006,6 +1013,7 @@ async function runOneTask(
     if (inputs.length > 0) deps.declaredInputs?.declare(id, inputs);
   };
   const disarmWorkerSession = (id: string): void => {
+    deps.workerBudget?.unbindSession(id);
     // Always: the gate is process-wide and a stale refusal policy keyed
     // to a dead session is a slow leak, not a visible bug.
     deps.approvals.clearSessionPolicy(id);

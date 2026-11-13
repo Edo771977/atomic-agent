@@ -37,3 +37,5 @@ The advertised wire schema does not replace runtime validation. For example, has
 ## Validation
 
 Run `npx vitest run src/tools/os/fs` on temporary directories and mocks. Include `src/tools/os/os-tools.test.ts`, affected approval/declared-input/read-coverage seams and `src/agent/tool-resource-class.test.ts` when a shared contract changes. Then run `npm run lint`, `npm run typecheck:tests`, `npm run imports:check` and `npm run docs:check`; the [development guide](../../../../docs/development.md) explains the existing type debt. Unit tests do not establish native trash behavior on every platform or authorize mutations of personal files.
+
+Declared-input write replacement and Fusion candidate promotion compare resolved paths with [input identity keys](fs-input-path-identity.ts): Windows normalizes separators and case, while POSIX preserves case. The registry deduplicates identities while retaining the first display spelling. This is lexical identity only; it does not resolve symlinks or broader filesystem aliases. Genuine declared glob suffixes keep their existing advisory semantics.

@@ -47,7 +47,9 @@ class Mem0Adapter implements CompetitorAdapter {
     private readonly apiKey: string,
     private readonly baseUrl: string,
     private readonly userIdPrefix: string,
-  ) {}
+  ) {
+    this._suppressUnused = [this.apiKey, this.baseUrl, this.userIdPrefix];
+  }
 
   async ensureSession(_sessionId: string): Promise<void> {
     // Mem0 creates user namespaces lazily on first write — no-op.
@@ -87,7 +89,7 @@ class Mem0Adapter implements CompetitorAdapter {
   }
 
   // Suppress unused-private-property warnings until the calls land.
-  readonly _suppressUnused = [this.apiKey, this.baseUrl, this.userIdPrefix];
+  readonly _suppressUnused: readonly string[];
 }
 
 export const mem0Factory: CompetitorAdapterFactory = {

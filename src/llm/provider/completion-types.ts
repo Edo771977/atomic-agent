@@ -15,6 +15,8 @@ export type ToolCallTransport = "grammar" | "native_tools";
 export type ReasoningEffort = "low" | "medium" | "high";
 
 export interface CompletionUsage {
+  /** Token counts were absent/incomplete on the wire; synthesized zeros are not a free bill. */
+  incomplete?: true;
   promptTokens: number;
   completionTokens: number;
   totalTokens: number;
@@ -123,7 +125,16 @@ export interface ChatPromptParts {
   enableThinking?: boolean;
 }
 
+/** Internal physical-send policy; never serialized into the provider body. */
+export interface CompletionRequestBudget {
+  beforeSend(body: Record<string, unknown>): void;
+  onResponse(status: number): void;
+}
+
 export interface CompletionRequest {
+  /** Internal active-turn budget owner; never serialized or used for provider routing. */
+  budgetOwnerSessionId?: string;
+  requestBudget?: CompletionRequestBudget;
   /** Full-context capacity check; internal, never serialized as an API field. */
   contextBudget?: { window: number | null; replyReserve: number };
   /** Internal policy of the attempted link; never part of the API request body. */

@@ -173,6 +173,7 @@ export class OpenAiProvider implements LlmProvider {
   readonly streamConsumer: StreamConsumer;
   readonly capabilities: ProviderCapabilities;
   readonly chatModelId: string | undefined;
+  readonly supportsRequestBudget = true;
 
   private readonly http: OpenAiHttpDeps;
   private readonly defaultChatModel: string | undefined;
@@ -1020,6 +1021,7 @@ function completionFromStreamFinal(
   accumulatedReasoning: string,
 ): CompletionResult {
   const usage = streamFinal?.usage ?? {
+    incomplete: true as const,
     promptTokens: 0,
     completionTokens: 0,
     totalTokens: 0,

@@ -49,7 +49,7 @@ describe("probeAdapterRequirements", () => {
   });
 
   it("checks every required key for langmem (two env vars)", () => {
-    expect(probeAdapterRequirements(langMemFactory).sort()).toEqual([
+    expect([...probeAdapterRequirements(langMemFactory)].sort()).toEqual([
       "LANGMEM_BRIDGE_URL",
       "OPENAI_API_KEY",
     ]);

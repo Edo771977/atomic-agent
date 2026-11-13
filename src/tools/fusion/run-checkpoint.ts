@@ -3,6 +3,7 @@ import {
   readFileSync,
   readdirSync,
   renameSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -18,11 +19,32 @@ import {
 } from "../../session/turn-owner.js";
 import type { MergeTaskSuggestion } from "./branch-merge.js";
 import type { DelegateTask } from "./delegate-args.js";
-import type {
-  WorkerTaskResult,
-  WorkerTaskStatus,
-  WorkerToolStats,
+import {
+  WORKER_STATUS_ORDER,
+  type WorkerTaskResult,
+  type WorkerTaskStatus,
+  type WorkerToolStats,
 } from "./worker-result.js";
+import { UNTRACKED_WRITE_TOOLS, type FileChange } from "./worker-changes.js";
+import { incompleteArtifactManifest, storedArtifactManifest } from "./artifact-manifest.js";
+import type { ArtifactManifest } from "./artifact-manifest-types.js";
+import { OS_FS_WRITE_CONTRACT } from "../os/fs/fs-write-contract.js";
+import { OS_FS_EDIT_CONTRACT } from "../os/fs/fs-edit-contract.js";
+import { OS_FS_PATCH_CONTRACT } from "../os/fs/fs-patch-contract.js";
+import { OS_FS_MOVE_CONTRACT } from "../os/fs/fs-move-contract.js";
+import { OS_FS_TRASH_CONTRACT } from "../os/fs/fs-trash-contract.js";
+import { OS_FS_RESTORE_CONTRACT } from "../os/fs/fs-restore-contract.js";
+
+// The operation contracts own mutation metadata; the worker's writes tally
+// intentionally omits move/trash and cannot establish legacy coverage.
+const FILE_MUTATIONS: ReadonlySet<string> = new Set([
+  OS_FS_WRITE_CONTRACT, OS_FS_EDIT_CONTRACT, OS_FS_PATCH_CONTRACT,
+  OS_FS_MOVE_CONTRACT, OS_FS_TRASH_CONTRACT, OS_FS_RESTORE_CONTRACT,
+].filter((operation) => !operation.readonly).map((operation) => operation.name));
+
+export function checkpointHasFileMutations(tools: WorkerToolStats): boolean {
+  return tools.writes > 0 || Object.keys(tools.byTool).some((tool) => FILE_MUTATIONS.has(tool));
+}
 
 /**
  * Checkpoints of a fusion run (ATO-617): a long fan-out survives a crash,
@@ -48,6 +70,10 @@ export const FUSION_RUN_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
 /** A worker's reply kept in the checkpoint, at most this many chars. */
 export const CHECKPOINT_REPLY_CHARS = 4_000;
+/** Bounds durable input and verification targets without silently losing coverage. */
+export const CHECKPOINT_MAX_BYTES = 8 * 1024 * 1024;
+export const CHECKPOINT_MAX_CHANGES = 256;
+const CHECKPOINT_PATH_CHARS = 4_096;
 
 const CHECKPOINT_VERSION = 1;
 
@@ -111,6 +137,11 @@ export interface CheckpointTaskResult {
   notes?: string[];
   /** The worker leg's priced spend for this task, `0` when unpriced. */
   costUsd: number;
+  changes?: FileChange[];
+  shellRan?: true;
+  /** Absent in older v1 files. Incomplete coverage must never resume green. */
+  artifactMetadata?: "complete" | "incomplete";
+  artifactManifest?: ArtifactManifest;
 }
 
 export interface CheckpointTask {
@@ -253,7 +284,8 @@ export class FusionRunStore {
   /** The run's checkpoint, or `null` when there is none (or it is unreadable). */
   load(runId: string): FusionRunCheckpoint | null {
     if (!FusionRunStore.isValidRunId(runId)) return null;
-    return readCheckpoint(this.path(runId));
+    const checkpoint = readCheckpoint(this.path(runId));
+    return checkpoint?.runId === runId ? checkpoint : null;
   }
 
   /** A process — this one, or another alive — is working on the run now. */
@@ -281,7 +313,7 @@ export class FusionRunStore {
       const runId = name.slice(0, -".json".length);
       if (!FusionRunStore.isValidRunId(runId)) continue;
       const checkpoint = readCheckpoint(join(this.dir, name));
-      if (checkpoint === null) continue;
+      if (checkpoint === null || checkpoint.runId !== runId) continue;
       if (this.now() - checkpoint.updatedAt > this.retentionMs) {
         if (!this.active.has(runId)) this.remove(runId);
         continue;
@@ -301,16 +333,42 @@ export class FusionRunStore {
   }
 
   /** @internal — the recorder's write. */
-  write(checkpoint: FusionRunCheckpoint): void {
+  write(checkpoint: FusionRunCheckpoint): string | undefined {
     try {
+      const durable = structuredClone(checkpoint);
+      // Labels are display-only; ids, arguments and the operator request
+      // retain their exact bytes for replay and input-file protection.
+      for (const task of durable.tasks) task.title = task.title.slice(0, 8_192);
+      let json = JSON.stringify(durable);
+      if (Buffer.byteLength(json, "utf8") > CHECKPOINT_MAX_BYTES) {
+        // Verification telemetry can exceed the aggregate budget despite
+        // each individual row fitting. Keep the run and fail coverage closed.
+        for (const task of durable.tasks) {
+          if (task.result === undefined) continue;
+          task.result.changes = [];
+          task.result.notes = ["checkpoint detail omitted to stay within its storage budget"];
+          task.result.reply = "";
+          task.result.tools.byTool = {};
+          task.sideEffectTools = task.sideEffectTools.slice(0, 8).map((tool) => tool.slice(0, 1_024));
+          task.result.artifactMetadata = "incomplete";
+          if (task.result.artifactManifest !== undefined) task.result.artifactManifest = incompleteArtifactManifest(task.result.artifactManifest);
+        }
+        json = JSON.stringify(durable);
+      }
+      if (Buffer.byteLength(json, "utf8") > CHECKPOINT_MAX_BYTES) {
+        this.remove(checkpoint.runId);
+        return "exact replay arguments, identity and original request exceed the 8 MiB checkpoint budget";
+      }
       mkdirSync(this.dir, { recursive: true });
       const file = this.path(checkpoint.runId);
       const tmp = `${file}.tmp-${process.pid}`;
-      writeFileSync(tmp, JSON.stringify(checkpoint), "utf8");
+      writeFileSync(tmp, json, "utf8");
       renameSync(tmp, file);
+      return undefined;
     } catch {
       // Best-effort: a read-only state dir or a full disk costs the run
       // its resumability, never the fan-out.
+      return "checkpoint storage is unavailable";
     }
   }
 
@@ -342,6 +400,7 @@ export class FusionRunStore {
 /** One run's checkpoint as the fan-out writes it. */
 export class FusionRunRecorder {
   private ended = false;
+  private warning: string | undefined;
   /** The task tree's parent links (ATO-1320); absent without a tree. */
   private parentOf: ((taskId: string) => string | undefined) | undefined;
 
@@ -352,6 +411,10 @@ export class FusionRunRecorder {
 
   get runId(): string {
     return this.checkpoint.runId;
+  }
+
+  get checkpointWarning(): string | undefined {
+    return this.warning;
   }
 
   /** A copy of what is recorded so far. */
@@ -419,17 +482,39 @@ export class FusionRunRecorder {
       this.flush();
       return;
     }
+    const changes = result.changes ?? [];
+    const artifactManifest = result.artifactManifest === undefined ? undefined : storedArtifactManifest(result.artifactManifest);
+    const shellRan = result.shellRan === true ||
+      Object.keys(result.tools.byTool).some((tool) => UNTRACKED_WRITE_TOOLS.has(tool));
+    const complete = !shellRan && changes.length <= CHECKPOINT_MAX_CHANGES && changes.every(validChange) &&
+      (!checkpointHasFileMutations(result.tools) || changes.length > 0) &&
+      (result.notes === undefined || (result.notes.length <= 64 && result.notes.every((n) => n.length <= CHECKPOINT_REPLY_CHARS))) &&
+      !artifactManifest?.coverage.reasons.includes("metadata_truncated");
     task.result = {
       status: result.status,
       reply: result.reply.slice(0, CHECKPOINT_REPLY_CHARS),
       stepCount: result.stepCount,
       durationMs: result.durationMs,
       tools: result.tools,
-      ...(result.error === undefined ? {} : { error: result.error }),
-      ...(result.notes === undefined ? {} : { notes: result.notes }),
+      ...(result.error === undefined ? {} : { error: result.error.slice(0, CHECKPOINT_REPLY_CHARS) }),
+      ...(result.notes === undefined ? {} : { notes: result.notes.slice(0, 64).map((n) => n.slice(0, CHECKPOINT_REPLY_CHARS)) }),
       costUsd: spend,
+      changes: changes.filter(validChange).slice(0, CHECKPOINT_MAX_CHANGES),
+      ...(shellRan ? { shellRan: true } : {}),
+      artifactMetadata: complete ? "complete" : "incomplete",
+      ...(artifactManifest === undefined ? {} : { artifactManifest }),
     };
     this.checkpoint.spentUsd += spend;
+    this.flush();
+  }
+
+  /** Final evidence augments an existing row without charging its spend twice. */
+  recordArtifactManifest(taskId: string, manifest: ArtifactManifest): void {
+    if (this.ended) return;
+    const result = this.checkpoint.tasks.find(t => t.id === taskId)?.result;
+    if (result === undefined) return;
+    result.artifactManifest = storedArtifactManifest(manifest);
+    if (result.artifactManifest.coverage.reasons.includes("metadata_truncated")) result.artifactMetadata = "incomplete";
     this.flush();
   }
 
@@ -472,31 +557,90 @@ export class FusionRunRecorder {
   /** @internal */
   flush(): void {
     this.checkpoint.updatedAt = this.store.stamp();
-    this.store.write(this.checkpoint);
+    this.warning = this.store.write(this.checkpoint);
   }
 }
 
 function readCheckpoint(file: string): FusionRunCheckpoint | null {
   let parsed: unknown;
   try {
-    parsed = JSON.parse(readFileSync(file, "utf8"));
+    if (statSync(file).size > CHECKPOINT_MAX_BYTES) return null;
+    const bytes = readFileSync(file);
+    if (bytes.length > CHECKPOINT_MAX_BYTES) return null;
+    parsed = JSON.parse(bytes.toString("utf8"));
   } catch {
     return null;
   }
-  if (typeof parsed !== "object" || parsed === null) return null;
+  if (!record(parsed)) return null;
   const c = parsed as Partial<FusionRunCheckpoint>;
   if (
     c.version !== CHECKPOINT_VERSION ||
-    typeof c.runId !== "string" ||
-    typeof c.sessionId !== "string" ||
-    typeof c.workingDir !== "string" ||
-    typeof c.args !== "object" ||
-    c.args === null ||
+    !boundedString(c.runId, 64) || !RUN_ID_PATTERN.test(c.runId) ||
+    !boundedString(c.sessionId, CHECKPOINT_MAX_BYTES) ||
+    !boundedString(c.workingDir, CHECKPOINT_MAX_BYTES) ||
+    !record(c.args) ||
     !Array.isArray(c.tasks) ||
-    typeof c.updatedAt !== "number" ||
-    typeof c.owner !== "string"
+    c.tasks.length > 16 || !c.tasks.every(validTask) ||
+    new Set(c.tasks.map((t) => t.id)).size !== c.tasks.length ||
+    !nonnegative(c.updatedAt) || !nonnegative(c.startedAt) ||
+    !nonnegative(c.spentUsd) || !nonnegative(c.wavesDone) ||
+    !nonnegative(c.waveCount) || !nonnegative(c.resumes) ||
+    (c.state !== "running" && c.state !== "interrupted") ||
+    !boundedString(c.owner, CHECKPOINT_MAX_BYTES) ||
+    (c.originalRequest !== undefined && !boundedString(c.originalRequest, CHECKPOINT_MAX_BYTES)) ||
+    (c.merges !== undefined && (!Array.isArray(c.merges) || !c.merges.every((m) =>
+      record(m) && boundedString(m.id, CHECKPOINT_MAX_BYTES) && boundedString(m.title, CHECKPOINT_MAX_BYTES) &&
+      boundedString(m.instructions, CHECKPOINT_MAX_BYTES) && stringList(m.files, CHECKPOINT_MAX_BYTES, CHECKPOINT_MAX_BYTES))))
   ) {
     return null;
   }
+  for (const task of c.tasks) {
+    if (task.result?.artifactManifest !== undefined) {
+      task.result.artifactManifest = storedArtifactManifest(task.result.artifactManifest);
+      if (task.result.artifactManifest.coverage.reasons.includes("metadata_truncated")) task.result.artifactMetadata = "incomplete";
+    }
+  }
   return c as FusionRunCheckpoint;
+}
+
+function record(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function boundedString(value: unknown, max: number): value is string {
+  return typeof value === "string" && value.length <= max;
+}
+
+function nonnegative(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+function stringList(value: unknown, count: number, chars: number): value is string[] {
+  return Array.isArray(value) && value.length <= count && value.every((v) => boundedString(v, chars));
+}
+
+function validChange(value: unknown): value is FileChange {
+  return record(value) && boundedString(value.path, CHECKPOINT_PATH_CHARS) && value.path.length > 0 &&
+    ["new", "modified", "restored", "trashed"].includes(value.kind as string) &&
+    (value.addedLines === undefined || nonnegative(value.addedLines)) &&
+    (value.removedLines === undefined || nonnegative(value.removedLines)) &&
+    (value.movedFrom === undefined || boundedString(value.movedFrom, CHECKPOINT_PATH_CHARS));
+}
+
+function validTask(value: unknown): value is CheckpointTask {
+  if (!record(value) || !boundedString(value.id, CHECKPOINT_MAX_BYTES) || !boundedString(value.title, CHECKPOINT_MAX_BYTES) ||
+      typeof value.sideEffects !== "boolean" || !stringList(value.sideEffectTools, CHECKPOINT_MAX_BYTES, CHECKPOINT_MAX_BYTES)) return false;
+  const r = value.result;
+  if (r === undefined) return true;
+  if (!record(r) || !WORKER_STATUS_ORDER.includes(r.status as WorkerTaskStatus) ||
+      !boundedString(r.reply, CHECKPOINT_REPLY_CHARS) || !nonnegative(r.stepCount) ||
+      !nonnegative(r.durationMs) || !nonnegative(r.costUsd) || !record(r.tools) ||
+      !nonnegative(r.tools.calls) || !nonnegative(r.tools.errors) || !nonnegative(r.tools.writes) ||
+      !record(r.tools.byTool) ||
+      !Object.entries(r.tools.byTool).every(([tool, count]) => tool.length <= CHECKPOINT_MAX_BYTES && nonnegative(count))) return false;
+  return (r.error === undefined || boundedString(r.error, CHECKPOINT_MAX_BYTES)) &&
+    (r.notes === undefined || stringList(r.notes, CHECKPOINT_MAX_BYTES, CHECKPOINT_MAX_BYTES)) &&
+    (r.changes === undefined || (Array.isArray(r.changes) && r.changes.length <= CHECKPOINT_MAX_CHANGES && r.changes.every(validChange))) &&
+    (r.shellRan === undefined || r.shellRan === true) &&
+    (r.artifactMetadata === undefined || r.artifactMetadata === "complete" || r.artifactMetadata === "incomplete");
 }

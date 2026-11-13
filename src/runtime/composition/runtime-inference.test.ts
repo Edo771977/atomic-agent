@@ -14,6 +14,7 @@ import { TurnUsageMeter } from "../../analytics/index.js";
 import { StructuredLogger } from "../../tracing/structured-logger.js";
 import { OpenAiHttpError } from "../../llm/provider/openai/openai-http.js";
 import { connectRuntimeFallback, connectRuntimeProviders, createRuntimeModelContext, createRuntimeProviderReloads, type RuntimeProviders } from "./runtime-inference.js";
+import { FusionTurnBudget } from "../../tools/fusion/turn-budget.js";
 
 function completion(modelId = "priced-model"): CompletionResult {
   return {
@@ -194,6 +195,29 @@ describe("runtime provider/context/fallback/reload phases", () => {
     const deps = { fallbackChain, resolveActiveLlmSlice: providers.resolveActiveLlmSlice, localBackend, profileManager: undefined, costAccumulator, turnUsageMeter, resolveModelPricing: context.resolveModelPricing };
     return { deps, costAccumulator, turnUsageMeter, fallbackChain };
   }
+
+  it("refuses unverified unary and stream inference overrides under a USD cap", async () => {
+    const fixture = fallback();
+    const turnBudget = new FusionTurnBudget();
+    turnBudget.begin("turn", 0, { usd: 1 });
+    const complete = vi.fn(async () => completion());
+    const stream = vi.fn(async function* () { return completion(); });
+    const wired = connectRuntimeFallback({ overrides: { llamaComplete: complete, llamaCompleteStream: stream } }, { ...fixture.deps, turnBudget });
+    await expect(wired.llmComplete(params)).rejects.toThrow(/inference override/);
+    await expect(wired.llmCompleteStream!(params).next()).rejects.toThrow(/inference override/);
+    expect(complete).not.toHaveBeenCalled();
+    expect(stream).not.toHaveBeenCalled();
+  });
+
+  it("keeps uncapped inference overrides usable with the shared budget service installed", async () => {
+    const fixture = fallback();
+    const turnBudget = new FusionTurnBudget();
+    turnBudget.begin("turn");
+    const complete = vi.fn(async () => completion());
+    const wired = connectRuntimeFallback({ overrides: { llamaComplete: complete } }, { ...fixture.deps, turnBudget });
+    await wired.llmComplete(params);
+    expect(complete).toHaveBeenCalledWith(params);
+  });
 
   it("unary usage is priced against the served pin rather than the active provider", async () => {
     const fixture = fallback();

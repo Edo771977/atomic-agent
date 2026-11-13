@@ -5,6 +5,10 @@ Owner: src/uninstall/
 
 Resolves explicit uninstall targets before destructive removal. Preserve platform path handling and user-state choices.
 
+The pure safety backstop counts path components below the platform's parsed root: a Windows drive or UNC share is the root, not an ordinary component. It refuses the root, home and its ancestors, and immediate children of a root outside home before removal is attempted. Native and cross-platform path regressions live in [uninstall-safety-native.test.ts](uninstall-safety-native.test.ts).
+
+On Windows the backstop intentionally rejects namespace/device paths, including `\\?\`, `\\.\` and NT `\??\` spellings, for either the target or home. Extended DOS/UNC aliases, `GLOBALROOT`, volume names and device names are unsupported uninstall targets; use ordinary drive or UNC paths. This is a pure lexical check, with no `realpath`, stat or deletion used to resolve aliases. POSIX paths retain their case-sensitive meaning.
+
 Entry point: [resolve-uninstall-plan.ts](resolve-uninstall-plan.ts). Read the root instruction route and the underlying domain instructions before cross-domain changes.
 
 ## Linux packages

@@ -642,6 +642,11 @@ export class LlamaServerClient {
    */
   private readonly slotsPollsInFlight = new Map<string, Promise<unknown>>();
 
+  /** Effective text-serving base, including a client's pinned override. */
+  get textRequestBaseUrl(): string {
+    return this.baseUrlOverride ?? getConfig().localModels.url;
+  }
+
   constructor(options: LlamaServerClientOptions = {}) {
     const config = getConfig();
     this.baseUrlOverride = options.baseUrl;

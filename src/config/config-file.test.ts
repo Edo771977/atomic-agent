@@ -49,6 +49,21 @@ describe("user config file IO", () => {
   it("getUserConfigPath joins stateDir with config.json", () => {
     expect(getUserConfigPath(dir)).toBe(join(dir, "config.json"));
   });
+  it("persists measured routing opt-in and explicit disable across reloads", () => {
+    const path = getUserConfigPath(dir);
+    const config = parseUserConfigFile({ ...USER_CONFIG_DEFAULTS, llm: {
+      activeTextProvider: "remote", activeEmbeddingProvider: "local", toolTransport: "auto",
+      providers: [{ id: "remote", kind: "openrouter", defaultChatModel: "large" },
+        { id: "local", kind: "llama-server", url: "http://127.0.0.1:8080" }],
+      runMode: { mode: "fusion", fusion: { measuredRouting: { enabled: true, minSamples: 6, days: 20 } } },
+    } });
+    writeUserConfigFileSync(path, config);
+    const reloaded = readUserConfigFileSync(path)!;
+    expect(reloaded.llm?.runMode?.fusion?.measuredRouting).toEqual({ enabled: true, minSamples: 6, days: 20 });
+    reloaded.llm!.runMode!.fusion!.measuredRouting = { enabled: false };
+    writeUserConfigFileSync(path, reloaded);
+    expect(readUserConfigFileSync(path)?.llm?.runMode?.fusion?.measuredRouting).toEqual({ enabled: false });
+  });
 
   it("readUserConfigFileSync returns null when the file is absent", () => {
     expect(readUserConfigFileSync(getUserConfigPath(dir))).toBeNull();

@@ -50,6 +50,27 @@ describe("ApprovalGate with saved rules (ATO-1141)", () => {
   });
 
   describe("ruleDecisionFor", () => {
+    it("keeps original-project path denials in a candidate without translating allow rules", async () => {
+      const candidate = join(tmpdir(), "atag-private-candidate");
+      const g = gate(5);
+      store.add({ decision: "deny", path: join(project, "protected"), project, source: "user" });
+      g.setSessionPolicy("worker", { onPrompt: "refuse", reason: "worker", ruleWorkdir: project, rulePathRoot: candidate });
+      const request = { sessionId: "worker", tool: "os.fs.write", category: "other" as const, reason: "write", workdir: candidate, targetPaths: [join(candidate, "protected", "data.txt")] };
+      expect(g.ruleDecisionFor(request)).toBe("deny");
+      expect((await g.request(request)).approved).toBe(false);
+      const allowGate = gate(1);
+      store.add({ decision: "allow", tool: "os.fs.write", path: join(project, "public"), project, source: "user" });
+      allowGate.setSessionPolicy("worker", { onPrompt: "refuse", reason: "worker", ruleWorkdir: project, rulePathRoot: candidate });
+      expect(allowGate.ruleDecisionFor({ ...request, targetPaths: [join(candidate, "public", "data.txt")] })).toBeNull();
+    });
+    it("keeps a parent's declined file refused in the private candidate", async () => {
+      const candidate = join(tmpdir(), "atag-private-candidate"); const g = gate(1);
+      const parent = { sessionId: "parent", tool: "os.fs.write", category: "other" as const, reason: "write", targetPaths: [join(project, "data.txt")] };
+      const denied = g.request(parent); g.resolve({ approvalId: emitted[0]!.approvalId, approved: false }); await denied;
+      g.setLevel(5); g.followDeclined("worker", "parent");
+      g.setSessionPolicy("worker", { onPrompt: "refuse", reason: "worker", ruleWorkdir: project, rulePathRoot: candidate });
+      expect((await g.request({ ...parent, sessionId: "worker", targetPaths: [join(candidate, "data.txt")] })).declinedEarlier).toBe(true);
+    });
     it("reports a deny or ask rule without asking anyone", () => {
       store.add({ decision: "deny", commandPrefix: ["npm", "publish"], source: "user" });
       const g = gate();

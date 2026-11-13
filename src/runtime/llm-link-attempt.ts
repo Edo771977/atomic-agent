@@ -1,12 +1,14 @@
 import type { LlmStreamParams } from "../agent/step/step-contract.js";
 import type {
   CompletionResult,
+  CompletionRequest,
   StreamChunk,
   ToolCallTransport,
 } from "../llm/provider/completion-types.js";
 import type { LlmProvider } from "../llm/provider/llm-provider.js";
 import { primeStream, type PrimedStream } from "../llm/fallback/index.js";
 import { resolveModelMode } from "../llm/model-mode.js";
+import type { RequestBudgetScope } from "./request-budget.js";
 
 /**
  * The `{ provider, transport }` slice for one chosen link. `bootstrap`
@@ -28,6 +30,7 @@ export interface ResolvedLinkSlice {
 export interface LinkAttemptDeps {
   resolveSlice: (providerId: string) => ResolvedLinkSlice;
   prepareLink?: (providerId: string) => Promise<void>;
+  requestBudget?: (providerId: string, request: CompletionRequest, provider: LlmProvider) => RequestBudgetScope | undefined;
 }
 
 /**
@@ -106,6 +109,7 @@ function grammarRequestFields(params: LlmStreamParams) {
  */
 function turnRequestFields(params: LlmStreamParams) {
   return {
+    ...(params.budgetOwnerSessionId === undefined ? {} : { budgetOwnerSessionId: params.budgetOwnerSessionId }),
     ...(params.contextBudget ? { contextBudget: params.contextBudget } : {}),
     ...(typeof params.maxOutputTokens === "number"
       ? { maxOutputTokens: params.maxOutputTokens }
@@ -147,9 +151,9 @@ export async function completeOnLink(
     ...turnRequestFields(params),
     ...(params.signal ? { signal: params.signal } : {}),
   };
-  const result =
+  const request: CompletionRequest =
     transport === "native_tools"
-      ? await provider.complete({
+      ? {
           ...base,
           ...nativeRequestFields(params),
           // Cloud sub-runners forward a `responseFormat` JSON-Schema
@@ -158,9 +162,17 @@ export async function completeOnLink(
           ...(params.responseFormat
             ? { responseFormat: params.responseFormat }
             : {}),
-        })
-      : await provider.complete({ ...base, ...grammarRequestFields(params) });
-  return { result, transport };
+        }
+      : { ...base, ...grammarRequestFields(params) };
+  const scope = deps.requestBudget?.(providerId, request, provider);
+  if (scope !== undefined) { request.requestBudget = scope; request.signal = scope.signal ?? request.signal; }
+  let result: CompletionResult | undefined;
+  try {
+    result = await provider.complete(request);
+    return { result, transport };
+  } finally {
+    scope?.finish(result);
+  }
 }
 
 /**
@@ -192,10 +204,22 @@ export async function openStreamOnLink(
     ...turnRequestFields(params),
     ...(params.signal ? { signal: params.signal } : {}),
   };
-  const stream =
+  const request: CompletionRequest =
     transport === "native_tools"
-      ? provider.completeStream({ ...base, ...nativeRequestFields(params) })
-      : provider.completeStream({ ...base, ...grammarRequestFields(params) });
+      ? { ...base, ...nativeRequestFields(params) }
+      : { ...base, ...grammarRequestFields(params) };
+  const scope = deps.requestBudget?.(providerId, request, provider);
+  if (scope !== undefined) { request.requestBudget = scope; request.signal = scope.signal ?? request.signal; }
+  async function* budgetedStream(): AsyncGenerator<StreamChunk, CompletionResult, void> {
+    let result: CompletionResult | undefined;
+    try {
+      result = yield* provider.completeStream(request);
+      return result;
+    } finally {
+      scope?.finish(result);
+    }
+  }
+  const stream = scope === undefined ? provider.completeStream(request) : budgetedStream();
   return { primed: await primeStream(stream), transport };
 }
 

@@ -85,13 +85,16 @@ export async function workspaceChanges(
   set: Pick<BranchSet, "baseDir">,
   workspace: BranchWorkspace,
   context: number = DIFF_CONTEXT_LINES,
+  signal?: AbortSignal,
 ): Promise<WorkspaceChange[]> {
   const out: WorkspaceChange[] = [];
-  for (const rel of await touchedPaths(workspace)) {
+  for (const rel of await touchedPaths(workspace, signal)) {
+    signal?.throwIfAborted();
     const [base, task] = await Promise.all([
       readEntry(join(set.baseDir, rel)),
       readEntry(join(workspace.dir, rel)),
     ]);
+    signal?.throwIfAborted();
     if (base === null && task === null) continue;
     if (sameEntry(base, task)) continue;
     const path = slash(rel);
@@ -185,7 +188,7 @@ export async function removeTaskPatch(realDir: string, taskId: string): Promise<
 /** Runs git for the patch; resolves `null` when git is not there to run. */
 export type PatchGit = (
   args: readonly string[],
-  options: { cwd: string; env: Record<string, string>; input?: string },
+  options: { cwd: string; env: Record<string, string>; input?: string; signal?: AbortSignal },
 ) => Promise<CommandResult | null>;
 
 const PATCH_GIT_TIMEOUT_MS = 120_000;
@@ -196,6 +199,7 @@ const PATCH_MAX_BYTES = 64 * 1024 * 1024;
  * `diff.noprefix`), no hooks, no prompt and none of the agent's keys.
  */
 export const defaultPatchGit: PatchGit = async (args, options) => {
+  options.signal?.throwIfAborted();
   try {
     return await runCommand("git", ["--no-pager", "-c", "core.hooksPath=/dev/null", ...args], {
       cwd: options.cwd,
@@ -209,6 +213,7 @@ export const defaultPatchGit: PatchGit = async (args, options) => {
         ...options.env,
       },
       ...(options.input === undefined ? {} : { input: options.input }),
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
       timeoutMs: PATCH_GIT_TIMEOUT_MS,
       maxOutputBytes: PATCH_MAX_BYTES,
     });
@@ -232,7 +237,16 @@ export async function gitBinaryPatch(
   paths: readonly string[],
   git: PatchGit = defaultPatchGit,
   tmpRoot: string = tmpdir(),
+  signal?: AbortSignal,
 ): Promise<string | null> {
+  const rawGit = git;
+  git = async (args, options) => {
+    signal?.throwIfAborted();
+    const result = await rawGit(args, { ...options, ...(signal === undefined ? {} : { signal }) });
+    signal?.throwIfAborted();
+    return result;
+  };
+  signal?.throwIfAborted();
   const store = await mkdtemp(join(tmpRoot, `${FUSION_TMP_PREFIX}patch-`));
   try {
     const gitDir = join(store, "objects.git");
@@ -242,6 +256,7 @@ export async function gitBinaryPatch(
       const env = { GIT_DIR: gitDir, GIT_INDEX_FILE: join(store, `index-${name}`) };
       const entries: Array<{ mode: string; file: string; path: string }> = [];
       for (const rel of paths) {
+        signal?.throwIfAborted();
         const entry = await readEntry(join(root, rel));
         if (entry === null) continue;
         let file = join(root, rel);
@@ -331,7 +346,9 @@ export async function writeTaskPatch(input: {
   changes: readonly WorkspaceChange[];
   patchGit?: PatchGit;
   tmpRoot?: string;
+  signal?: AbortSignal;
 }): Promise<SavedTaskPatch> {
+  input.signal?.throwIfAborted();
   const rel = taskPatchPath(input.taskId);
   const at = join(input.realDir, rel);
   const filesRel = taskFilesPath(rel);
@@ -339,14 +356,16 @@ export async function writeTaskPatch(input: {
   await ensureMergeDir(input.realDir);
   // An earlier attempt's copies are not this attempt's.
   await rm(filesAt, { recursive: true, force: true });
-  const paths = await touchedPaths(input.workspace);
+  const paths = await touchedPaths(input.workspace, input.signal);
   const binary = await gitBinaryPatch(
     input.set.baseDir,
     input.workspace.dir,
     paths,
     input.patchGit,
     input.tmpRoot,
+    input.signal,
   );
+  input.signal?.throwIfAborted();
   if (binary !== null) {
     await writeFile(at, binary);
     return { path: rel, method: "git" };
@@ -356,6 +375,7 @@ export async function writeTaskPatch(input: {
   let saved = 0;
   const removed: string[] = [];
   for (const change of rest) {
+    input.signal?.throwIfAborted();
     const from = join(input.workspace.dir, ...change.path.split("/"));
     const entry = await readEntry(from);
     if (entry === null) {

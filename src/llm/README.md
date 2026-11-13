@@ -5,6 +5,8 @@ Owner: src/llm/
 
 This area owns inference protocols and model profiles. Read [AGENTS.md](AGENTS.md) before changing it.
 
+The provider registry keeps defensive construction-entry snapshots and exposes credential-free identity fields only after a successful build or replacement. Measured Fusion routing compares those loaded fields with current configuration. `LlamaServerProvider.textRequestBaseUrl` instead reads the actual shared text client's effective base (its pinned override or current local URL); its vision entry URL is separate. Together with the tracked `chatModelId`, this supports known managed-local history without claiming remote served-weight attestation.
+
 ## Entry points
 
 - [model-profile.ts](model-profile.ts)

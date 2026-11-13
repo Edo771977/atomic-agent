@@ -43,10 +43,10 @@ describe("withinOneAgreement", () => {
 describe("confusionMatrix", () => {
   it("counts each (a,b) pair into the correct cell", () => {
     const m = confusionMatrix([1, 2, 2, 3], [1, 2, 3, 3], 5);
-    expect(m[0][0]).toBe(1); // (1,1)
-    expect(m[1][1]).toBe(1); // (2,2)
-    expect(m[1][2]).toBe(1); // (2,3)
-    expect(m[2][2]).toBe(1); // (3,3)
+    expect(m[0]![0]).toBe(1); // (1,1)
+    expect(m[1]![1]).toBe(1); // (2,2)
+    expect(m[1]![2]).toBe(1); // (2,3)
+    expect(m[2]![2]).toBe(1); // (3,3)
   });
 
   it("rejects out-of-range scores", () => {

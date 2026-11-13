@@ -1,8 +1,10 @@
-import type {
-  CheckpointTask,
-  FusionRunCheckpoint,
+import {
+  checkpointHasFileMutations,
+  type CheckpointTask,
+  type FusionRunCheckpoint,
 } from "./run-checkpoint.js";
 import { WorkerRunCollector, type WorkerTaskResult } from "./worker-result.js";
+import { UNTRACKED_WRITE_TOOLS } from "./worker-changes.js";
 
 /**
  * Resuming a fusion run that did not end (ATO-617).
@@ -53,12 +55,13 @@ export function readResumeRequest(
 }
 
 /**
- * A finished task stands, except a `cancelled` one: a run cut off by a
- * quit or a stop leaves its running workers cancelled and the rest
- * `not started`, and neither is an answer.
+ * A finished task stands. Cancelled, never-served queued and explicitly
+ * not-started rows are unfinished; their side-effect confirmation guard
+ * still applies before another attempt.
  */
 export function isSettledForResume(task: CheckpointTask): boolean {
-  return task.result !== undefined && task.result.status !== "cancelled";
+  return task.result !== undefined && task.result.status !== "cancelled" &&
+    task.result.status !== "queued" && !(task.result.error ?? "").startsWith("not started:");
 }
 
 export interface ResumePlan {
@@ -107,16 +110,28 @@ export function planResume(
 
 function carriedResult(task: CheckpointTask): WorkerTaskResult {
   const r = task.result!;
+  // Older rows kept tool names but not the shell-coverage flag. An old
+  // verify.run also cannot prove that its execution was isolated.
+  const legacyWrites = checkpointHasFileMutations(r.tools) || r.shellRan === true ||
+    Object.keys(r.tools.byTool).some((tool) => UNTRACKED_WRITE_TOOLS.has(tool) || tool === "verify.run");
+  const incomplete = r.artifactMetadata === "incomplete" ||
+    (r.artifactMetadata === undefined && legacyWrites);
+  const coverageError = incomplete && r.status === "ok"
+    ? "checkpoint artifact coverage is incomplete; verify the changed files before replanning this task"
+    : undefined;
   return {
     id: task.id,
     title: task.title,
-    status: r.status,
+    status: coverageError === undefined ? r.status : "needs_orchestrator",
     reply: r.reply,
     stepCount: r.stepCount,
     durationMs: r.durationMs,
     queueWaitMs: null,
     tools: r.tools,
-    ...(r.error === undefined ? {} : { error: r.error }),
+    ...((coverageError ?? r.error) === undefined ? {} : { error: coverageError ?? r.error }),
+    ...(r.changes === undefined ? {} : { changes: r.changes }),
+    ...(r.shellRan === true ? { shellRan: true } : {}),
+    ...(r.artifactManifest === undefined ? {} : { artifactManifest: r.artifactManifest }),
     notes: [...(r.notes ?? []), CARRIED_NOTE],
   };
 }

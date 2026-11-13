@@ -13,18 +13,22 @@
  * Inside a git repo a workspace is a detached `git worktree` of a
  * snapshot commit: `git stash create` captures the tracked files'
  * uncommitted state without touching the working tree or the stash
- * list (HEAD when there is nothing uncommitted). Untracked files are
- * copied in; ignored directories (`node_modules`, build output) are
- * symlinked to the originals so a test run still finds them, and
- * ignored files are copied. Outside git, or when git cannot snapshot
+ * list (HEAD when there is nothing uncommitted). The commit supplies
+ * Git metadata only: tracked paths are overlaid from the original's
+ * actual bytes into the base, then from that frozen base into each
+ * task, bypassing clean/smudge filters and Git's stat cache. Untracked files are
+ * copied in; ignored directories (`node_modules`, build output) and
+ * ignored files are copied privately so a test run still finds them.
+ * Outside git, or when git cannot snapshot
  * (no commit yet, a merge in progress, no git binary), a workspace is
- * a folder copy: APFS clonefile on macOS, else the `verify.run` copy
- * with its exclusions symlinked. A tree too large to copy is not
- * isolated at all; the caller runs the wave in place and says so.
+ * a private folder copy without the original's git metadata. Copying
+ * is bounded across the base and every task. A tree too large to copy is not
+ * isolated at all; the caller refuses the wave before any worker starts.
  *
- * Writes into a symlinked directory land in the original, as they do
- * for `verify.run`; nothing under one is merged, because it is already
- * there. Submodules are not checked out in a worktree.
+ * Dependencies and build outputs are readable but their private writes
+ * are not merged. Existing user symlinks retain their targets; this is
+ * workspace isolation, not a process sandbox. Submodules are not checked
+ * out in a worktree.
  */
 import { randomBytes } from "node:crypto";
 import {
@@ -46,12 +50,8 @@ import { tmpdir } from "node:os";
 import { dirname, join, relative, sep } from "node:path";
 import { runCommand, type CommandResult } from "../../sandbox/command-runner.js";
 import { buildCommandEnv } from "../../sandbox/command-env.js";
-import {
-  copyTreeWithExclusions,
-  measureTree,
-  VERIFY_COPY_EXCLUDED,
-  VERIFY_COPY_MAX_BYTES,
-} from "../verify/verify-workspace-copy.js";
+import { VERIFY_COPY_EXCLUDED, VERIFY_COPY_MAX_BYTES } from "../verify/verify-workspace-copy.js";
+import { createDirectoryIgnorePolicy, type DirectoryIgnorePolicy, type IgnoreGit } from "./branch-ignore-policy.js";
 
 /** Where conflicting sides are saved for the merge task, relative to the working directory. */
 export const BRANCH_MERGE_DIR = join(".atomic-agent", "fusion-merge");
@@ -86,7 +86,8 @@ function processAlive(pid: number): boolean {
 
 async function staleRoot(root: string): Promise<boolean> {
   try {
-    const owner = JSON.parse(await readFile(join(root, OWNER_FILE), "utf8")) as { pid?: unknown };
+    const owner = JSON.parse(await readFile(join(root, OWNER_FILE), "utf8")) as { pid?: unknown; recovery?: unknown };
+    if (owner.recovery === true) return false;
     return typeof owner.pid !== "number" || !processAlive(owner.pid);
   } catch {
     const info = await stat(root).catch(() => null);
@@ -157,9 +158,15 @@ export interface BranchWorkspace {
   readonly dir: string;
   /** Files as they were when the workspace was made, by path relative to `dir`. */
   readonly manifest: ReadonlyMap<string, FileStamp>;
+  /** Private ignored directories: available to checks, never merged as outputs. */
+  readonly excludedDirectories?: ReadonlySet<string>;
+  /** Frozen rules also classify ignored directories created after dispatch. */
+  readonly directoryIgnorePolicy?: DirectoryIgnorePolicy;
 }
 
 export interface BranchSet {
+  /** Keep a rejected candidate for manual recovery when a bounded patch cannot be saved; never resumable. */
+  retainForRecovery?(): Promise<void>;
   readonly method: BranchMethod;
   /** The working directory the workspaces mirror and are merged back into. */
   readonly realDir: string;
@@ -183,11 +190,14 @@ export type GitExec = (
 ) => Promise<CommandResult | null>;
 
 export interface CreateBranchSetOptions {
+  signal?: AbortSignal;
   tmpRoot?: string;
   platform?: NodeJS.Platform;
   /** Test seam. */
   git?: GitExec;
-  /** Test seam: a tree over this many bytes is not copied. */
+  /** Test seam: independent Git evaluator for frozen directory-ignore rules. */
+  ignoreGit?: IgnoreGit;
+  /** Maximum actual copied bytes across base and tasks; not Git's separate checkout materializations. */
   maxCopyBytes?: number;
 }
 
@@ -198,11 +208,12 @@ const GIT_MAX_OUTPUT_BYTES = 32 * 1024 * 1024;
  * Git with no pager, no prompt, no hooks and none of the agent's keys
  * in its environment (the same rules as `runGit`).
  */
-export const defaultGitExec: GitExec = async (args, cwd) => {
+async function executeGit(args: readonly string[], cwd: string, signal?: AbortSignal): Promise<CommandResult | null> {
+  signal?.throwIfAborted();
   try {
     return await runCommand(
       "git",
-      ["--no-pager", "-c", "core.hooksPath=/dev/null", ...args],
+      ["--no-pager", "-c", "core.hooksPath=/dev/null", "-c", "core.autocrlf=false", ...args],
       {
         cwd,
         env: {
@@ -212,13 +223,15 @@ export const defaultGitExec: GitExec = async (args, cwd) => {
           LC_ALL: "C",
         },
         timeoutMs: GIT_TIMEOUT_MS,
+        ...(signal === undefined ? {} : { signal }),
         maxOutputBytes: GIT_MAX_OUTPUT_BYTES,
       },
     );
   } catch {
     return null;
   }
-};
+}
+export const defaultGitExec: GitExec = (args, cwd) => executeGit(args, cwd);
 
 function ok(result: CommandResult | null): result is CommandResult {
   return (
@@ -250,27 +263,40 @@ function isUnderMergeDir(rel: string): boolean {
  * `node_modules`, …) and the merge folder are skipped: none of it is
  * merged back.
  */
-export async function stampTree(root: string): Promise<Map<string, FileStamp>> {
+export async function stampTree(
+  root: string,
+  excludedDirectories: ReadonlySet<string> = new Set(),
+  directoryIgnorePolicy?: DirectoryIgnorePolicy,
+  signal?: AbortSignal,
+): Promise<Map<string, FileStamp>> {
+  signal?.throwIfAborted();
   const out = new Map<string, FileStamp>();
+  const directories: string[] = [];
   const stack = [root];
   while (stack.length > 0) {
+    signal?.throwIfAborted();
     const dir = stack.pop()!;
     let entries;
     try {
       entries = await readdir(dir, { withFileTypes: true });
+      signal?.throwIfAborted();
     } catch {
+      signal?.throwIfAborted();
       continue;
     }
     for (const entry of entries) {
+      signal?.throwIfAborted();
       if (VERIFY_COPY_EXCLUDED.has(entry.name)) continue;
       const full = join(dir, entry.name);
       const rel = relative(root, full);
-      if (isUnderMergeDir(rel)) continue;
+      if (isUnderMergeDir(rel) || excludedDirectories.has(rel)) continue;
       if (entry.isDirectory()) {
+        directories.push(rel);
         stack.push(full);
       } else if (entry.isFile() || entry.isSymbolicLink()) {
         try {
           const info = await lstat(full);
+          signal?.throwIfAborted();
           out.set(
             rel,
             info.isSymbolicLink()
@@ -278,8 +304,20 @@ export async function stampTree(root: string): Promise<Map<string, FileStamp>> {
               : { size: info.size, mtimeMs: info.mtimeMs, mode: info.mode & 0o777 },
           );
         } catch {
+          signal?.throwIfAborted();
           // Vanished mid-walk.
         }
+      }
+    }
+  }
+  signal?.throwIfAborted();
+  const ignored = await directoryIgnorePolicy?.(directories, signal);
+  signal?.throwIfAborted();
+  if (ignored !== undefined && ignored.size > 0) {
+    for (const rel of out.keys()) {
+      signal?.throwIfAborted();
+      for (let dir = dirname(rel); dir !== "."; dir = dirname(dir)) {
+        if (ignored.has(dir)) { out.delete(rel); break; }
       }
     }
   }
@@ -290,7 +328,45 @@ async function copyFileKeepingMode(from: string, to: string): Promise<void> {
   await mkdir(dirname(to), { recursive: true });
   await copyFile(from, to);
   const mode = (await lstat(from)).mode & 0o777;
-  if (mode & 0o111) await chmod(to, mode);
+  await chmod(to, mode);
+}
+
+class PrivateCopyLimitError extends Error {
+  constructor() { super("the private workspace copies exceed the copy byte limit"); }
+}
+
+interface PrivateCopyBudget { left: number; signal?: AbortSignal }
+
+/** Copy entries without creating links back to the source or sharing its git metadata. */
+async function copyPrivateEntry(
+  from: string,
+  to: string,
+  budget: PrivateCopyBudget,
+  rel = "",
+): Promise<void> {
+  budget.signal?.throwIfAborted();
+  if (isUnderMergeDir(rel)) return;
+  const info = await lstat(from);
+  if (info.isDirectory()) {
+    await mkdir(to, { recursive: true });
+    for (const name of await readdir(from)) {
+      if (name === ".git") continue;
+      await copyPrivateEntry(join(from, name), join(to, name), budget, join(rel, name));
+    }
+  } else if (info.isSymbolicLink()) {
+    await mkdir(dirname(to), { recursive: true });
+    await symlink(await readlink(from), to);
+  } else if (info.isFile()) {
+    if (info.size > budget.left) throw new PrivateCopyLimitError();
+    budget.left -= info.size;
+    await copyFileKeepingMode(from, to);
+    budget.signal?.throwIfAborted();
+    // A file growing during the copy must not evade the shared limit.
+    budget.left -= (await lstat(to)).size - info.size;
+    if (budget.left < 0) throw new PrivateCopyLimitError();
+  } else {
+    throw new Error(`cannot copy a special workspace entry: ${from}`);
+  }
 }
 
 /** What a git snapshot needs: the commit, and what lives outside it. */
@@ -299,6 +375,7 @@ interface GitSnapshot {
   /** The working directory relative to the repo's top. */
   rel: string;
   commit: string;
+  tracked: string[];
   untracked: string[];
   /** Ignored entries; a trailing `/` marks a directory. */
   ignored: string[];
@@ -321,6 +398,7 @@ async function gitSnapshot(
   const stash = await git(["stash", "create"], realDir);
   if (!ok(stash)) return null;
   const commit = stash.stdout.trim() || head.stdout.trim();
+  const tracked = await git(["ls-files", "--cached", "-z"], realDir);
   const untracked = await git(
     ["ls-files", "--others", "--exclude-standard", "-z"],
     realDir,
@@ -329,22 +407,24 @@ async function gitSnapshot(
     ["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"],
     realDir,
   );
-  if (!ok(untracked) || !ok(ignored)) return null;
+  if (!ok(tracked) || !ok(untracked) || !ok(ignored)) return null;
   return {
     top,
     rel,
     commit,
+    tracked: zList(tracked.stdout),
     untracked: zList(untracked.stdout),
     ignored: zList(ignored.stdout),
   };
 }
 
-/** One worktree of the snapshot at `root`, with what git does not carry copied or linked in. */
+/** One worktree of the snapshot at `root`, with private copies of what git does not carry. */
 async function addWorktree(
   snapshot: GitSnapshot,
   realDir: string,
   root: string,
   git: GitExec,
+  budget: PrivateCopyBudget,
 ): Promise<string> {
   const added = await git(
     ["worktree", "add", "--detach", "--quiet", root, snapshot.commit],
@@ -357,51 +437,35 @@ async function addWorktree(
   }
   const dir = snapshot.rel.length === 0 ? root : join(root, snapshot.rel);
   await mkdir(dir, { recursive: true });
+  for (const path of snapshot.tracked) {
+    const from = join(realDir, path);
+    let info;
+    try {
+      info = await lstat(from);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    }
+    const to = join(dir, path);
+    // Checkout filters and a cached-clean index may disagree with the
+    // working tree. Replace, never normalize, the actual source entry.
+    await rm(to, { recursive: true, force: true });
+    if (info?.isDirectory()) {
+      // A submodule remains unpopulated, as with Git worktree checkout.
+      // Untracked children of a file replaced by a directory follow below.
+      await mkdir(to, { recursive: true });
+    } else if (info !== undefined) {
+      await copyPrivateEntry(from, to, budget, path);
+    }
+  }
   for (const path of snapshot.untracked) {
-    await copyFileKeepingMode(join(realDir, path), join(dir, path)).catch(
-      () => undefined,
-    );
+    await copyPrivateEntry(join(realDir, path), join(dir, path), budget, path);
   }
   for (const entry of snapshot.ignored) {
     const isDir = entry.endsWith("/");
     const path = isDir ? entry.slice(0, -1) : entry;
-    const from = join(realDir, path);
-    const to = join(dir, path);
-    try {
-      if (isDir) {
-        await mkdir(dirname(to), { recursive: true });
-        await symlink(from, to, "dir");
-      } else {
-        await copyFileKeepingMode(from, to);
-      }
-    } catch {
-      // An ignored entry that cannot be mirrored is one a worker cannot
-      // see; not a reason to give up the isolation.
-    }
+    await copyPrivateEntry(join(realDir, path), join(dir, path), budget, path);
   }
   return dir;
-}
-
-function cloneWithCp(src: string, dest: string): Promise<boolean> {
-  return runCommand("cp", ["-c", "-R", src, dest], {
-    cwd: dirname(dest),
-    timeoutMs: 300_000,
-  })
-    .then((r) => r.exitCode === 0)
-    .catch(() => false);
-}
-
-async function copyWorkspace(
-  realDir: string,
-  root: string,
-  platform: NodeJS.Platform,
-): Promise<BranchMethod> {
-  if (platform === "darwin" && (await cloneWithCp(realDir, root))) {
-    return "clonefile";
-  }
-  await rm(root, { recursive: true, force: true });
-  await copyTreeWithExclusions(realDir, root);
-  return "copy";
 }
 
 /**
@@ -415,8 +479,9 @@ export async function createBranchSet(
   taskIds: readonly string[],
   options: CreateBranchSetOptions = {},
 ): Promise<BranchSet | null> {
-  const git = options.git ?? defaultGitExec;
-  const platform = options.platform ?? process.platform;
+  options.signal?.throwIfAborted();
+  const git = options.git ?? ((args, cwd) => executeGit(args, cwd, options.signal));
+  const cleanupGit = options.git ?? defaultGitExec;
   const real = await realpath(realDir);
   const runRoot = await realpath(
     await mkdtemp(
@@ -432,12 +497,14 @@ export async function createBranchSet(
     join(runRoot, OWNER_FILE),
     JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }),
   ).catch(() => undefined);
-  const snapshot = await gitSnapshot(real, git);
+  let snapshot: GitSnapshot | null;
+  try { snapshot = await gitSnapshot(real, git); }
+  catch (err) { await rm(runRoot, { recursive: true, force: true }); throw err; }
   await sweepStaleBranchSets(dirname(runRoot), snapshot?.top, git);
   const roots: string[] = [];
   const removeRoot = async (root: string): Promise<void> => {
     if (snapshot !== null) {
-      await git(["worktree", "remove", "--force", root], snapshot.top).catch(
+      await cleanupGit(["worktree", "remove", "--force", root], snapshot.top).catch(
         () => null,
       );
     }
@@ -461,48 +528,56 @@ export async function createBranchSet(
         await rm(root, { recursive: true, force: true }).catch(() => undefined);
       }
       if (snapshot !== null) {
-        await git(["worktree", "prune"], snapshot.top).catch(() => null);
+        await cleanupGit(["worktree", "prune"], snapshot.top).catch(() => null);
       }
       return;
     }
     for (const root of roots) await removeRoot(root);
     await rm(runRoot, { recursive: true, force: true }).catch(() => undefined);
     if (snapshot !== null) {
-      await git(["worktree", "prune"], snapshot.top).catch(() => null);
+      await cleanupGit(["worktree", "prune"], snapshot.top).catch(() => null);
     }
   };
-  if (snapshot === null) {
-    const limit = options.maxCopyBytes ?? VERIFY_COPY_MAX_BYTES;
-    if ((await measureTree(real, limit)) > limit) {
-      await cleanup();
-      return null;
-    }
-  }
+  const budget: PrivateCopyBudget = { left: options.maxCopyBytes ?? VERIFY_COPY_MAX_BYTES, ...(options.signal === undefined ? {} : { signal: options.signal }) };
   try {
-    let method: BranchMethod = "worktree";
-    const make = async (name: string): Promise<string> => {
+    const method: BranchMethod = snapshot === null ? "copy" : "worktree";
+    const make = async (name: string, source: string): Promise<string> => {
       const root = join(runRoot, name);
       roots.push(root);
-      if (snapshot !== null) return addWorktree(snapshot, real, root, git);
-      method = await copyWorkspace(real, root, platform);
+      if (snapshot !== null) return addWorktree(snapshot, source, root, git, budget);
+      await copyPrivateEntry(source, root, budget);
       return root;
     };
-    const baseDir = await make("base");
+    const baseDir = await make("base", real);
+    const directoryIgnorePolicy = await createDirectoryIgnorePolicy({
+      originalDir: real, baseDir, probeDir: join(runRoot, "ignore-policy"),
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
+      copy: (from, to) => copyPrivateEntry(from, to, budget),
+      ...(options.ignoreGit === undefined ? {} : { git: options.ignoreGit }),
+    });
+    const excludedDirectories = new Set(
+      (snapshot?.ignored ?? [])
+        .filter((path) => path.endsWith("/"))
+        .map((path) => path.slice(0, -1).split("/").join(sep)),
+    );
     const workspaces = new Map<string, BranchWorkspace>();
     for (const [index, taskId] of taskIds.entries()) {
       const name = workspaceName(index, taskId);
       workspaceRoots.set(taskId, join(runRoot, name));
-      const dir = await make(name);
+      const dir = await make(name, baseDir);
       workspaces.set(taskId, {
         taskId,
         name,
         dir,
-        manifest: await stampTree(dir),
+        manifest: await stampTree(dir, excludedDirectories, directoryIgnorePolicy, options.signal),
+        excludedDirectories,
+        ...(directoryIgnorePolicy === undefined ? {} : { directoryIgnorePolicy }),
       });
     }
-    return { method, realDir: real, baseDir, workspaces, cleanup };
+    return { method, realDir: real, baseDir, workspaces, cleanup, retainForRecovery: () => writeFile(join(runRoot, OWNER_FILE), JSON.stringify({ pid: process.pid, recovery: true, createdAt: new Date().toISOString() })) };
   } catch (err) {
     await cleanup();
+    if (err instanceof PrivateCopyLimitError) return null;
     throw err;
   }
 }
@@ -514,10 +589,12 @@ export async function createBranchSet(
  */
 export async function touchedPaths(
   workspace: BranchWorkspace,
+  signal?: AbortSignal,
 ): Promise<string[]> {
-  const now = await stampTree(workspace.dir);
+  const now = await stampTree(workspace.dir, workspace.excludedDirectories, workspace.directoryIgnorePolicy, signal);
   const out: string[] = [];
   for (const [rel, stamp] of now) {
+    signal?.throwIfAborted();
     const before = workspace.manifest.get(rel);
     if (
       before === undefined ||
@@ -530,6 +607,7 @@ export async function touchedPaths(
     }
   }
   for (const rel of workspace.manifest.keys()) {
+    signal?.throwIfAborted();
     if (!now.has(rel)) out.push(rel);
   }
   return out.sort();

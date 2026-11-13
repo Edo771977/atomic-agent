@@ -219,6 +219,8 @@ export type UserLlmFusionConfig = {
    * Default `true`; `false` writes nothing.
    */
   outcomeLog?: boolean;
+  /** Opt-in decisions from recent objective task-check outcomes; absent is off. */
+  measuredRouting?: { enabled?: boolean; minSamples?: number; days?: number };
   /**
    * The one-call format check before the first fan-out on a local worker
    * leg: a few dozen tokens under the workers' own grammar, and a reply
@@ -237,6 +239,8 @@ export type UserLlmFusionConfig = {
    * straight into the working directory, as before.
    */
   isolation?: FusionIsolationMode;
+  /** Whole-fanout verified file promotion; direct (default) keeps existing integration behavior. */
+  integration?: "direct" | "candidate";
   /**
    * The task tree (ATO-940). Off by default. On, a worker whose task is
    * too big (no write by half its step budget, or its first answer cut
@@ -622,6 +626,12 @@ function parseFusion(
     }
     out.isolation = obj.isolation;
   }
+  if (obj.integration !== undefined && !isSetAsideString(obj.integration, ["direct", "candidate"], `${field}.integration`, undefined)) {
+    if (obj.integration !== "direct" && obj.integration !== "candidate") {
+      throw new ConfigValidationError(`${field}.integration`, "expected direct|candidate");
+    }
+    out.integration = obj.integration;
+  }
   if (obj.maxRoundsPerTurn !== undefined) {
     out.maxRoundsPerTurn = parseBoundedInt(
       obj.maxRoundsPerTurn,
@@ -671,6 +681,22 @@ function parseFusion(
       throw new ConfigValidationError(`${field}.outcomeLog`, "expected boolean");
     }
     out.outcomeLog = obj.outcomeLog;
+  }
+  if (obj.measuredRouting !== undefined) {
+    const fieldName = `${field}.measuredRouting`;
+    const value = obj.measuredRouting;
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+      throw new ConfigValidationError(fieldName, "expected object");
+    }
+    const routing = value as Record<string, unknown>;
+    if (routing.enabled !== undefined && typeof routing.enabled !== "boolean") {
+      throw new ConfigValidationError(`${fieldName}.enabled`, "expected boolean");
+    }
+    out.measuredRouting = {
+      ...(routing.enabled === undefined ? {} : { enabled: routing.enabled as boolean }),
+      ...(routing.minSamples === undefined ? {} : { minSamples: parseBoundedInt(routing.minSamples, `${fieldName}.minSamples`, 3, 1000) }),
+      ...(routing.days === undefined ? {} : { days: parseBoundedInt(routing.days, `${fieldName}.days`, 1, 365) }),
+    };
   }
   if (obj.localFormatCheck !== undefined) {
     if (typeof obj.localFormatCheck !== "boolean") {

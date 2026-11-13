@@ -10,6 +10,7 @@ import {
   type FusionRunCheckpoint,
 } from "./run-checkpoint.js";
 import { WorkerRunCollector, type WorkerTaskResult } from "./worker-result.js";
+import { parseDelegateArgs } from "./delegate-args.js";
 
 const TASKS = [
   { id: "t1", title: "One" },
@@ -88,6 +89,110 @@ describe("fusion run checkpoints (ATO-617)", () => {
     expect(saved.tasks[0]!.result?.reply).toBe("reply of t1");
     expect(saved.tasks[1]!.result).toBeUndefined();
     expect(saved.spentUsd).toBeCloseTo(0.25);
+  });
+
+  it("keeps observed changes and shell coverage for artifact verification after a restart", () => {
+    const store = new FusionRunStore({ dir });
+    const run = start(store);
+    const changes: NonNullable<WorkerTaskResult["changes"]> = [{ path: "bad.js", kind: "new", addedLines: 1, removedLines: 0 }];
+    run.recordTask(row("t1", { changes, shellRan: true }));
+    const saved = store.load(run.runId)!;
+    expect(saved.tasks[0]!.result).toMatchObject({ changes, shellRan: true });
+  });
+
+  it("does not claim complete metadata for an unobserved move with writes=0", () => {
+    const store = new FusionRunStore({ dir });
+    const run = start(store);
+    run.recordTask(row("t1", { tools: { calls: 1, errors: 0, writes: 0, byTool: { "os.fs.move": 1 } } }));
+    expect(store.load(run.runId)!.tasks[0]!.result?.artifactMetadata).toBe("incomplete");
+  });
+
+  it("rejects malformed nested checkpoint rows instead of trusting an invalid status", () => {
+    const store = new FusionRunStore({ dir });
+    const run = start(store);
+    run.recordTask(row("t1"));
+    const saved = run.snapshot();
+    (saved.tasks[0]!.result as unknown as { status: string }).status = "invented-success";
+    writeFileSync(join(dir, `${run.runId}.json`), JSON.stringify(saved));
+    expect(store.load(run.runId)).toBeNull();
+  });
+
+  it("bounds checkpoint input before parsing", () => {
+    const store = new FusionRunStore({ dir });
+    const run = start(store);
+    const saved = { ...run.snapshot(), oversized: "x".repeat(9 * 1024 * 1024) };
+    writeFileSync(join(dir, `${run.runId}.json`), JSON.stringify(saved));
+    expect(store.load(run.runId) === null).toBe(true);
+  });
+
+  it.each(["title", "id", "sessionId", "workingDir", "originalRequest"])("round-trips accepted %s beyond the previous reader-only bound", field => {
+    const store = new FusionRunStore({ dir });
+    const task = { id: field === "id" ? "i".repeat(1_025) : "one", title: field === "title" ? "t".repeat(8_193) : "One", instructions: "work" };
+    const parsed = parseDelegateArgs({ tasks: [task] });
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) throw new Error(parsed.error);
+    const run = store.start({ sessionId: field === "sessionId" ? "s".repeat(1_025) : "s-1", workingDir: field === "workingDir" ? "/" + "p".repeat(4_096) : "/repo", ...(field === "originalRequest" ? { originalRequest: "r".repeat(1_000_001) } : {}), args: { tasks: [task] }, tasks: parsed.tasks, waveCount: 1 });
+    run.finish("interrupted");
+    const saved = store.load(run.runId);
+    expect(saved === null).toBe(false);
+    expect(saved?.tasks[0]!.id).toBe(task.id);
+    expect(saved?.args).toEqual({ tasks: [task] });
+    expect(store.listResumable()).toHaveLength(1);
+  });
+
+  it("retains a legacy long title and id within the aggregate v1 file budget", () => {
+    const store = new FusionRunStore({ dir });
+    const run = start(store);
+    const saved = run.snapshot();
+    saved.tasks[0]!.id = "legacy-" + "i".repeat(1_025);
+    saved.tasks[0]!.title = "t".repeat(8_193);
+    writeFileSync(join(dir, `${run.runId}.json`), JSON.stringify(saved));
+    expect(store.load(run.runId)?.tasks[0]).toEqual(saved.tasks[0]);
+  });
+
+  it("round-trips tool maps and side-effect names without reader-only per-field limits", () => {
+    const store = new FusionRunStore({ dir });
+    const run = start(store);
+    const byTool = Object.fromEntries(Array.from({ length: 257 }, (_, i) => [`tool.${i}.${"x".repeat(1_025)}`, 1]));
+    run.recordTask(row("t1", { tools: { calls: 257, errors: 0, writes: 0, byTool } }));
+    const saved = store.load(run.runId);
+    expect(saved?.tasks[0]!.result?.tools.byTool).toEqual(byTool);
+    expect(saved?.tasks[0]!.sideEffects).toBe(true);
+  });
+
+  it.each([{ notes: Array.from({ length: 65 }, () => "note") }, { notes: ["n".repeat(4_001)] }])("keeps a run but marks coverage incomplete when bounded notes are clipped", ({ notes }) => {
+    const store = new FusionRunStore({ dir });
+    const run = start(store);
+    run.recordTask(row("t1", { notes }));
+    expect(store.load(run.runId)?.tasks[0]!.result?.artifactMetadata).toBe("incomplete");
+  });
+
+  it.each([4_096, 4_097])("round-trips an observed path of %i characters without losing the run", length => {
+    const store = new FusionRunStore({ dir });
+    const run = start(store);
+    run.recordTask(row("t1", { changes: [{ path: "p".repeat(length), kind: "new" }] }));
+    expect(store.load(run.runId)?.tasks[0]!.result?.artifactMetadata).toBe(length === 4_096 ? "complete" : "incomplete");
+  });
+
+  it("compacts aggregate verification metadata rather than writing an unreadable run", () => {
+    const store = new FusionRunStore({ dir });
+    const tasks = Array.from({ length: 8 }, (_, i) => ({ id: `t${i}`, title: `Task ${i}`, instructions: "work" }));
+    const run = store.start({ sessionId: "s-1", workingDir: "/repo", args: { tasks }, tasks, waveCount: 1 });
+    const changes: NonNullable<WorkerTaskResult["changes"]> = Array.from({ length: 256 }, (_, i) => ({ path: String(i).padStart(4_096, "p"), kind: "new" }));
+    for (const task of tasks) run.recordTask(row(task.id, { changes }));
+    run.finish("interrupted");
+    const saved = store.load(run.runId);
+    expect(saved === null).toBe(false);
+    expect(saved?.tasks.some(t => t.result?.artifactMetadata === "incomplete")).toBe(true);
+  });
+
+  it("reports irreducibly oversized replay arguments without emitting a bogus checkpoint", () => {
+    const store = new FusionRunStore({ dir });
+    const tasks = [{ id: "one", title: "x".repeat(8 * 1024 * 1024), instructions: "work" }];
+    const run = store.start({ sessionId: "s-1", workingDir: "/repo", args: { tasks }, tasks, waveCount: 1 });
+    run.finish("interrupted");
+    expect(run.checkpointWarning).toContain("8 MiB");
+    expect(existsSync(join(dir, `${run.runId}.json`))).toBe(false);
   });
 
   it("writes the wave count after a wave", () => {

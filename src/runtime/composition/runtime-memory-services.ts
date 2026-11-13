@@ -302,6 +302,7 @@ export function createRuntimeMemoryServices(args: MemoryServiceDependencies & {
         grammar: params.grammar,
         slotId: params.slotId,
         sessionId: params.sessionId,
+        ...(params.budgetOwnerSessionId === undefined ? {} : { budgetOwnerSessionId: params.budgetOwnerSessionId }),
         ...(params.responseFormat
           ? { responseFormat: params.responseFormat }
           : {}),

@@ -93,6 +93,20 @@ const BASE = {
 };
 
 describe("runWorkerTasks", () => {
+  it("binds request budgets to the parent only while the worker is running", async () => {
+    const active = new Map<string, string>();
+    const { deps, calls } = harness(async ({ session }) => {
+      expect(active.get(session.id)).toBe(BASE.parentSessionId);
+      throw new Error("worker failed");
+    });
+    deps.workerBudget = {
+      bindSession: (id, parent) => { active.set(id, parent); },
+      unbindSession: id => { active.delete(id); },
+    };
+    await runWorkerTasks(deps, { ...BASE, tasks: tasks(1), maxWorkers: 1, signal: new AbortController().signal });
+    expect(calls).toHaveLength(1);
+    expect(active.size).toBe(0);
+  });
   it("starts no further task after the turn is stopped, with no budget cap set (ATO-1334)", async () => {
     const stop = new AbortController();
     const { deps, calls } = harness(async () => {

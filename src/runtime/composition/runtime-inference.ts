@@ -16,6 +16,8 @@ import type { ResolvedModel } from "../../llm/provider/model-resolver.js";
 import type { SessionUsageLedger } from "../../session/usage-meter.js";
 import { isLocalServerUrl } from "../../llm/provider/openai/local-server-url.js";
 import { resolveModelPricingFor } from "../resolve-model-pricing.js";
+import { createRequestBudgetScope } from "../request-budget.js";
+import type { FusionTurnBudget } from "../../tools/fusion/turn-budget.js";
 import { LearnedContextWindows } from "../learned-context-windows.js";
 import { isOllamaEntry, readOllamaContextWindow } from "../../llm/provider/ollama/ollama-context-window.js";
 import { resolveVisionProvider, visionRouteAvailable } from "../vision-route.js";
@@ -315,6 +317,7 @@ export function connectRuntimeFallback(
     sessionUsage?: SessionUsageLedger;
     resolveModelPricing: RuntimeModelContext["resolveModelPricing"];
     resolveCatalogContextWindow?: RuntimeModelContext["resolveCatalogContextWindow"];
+    turnBudget?: FusionTurnBudget;
   },
 ) {
   const {
@@ -458,20 +461,54 @@ export function connectRuntimeFallback(
     // against it. No-op on every other attempt — one boolean after the
     // first call. See `prepareLocalLink` above.
     prepareLink: prepareLocalLink,
+    ...(deps.turnBudget === undefined ? {} : {
+      requestBudget: (providerId, request, provider) => {
+        const owner = request.budgetOwnerSessionId ?? request.sessionId;
+        if (owner === undefined || deps.turnBudget?.requestLimits(owner) === undefined) return undefined;
+        const entry = resolveLlmConfig(getConfig()).providers.find(p => p.id === providerId);
+        return createRequestBudgetScope(deps.turnBudget, request, provider, entry,
+          resolveModelPricing(provider.chatModelId ?? entry?.defaultChatModel ?? entry?.model ?? null, providerId));
+      },
+    } satisfies Pick<FallbackSeamDeps, "requestBudget">),
     recordUnaryUsage,
     recordStreamUsage,
   };
 
-  const llmComplete =
-    options.overrides?.llamaComplete ??
-    createFallbackCompleter(fallbackSeamDeps);
+  const overrideScope = (params: LlmStreamParams) => {
+    const limits = deps.turnBudget?.requestLimits(params.budgetOwnerSessionId ?? params.sessionId);
+    if (limits === undefined) return undefined;
+    if (limits.usd !== undefined) throw new Error("turn budget cannot verify physical requests made by an inference override");
+    const { provider } = resolveActiveLlmSlice(params.providerId);
+    return fallbackSeamDeps.requestBudget?.(provider.id, params, provider);
+  };
+  const unaryOverride = options.overrides?.llamaComplete;
+  const llmComplete = unaryOverride === undefined
+    ? createFallbackCompleter(fallbackSeamDeps)
+    : deps.turnBudget === undefined ? unaryOverride
+    : async (params: LlmStreamParams): Promise<CompletionResult> => {
+        const scope = overrideScope(params);
+        let result: CompletionResult | undefined;
+        try {
+          result = await unaryOverride(scope === undefined ? params : { ...params, signal: scope.signal ?? params.signal });
+          return result;
+        } finally { scope?.finish(result); }
+      };
 
   const llmCompleteStream = options.overrides?.disableStreaming
     ? undefined
-    : (options.overrides?.llamaCompleteStream ??
+    : (options.overrides?.llamaCompleteStream === undefined ?
       (options.overrides?.llamaComplete
         ? undefined
-        : createFallbackStreamer(fallbackSeamDeps)));
+        : createFallbackStreamer(fallbackSeamDeps))
+      : deps.turnBudget === undefined ? options.overrides.llamaCompleteStream
+      : async function* (params: LlmStreamParams) {
+          const scope = overrideScope(params);
+          let result: CompletionResult | undefined;
+          try {
+            result = yield* options.overrides!.llamaCompleteStream!(scope === undefined ? params : { ...params, signal: scope.signal ?? params.signal });
+            return result;
+          } finally { scope?.finish(result); }
+        });
 
 
   return {

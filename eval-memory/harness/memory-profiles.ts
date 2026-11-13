@@ -131,7 +131,7 @@ export function buildMemoryConfig(
 
   config.agent = {
     ...config.agent,
-    approvalRequired: false,
+    approvalLevel: 5,
     maxSteps: opts.maxSteps ?? config.agent.maxSteps,
   };
 

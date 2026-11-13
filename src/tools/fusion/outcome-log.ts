@@ -86,6 +86,13 @@ export interface TaskOutcomeRecord {
   leg: OutcomeLeg;
   /** The role that picked the model, `"orchestrator"` for that target, else null. */
   role: string | null;
+  /** Requested task role, independently of the execution leg's role. */
+  taskRole?: string | null;
+  /** Objective declared checks only; neither judge/self-report nor full integration acceptance. */
+  acceptance?: "checks-passed" | "checks-failed";
+  acceptanceScope?: "task-checks";
+  /** SHA256 of known configured request identity, stable through execution; not served-model attestation. */
+  routingIdentity?: string;
   status: WorkerTaskStatus;
   failure: FailureCategory | null;
   /** This turn's attempt at the task (1 = first), replans and re-delegations alike. */
@@ -212,6 +219,8 @@ export interface TaskOutcomeContext {
   model: string;
   leg: OutcomeLeg;
   role: string | null;
+  taskRole?: string | null;
+  routingIdentity?: string;
   attempt: number;
   pricing: WorkerPricing | undefined;
   merge: MergeOutcome | null;
@@ -256,6 +265,15 @@ export function taskOutcomeRecord(
     model: outcomeLabel(context.model),
     leg: context.leg,
     role: context.role,
+    ...(context.taskRole === undefined ? {} : { taskRole: context.taskRole }),
+    ...(context.routingIdentity !== undefined && /^[a-f0-9]{64}$/.test(context.routingIdentity) ? { routingIdentity: context.routingIdentity } : {}),
+    ...((row.checks?.total ?? 0) > 0 && (row.escalations ?? 0) === 0 && row.judge?.retried !== true &&
+      context.merge !== "held" && context.merge !== "conflict"
+      ? (row.checks!.failed > 0 && row.status === "failed"
+        ? { acceptance: "checks-failed" as const, acceptanceScope: "task-checks" as const }
+        : row.checks!.failed === 0 && row.status === "ok"
+          ? { acceptance: "checks-passed" as const, acceptanceScope: "task-checks" as const } : {})
+      : {}),
     status: row.status,
     failure: failureCategory(row),
     attempt: Math.max(1, context.attempt),

@@ -23,7 +23,7 @@ const turnStarted = (turnIndex: number, seq: number): TraceEvent => ({
 const turnFinished = (
   turnIndex: number,
   seq: number,
-  reason: "reply" | "finish" | "failed" | "cancelled" | "max_steps" | "stalled",
+  reason: Extract<TraceEvent, { type: "turn_finished" }>["reason"],
   stepCount = 1,
   durationMs = 1000,
 ): TraceEvent => ({
@@ -101,13 +101,13 @@ describe("analyzeTrace", () => {
     expect(r.reasonHistogram).toEqual({ reply: 1, max_steps: 1, failed: 1 });
     expect(r.problemTurns.length).toBe(2);
 
-    const t1 = r.turns[1];
+    const t1 = r.turns[1]!;
     expect(t1.turnIndex).toBe(1);
     expect(t1.maxPromptTokens).toBe(15000);
     expect(t1.totalPromptTokens).toBe(27000);
     expect(t1.stepCount).toBe(16);
 
-    const t2 = r.turns[2];
+    const t2 = r.turns[2]!;
     expect(t2.errorCount).toBe(2);
     expect(t2.lastErrors.map((e) => e.category)).toEqual(["transport", "model"]);
   });
@@ -131,8 +131,8 @@ describe("analyzeTrace", () => {
       turnFinished(0, 6, "failed", 5, 1000),
     ];
     const r = analyzeTrace(events);
-    expect(r.turns[0].errorCount).toBe(5);
-    expect(r.turns[0].lastErrors.map((e) => e.message)).toEqual(["e3", "e4", "e5"]);
+    expect(r.turns[0]!.errorCount).toBe(5);
+    expect(r.turns[0]!.lastErrors.map((e) => e.message)).toEqual(["e3", "e4", "e5"]);
   });
 
   it("captures trace_truncated marker", () => {

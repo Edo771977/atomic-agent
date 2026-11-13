@@ -4,9 +4,10 @@ import {
   type ApprovalRequest,
 } from "../../approval/approval-gate.js";
 import { FanoutScopeRegistry } from "../../approval/fanout-scope.js";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 
 import type { RunTurnResult } from "../../agent/agent-loop.js";
@@ -23,6 +24,11 @@ import {
   type FusionDelegateDeps,
 } from "./fusion-delegate.js";
 import type { WorkerTaskResult } from "./worker-result.js";
+import { outcomeLogPath } from "./outcome-log.js";
+import { FusionTurnBudget } from "./turn-budget.js";
+import { FusionRunStore } from "./run-checkpoint.js";
+import type { OutcomeRecord } from "./outcome-log.js";
+import type { DelegateTask } from "./delegate-args.js";
 
 const logger = new StructuredLogger({ level: "error", sinks: [] });
 
@@ -98,6 +104,136 @@ const TASKS = [
   { id: "t1", title: "One", instructions: "Do one" },
   { id: "t2", title: "Two", instructions: "Do two" },
 ];
+
+describe("fusion.delegate measured routing", () => {
+  const identity = (provider: string, requestModel = "actual-v1") => createHash("sha256").update(`${provider}:${requestModel}`).digest("hex");
+  async function route(over: Partial<ResolvedRunMode> = {}, tasks: DelegateTask[] = [{ id: "route", title: "Build", instructions: "build" }], extra: Partial<FusionDelegateDeps> = {}, legacy = false, rawArgs?: Record<string, unknown>) {
+    const state = mkdtempSync(join(tmpdir(), "fusion-routing-"));
+    mkdirSync(join(state, "fusion"));
+    const rows = ["local-llama", "openrouter"].flatMap((provider) => Array.from({ length: 3 }, (_, i) => ({
+      v: 1, type: "task", ts: new Date().toISOString(), session: `history-${i}`, provider,
+      model: provider === "local-llama" ? "small" : "big", leg: provider === "local-llama" ? "local" : "orchestrator",
+      role: null, taskRole: null, routingIdentity: identity(provider), status: provider === "local-llama" ? "failed" : "ok", failure: provider === "local-llama" ? "checks" : null,
+      attempt: 1, escalations: 0, judgeRetried: false, selfCheckNotice: false, judge: "off", syntaxDemoted: false,
+      steps: 1, durationMs: 100, tokensIn: 10, tokensOut: 10, cachedTokens: null, costUsd: provider === "local-llama" ? null : .01, merge: null,
+      ...(legacy ? {} : { acceptance: provider === "local-llama" ? "checks-failed" : "checks-passed", acceptanceScope: "task-checks" }),
+    })));
+    const build = over.roles?.byRole.build;
+    if (build !== undefined) rows.push(...rows.filter((r) => r.provider === "openrouter").map((r) => ({ ...r, provider: build.providerId, model: build.model ?? build.providerId, routingIdentity: identity(build.providerId) })));
+    writeFileSync(outcomeLogPath(state), rows.map((r) => JSON.stringify(r)).join("\n"));
+    const pins: Array<string | undefined> = [];
+    const mode = fusionMode({ measuredRouting: { enabled: true, minSamples: 3, days: 30 }, ...over });
+    try {
+      const result = await buildFusionDelegateTool(deps({ agentStateDir: state, resolveRunMode: () => mode,
+        ...{ resolveRoutingIdentity: (provider: string) => identity(provider) },
+        runTurn: async (_s, _m, options) => { pins.push(options.providerId); return turnResult(); }, ...extra,
+      })).run(rawArgs ?? { tasks }, ctx());
+      return { result, pins };
+    } finally { rmSync(state, { recursive: true, force: true }); }
+  }
+
+  it("routes an unpinned default task to the eligible target using verified check history", async () => {
+    const { pins, result } = await route();
+    expect(pins).toEqual(["openrouter"]);
+    expect(result.details.routing).toMatchObject([{ taskId: "route", selectedProvider: "openrouter", reason: "measured-improvement" }]);
+  });
+  it("keeps legacy self-reported outcomes insufficient", async () => {
+    const { pins, result } = await route({}, undefined, {}, true);
+    expect(pins).toEqual(["local-llama"]);
+    expect(result.details.routing).toMatchObject([{ reason: "insufficient-evidence" }]);
+  });
+  it("preserves an explicit model pin", async () => {
+    const { pins } = await route({}, [{ id: "route", title: "Build", instructions: "build", model: "small" }]);
+    expect(pins).toEqual(["local-llama"]);
+  });
+  it("does not route around strong-target or CLI tools restrictions", async () => {
+    expect((await route({ maxOrchestratorTasksPerTurn: 0 })).pins).toEqual(["local-llama"]);
+    expect((await route({}, undefined, { cliToolsStayOn: () => true })).pins).toEqual(["local-llama"]);
+  });
+  it("does not mint a new strong attempt for a retry family", async () => {
+    const budget = new FusionTurnBudget();
+    budget.noteRoundAttempts("s-parent", ["route"]);
+    expect((await route({}, undefined, { turnBudget: budget })).pins).toEqual(["local-llama"]);
+  });
+  it("leaves the default-off path unchanged", async () => {
+    const { pins, result } = await route({ measuredRouting: undefined });
+    expect(pins).toEqual(["local-llama"]);
+    expect(result.details.routing).toBeUndefined();
+  });
+  it("uses the existing shared strong count and USD admission after selection", async () => {
+    const budget = new FusionTurnBudget();
+    budget.noteRound("s-parent", 1, 1);
+    expect((await route({ maxOrchestratorTasksPerTurn: 1 }, undefined, { turnBudget: budget })).pins).toEqual(["local-llama"]);
+    budget.addWorkerSpend("s-parent", 1);
+    const { pins, result } = await route({ turnBudgetUsd: .5 }, undefined, { turnBudget: budget });
+    expect(pins).toEqual([]);
+    expect(result.details.reason).toBe("turn-budget");
+  });
+  it("keeps current-turn provider blockers authoritative after a measured choice", async () => {
+    const budget = new FusionTurnBudget();
+    budget.noteTrip("s-parent", { signature: "blocker:out-of-credit", blocker: true, label: "out of credit", count: 1, providerId: "local-llama" });
+    const { pins, result } = await route({}, undefined, { turnBudget: budget });
+    expect(pins).toEqual([]);
+    expect(result.status).toBe("error");
+  });
+  it.each([false, true])("reserves all pinned local assignments before adaptation, reverse order=%s", async (reverse) => {
+    const roles: NonNullable<ResolvedRunMode["roles"]> = { byRole: {
+      build: { providerId: "local-build", model: "builder", local: true },
+      review: { providerId: "local-review", model: "reviewer", local: true },
+    }, mixLocalModels: false, localLegProviderIds: [] };
+    const tasks: DelegateTask[] = [{ id: "pin", title: "Review", instructions: "review", role: "review" },
+      { id: "auto", title: "Build", instructions: "build" }];
+    if (reverse) tasks.reverse();
+    const { pins, result } = await route({ roles, orchestratorProviderId: null }, tasks, {
+      workerSupportsSlotAffinity: (provider) => provider.startsWith("local-") && provider !== "local-llama",
+    });
+    expect([...pins].sort()).toEqual(["local-llama", "local-review"]);
+    expect((result.details.routing as Array<{ taskId: string; excluded: unknown[] }>).find((r) => r.taskId === "auto")?.excluded)
+      .toContainEqual({ provider: "local-build", reason: "mix-local-models" });
+  });
+  it("does not adapt or train on resumed carried output that no worker ran now", async () => {
+    const state = mkdtempSync(join(tmpdir(), "routing-resume-"));
+    try {
+      const store = new FusionRunStore({ dir: state });
+      const tasks = [{ id: "carried", title: "Old output", instructions: "build" }];
+      const run = store.start({ sessionId: "s-parent", workingDir: "/repo", tasks, waveCount: 1,
+        args: { tasks, contract: { checks: [{ task: "carried", type: "command", command: "test" }] } } });
+      run.recordTask({ id: "carried", title: "Old output", status: "ok", reply: "completed before restart", stepCount: 2,
+        durationMs: 700, tools: { calls: 0, errors: 0, writes: 0, byTool: {} } });
+      run.finish("interrupted");
+      const logged: OutcomeRecord[] = [];
+      const { pins, result } = await route({}, tasks, { runCheckpoints: store,
+        outcomeLog: { append: (records) => { logged.push(...records); } },
+        runChecks: async (specs) => ({ ok: true, results: specs.map(() => ({ ok: true })) }),
+      }, false, { resume: run.runId });
+      expect(pins).toEqual([]);
+      expect(logged).toEqual([]);
+      expect(result.details.routing).toEqual([]);
+      expect((result.details.tasks as WorkerTaskResult[])[0]?.checks).toMatchObject({ total: 1, failed: 0 });
+    } finally { rmSync(state, { recursive: true, force: true }); }
+  });
+  it("rejects old history when configured request identity changes under the same display label", async () => {
+    const entry = { defaultChatModel: "actual-v2" };
+    const { pins, result } = await route({}, undefined, { ...{ resolveRoutingIdentity: (provider: string) => identity(provider, entry.defaultChatModel) } });
+    expect(pins).toEqual(["local-llama"]);
+    expect(result.details.routing).toMatchObject([{ reason: "insufficient-evidence" }]);
+  });
+  it("keeps unidentified configured targets insufficient", async () => {
+    const { pins } = await route({}, undefined, { ...{ resolveRoutingIdentity: () => undefined } });
+    expect(pins).toEqual(["local-llama"]);
+  });
+  it.each([false, true])("records dispatch identity only while it stays unchanged, changed=%s", async (changed) => {
+    let requestModel = "actual-v1";
+    const logged: OutcomeRecord[] = [];
+    await route({}, undefined, { resolveRoutingIdentity: (provider) => identity(provider, requestModel),
+      outcomeLog: { append: (records) => { logged.push(...records); } },
+      runTurn: async () => { if (changed) requestModel = "actual-v2"; return turnResult(); },
+    });
+    expect(logged).toHaveLength(1);
+    expect(logged[0]).toMatchObject({ provider: "openrouter", model: "big" });
+    expect(logged[0]?.type === "task" ? logged[0].routingIdentity : null).toBe(changed ? undefined : identity("openrouter"));
+  });
+});
 
 /** Six independent tasks — more than the fixture's configured `workers` (3). */
 function sixTasks(): Array<{
@@ -1180,22 +1316,22 @@ describe("fusion.delegate", () => {
           "You may rely on: HD.Ship (symbol from t1 in js/ship.js)",
         );
 
-        // Each worker ran its own check once before its reply closed
-        // (t1's passed, t2's failed); then the fan-out's run of them all.
+        // Each worker ran its own check before replying; the provider's
+        // check also gates consumer release, then the fan-out checks all.
         // The runner sees the specs without their `task` key, and the call's cwd.
-        expect(runChecks).toHaveBeenCalledTimes(3);
+        expect(runChecks).toHaveBeenCalledTimes(4);
         expect(runChecks.mock.calls[0]![0]).toEqual([
           { kind: "command", cmd: "node", args: ["--check", "js/ship.js"] },
         ]);
-        expect(runChecks.mock.calls[1]![0]).toEqual([
+        expect(runChecks.mock.calls[2]![0]).toEqual([
           { kind: "page", path: "index.html", checks: ["no errors"] },
         ]);
-        expect(runChecks.mock.calls[2]![0]).toEqual([
+        expect(runChecks.mock.calls[3]![0]).toEqual([
           { kind: "command", cmd: "node", args: ["--check", "js/ship.js"] },
           { kind: "page", path: "index.html", checks: ["no errors"] },
           { kind: "command", cmd: "npm", args: ["test"] },
         ]);
-        expect(runChecks.mock.calls[2]![1].workingDir).toBe(dir);
+        expect(runChecks.mock.calls[3]![1].workingDir).toBe(dir);
 
         // Presence: `HD.Ship.reset` was never written; the id is spelled the other way.
         const lines = result.summary.split("\n");
@@ -1266,7 +1402,7 @@ describe("fusion.delegate", () => {
       }
     });
 
-    it("reports declared checks as not run when no runner is wired, and never fails a task on them", async () => {
+    it("reports unavailable checks and holds consumers when no runner is wired", async () => {
       const dir = fixture();
       try {
         const tool = buildFusionDelegateTool(deps({ workingDir: dir }));
@@ -1278,7 +1414,7 @@ describe("fusion.delegate", () => {
           "3 checks not run — no check runner is wired",
         );
         const rows = result.details.tasks as WorkerTaskResult[];
-        expect(rows.map((r) => r.status)).toEqual(["ok", "ok"]);
+        expect(rows.map((r) => r.status)).toEqual(["needs_orchestrator", "cancelled"]);
         expect(rows[0]).not.toHaveProperty("checks");
       } finally {
         rmSync(dir, { recursive: true, force: true });
@@ -1399,6 +1535,10 @@ describe("fusion.delegate", () => {
   });
 
   describe("waves ordered by the contract (F45)", () => {
+    const waveDirs: string[] = [];
+    afterEach(() => {
+      for (const dir of waveDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+    });
     it("is byte-identical without a contract: one wave, no wave plan on the head line or in the details", async () => {
       const tool = buildFusionDelegateTool(deps());
       const result = await tool.run({ tasks: TASKS, maxWorkers: 2 }, ctx());
@@ -1485,12 +1625,14 @@ describe("fusion.delegate", () => {
         briefs?: string[];
       } = {},
     ) {
+      const dir = mkdtempSync(join(tmpdir(), "fusion-wave-"));
+      waveDirs.push(dir);
       const started: string[] = [];
       const resolvedBefore: Record<string, string[]> = {};
       const resolved: string[] = [];
       let inFlight = 0;
       let peakInFlight = 0;
-      const runTurn: FusionDelegateDeps["runTurn"] = async (session, brief) => {
+      const runTurn: FusionDelegateDeps["runTurn"] = async (session, brief, options) => {
         const taskId = (
           session.metadata as { fusionWorker: { taskId: string } }
         ).fusionWorker.taskId;
@@ -1499,20 +1641,25 @@ describe("fusion.delegate", () => {
         resolvedBefore[taskId] = [...resolved];
         inFlight += 1;
         peakInFlight = Math.max(peakInFlight, inFlight);
+        if (taskId === "analyze" && (over.reasonFor?.(taskId) ?? "reply") === "reply") {
+          const path = join(dir, "manifest.json");
+          writeFileSync(path, "{}");
+          options.eventHook?.({ type: "llm_event", event: { type: "tool_call_executed", result: { tool: "os.fs.write", status: "ok", summary: "written", details: { path, existed: false, addedLines: 1, removedLines: 0 }, truncated: false }, batchIndex: 0, batchSize: 1 } });
+        }
         await new Promise((r) => setTimeout(r, 5));
         inFlight -= 1;
         resolved.push(taskId);
         return turnResult({ reason: over.reasonFor?.(taskId) ?? "reply" });
       };
-      return { runTurn, started, resolvedBefore, peak: () => peakInFlight };
+      return { runTurn, started, resolvedBefore, peak: () => peakInFlight, dir };
     }
 
     it("runs the dependents in a second wave, after the provider's turn resolved", async () => {
       const fake = ordering();
-      const tool = buildFusionDelegateTool(deps({ runTurn: fake.runTurn }));
+      const tool = buildFusionDelegateTool(deps({ runTurn: fake.runTurn, workingDir: fake.dir }));
       const result = await tool.run(
         { tasks: PIPELINE, contract: PIPELINE_CONTRACT, maxWorkers: 3 },
-        ctx(),
+        ctx({ workingDir: fake.dir }),
       );
       expect(fake.started).toEqual(["analyze", "organize", "index"]);
       expect(fake.resolvedBefore.analyze).toEqual([]);
@@ -1523,7 +1670,7 @@ describe("fusion.delegate", () => {
       expect(result.status).toBe("ok");
       const lines = result.summary.split("\n");
       expect(lines[0]).toBe(
-        "3 tasks in 2 waves (analyze → organize, index): 2 ok, 1 failed",
+        "3 tasks in 2 waves (analyze → organize, index): 3 ok",
       );
       expect(result.details.waves).toEqual([
         ["analyze"],
@@ -1537,7 +1684,7 @@ describe("fusion.delegate", () => {
 
     it("bounds each wave by maxWorkers", async () => {
       const fake = ordering();
-      const tool = buildFusionDelegateTool(deps({ runTurn: fake.runTurn }));
+      const tool = buildFusionDelegateTool(deps({ runTurn: fake.runTurn, workingDir: fake.dir }));
       const tasks = [
         ...PIPELINE,
         { id: "report", title: "Report", instructions: "r" },
@@ -1549,7 +1696,7 @@ describe("fusion.delegate", () => {
           { task: "report", name: "manifest.json" },
         ],
       };
-      const result = await tool.run({ tasks, contract, maxWorkers: 2 }, ctx());
+      const result = await tool.run({ tasks, contract, maxWorkers: 2 }, ctx({ workingDir: fake.dir }));
       expect(fake.started).toEqual(["analyze", "organize", "index", "report"]);
       expect(fake.resolvedBefore.report).toContain("analyze");
       expect(fake.peak()).toBe(2);
@@ -1558,11 +1705,11 @@ describe("fusion.delegate", () => {
         ["organize", "index", "report"],
       ]);
       expect(result.summary.split("\n")[0]).toBe(
-        "4 tasks in 2 waves (analyze → organize, index, report): 3 ok, 1 failed",
+        "4 tasks in 2 waves (analyze → organize, index, report): 4 ok",
       );
     });
 
-    it("still runs a dependent whose provider did not deliver, warning it and the orchestrator", async () => {
+    it("holds dependents whose provider did not deliver and warns the orchestrator", async () => {
       const briefs: string[] = [];
       const fake = ordering({
         briefs,
@@ -1576,27 +1723,23 @@ describe("fusion.delegate", () => {
       const organizeNote =
         "task organize depends on analyze, which ended failed";
       const indexNote = "task index depends on analyze, which ended failed";
-      expect(fake.started).toEqual(["analyze", "organize", "index"]);
-      // The provider's own brief carried no such note; the dependents' do.
+      expect(fake.started).toEqual(["analyze"]);
       expect(briefs[0]).not.toContain("depends on");
-      expect(briefs[1]).toContain(`contract: ${organizeNote}`);
-      expect(briefs[1]).toContain(`contract: ${indexNote}`);
-      expect(briefs[2]).toContain(`contract: ${indexNote}`);
-      const lines = result.summary.split("\n");
-      expect(lines[0]).toBe(
-        "3 tasks in 2 waves (analyze → organize, index): 2 ok, 1 failed",
+      expect(briefs).toHaveLength(1);
+      expect(result.summary).toContain(
+        "3 tasks in 2 waves (analyze → organize, index): 1 failed, 2 cancelled",
       );
-      expect(lines[1]).toBe(
+      expect(result.summary).toContain(
         `contract: 1 missing — [analyze] file manifest.json does not exist; ${organizeNote}; ${indexNote}`,
       );
       expect(
         (result.details.tasks as WorkerTaskResult[]).map((r) => r.status),
-      ).toEqual(["failed", "ok", "ok"]);
+      ).toEqual(["failed", "cancelled", "cancelled"]);
       const report = result.details.contract as { warnings: string[] };
       expect(report.warnings).toEqual([organizeNote, indexNote]);
     });
 
-    it("runs a cyclic contract as one wave, in the order given, with a warning", async () => {
+    it("holds a cyclic contract with a warning", async () => {
       const briefs: string[] = [];
       const fake = ordering({ briefs });
       const tool = buildFusionDelegateTool(deps({ runTurn: fake.runTurn }));
@@ -1621,14 +1764,13 @@ describe("fusion.delegate", () => {
         ctx(),
       );
       const note =
-        "requires form a cycle (a → b → a), so the tasks run in one wave in the order given";
-      expect(fake.started).toEqual(["a", "b"]);
-      expect(fake.peak()).toBe(2);
-      for (const brief of briefs) expect(brief).toContain(`contract: ${note}`);
+        "requires form a cycle (a → b → a); tasks with unmet dependencies are not started";
+      expect(fake.started).toEqual([]);
+      expect(fake.peak()).toBe(0);
+      expect(briefs).toEqual([]);
       expect(result.details.waves).toEqual([["a", "b"]]);
-      const lines = result.summary.split("\n");
-      expect(lines[0]).toBe("2 tasks in 1 wave (a, b): 2 ok");
-      expect(lines[1]).toContain(note);
+      expect(result.summary).toContain("2 tasks in 1 wave (a, b): 2 cancelled");
+      expect(result.summary).toContain(note);
       expect(
         (result.details.contract as { warnings: string[] }).warnings,
       ).toEqual([note]);

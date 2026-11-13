@@ -13,9 +13,11 @@ import { resolveLlmConfig } from "../../llm/provider/index.js";
 import type { ResolvedRunMode } from "../../llm/run-mode/index.js";
 import { visionCapableAlternatives } from "../../llm/provider/model-vision.js";
 import { resolveModelPricingFor } from "../resolve-model-pricing.js";
+import { createRequestBudgetScope } from "../request-budget.js";
 import type { ModelProfile } from "../../llm/model-profile.js";
 import type { SlotManager } from "../../llm/slot-manager.js";
 import { createFusionFormatProbeFor } from "./fusion-format-check.js";
+import { configuredFusionRoutingIdentity } from "./fusion-routing-identity.js";
 import type { SessionUsageLedger } from "../../session/usage-meter.js";
 import { isLocalServerUrl } from "../../llm/provider/openai/local-server-url.js";
 import { ToolRegistry } from "../../tools/tool-registry.js";
@@ -689,7 +691,7 @@ export function registerRuntimeFusionAndReadScope(input: {
   prepareLocalLink: FusionDelegateDeps["warmWorkerBackend"];
   emitAgentLoopEventFor: FusionDelegateDeps["emitEvent"];
   resolveCurrentRunMode: FusionDelegateDeps["resolveRunMode"];
-  providerRegistry: Pick<ProviderRegistry, "getProvider">;
+  providerRegistry: Pick<ProviderRegistry, "getProvider"> & Partial<Pick<ProviderRegistry, "getLoadedEntrySnapshot">>;
   llama: Pick<
     LlamaServerClient,
     "measuredTokensPerSecond" | "fetchSlots" | "probeHealth"
@@ -744,6 +746,24 @@ export function registerRuntimeFusionAndReadScope(input: {
         runTurn(session, userMessage, turnOptions),
       createEphemeralSession,
       resolveOriginalRequest: resolveOriginalRequest,
+      resolveRoutingIdentity: (providerId) => {
+        const live = getConfig();
+        const entry = resolveLlmConfig(live).providers.find((provider) => provider.id === providerId);
+        const loaded = providerRegistry.getLoadedEntrySnapshot?.(providerId);
+        if (loaded === undefined) return undefined;
+        if (loaded.kind === "llama-server") {
+          const provider = providerRegistry.getProvider(providerId);
+          // entry.url is vision-only: read the loaded text client's real base.
+          if (entry?.kind !== loaded.kind || provider?.textRequestBaseUrl === undefined) return undefined;
+          return configuredFusionRoutingIdentity({ ...loaded, url: provider.textRequestBaseUrl }, {
+            mode: live.localModels.mode, url: live.localModels.url,
+            configuredModelId: live.localModels.managed.modelId, liveModelId: provider.chatModelId ?? null,
+          });
+        }
+        const loadedIdentity = configuredFusionRoutingIdentity(loaded);
+        return loadedIdentity !== undefined && loadedIdentity === configuredFusionRoutingIdentity(entry)
+          ? loadedIdentity : undefined;
+      },
       declaredInputs,
       // The Codex CLI confines its own shell (`-s read-only`) rather than
       // turning it off, so it is no `model: "orchestrator"` target.
@@ -821,6 +841,7 @@ export function registerRuntimeFusionAndReadScope(input: {
       // The turn's $ / time caps (ATO-947), reset at each fusion turn's
       // start by the loop; read only when a cap is configured.
       ...(turnBudget === undefined ? {} : { turnBudget }),
+      ...(turnBudget === undefined ? {} : { workerBudget: turnBudget, requestBudgetAccounting: true }),
       ...(orchestratorTurnSpendUsd === undefined
         ? {}
         : { orchestratorTurnSpendUsd }),
@@ -832,11 +853,22 @@ export function registerRuntimeFusionAndReadScope(input: {
         if (provider === undefined) {
           throw new Error(`escalation provider ${providerId} is not configured`);
         }
-        const result = await provider.complete({
+        const request = {
           prompt,
           maxOutputTokens,
           signal,
-        });
+        };
+        const resolvedForBudget = sessionId !== undefined && turnBudget?.requestLimits(sessionId) !== undefined
+          ? resolveLlmConfig(getConfig()) : undefined;
+        const entryForBudget = resolvedForBudget?.providers.find(p => p.id === providerId);
+        const scope = resolvedForBudget === undefined ? undefined : createRequestBudgetScope(turnBudget, { ...request, sessionId }, provider, entryForBudget,
+          resolveModelPricingFor(resolvedForBudget, provider.chatModelId ?? entryForBudget?.defaultChatModel ?? entryForBudget?.model ?? null, providerId));
+        let result: Awaited<ReturnType<typeof provider.complete>> | undefined;
+        try {
+          result = await provider.complete({ ...request, ...(scope === undefined ? {} : { requestBudget: scope, signal: scope.signal ?? signal }) });
+        } finally {
+          scope?.finish(result);
+        }
         // These calls go straight to the provider, past the seam that
         // feeds the session's readout, so they are counted here on the
         // session that delegated (ATO-1388). Priced like any other call:

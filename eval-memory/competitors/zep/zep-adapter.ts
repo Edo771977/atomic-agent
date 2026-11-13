@@ -41,7 +41,9 @@ class ZepAdapter implements CompetitorAdapter {
   readonly name = NAME;
   readonly label = LABEL;
 
-  constructor(private readonly baseUrl: string) {}
+  constructor(private readonly baseUrl: string) {
+    this._suppressUnused = [this.baseUrl];
+  }
 
   async ensureSession(_sessionId: string): Promise<void> {
     throw new CompetitorAdapterError(
@@ -75,7 +77,7 @@ class ZepAdapter implements CompetitorAdapter {
     // No persistent connections to close.
   }
 
-  readonly _suppressUnused = [this.baseUrl];
+  readonly _suppressUnused: readonly string[];
 }
 
 export const zepFactory: CompetitorAdapterFactory = {

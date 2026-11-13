@@ -1,4 +1,5 @@
 import { isAsciiOnly } from "./ascii-header-guard.js";
+import type { CompletionRequestBudget } from "../completion-types.js";
 import { buildOpenAiAuthHeaders } from "./openai-auth-headers.js";
 import { readErrnoCode } from "../../errno-code.js";
 import {
@@ -635,7 +636,7 @@ export async function openAiPostJson(
   deps: OpenAiHttpDeps,
   path: string,
   body: Record<string, unknown>,
-  request: { signal?: AbortSignal; requestTimeoutMs?: number },
+  request: { signal?: AbortSignal; requestTimeoutMs?: number; requestBudget?: CompletionRequestBudget },
   onSend?: OnOpenAiRequestBody,
 ): Promise<Record<string, unknown>> {
   return withCreditLimitRetry(deps, body, onSend, (attemptBody) =>
@@ -649,7 +650,7 @@ export async function openAiPostJson(
         "POST",
       );
       if (!res.ok) {
-        throw await httpErrorFromResponse(deps, path, res);
+        throw await httpErrorFromResponse(deps, path, res, request);
       }
       return readJsonBody(res, request.signal);
     }),
@@ -778,7 +779,7 @@ export async function openAiStartStream(
   deps: OpenAiHttpDeps,
   path: string,
   body: Record<string, unknown>,
-  request: { signal?: AbortSignal },
+  request: { signal?: AbortSignal; requestBudget?: CompletionRequestBudget },
   budget?: OpenAiAttemptBudget,
   onSend?: OnOpenAiRequestBody,
 ): Promise<Response & { body: NonNullable<Response["body"]> }> {
@@ -800,7 +801,7 @@ export async function openAiStartStream(
           "POST",
         );
         if (!res.ok || !res.body) {
-          throw await httpErrorFromResponse(deps, path, res);
+          throw await httpErrorFromResponse(deps, path, res, request);
         }
         return res as Response & { body: NonNullable<Response["body"]> };
       },
@@ -832,7 +833,7 @@ export async function openAiFetch(
   deps: OpenAiHttpDeps,
   path: string,
   body: Record<string, unknown> | null,
-  request: { signal?: AbortSignal; requestTimeoutMs?: number },
+  request: { signal?: AbortSignal; requestTimeoutMs?: number; requestBudget?: CompletionRequestBudget },
   stream: boolean,
   method: "GET" | "POST" = "POST",
 ): Promise<Response> {
@@ -858,6 +859,10 @@ export async function openAiFetch(
       isAsciiOnly(deps.apiKey) ? undefined : { keyProblem: "non_ascii" },
     );
   }
+  // Outside the network-error wrapper: a policy refusal is deterministic,
+  // never a transport failure to retry or route to another provider.
+  if (request.requestBudget !== undefined && request.signal?.aborted) throw request.signal.reason;
+  if (body !== null && method === "POST") request.requestBudget?.beforeSend(body);
   const controller = new AbortController();
   let timedOut = false;
   // A caller that owns a longer deadline (context compaction) replaces ours.
@@ -882,6 +887,7 @@ export async function openAiFetch(
       ...(body && method === "POST" ? { body: JSON.stringify(body) } : {}),
       signal: controller.signal,
     });
+    request.requestBudget?.onResponse(res.status);
     if (deps.onResponseHeaders && res.headers) {
       try {
         deps.onResponseHeaders(res.headers);
@@ -931,8 +937,19 @@ async function httpErrorFromResponse(
   deps: OpenAiHttpDeps,
   path: string,
   res: Response,
+  request?: { signal?: AbortSignal; requestTimeoutMs?: number },
 ): Promise<OpenAiHttpError> {
-  const text = await res.text().catch(() => "");
+  const timeout = new AbortController();
+  const signal = request?.signal === undefined ? timeout.signal : AbortSignal.any([request.signal, timeout.signal]);
+  const timeoutMs = request?.requestTimeoutMs ?? deps.requestTimeoutMs;
+  const timer = setTimeout(() => timeout.abort(new OpenAiHttpError(
+    `openai provider error body timed out after ${timeoutMs}ms: ${deps.baseUrl}${path}`,
+    res.status, `${deps.baseUrl}${path}`, true, null, deps.label,
+  )), timeoutMs);
+  timer.unref?.();
+  let text: string;
+  try { text = await readErrorBody(res, signal); }
+  finally { clearTimeout(timer); }
   // The standard `retry-after` header wins; some providers advertise
   // their cooldown only inside the error JSON (Gemini's OpenAI-compat
   // endpoint sends `google.rpc.RetryInfo` and no header), so fall back
@@ -957,6 +974,48 @@ async function httpErrorFromResponse(
       ...(keyMissing ? { keyProblem: "missing" as const } : {}),
     },
   );
+}
+
+/** Diagnostic data is bounded and remains cancellable after fetch headers arrived. */
+async function readErrorBody(res: Response, signal: AbortSignal): Promise<string> {
+  if (res.body === null) return "";
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  const maxBytes = 65_536;
+  let bytes = 0;
+  let wake: ((reason: unknown) => void) | undefined;
+  const onAbort = (): void => {
+    void reader.cancel(signal.reason).catch(() => undefined);
+    wake?.(signal.reason);
+  };
+  signal.addEventListener("abort", onAbort, { once: true });
+  try {
+    for (;;) {
+      signal.throwIfAborted();
+      const next = await Promise.race([
+        reader.read(),
+        new Promise<never>((_resolve, reject) => { wake = reject; }),
+      ]);
+      wake = undefined;
+      if (next.done) break;
+      const kept = next.value.slice(0, maxBytes - bytes);
+      chunks.push(kept);
+      bytes += kept.byteLength;
+      if (bytes >= maxBytes) {
+        void reader.cancel().catch(() => undefined);
+        break;
+      }
+    }
+    signal.throwIfAborted();
+    return new TextDecoder().decode(Buffer.concat(chunks));
+  } catch (error) {
+    if (signal.aborted) throw signal.reason;
+    return ""; // Preserve the status when the diagnostic body itself failed.
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+    if (signal.aborted) void reader.cancel(signal.reason).catch(() => undefined);
+    reader.releaseLock();
+  }
 }
 
 /**

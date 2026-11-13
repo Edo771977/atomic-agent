@@ -41,7 +41,9 @@ class LangMemAdapter implements CompetitorAdapter {
   readonly name = NAME;
   readonly label = LABEL;
 
-  constructor(private readonly bridgeUrl: string) {}
+  constructor(private readonly bridgeUrl: string) {
+    this._suppressUnused = [this.bridgeUrl];
+  }
 
   async ensureSession(_sessionId: string): Promise<void> {
     // LangMem uses (namespace, key) addressing — sessions become a
@@ -76,7 +78,7 @@ class LangMemAdapter implements CompetitorAdapter {
     // by the adapter.
   }
 
-  readonly _suppressUnused = [this.bridgeUrl];
+  readonly _suppressUnused: readonly string[];
 }
 
 export const langMemFactory: CompetitorAdapterFactory = {

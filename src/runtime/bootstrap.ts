@@ -450,6 +450,7 @@ export async function createAgentRuntime(
   const { prepareLocalLink, llmComplete, llmCompleteStream } = connectRuntimeFallback(options, {
     fallbackChain, resolveActiveLlmSlice, localBackend: connectedLocal.localBackend, profileManager,
     costAccumulator, turnUsageMeter, sessionUsage, resolveModelPricing, resolveCatalogContextWindow,
+    turnBudget: fusionTurnBudget,
   });
   // Smart approval (ATO-465): off unless `agent.smartApproval`, read live.
   installRiskReviewer({
@@ -572,6 +573,7 @@ export async function createAgentRuntime(
       fusionTurnBudget.begin(
         sessionId,
         turnUsageMeter.peekCostUsd(sessionId) ?? 0,
+        { usd: resolveCurrentRunMode().turnBudgetUsd, timeMs: resolveCurrentRunMode().turnTimeBudgetMs },
       );
       fusionOutcomes.beginTurn(sessionId);
     },
@@ -682,7 +684,13 @@ export async function createAgentRuntime(
     // per-submission hooks, and reports terminal LLM failures to Sentry.
     // A fusion turn's receipt goes out just before its `turn_finished`.
     onEvent: fusionOutcomes.wrapEventSink(
-      emitAgentLoopEvent,
+      (event) => {
+        if (event.type === "turn_finished") {
+          const sessionId = turnContext.getStore()?.sessionId;
+          if (sessionId !== undefined) fusionTurnBudget.end(sessionId);
+        }
+        emitAgentLoopEvent(event);
+      },
       () => turnContext.getStore()?.sessionId,
     ),
     metrics,

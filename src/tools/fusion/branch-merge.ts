@@ -502,9 +502,9 @@ function heldNote(
  * order. With a `gate`, a task is merged only when the gate passes it;
  * one it holds back leaves the folder as it was and its changes in a
  * patch file. The workspaces are removed whatever happens, an abort and
- * a throw included, except those a gate kept. When no workspace can be
- * made the wave runs in place, as without isolation, and every row says
- * so.
+ * a throw included, except those a gate kept. If a private workspace
+ * cannot be made, no task in this wave starts: requesting isolation must
+ * never grant a worker direct access to the original as a fallback.
  */
 export async function runIsolatedWave(
   input: IsolatedWaveInput,
@@ -529,15 +529,21 @@ export async function runIsolatedWave(
       reason = err instanceof Error ? err.message : String(err);
     }
   }
-  const inPlace = fresh.length > 0 && set === null;
-  if (inPlace && kept.size === 0) {
-    const results = await input.run(input.tasks, undefined);
-    const note = `ran in the folder itself, not in a workspace of its own: ${reason}`;
+  if (fresh.length > 0 && set === null) {
     return {
-      results: results.map((r) => ({ ...r, notes: [...(r.notes ?? []), note] })),
+      results: input.tasks.map((task): WorkerTaskResult => ({
+        id: task.id,
+        title: task.title,
+        status: "cancelled",
+        reply: "",
+        stepCount: 0,
+        durationMs: 0,
+        queueWaitMs: null,
+        tools: { calls: 0, errors: 0, writes: 0, byTool: {} },
+        error: `not started: could not create a private workspace: ${reason}`,
+      })),
       merges: [],
       outcomes: [],
-      inPlace: reason,
     };
   }
   const freshSet = set;
@@ -575,16 +581,13 @@ export async function runIsolatedWave(
       const rel = relative(input.realDir, abs);
       if (rel.length > 0 && !rel.startsWith("..")) protectedPaths.add(rel);
     }
-    const inPlaceNote = `ran in the folder itself, not in a workspace of its own: ${reason}`;
     const merges: MergeTaskSuggestion[] = [];
     const outcomes: BranchMergeOutcome[] = [];
     const out: WorkerTaskResult[] = [];
     for (const raw of results) {
       const branch = lookup(raw.id);
       if (branch === undefined) {
-        out.push(
-          inPlace ? { ...raw, notes: [...(raw.notes ?? []), inPlaceNote] } : raw,
-        );
+        out.push(raw);
         continue;
       }
       const ws = branch.workspace;
@@ -680,7 +683,6 @@ export async function runIsolatedWave(
       results: out,
       merges,
       outcomes,
-      ...(inPlace ? { inPlace: reason } : {}),
       ...(newlyKept.size === 0 ? {} : { kept: newlyKept }),
     };
   } finally {

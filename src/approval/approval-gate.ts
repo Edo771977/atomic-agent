@@ -1,7 +1,7 @@
 import { FanoutScopeRegistry, isInside } from "./fanout-scope.js";
 import { ReadScopeGrants } from "./read-scope-grants.js";
 import { randomUUID } from "node:crypto";
-import { resolve as resolvePath } from "node:path";
+import { isAbsolute, join, relative, resolve as resolvePath } from "node:path";
 import {
   currentApprovalLedger,
   recordAutoApproval,
@@ -228,6 +228,8 @@ export interface SessionApprovalPolicy {
    * still working on its parent's project.
    */
   ruleWorkdir?: string;
+  /** Private candidate root corresponding to ruleWorkdir; map deny/ask rules and declines only. */
+  rulePathRoot?: string;
 }
 
 /** A live, in-memory view of a session's point grants. Diagnostic only. */
@@ -728,7 +730,16 @@ export class ApprovalGate {
         ...(workdir !== undefined ? (store.projectRules?.(workdir) ?? []) : []),
       ];
       if (rules.length === 0) return null;
-      return matchRules(rules, request, workdir !== undefined ? { workdir } : {});
+      const context = workdir !== undefined ? { workdir } : {};
+      const raw = matchRules(rules, request, context);
+      const policy = this.policiesBySession.get(request.sessionId);
+      if (policy?.rulePathRoot === undefined || policy.ruleWorkdir === undefined) return raw;
+      const map = (paths: readonly string[] | undefined): string[] | undefined => paths?.map(path => this.originalCandidatePath(request.sessionId, path));
+      const original = matchRules(rules.filter(rule => rule.decision !== "allow"), {
+        ...request, targetPaths: map(request.targetPaths), affectedResources: map(request.affectedResources),
+      }, context);
+      if (raw?.decision === "deny" || original?.decision !== "deny" && raw?.decision === "ask") return raw;
+      return original ?? raw;
     } catch {
       return null;
     }
@@ -781,7 +792,7 @@ export class ApprovalGate {
    * declined that `query` would change by another route, or `null`.
    */
   private declinedTarget(query: TargetQuery): string | null {
-    const targets = normaliseTargets(query.targetPaths);
+    const targets = normaliseTargets([...(query.targetPaths ?? []), ...(query.targetPaths ?? []).map(path => this.originalCandidatePath(query.sessionId, path))]);
     if (targets.length === 0) return null;
     for (const declined of this.declinedRecords(query.sessionId)) {
       for (const target of targets) {
@@ -795,6 +806,12 @@ export class ApprovalGate {
       }
     }
     return null;
+  }
+
+  private originalCandidatePath(sessionId: string, path: string): string {
+    const policy = this.policiesBySession.get(sessionId);
+    return policy?.rulePathRoot !== undefined && policy.ruleWorkdir !== undefined && isAbsolute(path) && isInside(resolvePath(policy.rulePathRoot), resolvePath(path))
+      ? join(policy.ruleWorkdir, relative(policy.rulePathRoot, path)) : path;
   }
 
   /** The session's own record, then the one of the session it works for. */

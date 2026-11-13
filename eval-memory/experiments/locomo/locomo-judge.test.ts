@@ -210,6 +210,8 @@ describe("alignVerdictsWithRunner", () => {
       durationMs: 14000,
       promptTokens: 9800,
       predictedTokens: 18,
+      reason: "reply",
+      failureCategory: null,
     };
     const aligned = alignVerdictsWithRunner([verdict], [runnerResult]);
     expect(aligned).toHaveLength(1);

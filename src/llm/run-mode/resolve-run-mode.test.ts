@@ -30,6 +30,16 @@ function llm(
 }
 
 describe("resolveRunMode", () => {
+  it("keeps measured routing absent by default and resolves only explicit opt-in", () => {
+    expect(resolveRunMode(llm("openrouter", { mode: "fusion" })).measuredRouting).toBeUndefined();
+    expect(resolveRunMode(llm("openrouter", { mode: "fusion", fusion: { measuredRouting: { enabled: false } } })).measuredRouting).toBeUndefined();
+    expect(resolveRunMode(llm("openrouter", { mode: "fusion", fusion: { measuredRouting: { enabled: true } } })).measuredRouting).toEqual({ enabled: true, minSamples: 8, days: 30 });
+  });
+  it("enables candidate integration only when explicitly selected", () => {
+    expect(resolveRunMode(llm("openrouter", { mode: "fusion" })).integration).toBeUndefined();
+    expect(resolveRunMode(llm("openrouter", { mode: "fusion", fusion: { integration: "direct" } })).integration).toBeUndefined();
+    expect(resolveRunMode(llm("openrouter", { mode: "fusion", fusion: { integration: "candidate" } })).integration).toBe("candidate");
+  });
   it("derives local from a llama-server active provider when the block is absent", () => {
     const rm = resolveRunMode(llm("local-llama"));
     expect(rm.stored).toBeNull();

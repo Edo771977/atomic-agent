@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { FanoutScopeRegistry } from "../../approval/fanout-scope.js";
 import type { RunTurnResult } from "../../agent/agent-loop.js";
 import type { ResolvedRunMode } from "../../llm/run-mode/index.js";
@@ -111,6 +111,62 @@ const THREE = [1, 2, 3].map((i) => ({
   title: `T${i}`,
   instructions: `do ${i}`,
 }));
+
+describe("budget settlement lifecycle", () => {
+  it("reports final spend after concurrent completions settle", async () => {
+    const budget = new FusionTurnBudget();
+    budget.begin("s-parent");
+    let release!: () => void;
+    const latch = new Promise<void>(resolve => { release = resolve; });
+    let started = 0;
+    const d = deps({
+      turnBudget: budget,
+      resolveRunMode: () => mode({ workers: 3, cloudWorkers: 3, turnBudgetUsd: 1.5 }),
+      runTurn: async (session, _message, options) => {
+        if (++started === 3) release();
+        await latch;
+        options.eventHook?.(completedEvent(1_000_000));
+        return { session, reason: "reply", stepCount: 1 };
+      },
+    });
+    const result = await buildFusionDelegateTool(d).run({ tasks: THREE }, ctx());
+    expect(budget.workerSpend("s-parent")).toBe(3);
+    expect(result.details.turnBudget).toMatchObject({ kind: "usd", spentUsd: 3 });
+    expect(result.summary).toContain("$3.00 spent");
+  });
+
+  it("keeps the turn deadline active through the post-wave judge", async () => {
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    let pending: Promise<unknown> | undefined;
+    try {
+      const budget = new FusionTurnBudget();
+      budget.begin("s-parent");
+      let judgeSignal: AbortSignal | undefined;
+      const d = deps({
+        turnBudget: budget,
+        resolveRunMode: () => mode({ turnTimeBudgetMs: 100, judge: { providerId: "judge", model: "judge" } }),
+        escalationComplete: async ({ signal }) => {
+          judgeSignal = signal;
+          await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+          throw signal.reason;
+        },
+      });
+      pending = buildFusionDelegateTool(d).run({ tasks: [THREE[0]] }, { ...ctx(), signal: controller.signal });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(judgeSignal).toBeDefined();
+      await vi.advanceTimersByTimeAsync(101);
+      expect(judgeSignal!.aborted).toBe(true);
+      const result = await pending as Awaited<ReturnType<ReturnType<typeof buildFusionDelegateTool>["run"]>>;
+      expect(result.details.turnBudget).toMatchObject({ kind: "time" });
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      controller.abort();
+      await pending;
+      vi.useRealTimers();
+    }
+  });
+});
 
 describe("honest worker spend (ATO-918)", () => {
   it("keeps cached tokens through the per-step sum", () => {

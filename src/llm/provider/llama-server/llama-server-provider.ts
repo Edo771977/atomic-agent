@@ -38,6 +38,11 @@ export class LlamaServerProvider implements LlmProvider {
     return this.getModelId?.() ?? undefined;
   }
 
+  /** Text uses the shared client; entry.url binds vision and is not proof of this endpoint. */
+  get textRequestBaseUrl(): string | undefined {
+    return this.client.textRequestBaseUrl;
+  }
+
   get capabilities(): ProviderCapabilities {
     const visionCaps = resolveVisionCapabilities({
       profile: this.getProfile(),

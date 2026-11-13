@@ -1,11 +1,4 @@
-import {
-  basename,
-  dirname,
-  posix as pathPosix,
-  resolve,
-  sep,
-  win32 as pathWin32,
-} from "node:path";
+import { posix as pathPosix, win32 as pathWin32 } from "node:path";
 
 import type { InstallSource } from "../update/install-source.js";
 
@@ -157,6 +150,11 @@ export function planUninstallTargets(
   return targets;
 }
 
+function isWindowsNamespace(value: string): boolean {
+  const slashes = value.replace(/\//g, "\\");
+  return /^\\{2,}[?.](?:\\|$)/.test(slashes) || /^\\+\?\?(?:\\|$)/.test(slashes);
+}
+
 /**
  * Paths that must never be handed to `rm -rf`, however we got there.
  *
@@ -166,17 +164,31 @@ export function planUninstallTargets(
  * the operator's home directory. A denylist that costs a string compare
  * is the right price for that.
  */
-export function isSafeToRemove(path: string, homeDir: string): boolean {
-  const target = resolve(path);
-  const home = resolve(homeDir);
-  if (target === home) return false;
-  // Root of a POSIX filesystem or of a Windows drive: `dirname` of a
-  // root is the root itself, which is the only fixed point there is.
-  if (dirname(target) === target) return false;
-  if (basename(target).length === 0) return false;
-  const segments = target.split(sep).filter((part) => part.length > 0);
+export function isSafeToRemove(
+  input: string,
+  homeDir: string,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  const path = pathFor(platform);
+  const target = path.resolve(input);
+  const home = path.resolve(homeDir);
+  // Device/extended namespaces do not share ordinary DOS/UNC root and
+  // alias semantics. Reject them for either operand rather than risk
+  // comparing a protected home with a spelling of a different root.
+  if (platform === "win32" && [input, homeDir, target, home].some(isWindowsNamespace)) return false;
+  const fromHome = path.relative(home, target);
+  if (fromHome.length === 0) return false;
+  const toHome = path.relative(target, home);
+  if (!path.isAbsolute(toHome) && toHome !== ".." && !toHome.startsWith(`..${path.sep}`)) return false;
+  // Remove the parsed root before counting: a Windows drive letter or
+  // UNC server/share prefix is not an ordinary directory component.
+  const root = path.parse(target).root;
+  const belowRoot = path.relative(root, target);
+  if (belowRoot.length === 0) return false;
+  const segments = belowRoot.split(path.sep).filter((part) => part.length > 0);
   // `/usr`, `/etc`, `C:\Windows` — one segment deep and outside home is
   // never something we installed.
-  if (segments.length < 2 && !target.startsWith(`${home}${sep}`)) return false;
+  const insideHome = !path.isAbsolute(fromHome) && fromHome !== ".." && !fromHome.startsWith(`..${path.sep}`);
+  if (segments.length < 2 && !insideHome) return false;
   return true;
 }
