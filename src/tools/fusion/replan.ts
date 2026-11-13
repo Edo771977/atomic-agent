@@ -17,7 +17,9 @@ import type { WorkerTaskResult, WorkerTaskStatus } from "./worker-result.js";
  * (`t3.a`, `t3.b`: the failed id, a dot, a suffix). Continuations count
  * on the task they continue (`FusionTurnBudget.noteRoundAttempts`): one
  * attempt per round for the whole family, and they share its replans,
- * so a split never buys more than the cap. Each pending task carries
+ * so a split never buys more than the cap. Only an open task has
+ * continuations: once a family closed green (`noteRoundOutcomes`), a
+ * dotted id after it is new work with its own replans. Each pending task carries
  * the fix its status calls for (`replanFix`).
  */
 
@@ -47,10 +49,17 @@ export interface ReplanTask {
 export interface ReplanReport {
   pending: ReplanTask[];
   exhausted: ReplanTask[];
+  /**
+   * Still open after two or more runs, one of them on the orchestrator's
+   * model this turn: past what another round fixes, so reported to the
+   * person like an exhausted task, whatever replans are left.
+   */
+  failedOnOrchestrator: ReplanTask[];
   max: number;
 }
 
-function isOpen(result: WorkerTaskResult): boolean {
+/** Whether a row leaves its task open: for the planner to replan or report. */
+export function isOpenResult(result: WorkerTaskResult): boolean {
   if (OPEN_STATUSES.has(result.status)) return true;
   return (
     result.status === "cancelled" &&
@@ -61,17 +70,24 @@ function isOpen(result: WorkerTaskResult): boolean {
 /**
  * The fix a pending task's status calls for. A task that is still open
  * after two runs is past what a re-brief fixes on the worker: it goes to
- * the orchestrator's model, unless it already ran there. Otherwise by
- * status: out of steps or time is too big, so split it; no change at all
- * means the brief did not say what to change.
+ * the orchestrator's model (a task that already ran there this turn is
+ * not pending at all: `describeReplan` reports it). Otherwise by status:
+ * out of steps or time is too big, so split it; no change at all means
+ * the brief did not say what to change.
  */
 export function replanFix(
   id: string,
   status: WorkerTaskStatus,
   attempts: number,
   ranOnOrchestrator: boolean,
+  orchestratorAvailable = true,
 ): string | undefined {
-  if (attempts >= 2 && status !== "cancelled" && !ranOnOrchestrator) {
+  if (
+    attempts >= 2 &&
+    status !== "cancelled" &&
+    !ranOnOrchestrator &&
+    orchestratorAvailable
+  ) {
     return 'it failed twice on a worker: send it with `model: "orchestrator"`';
   }
   if (status === "max_steps" || status === "timeout") {
@@ -87,25 +103,39 @@ export function replanFix(
  * Which tasks go back to the planner. `attempts(id)` is how many times
  * the task (its continuation family) was run this turn, this call
  * included; a task run `max + 1` times has used every replan.
- * `ranOnOrchestrator(id)` says the task already ran on the orchestrator
- * leg, so its fix is never "send it there".
+ * `ranOnOrchestrator(id)` says the task's family already ran on the
+ * orchestrator leg this turn, in any round: its fix is never "send it
+ * there", and once it has run twice it is listed in
+ * `failedOnOrchestrator`, for the planner to report to the person.
+ * `orchestratorAvailable` is false when the target is off or this
+ * turn's `maxOrchestratorTasksPerTurn` is used: then no fix names it.
  */
 export function describeReplan(
   results: readonly WorkerTaskResult[],
   attempts: (taskId: string) => number,
   max: number,
   ranOnOrchestrator: (taskId: string) => boolean = () => false,
+  orchestratorAvailable = true,
 ): ReplanReport {
   const pending: ReplanTask[] = [];
   const exhausted: ReplanTask[] = [];
+  const failedOnOrchestrator: ReplanTask[] = [];
   for (const result of results) {
-    if (!isOpen(result)) continue;
+    if (!isOpenResult(result)) continue;
     const runs = attempts(result.id);
     const used = Math.max(0, runs - 1);
     const left = max - used;
+    const onOrchestrator = ranOnOrchestrator(result.id);
+    const stop = left > 0 && runs >= 2 && onOrchestrator;
     const fix =
-      left > 0
-        ? replanFix(result.id, result.status, runs, ranOnOrchestrator(result.id))
+      left > 0 && !stop
+        ? replanFix(
+            result.id,
+            result.status,
+            runs,
+            onOrchestrator,
+            orchestratorAvailable,
+          )
         : undefined;
     const task: ReplanTask = {
       id: result.id,
@@ -114,10 +144,11 @@ export function describeReplan(
       replansLeft: Math.max(0, left - 1),
       ...(fix === undefined ? {} : { fix }),
     };
-    if (left > 0) pending.push(task);
+    if (stop) failedOnOrchestrator.push({ ...task, replansLeft: 0 });
+    else if (left > 0) pending.push(task);
     else exhausted.push(task);
   }
-  return { pending, exhausted, max };
+  return { pending, exhausted, failedOnOrchestrator, max };
 }
 
 export function renderReplanBlock(report: ReplanReport): string {
@@ -138,6 +169,16 @@ export function renderReplanBlock(report: ReplanReport): string {
       [
         `NO REPLANS LEFT (${report.max} used) — do not send these again this turn; tell the person plainly what failed and why:`,
         ...report.exhausted.map((t) => `- ${t.id} (${t.status}): ${t.why}`),
+      ].join("\n"),
+    );
+  }
+  if (report.failedOnOrchestrator.length > 0) {
+    parts.push(
+      [
+        `FAILED ON THE ORCHESTRATOR'S MODEL TOO — these already ran on \`model: "orchestrator"\` this turn; do not send them again: tell the person plainly what failed and why, and ask how to continue:`,
+        ...report.failedOnOrchestrator.map(
+          (t) => `- ${t.id} (${t.status}): ${t.why}`,
+        ),
       ].join("\n"),
     );
   }

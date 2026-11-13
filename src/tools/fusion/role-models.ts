@@ -22,7 +22,9 @@ import type { DelegateTask } from "./delegate-args.js";
  * refusals, fan-out write scope, read scope, pinned provider). The
  * orchestrator's own turn still changes nothing itself; this is how it
  * hands a hard part to the stronger model without doing it in its own
- * turn. Priced and capped like any other leg.
+ * turn. Counted against `maxOrchestratorTasksPerTurn`; priced toward
+ * `turnBudgetUsd` only where the leg has a price (a subscription CLI
+ * leg has none).
  *
  * One guard: a second LOCAL model. A llama-server provider other than
  * the ones the session's legs already hold needs its own server and its
