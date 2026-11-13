@@ -30,8 +30,8 @@ import {
   copyFile,
   lstat,
   mkdir,
-  readFile,
   rm,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
@@ -40,15 +40,19 @@ import { buildCommandEnv } from "../../sandbox/command-env.js";
 import {
   BRANCH_MERGE_DIR,
   createBranchSet,
+  readEntry,
+  sameEntry,
   touchedPaths,
+  type PathEntry,
   type BranchSet,
   type BranchWorkspace,
   type CreateBranchSetOptions,
 } from "./branch-workspace.js";
 import {
-  renderPatch,
-  saveTaskPatch,
   workspaceChanges,
+  writeTaskPatch,
+  type PatchGit,
+  type SavedTaskPatch,
   type WorkspaceChange,
 } from "./branch-diff.js";
 import { resolveContractInputs } from "./contract-inputs.js";
@@ -120,19 +124,6 @@ export interface BranchMergeOutcome {
   savedDir?: string;
 }
 
-async function readOrNull(path: string): Promise<Buffer | null> {
-  try {
-    return await readFile(path);
-  } catch {
-    return null;
-  }
-}
-
-function same(a: Buffer | null, b: Buffer | null): boolean {
-  if (a === null || b === null) return a === b;
-  return a.equals(b);
-}
-
 function lineCount(buf: Buffer): number {
   if (buf.length === 0) return 0;
   let n = 0;
@@ -164,8 +155,18 @@ export function inputReplacement(
   return undefined;
 }
 
-async function writeKeepingMode(from: string, to: string): Promise<void> {
+async function writeKeepingMode(from: string, to: string, entry: PathEntry): Promise<void> {
   await mkdir(dirname(to), { recursive: true });
+  if (entry.link !== undefined) {
+    // A symlink lands as a symlink, not as a copy of what it points at.
+    await rm(to, { force: true });
+    await symlink(entry.link, to);
+    return;
+  }
+  // Never write through a symlink the folder has where the file goes.
+  if ((await lstat(to).catch(() => null))?.isSymbolicLink() === true) {
+    await rm(to, { force: true });
+  }
   await copyFile(from, to);
   const mode = (await lstat(from)).mode & 0o777;
   await chmod(to, mode).catch(() => undefined);
@@ -188,12 +189,12 @@ export async function mergeBranch(
     refused: [],
   };
   const savedRoot = join(BRANCH_MERGE_DIR, workspace.name);
-  const save = async (rel: string, base: Buffer | null, task: Buffer | null): Promise<void> => {
+  const save = async (rel: string, base: PathEntry | null, task: PathEntry | null): Promise<void> => {
     const at = join(set.realDir, savedRoot, rel);
     await mkdir(dirname(at), { recursive: true });
-    if (task !== null) await writeBuffer(`${at}.task`, task);
+    if (task !== null) await writeBuffer(`${at}.task`, task.data);
     else await writeBuffer(`${at}.task-removed`, Buffer.alloc(0));
-    if (base !== null) await writeBuffer(`${at}.base`, base);
+    if (base !== null) await writeBuffer(`${at}.base`, base.data);
     outcome.savedDir = savedRoot;
   };
   for (const rel of await touchedPaths(workspace)) {
@@ -201,27 +202,27 @@ export async function mergeBranch(
     const basePath = join(set.baseDir, rel);
     const realPath = join(set.realDir, rel);
     const [task, base, current] = await Promise.all([
-      readOrNull(taskPath),
-      readOrNull(basePath),
-      readOrNull(realPath),
+      readEntry(taskPath),
+      readEntry(basePath),
+      readEntry(realPath),
     ]);
     // One path that cannot be written (a file where its folder should be,
     // a read-only target) must not cost the rest of the wave.
     try {
       // Touched, not changed: nothing to bring back.
-      if (same(task, base)) continue;
+      if (sameEntry(task, base)) continue;
       if (protectedPaths.has(rel)) {
-        const reason = inputReplacement(base, task);
+        const reason = inputReplacement(base?.data ?? null, task?.data ?? null);
         if (reason !== undefined) {
           outcome.refused.push({ path: rel, reason });
           continue;
         }
       }
       // Already what the task wants (another task did the same).
-      if (same(current, task)) continue;
-      if (same(current, base)) {
+      if (sameEntry(current, task)) continue;
+      if (sameEntry(current, base)) {
         if (task === null) await rm(realPath, { force: true });
-        else await writeKeepingMode(taskPath, realPath);
+        else await writeKeepingMode(taskPath, realPath, task);
         outcome.applied.push(rel);
         continue;
       }
@@ -230,9 +231,12 @@ export async function mergeBranch(
         task !== null &&
         base !== null &&
         current !== null &&
-        mergeableText(task) &&
-        mergeableText(base) &&
-        mergeableText(current)
+        task.link === undefined &&
+        base.link === undefined &&
+        current.link === undefined &&
+        mergeableText(task.data) &&
+        mergeableText(base.data) &&
+        mergeableText(current.data)
       ) {
         const merged = await mergeFile({
           current: realPath,
@@ -454,7 +458,7 @@ export interface IsolatedWaveInput {
    * Their owner removes them (`set.cleanup()`), not this wave.
    */
   kept?: ReadonlyMap<string, KeptBranch>;
-  options?: CreateBranchSetOptions & { mergeFile?: MergeFile };
+  options?: CreateBranchSetOptions & { mergeFile?: MergeFile; patchGit?: PatchGit };
 }
 
 export interface IsolatedWaveResult {
@@ -471,16 +475,22 @@ export interface IsolatedWaveResult {
 function heldNote(
   reason: string | undefined,
   changes: number,
-  patch: string | undefined,
+  patch: SavedTaskPatch | undefined,
   kept: boolean,
 ): string {
   const why = reason === undefined ? "not merged" : `not merged (${reason})`;
   if (changes === 0) return `${why}: it changed no files`;
   const files = `${changes} file${changes === 1 ? "" : "s"}`;
-  const where =
-    patch === undefined
-      ? `its changes to ${files} could not be saved as a patch`
-      : `its changes to ${files} are kept as a patch at ${patch.split(sep).join("/")}; the folder is unchanged`;
+  let where: string;
+  if (patch === undefined) {
+    where = `its changes to ${files} could not be saved as a patch`;
+  } else {
+    where = `its changes to ${files} are kept as a patch at ${patch.path.split(sep).join("/")} (\`git apply\` in the folder); the folder is unchanged`;
+    if (patch.filesDir !== undefined) {
+      const n = patch.saved ?? 0;
+      where += `; ${n} file${n === 1 ? "" : "s"} a text patch cannot carry (binary, too large, empty, a symlink or a mode change) ${n === 1 ? "is" : "are"} saved whole in ${patch.filesDir.split(sep).join("/")}/`;
+    }
+  }
   return `${why}: ${where}${kept ? "; its workspace is kept for the retry" : ""}`;
 }
 
@@ -620,11 +630,21 @@ export async function runIsolatedWave(
           const changes = await workspaceChanges(branch.set, ws).catch(
             (): WorkspaceChange[] => [],
           );
-          let patch: string | undefined;
+          let patch: SavedTaskPatch | undefined;
           if (changes.length > 0) {
-            patch = await saveTaskPatch(realDir, row.id, renderPatch(changes)).catch(
-              () => undefined,
-            );
+            patch = await writeTaskPatch({
+              realDir,
+              set: branch.set,
+              workspace: ws,
+              taskId: row.id,
+              changes,
+              ...(input.options?.patchGit === undefined
+                ? {}
+                : { patchGit: input.options.patchGit }),
+              ...(input.options?.tmpRoot === undefined
+                ? {}
+                : { tmpRoot: input.options.tmpRoot }),
+            }).catch(() => undefined);
           }
           const keep = verdict.keep === true && changes.length > 0;
           if (keep) newlyKept.set(row.id, branch);

@@ -7,41 +7,53 @@
  * orchestrator to re-delegate from or the person to inspect; and the
  * judge (`judge.ts`) reads the task's changes instead of the first
  * characters of each declared file.
+ *
+ * The saved patch must carry everything, because the workspace is
+ * removed once it is written: with git on the machine it is made by git
+ * itself (`git diff-tree --binary` between two throwaway trees of the
+ * touched paths, base side and task side, hashed with `--no-filters`),
+ * so binary files, empty files, removals, exec-bit changes and symlinks
+ * all `git apply`. Without git, the patch has the text changes and
+ * everything a text patch cannot carry is copied into a folder next to
+ * it, and the note says so.
  */
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, join, sep } from "node:path";
 import { createTwoFilesPatch, FILE_HEADERS_ONLY } from "diff";
+import { runCommand, type CommandResult } from "../../sandbox/command-runner.js";
+import { buildCommandEnv } from "../../sandbox/command-env.js";
 import {
   BRANCH_MERGE_DIR,
+  readEntry,
+  sameEntry,
   touchedPaths,
   type BranchSet,
   type BranchWorkspace,
+  type PathEntry,
 } from "./branch-workspace.js";
 
-export type WorkspaceChangeKind = "added" | "modified" | "removed" | "binary";
+export type WorkspaceChangeKind = "added" | "modified" | "removed" | "binary" | "special";
 
 export interface WorkspaceChange {
   /** Relative to the workspace's `dir`, `/`-separated. */
   path: string;
   kind: WorkspaceChangeKind;
-  /** The unified diff for this path (`a/` and `b/` prefixes), or a one-line note for a binary. */
+  /**
+   * The unified diff for this path (`a/` and `b/` prefixes), or a
+   * one-line note for a binary, a symlink or a mode change.
+   */
   patch: string;
   /** An added text file's content: the judge reads it as a file head. */
   content?: string;
+  /** The diff could not be computed in time: only a note. */
+  notComputed?: true;
 }
 
 /** Lines of context around each hunk. */
 export const DIFF_CONTEXT_LINES = 3;
 /** A file pair the diff cannot finish in this long gets a note, not a hunk. */
 const DIFF_TIMEOUT_MS = 2_000;
-
-async function readOrNull(path: string): Promise<Buffer | null> {
-  try {
-    return await readFile(path);
-  } catch {
-    return null;
-  }
-}
 
 function isText(buf: Buffer): boolean {
   if (buf.includes(0)) return false;
@@ -52,9 +64,19 @@ function slash(rel: string): string {
   return rel.split(sep).join("/");
 }
 
+function describeSpecial(path: string, base: PathEntry | null, task: PathEntry | null): string {
+  const side = (e: PathEntry | null): string =>
+    e === null
+      ? "nothing"
+      : e.link !== undefined
+        ? `a symlink to ${e.link}`
+        : `a${e.executable ? "n executable" : ""} file`;
+  return `${path}: ${side(base)} → ${side(task)}\n`;
+}
+
 /**
  * Every path the task added, changed or removed, with its diff. A file
- * touched but left byte-identical is not a change.
+ * touched but left byte-identical (same exec bit) is not a change.
  */
 export async function workspaceChanges(
   set: Pick<BranchSet, "baseDir">,
@@ -64,13 +86,21 @@ export async function workspaceChanges(
   const out: WorkspaceChange[] = [];
   for (const rel of await touchedPaths(workspace)) {
     const [base, task] = await Promise.all([
-      readOrNull(join(set.baseDir, rel)),
-      readOrNull(join(workspace.dir, rel)),
+      readEntry(join(set.baseDir, rel)),
+      readEntry(join(workspace.dir, rel)),
     ]);
     if (base === null && task === null) continue;
-    if (base !== null && task !== null && base.equals(task)) continue;
+    if (sameEntry(base, task)) continue;
     const path = slash(rel);
-    if ((base !== null && !isText(base)) || (task !== null && !isText(task))) {
+    if (
+      base?.link !== undefined ||
+      task?.link !== undefined ||
+      (base !== null && task !== null && base.data.equals(task.data))
+    ) {
+      out.push({ path, kind: "special", patch: describeSpecial(path, base, task) });
+      continue;
+    }
+    if ((base !== null && !isText(base.data)) || (task !== null && !isText(task.data))) {
       out.push({
         path,
         kind: "binary",
@@ -78,8 +108,8 @@ export async function workspaceChanges(
       });
       continue;
     }
-    const before = base?.toString("utf8") ?? "";
-    const after = task?.toString("utf8") ?? "";
+    const before = base?.data.toString("utf8") ?? "";
+    const after = task?.data.toString("utf8") ?? "";
     const kind: WorkspaceChangeKind =
       base === null ? "added" : task === null ? "removed" : "modified";
     const patch = createTwoFilesPatch(
@@ -97,15 +127,27 @@ export async function workspaceChanges(
       patch:
         patch ??
         `--- a/${path}\n+++ b/${path}\n[diff not computed: the change is too large to compare]\n`,
+      ...(patch === undefined ? { notComputed: true as const } : {}),
       ...(kind === "added" ? { content: after } : {}),
     });
   }
   return out;
 }
 
-/** The changes as one patch file (`git apply` takes the text hunks). */
+/** Whether a text patch carries this change in full (`git apply` / `patch`). */
+function textApplies(change: WorkspaceChange): boolean {
+  if (change.kind === "binary" || change.kind === "special") return false;
+  if (change.notComputed === true) return false;
+  // An empty new file has no hunk: a text patch cannot create it.
+  return !(change.kind === "added" && (change.content ?? "").length === 0);
+}
+
+/** The text changes as one patch file. */
 export function renderPatch(changes: readonly WorkspaceChange[]): string {
-  return changes.map((c) => (c.patch.endsWith("\n") ? c.patch : `${c.patch}\n`)).join("");
+  return changes
+    .filter(textApplies)
+    .map((c) => (c.patch.endsWith("\n") ? c.patch : `${c.patch}\n`))
+    .join("");
 }
 
 /** `.atomic-agent/fusion-merge/<task>.patch`, relative to the working directory. */
@@ -114,19 +156,199 @@ export function taskPatchPath(taskId: string): string {
   return join(BRANCH_MERGE_DIR, `${safe}.patch`);
 }
 
+/** Runs git for the patch; resolves `null` when git is not there to run. */
+export type PatchGit = (
+  args: readonly string[],
+  options: { cwd: string; env: Record<string, string>; input?: string },
+) => Promise<CommandResult | null>;
+
+const PATCH_GIT_TIMEOUT_MS = 120_000;
+const PATCH_MAX_BYTES = 64 * 1024 * 1024;
+
 /**
- * Save a held-back task's changes into the working directory. Returns
- * the path relative to it; a later attempt of the same task replaces
- * its patch.
+ * Git with none of the person's config (no filters, no diff drivers, no
+ * `diff.noprefix`), no hooks, no prompt and none of the agent's keys.
  */
-export async function saveTaskPatch(
-  realDir: string,
-  taskId: string,
-  patch: string,
-): Promise<string> {
-  const rel = taskPatchPath(taskId);
-  const at = join(realDir, rel);
+export const defaultPatchGit: PatchGit = async (args, options) => {
+  try {
+    return await runCommand("git", ["--no-pager", "-c", "core.hooksPath=/dev/null", ...args], {
+      cwd: options.cwd,
+      env: {
+        ...buildCommandEnv(process.env),
+        GIT_CONFIG_GLOBAL: "/dev/null",
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_PAGER: "",
+        GIT_TERMINAL_PROMPT: "0",
+        LC_ALL: "C",
+        ...options.env,
+      },
+      ...(options.input === undefined ? {} : { input: options.input }),
+      timeoutMs: PATCH_GIT_TIMEOUT_MS,
+      maxOutputBytes: PATCH_MAX_BYTES,
+    });
+  } catch {
+    return null;
+  }
+};
+
+function ran(result: CommandResult | null): result is CommandResult {
+  return result !== null && result.exitCode === 0 && !result.timedOut && !result.truncated;
+}
+
+/**
+ * The binary patch from `baseDir` to `taskDir` over `paths` (relative,
+ * OS separators), made by git in a throwaway object store; `null` when
+ * git cannot make it.
+ */
+export async function gitBinaryPatch(
+  baseDir: string,
+  taskDir: string,
+  paths: readonly string[],
+  git: PatchGit = defaultPatchGit,
+  tmpRoot: string = tmpdir(),
+): Promise<string | null> {
+  const store = await mkdtemp(join(tmpRoot, "atag-fusion-patch-"));
+  try {
+    const gitDir = join(store, "objects.git");
+    if (!ran(await git(["init", "-q", "--bare", gitDir], { cwd: store, env: {} }))) return null;
+    let links = 0;
+    const tree = async (root: string, name: string): Promise<string | null> => {
+      const env = { GIT_DIR: gitDir, GIT_INDEX_FILE: join(store, `index-${name}`) };
+      const entries: Array<{ mode: string; file: string; path: string }> = [];
+      for (const rel of paths) {
+        const entry = await readEntry(join(root, rel));
+        if (entry === null) continue;
+        let file = join(root, rel);
+        if (entry.link !== undefined) {
+          // Hash the link's target text, as git stores a symlink.
+          file = join(store, `link-${(links += 1)}`);
+          await writeFile(file, entry.link);
+        }
+        entries.push({
+          mode: entry.link !== undefined ? "120000" : entry.executable ? "100755" : "100644",
+          file,
+          path: slash(rel),
+        });
+      }
+      const lines: string[] = [];
+      for (let i = 0; i < entries.length; i += 100) {
+        const chunk = entries.slice(i, i + 100);
+        const hashed = await git(
+          ["hash-object", "-w", "--no-filters", "--", ...chunk.map((e) => e.file)],
+          { cwd: store, env },
+        );
+        if (!ran(hashed)) return null;
+        const shas = hashed.stdout.trim().split("\n");
+        if (shas.length !== chunk.length) return null;
+        chunk.forEach((e, j) => lines.push(`${e.mode} ${shas[j]}\t${e.path}\0`));
+      }
+      if (lines.length > 0) {
+        const indexed = await git(["update-index", "-z", "--index-info"], {
+          cwd: store,
+          env,
+          input: lines.join(""),
+        });
+        if (!ran(indexed)) return null;
+      }
+      const written = await git(["write-tree"], { cwd: store, env });
+      return ran(written) ? written.stdout.trim() : null;
+    };
+    const before = await tree(baseDir, "base");
+    const after = before === null ? null : await tree(taskDir, "task");
+    if (before === null || after === null) return null;
+    const diff = await git(
+      [
+        "diff-tree",
+        "-r",
+        "-p",
+        "--binary",
+        "--full-index",
+        "--no-renames",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+        `-U${DIFF_CONTEXT_LINES}`,
+        before,
+        after,
+      ],
+      { cwd: store, env: { GIT_DIR: gitDir } },
+    );
+    return ran(diff) ? diff.stdout : null;
+  } finally {
+    await rm(store, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
+export interface SavedTaskPatch {
+  /** The patch, relative to the working directory. */
+  path: string;
+  /** `git`: the patch carries every change; `text`: text changes only. */
+  method: "git" | "text";
+  /** With `text`: where the rest was copied, relative to the working directory. */
+  filesDir?: string;
+  /** How many paths were copied there. */
+  saved?: number;
+}
+
+/**
+ * Save a held-back task's changes into the working directory, as a
+ * patch that `git apply` takes on the folder (paths relative to the
+ * working directory). A later attempt of the same task replaces it.
+ */
+export async function writeTaskPatch(input: {
+  realDir: string;
+  set: Pick<BranchSet, "baseDir">;
+  workspace: BranchWorkspace;
+  taskId: string;
+  changes: readonly WorkspaceChange[];
+  patchGit?: PatchGit;
+  tmpRoot?: string;
+}): Promise<SavedTaskPatch> {
+  const rel = taskPatchPath(input.taskId);
+  const at = join(input.realDir, rel);
+  const filesRel = `${rel.slice(0, -".patch".length)}.files`;
+  const filesAt = join(input.realDir, filesRel);
   await mkdir(dirname(at), { recursive: true });
-  await writeFile(at, patch);
-  return rel;
+  // An earlier attempt's copies are not this attempt's.
+  await rm(filesAt, { recursive: true, force: true });
+  const paths = await touchedPaths(input.workspace);
+  const binary = await gitBinaryPatch(
+    input.set.baseDir,
+    input.workspace.dir,
+    paths,
+    input.patchGit,
+    input.tmpRoot,
+  );
+  if (binary !== null) {
+    await writeFile(at, binary);
+    return { path: rel, method: "git" };
+  }
+  await writeFile(at, renderPatch(input.changes));
+  const rest = input.changes.filter((c) => !textApplies(c));
+  let saved = 0;
+  const removed: string[] = [];
+  for (const change of rest) {
+    const from = join(input.workspace.dir, ...change.path.split("/"));
+    const entry = await readEntry(from);
+    if (entry === null) {
+      removed.push(change.path);
+      continue;
+    }
+    const to = join(filesAt, ...change.path.split("/"));
+    await mkdir(dirname(to), { recursive: true });
+    if (entry.link !== undefined) await symlink(entry.link, to);
+    else {
+      await copyFile(from, to);
+      if (entry.executable) await chmod(to, 0o755).catch(() => undefined);
+    }
+    saved += 1;
+  }
+  if (removed.length > 0) {
+    await mkdir(filesAt, { recursive: true });
+    await writeFile(join(filesAt, "REMOVED.txt"), `${removed.join("\n")}\n`);
+  }
+  if (saved === 0 && removed.length === 0) return { path: rel, method: "text" };
+  return { path: rel, method: "text", filesDir: filesRel, saved: saved + removed.length };
 }

@@ -34,6 +34,8 @@ import {
   mkdir,
   mkdtemp,
   readdir,
+  readFile,
+  readlink,
   realpath,
   rm,
   symlink,
@@ -54,10 +56,17 @@ export const BRANCH_MERGE_DIR = join(".atomic-agent", "fusion-merge");
 
 export type BranchMethod = "worktree" | "clonefile" | "copy";
 
-/** Size and mtime of one file at workspace creation: what "changed" is measured against. */
+/**
+ * Size, mtime and mode of one file or symlink at workspace creation:
+ * what "changed" is measured against. A chmod moves only the mode.
+ */
 export interface FileStamp {
   size: number;
   mtimeMs: number;
+  /** Permission bits; a symlink's are not compared. */
+  mode?: number;
+  /** A symlink, stamped itself (never followed). */
+  link?: boolean;
 }
 
 export interface BranchWorkspace {
@@ -156,9 +165,10 @@ function isUnderMergeDir(rel: string): boolean {
 }
 
 /**
- * Every regular file under `root` with its size and mtime. Symlinks are
- * not followed, the copy exclusions (`.git`, `node_modules`, …) and the
- * merge folder are skipped: none of it is merged back.
+ * Every regular file and symlink under `root` with its size, mtime and
+ * mode. Symlinks are stamped, not followed; the copy exclusions (`.git`,
+ * `node_modules`, …) and the merge folder are skipped: none of it is
+ * merged back.
  */
 export async function stampTree(root: string): Promise<Map<string, FileStamp>> {
   const out = new Map<string, FileStamp>();
@@ -178,10 +188,15 @@ export async function stampTree(root: string): Promise<Map<string, FileStamp>> {
       if (isUnderMergeDir(rel)) continue;
       if (entry.isDirectory()) {
         stack.push(full);
-      } else if (entry.isFile()) {
+      } else if (entry.isFile() || entry.isSymbolicLink()) {
         try {
           const info = await lstat(full);
-          out.set(rel, { size: info.size, mtimeMs: info.mtimeMs });
+          out.set(
+            rel,
+            info.isSymbolicLink()
+              ? { size: info.size, mtimeMs: info.mtimeMs, link: true }
+              : { size: info.size, mtimeMs: info.mtimeMs, mode: info.mode & 0o777 },
+          );
         } catch {
           // Vanished mid-walk.
         }
@@ -420,7 +435,9 @@ export async function touchedPaths(
     if (
       before === undefined ||
       before.size !== stamp.size ||
-      before.mtimeMs !== stamp.mtimeMs
+      before.mtimeMs !== stamp.mtimeMs ||
+      before.link !== stamp.link ||
+      before.mode !== stamp.mode
     ) {
       out.push(rel);
     }
@@ -429,4 +446,40 @@ export async function touchedPaths(
     if (!now.has(rel)) out.push(rel);
   }
   return out.sort();
+}
+
+/**
+ * One path as a merge or a patch sees it: a regular file's bytes and
+ * exec bit, or a symlink's target (never followed). `null` for nothing
+ * there, a directory, or what cannot be read.
+ */
+export interface PathEntry {
+  data: Buffer;
+  executable: boolean;
+  /** Set for a symlink: its target, as written. */
+  link?: string;
+}
+
+export async function readEntry(path: string): Promise<PathEntry | null> {
+  try {
+    const info = await lstat(path);
+    if (info.isSymbolicLink()) {
+      const link = await readlink(path);
+      return { data: Buffer.from(link, "utf8"), executable: false, link };
+    }
+    if (!info.isFile()) return null;
+    return { data: await readFile(path), executable: (info.mode & 0o111) !== 0 };
+  } catch {
+    return null;
+  }
+}
+
+/** The same bytes, kind and exec bit (what git records). */
+export function sameEntry(a: PathEntry | null, b: PathEntry | null): boolean {
+  if (a === null || b === null) return a === b;
+  return (
+    a.data.equals(b.data) &&
+    (a.link === undefined) === (b.link === undefined) &&
+    a.executable === b.executable
+  );
 }
