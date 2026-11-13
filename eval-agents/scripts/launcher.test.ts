@@ -56,6 +56,15 @@ describe("eval launcher actual Node children", () => {
     expect(result.diagnostic).toContain("no GAIA agent cases executed");
   });
 
+  it("uses one absolute report directory when caller and child working directories differ", () => {
+    const result = launch("relative-report", { LAUNCHER_MODE: "campaign", LAUNCHER_REQUIRE_CAMPAIGN: "1",
+      ATOMIC_AGENT_GAIA_REPORT_DIR: "relative-report" });
+    expect(result.status, result.diagnostic).toBe(0);
+    const child = JSON.parse(readFileSync(result.output, "utf8"));
+    expect(child.reportDir).toBe(join(scratch, "relative-report"));
+    expect(JSON.parse(readFileSync(join(scratch, "relative-report", "campaign.json"), "utf8"))).toMatchObject({ executed: 1 });
+  });
+
   it("settles a spawn error with a diagnostic instead of an unhandled error", () => {
     const result = launch("spawn-error", { LAUNCHER_CWD: join(scratch, "nonexistent") });
     expect(result.status).toBe(1);

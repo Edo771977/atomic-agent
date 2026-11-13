@@ -86,6 +86,9 @@ closes. An absent agent filter selects defaults; an explicitly empty string
 or comma-only filter selects no agents and fails.
 Set `ATOMIC_AGENT_GAIA_REPORT_DIR` to place a campaign's reports in a chosen
 directory (the default remains a timestamped directory under `reports/`).
+The launcher resolves a relative report directory against the test child's
+working directory (normally the repository root), then passes the same
+absolute path to the child and completion validator.
 
 Orchestrators launch the installed Vitest JavaScript entry with the current
 Node executable, including on Windows; forwarded arguments stay separate
