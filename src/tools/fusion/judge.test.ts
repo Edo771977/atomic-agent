@@ -403,4 +403,32 @@ describe("the retry brief carries a failing check's output", () => {
     expect(retry).toContain("    Error: score is NaN\n        at hud.js:3:9");
     rmSync(dir, { recursive: true, force: true });
   });
+
+  it("masks a secret in the check output before the retry brief quotes it", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "judge-mask-"));
+    const d = deps(dir, answer([{ id: "a3", pass: true }]), {
+      runChecks: async () => ({
+        ok: false,
+        results: [
+          {
+            ok: false,
+            summary: "verify.run command: FAILED\nexit 1 after 5 ms",
+            stderrTail: "Error: auth failed for sk_live_abcdefghijklmnop1234 at db.js:3:9",
+          },
+        ],
+      }),
+    });
+    await buildFusionDelegateTool(d).run(
+      {
+        tasks: TASK,
+        contract: { checks: [{ task: "t", kind: "command", cmd: "node db.js" }] },
+      },
+      { workingDir: dir, sessionId: "s-p", stepIndex: 0, signal: new AbortController().signal },
+    );
+    const retry = d.briefs.find((b) => b.includes("A judge found these acceptance items NOT met"));
+    expect(retry).toBeDefined();
+    expect(retry).toContain("Error: auth failed for [redacted:stripe-key] at db.js:3:9");
+    expect(retry).not.toContain("sk_live_abcdefghijklmnop1234");
+    rmSync(dir, { recursive: true, force: true });
+  });
 });

@@ -256,6 +256,65 @@ describe("AgentLoop end-to-end with mock LLM", () => {
     expect(seen).toEqual([{ effort: "low", cap: 12_000 }, {}]);
   });
 
+  it("bounds every step of a multi-step turn but the reserved final one", async () => {
+    const grammar = [
+      "root ::= think-prelude tool-call-array",
+      'think-prelude ::= think-body "</think>" prelude-trail-ws',
+      "think-body ::= think-fragment*",
+      'think-fragment ::= [^<]+ | "<" [^/]',
+      "prelude-trail-ws ::= ( [ \\t\\n\\r] ){0,8}",
+      'tool-call-array ::= "ok"',
+      "",
+    ].join("\n");
+    const registry = buildDefaultToolRegistry();
+    registry.register({
+      name: "noop",
+      description: "no-op",
+      readonly: true,
+      async run() {
+        return { tool: "noop", status: "ok", summary: "noop", details: {}, truncated: false };
+      },
+    });
+    const grammars: string[] = [];
+    const prompts: string[] = [];
+    const loop = new AgentLoop({
+      registry,
+      slotManager: new SlotManager(2),
+      grammar,
+      llmComplete: async (params) => {
+        grammars.push(params.grammar);
+        prompts.push(params.prompt);
+        // Work on every step it is allowed to; the reserved final step
+        // only accepts a terminal call.
+        return makeCompletion(
+          prompts.at(-1)!.includes("final allowed step")
+            ? JSON.stringify({ tool: "reply", args: { text: "done" } })
+            : JSON.stringify({ tool: "noop", args: { n: grammars.length } }),
+        );
+      },
+      toolDescriptors: [...TOOLS, { name: "noop", summary: "No-op.", argsSchema: "{}" }],
+      capabilities: CAPS,
+      skillCatalog: SKILLS,
+    });
+    const result = await loop.runTurn(createEmptySessionState({ id: "s-budget-steps", workingDir }), {
+      userMessage: "go",
+      maxSteps: 3,
+      taskMaxSteps: 3,
+      reasoningBudgetTokens: 64,
+      signal: new AbortController().signal,
+    });
+    expect(result.reason).toBe("reply");
+    expect(grammars).toHaveLength(3);
+    const bodyHead = (g: string) => g.split("\n").find((line) => line.startsWith("think-body ::= "));
+    // The working steps carry the turn's bound (64 tokens = 256 chars) ...
+    expect(bodyHead(grammars[0]!)).toBe("think-body ::= think-char{0,256}");
+    expect(bodyHead(grammars[1]!)).toBe("think-body ::= think-char{0,256}");
+    // ... and the reserved final step thinks unbounded.
+    expect(prompts[2]).toContain("final allowed step");
+    expect(bodyHead(grammars[2]!)).toBe("think-body ::= think-fragment*");
+    expect(grammars[2]).not.toMatch(/think-char\{/);
+  });
+
   it("passes RunTurnOptions.reasoningBudgetTokens to every step's grammar, not the prompt", async () => {
     const grammar = [
       "root ::= think-prelude tool-call-array",

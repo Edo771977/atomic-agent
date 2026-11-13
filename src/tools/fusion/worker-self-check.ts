@@ -5,9 +5,13 @@ import {
   type ContractCheckOutcome,
   type ContractCheckRunner,
 } from "./contract-checks.js";
-import type { ContractCheck, DelegateContract } from "./contract.js";
+import { ownedPaths, type ContractCheck, type DelegateContract } from "./contract.js";
 import type { DelegateTask } from "./delegate-args.js";
 import { inspectDeclaredFiles, type DegenerateFile } from "./declared-files.js";
+import {
+  maskSecrets,
+  type KnownSecret,
+} from "../../error-reporting/secret-detector.js";
 
 /**
  * A worker checks its own work before its reply closes the task.
@@ -53,6 +57,136 @@ export function ownChecks(
   return (contract?.checks ?? []).filter((check) => check.task === taskId);
 }
 
+function normalisePath(path: string): string {
+  return path.trim().replace(/^(?:\.\/)+/, "").replace(/\/+$/, "");
+}
+
+/**
+ * The paths a task running at the same time as `taskId` writes, by the
+ * contract: what `owners` gives a concurrent task, and where its
+ * `provides` must appear (`in`, or a `file` provide's own name). Less
+ * this task's own paths and the operator's `inputs`, which everyone may
+ * read. `concurrent` is every task id in the same run of tasks (a wave,
+ * a judge's retry), across legs.
+ *
+ * Why: the self-check runs mid-wave. Under `isolation: "worktree"` this
+ * task's workspace has none of its siblings' files; without isolation
+ * they are still being written. A check that needs one fails for a
+ * reason this worker cannot fix, and a weak worker told it failed may
+ * write a stub of the sibling's file. Tasks of earlier waves have
+ * finished, and their files are where a check reads them.
+ */
+export function concurrentPaths(
+  contract: DelegateContract | undefined,
+  taskId: string,
+  concurrent: readonly string[],
+): string[] {
+  if (contract === undefined) return [];
+  const others = new Set(concurrent.filter((id) => id !== taskId));
+  if (others.size === 0) return [];
+  const mine = new Set(
+    [...ownedPaths(contract, taskId), ...(contract.inputs ?? [])].map(normalisePath),
+  );
+  const out = new Set<string>();
+  const add = (path: string): void => {
+    const p = normalisePath(path);
+    if (p.length > 0 && !mine.has(p)) out.add(p);
+  };
+  for (const [path, owner] of Object.entries(contract.owners ?? {})) {
+    if (others.has(owner)) add(path);
+  }
+  for (const provide of contract.provides ?? []) {
+    if (!others.has(provide.task)) continue;
+    if (provide.in !== undefined) add(provide.in);
+    if (provide.kind === "file") add(provide.name);
+  }
+  return [...out];
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Whether `text` names `path` as a path: not as the tail of a longer
+ * name (`data.js` is not `a.js`), with any directory or `./` before it.
+ */
+export function mentionsPath(text: string, path: string): boolean {
+  return new RegExp(`(?:^|[^\\w.-])${escapeRegExp(path)}(?![\\w-]|\\.\\w)`).test(text);
+}
+
+function mentionsAny(text: string, paths: readonly string[]): string | undefined {
+  return paths.find((path) => mentionsPath(text, path));
+}
+
+/** JSON with object keys sorted, so key order never makes two specs differ. */
+function canonical(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, v]) => v !== undefined)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonical(v)}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+/**
+ * The identity of a check's `verify.run` spec: the contract's entry
+ * without its `task`, or a worker's `verify.run` arguments.
+ */
+export function checkSpecKey(spec: Record<string, unknown>): string {
+  const { task: _task, ...rest } = spec;
+  return canonical(rest);
+}
+
+/** Tools whose call changes nothing the self-check could ask about. */
+const NON_MUTATING_TOOLS: ReadonlySet<string> = new Set(["verify.run", "reply", "finish"]);
+
+/**
+ * Which of its checks a worker has already seen pass on its own work:
+ * a `verify.run` call with the identical spec that succeeded in a step
+ * after the worker's last step that could have changed a file. Any tool
+ * outside `readOnlyTools` counts as a change (a shell command can write
+ * as surely as `os.fs.write`), and a pass in the same step as a change
+ * does not count, since a batch's order is not the order it reads in.
+ * Fed from the worker turn's `tool_call_parsed` / `tool_call_executed`
+ * events, both turns of it.
+ */
+export class WorkerCheckRuns {
+  private readonly passedAt = new Map<string, number>();
+  private lastChangeStep = -1;
+  private readonly parsed = new Map<number, Record<string, unknown>>();
+
+  constructor(private readonly readOnlyTools: ReadonlySet<string>) {}
+
+  parsedCall(tool: string, args: Record<string, unknown>, batchIndex: number): void {
+    if (tool === "verify.run") this.parsed.set(batchIndex, args);
+    else this.parsed.delete(batchIndex);
+  }
+
+  executed(tool: string, status: string, batchIndex: number, step: number): void {
+    if (tool === "verify.run") {
+      const args = this.parsed.get(batchIndex);
+      this.parsed.delete(batchIndex);
+      const key = args === undefined ? undefined : checkSpecKey(args);
+      if (key === undefined) return;
+      if (status === "ok") this.passedAt.set(key, step);
+      else this.passedAt.delete(key);
+      return;
+    }
+    if (!NON_MUTATING_TOOLS.has(tool) && !this.readOnlyTools.has(tool)) {
+      this.lastChangeStep = step;
+    }
+  }
+
+  /** Whether `check` passed after the worker's last change. */
+  passedSinceLastChange(check: ContractCheck): boolean {
+    const at = this.passedAt.get(checkSpecKey(check));
+    return at !== undefined && at > this.lastChangeStep;
+  }
+}
+
 export interface SelfCheckFinding {
   /** Declared paths that do not exist. */
   missing: string[];
@@ -84,7 +218,29 @@ export async function runSelfCheck(input: {
   runChecks?: ContractCheckRunner;
   signal: AbortSignal;
   timeCapMs: number;
-}): Promise<SelfCheckFinding & { checksNotRun?: string }> {
+  /** The agent's own keys, for masking the checks' output. */
+  knownSecrets?: readonly KnownSecret[];
+  /**
+   * Paths tasks running alongside this one write (`concurrentPaths`).
+   * A check whose spec names one is not run here; a failure whose
+   * output names one is not this worker's to fix and gives no finding.
+   */
+  concurrentPaths?: readonly string[];
+  /**
+   * A check the worker's own `verify.run` already passed on its final
+   * state (`WorkerCheckRuns`): running it again tells nobody anything.
+   */
+  alreadyPassed?: (check: ContractCheck) => boolean;
+}): Promise<
+  SelfCheckFinding & {
+    checksNotRun?: string;
+    /** The run was cut at `timeCapMs`: it told the worker nothing. */
+    checksCapped?: true;
+    checksDeferred?: string[];
+    /** Own checks not run because the worker's own run already passed. */
+    checksAlreadyPassed?: number;
+  }
+> {
   const finding: SelfCheckFinding = { missing: [], degenerate: [], failed: [] };
   const files = input.task.files ?? [];
   if (files.length > 0) {
@@ -92,8 +248,27 @@ export async function runSelfCheck(input: {
     finding.missing = report.missing;
     finding.degenerate = report.degenerate ?? [];
   }
-  const checks = ownChecks(input.contract, input.task.id);
-  if (checks.length === 0 || input.runChecks === undefined) return finding;
+  const siblings = input.concurrentPaths ?? [];
+  const deferred: string[] = [];
+  let alreadyPassed = 0;
+  const checks = ownChecks(input.contract, input.task.id).filter((check) => {
+    const path = mentionsAny(describeSpec(check), siblings);
+    if (path !== undefined) deferred.push(path);
+    if (path !== undefined) return false;
+    if (input.alreadyPassed?.(check) === true) {
+      alreadyPassed += 1;
+      return false;
+    }
+    return true;
+  });
+  const withDeferred = <T extends object>(
+    out: T,
+  ): T & { checksDeferred?: string[]; checksAlreadyPassed?: number } => ({
+    ...out,
+    ...(deferred.length === 0 ? {} : { checksDeferred: [...new Set(deferred)] }),
+    ...(alreadyPassed === 0 ? {} : { checksAlreadyPassed: alreadyPassed }),
+  });
+  if (checks.length === 0 || input.runChecks === undefined) return withDeferred(finding);
   if (input.signal.aborted || input.timeCapMs <= 0) {
     return { ...finding, checksNotRun: "no time left" };
   }
@@ -118,19 +293,30 @@ export async function runSelfCheck(input: {
       runContractChecks(checks, input.runChecks, {
         workingDir: input.workingDir,
         signal: AbortSignal.any([input.signal, cap.signal]),
+        ...(input.knownSecrets === undefined ? {} : { knownSecrets: input.knownSecrets }),
       }),
       capped,
       stopped,
     ]);
     if (run === "cap") {
-      return { ...finding, checksNotRun: `not finished within ${Math.round(input.timeCapMs / 1000)}s` };
+      return withDeferred({
+        ...finding,
+        checksNotRun: `not finished within ${Math.round(input.timeCapMs / 1000)}s`,
+        checksCapped: true as const,
+      });
     }
-    if (run === "stopped") return { ...finding, checksNotRun: "the worker was stopped" };
-    if (run.checksSkipped !== undefined) return { ...finding, checksNotRun: run.checksSkipped };
+    if (run === "stopped") return withDeferred({ ...finding, checksNotRun: "the worker was stopped" });
+    if (run.checksSkipped !== undefined) return withDeferred({ ...finding, checksNotRun: run.checksSkipped });
     run.outcomes.forEach((outcome, i) => {
-      if (!outcome.ok) finding.failed.push({ spec: checks[i]!, outcome });
+      if (outcome.ok) return;
+      const path = mentionsAny(`${outcome.detail}\n${outcome.output ?? ""}`, siblings);
+      if (path !== undefined) {
+        deferred.push(path);
+        return;
+      }
+      finding.failed.push({ spec: checks[i]!, outcome });
     });
-    return finding;
+    return withDeferred(finding);
   } finally {
     clearTimeout(timer);
     if (onStop !== undefined) input.signal.removeEventListener("abort", onStop);
@@ -143,10 +329,18 @@ function describeSpec(check: ContractCheck): string {
   return json.length > CHECK_SPEC_CHARS ? `${json.slice(0, CHECK_SPEC_CHARS)}…` : json;
 }
 
-/** The one notice the worker gets, as the next message of its conversation. */
+/**
+ * The one notice the worker gets, as the next message of its
+ * conversation. Masked whole with the shared detector before it is sent
+ * (`known`: the agent's own keys, as the tool registry masks with,
+ * ATO-1077): the check ran outside the registry, and its output — a
+ * `DATABASE_URL`, a token a test printed — would otherwise reach the
+ * worker's model, its session and its trace as it was.
+ */
 export function renderSelfCheckNotice(
   finding: SelfCheckFinding,
   graceSteps: number,
+  known: readonly KnownSecret[] = [],
 ): string {
   const lines = [
     "Your reply did not close the task: the runtime checked your work and it is not done yet.",
@@ -167,7 +361,7 @@ export function renderSelfCheckNotice(
   lines.push(
     `Fix exactly this now; you have ${graceSteps} more steps. ${finding.missing.length + finding.degenerate.length > 0 ? "Write each declared file with its full content. " : ""}${finding.failed.length > 0 ? "Re-run the failing check with verify.run until it passes. " : ""}If the cause is a file another task owns, do not write it: say so in your reply. Then reply with what you changed.`,
   );
-  return lines.join("\n");
+  return maskSecrets(lines.join("\n"), known);
 }
 
 /** The row's note: what the worker was told, so the orchestrator knows it had its second chance. */

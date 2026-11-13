@@ -1,6 +1,7 @@
 export { buildGrammar, buildGrammarForTools } from "./build-grammar.js";
 export type { BuildGrammarOptions } from "./build-grammar.js";
 export {
+  hasReasoningPrelude,
   withoutReasoningPrelude,
   withReasoningBudget,
   withUnboundedReasoningPrelude,

@@ -72,11 +72,14 @@ export function effectiveReasoningBudgetTokens(budgetTokens: number): number {
  * per-request grammar bound (`withReasoningBudget`); a cloud leg keeps
  * reading the effort from the body builder instead.
  *
- * Picked from the fusion bench above (500–7,152 reasoning tokens per
- * tool step): `low` keeps the routine steps at the bench's low end,
- * `medium` lets a typical step finish its thought and cuts the long
- * tail that made workers miss their time limit, and `high` leaves room
- * for a hard step while still stopping a runaway one.
+ * Placed against the fusion bench above, which recorded a range of
+ * 500–7,152 reasoning tokens per tool step and no per-step distribution
+ * (no median or percentile): `low` sits at about the bench's low end,
+ * `medium` at about three times it, well under the top, so the long
+ * steps that made workers miss their time limit are cut, and `high`
+ * leaves about four-sevenths of the longest recorded step. Steps that
+ * needed more than a level allows are cut mid-thought; the bench cannot
+ * say how many that is.
  */
 export const LOCAL_WORKER_REASONING_BUDGET_TOKENS: Readonly<Record<ReasoningEffort, number>> = {
   low: 512,
@@ -94,15 +97,26 @@ export const DEFAULT_LOCAL_WORKER_REASONING_BUDGET_TOKENS = LOCAL_WORKER_REASONI
 
 /**
  * The reasoning bound, in budget tokens, for every step of a fusion
- * worker on a local leg. An explicit `workerReasoning` level wins. Unset,
- * a configured `localModels.reasoningBudgetTokens` (positive) is kept,
- * since the person chose it; otherwise the worker default. Never `0`:
- * a local worker is always bounded.
+ * worker on a local leg; `0` is no bound.
+ *
+ * - An explicit `workerReasoning` level wins, over a stricter configured
+ *   bound too (`low` is 512 with `localModels.reasoningBudgetTokens: 256`):
+ *   it is the fusion worker's own setting, the more specific of the two,
+ *   and a level that meant different things on different machines would
+ *   not be a level.
+ * - `unbounded` is the opt-out: `0`, whatever the config says. It is the
+ *   only way to an unbounded worker, since a configured `0` is also the
+ *   default (config v78) and cannot say it was chosen.
+ * - Unset, a positive `localModels.reasoningBudgetTokens` is used as set,
+ *   not capped at the default: since v78 migrated the old written default
+ *   away, a positive value is a choice the person made for their model,
+ *   larger ones included. Otherwise the worker default.
  */
 export function localWorkerReasoningBudgetTokens(
-  level: ReasoningEffort | undefined,
+  level: ReasoningEffort | "unbounded" | undefined,
   configuredBudgetTokens: number,
 ): number {
+  if (level === "unbounded") return 0;
   if (level !== undefined) return LOCAL_WORKER_REASONING_BUDGET_TOKENS[level];
   const configured = effectiveReasoningBudgetTokens(configuredBudgetTokens);
   return configured > 0 ? configured : DEFAULT_LOCAL_WORKER_REASONING_BUDGET_TOKENS;

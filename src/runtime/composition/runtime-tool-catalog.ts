@@ -843,6 +843,9 @@ export function registerRuntimeFusionAndReadScope(input: {
           signal: ctx.signal,
           config,
         }),
+      // Check output reaches workers outside the registry: masked with
+      // the same keys the registry masks tool results with (ATO-1077).
+      knownSecrets: () => runtimeKnownSecrets(getConfig()),
       logger,
     }),
   );

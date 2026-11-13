@@ -43,6 +43,7 @@ import {
 } from "./worker-result.js";
 import type { StructuredLogger } from "../../tracing/index.js";
 import { getConfig } from "../../config/index.js";
+import type { FusionWorkerReasoning } from "../../config/llm-run-mode-config.js";
 import { localWorkerReasoningBudgetTokens } from "../../llm/reasoning-budget.js";
 import {
   FUSION_WORKER_APPROVAL_REFUSED,
@@ -61,10 +62,16 @@ import {
 import { hasSplitProposal, splitSteer } from "./task-tree.js";
 import type { ContractCheckRunner } from "./contract-checks.js";
 import {
+  knownSecretsFromEnv,
+  type KnownSecret,
+} from "../../error-reporting/secret-detector.js";
+import {
   SELF_CHECK_GRACE_STEPS,
   SELF_CHECK_MAX_MS,
   SELF_CHECK_MIN_GRACE_STEPS,
   SELF_CHECK_MIN_REMAINING_MS,
+  WorkerCheckRuns,
+  concurrentPaths,
   describeSelfCheck,
   hasFindings,
   renderSelfCheckNotice,
@@ -194,7 +201,13 @@ export function describeFirstAnswerCut(input: {
   capTokens: number;
   tokensPerSecond: number;
   timeoutMs: number;
-  /** The worker's think-block bound on a local leg; absent on a cloud leg. */
+  /**
+   * The think-block bound the cut completion's request actually carried,
+   * as the step reported it (`llm_completed`'s `reasoningBoundTokens`).
+   * Absent when nothing bounded the thinking: a plain-instruct profile
+   * with no think prelude, a native-tools link, a fallback to a cloud
+   * link. The hint names the bound only then.
+   */
   reasoningBudgetTokens?: number;
 }): { reply: string; note: string; hint: string } {
   const budget =
@@ -535,6 +548,14 @@ export interface WorkerRunnerDeps {
    * are reported as not run and never assumed to have passed.
    */
   runChecks?: ContractCheckRunner;
+  /**
+   * The agent's own secrets (exact values: `.env`, the config's keys),
+   * for masking check output that reaches a worker outside the tool
+   * registry — the same list the registry masks tool results with
+   * (ATO-1077). Absent: the environment's (`knownSecretsFromEnv`); the
+   * detector's shape rules apply either way.
+   */
+  knownSecrets?: () => readonly KnownSecret[];
 }
 
 /** Escalations one worker may get, automatic and manual together. */
@@ -543,6 +564,12 @@ export const MAX_ESCALATIONS_PER_WORKER = 2;
 export interface RunWorkerTasksOptions {
   parentSessionId: string;
   tasks: readonly DelegateTask[];
+  /**
+   * Every task id running at the same time as these (a wave, a judge's
+   * retry), across all legs. A worker's self-check does not ask a
+   * sibling's files of it (`concurrentPaths`). Absent: `tasks`.
+   */
+  concurrentTaskIds?: readonly string[];
   /** Concurrency ceiling, already reconciled against the slot pool. */
   maxWorkers: number;
   /** The local leg every worker turn is pinned to. */
@@ -581,8 +608,9 @@ export interface RunWorkerTasksOptions {
    * local leg, which has no such parameter, it picks the think-block
    * bound of every non-final worker step instead
    * (`localWorkerReasoningBudgetTokens`), bounded by default when unset.
+   * `unbounded` sends no effort and lifts the local bound.
    */
-  workerReasoning?: ReasoningEffort;
+  workerReasoning?: FusionWorkerReasoning;
   /**
    * `runMode.fusion.workerMaxOutputTokens`, the per-step output cap. A
    * measured local leg may send less: what fits the worker's time
@@ -1182,6 +1210,9 @@ async function runOneTask(
   // Set while the worker fixes what its self-check found: those steps
   // were granted on top of the hand-back rule, not measured against it.
   let inSelfCheckGrace = false;
+  // The worker's own `verify.run` passes, so the self-check does not
+  // run a check a third time that the worker already saw pass.
+  const checkRuns = new WorkerCheckRuns(READ_ONLY_TOOLS);
   const maybeHandBack = (): void => {
     if (declaredFiles === 0 || wroteSomething || handBack.signal.aborted)
       return;
@@ -1233,7 +1264,11 @@ async function runOneTask(
   const replyCap = timeFittedCap ?? options.workerMaxOutputTokens;
   // A local leg bounds each worker step's thinking per request: unbounded,
   // it ran to thousands of tokens a step and the time limit cut the
-  // answer. A cloud leg keeps the provider's own (the effort above).
+  // answer. A cloud leg keeps the provider's own (the effort above), and
+  // needs no bound for a fallback: the turn is pinned to
+  // `options.providerId` and a pinned request never falls over to
+  // another link (`llm-fallback-seam.ts`), so a cloud worker's step never
+  // lands on a local grammar link.
   const reasoningBudgetTokens = options.localLeg === true
     ? localWorkerReasoningBudgetTokens(
         options.workerReasoning,
@@ -1241,8 +1276,10 @@ async function runOneTask(
       )
     : undefined;
   // How long the first answer ran when it spent the time-fitted cap
-  // before any step had completed; read once the turn is over.
+  // before any step had completed, and the think-block bound that
+  // answer's request really carried; read once the turn is over.
   let firstCutTokens: number | undefined;
+  let firstCutBoundTokens: number | undefined;
 
   // Escalation (ATO-942, ATO-66). The person's stop, the advisor that
   // reads a stuck worker's trace and steers it, and — behind
@@ -1438,6 +1475,10 @@ async function runOneTask(
       durationMs: 0,
     });
     if (provisional.status !== "ok") return first;
+    // A worker that already replaced one of the operator's inputs is the
+    // orchestrator's to handle (`replacedInputs` on the row): a second
+    // turn of the same worker on the same files only repeats the damage.
+    if ((provisional.replacedInputs?.length ?? 0) > 0) return first;
     if (mayPropose && hasSplitProposal(provisional.reply)) return first;
     const stepsLeft = stepBudget.value - first.stepCount;
     const graceSteps = Math.min(SELF_CHECK_GRACE_STEPS, stepsLeft);
@@ -1445,6 +1486,7 @@ async function runOneTask(
     const remainingMs =
       servedAt === null ? timeoutMs : timeoutMs - (Date.now() - servedAt);
     if (remainingMs < SELF_CHECK_MIN_REMAINING_MS) return first;
+    const knownSecrets = deps.knownSecrets?.() ?? knownSecretsFromEnv();
     const finding = await runSelfCheck({
       task,
       ...(options.contract === undefined ? {} : { contract: options.contract }),
@@ -1458,7 +1500,28 @@ async function runOneTask(
         replaceAbort.signal,
       ]),
       timeCapMs: Math.min(SELF_CHECK_MAX_MS, remainingMs),
+      knownSecrets,
+      concurrentPaths: concurrentPaths(
+        options.contract,
+        task.id,
+        options.concurrentTaskIds ?? options.tasks.map((t) => t.id),
+      ),
+      alreadyPassed: (check) => checkRuns.passedSinceLastChange(check),
     });
+    if (finding.checksCapped === true) {
+      // Said on the row, not only in the log: a check that always runs
+      // past the cap makes the self-check a no-op for this task, and
+      // the orchestrator should know its worker saw nothing.
+      selfCheckNotes.push(
+        `self-check: its own checks did not finish within ${Math.round(Math.min(SELF_CHECK_MAX_MS, remainingMs) / 1000)}s, so it was told nothing; only the post-fan-out run judges them`,
+      );
+    }
+    if (finding.checksDeferred !== undefined) {
+      deps.logger?.info("fusion: a worker's self-check left checks to the fan-out", {
+        taskId: task.id,
+        reason: `they read ${finding.checksDeferred.join(", ")}, written by a task running alongside it`,
+      });
+    }
     if (finding.checksNotRun !== undefined) {
       deps.logger?.info("fusion: a worker's self-check ran no checks", {
         taskId: task.id,
@@ -1474,31 +1537,27 @@ async function runOneTask(
     try {
       grace = await deps.runTurn(
         first.session,
-        renderSelfCheckNotice(finding, graceSteps),
+        renderSelfCheckNotice(finding, graceSteps, knownSecrets),
         runTurnOptions(graceSteps, Math.max(1, left)),
       );
     } finally {
       inSelfCheckGrace = false;
     }
     countUnreadNotes(session.id, grace.undelivered);
-    // The grace's own step cap is not the worker's: a forced final step
-    // there says the grace ran out, not the task's budget. The fan-out's
-    // checks still decide whether the fix held.
-    const ownCeiling =
-      grace.stopCause === "step_ceiling" && graceSteps < stepsLeft;
-    // Read here: a grace that ended on its forced final step with a
-    // reply is reported like any reply; one with no reply at all keeps
-    // its `max_steps`.
-    if (ownCeiling) {
+    // A grace that ran out of its steps ended on a forced final step:
+    // its reply is what the worker was made to say, not its claim of
+    // done, so it keeps the `step_ceiling` cause and the row stays
+    // `max_steps`, as any forced reply does. Nothing after the waves
+    // turns a row `ok` (the checks and the declared files only ever
+    // demote one), so stripping the cause here would have been the only
+    // thing calling an unfinished fix done. The note says the ceiling was
+    // the grace's, not the task's whole budget.
+    if (grace.stopCause === "step_ceiling") {
       selfCheckNotes.push(
         `self-check: the grace ran out of its ${graceSteps} steps; the last reply was written on the forced final step`,
       );
     }
-    const { stopCause: _cause, ...rest } = grace;
-    return {
-      ...(ownCeiling && grace.reason === "reply" ? rest : grace),
-      stepCount: first.stepCount + grace.stepCount,
-    };
+    return { ...grace, stepCount: first.stepCount + grace.stepCount };
   };
   let result: WorkerTaskResult;
   try {
@@ -1512,7 +1571,7 @@ async function runOneTask(
       taskMaxDurationMs,
       toolFilter: isWorkerVisibleTool,
       toolRole: WORKER_TOOL_ROLE,
-      ...(options.workerReasoning === undefined
+      ...(options.workerReasoning === undefined || options.workerReasoning === "unbounded"
         ? {}
         : { reasoningEffort: options.workerReasoning }),
       ...(replyCap === undefined ? {} : { maxOutputTokens: replyCap }),
@@ -1560,6 +1619,11 @@ async function runOneTask(
           // a batched step, so the dedupe above earns its keep.
           announceStart();
           announceTool(event.event.call.tool);
+          checkRuns.parsedCall(
+            event.event.call.tool,
+            event.event.call.args,
+            event.event.batchIndex,
+          );
           try {
             options.onWorkerTool?.(task.id, event.event.call.tool);
           } catch {
@@ -1601,6 +1665,7 @@ async function runOneTask(
             spent + REPLY_CAP_SLACK_TOKENS >= timeFittedCap
           ) {
             firstCutTokens = spent;
+            firstCutBoundTokens = event.event.reasoningBoundTokens;
             askForSplit("answer-cut");
             autoEscalate({
               kind: "first-answer-cut",
@@ -1616,6 +1681,12 @@ async function runOneTask(
           if (result.status === "ok" && WRITE_TOOLS.has(result.tool)) {
             wroteSomething = true;
           }
+          checkRuns.executed(
+            result.tool,
+            result.status,
+            event.event.batchIndex,
+            stepsFinished,
+          );
           currentFingerprints.push(fingerprintToolOutcome(result.tool, result));
           if (result.status === "ok" && !READ_ONLY_TOOLS.has(result.tool)) {
             currentBusy = true;
@@ -2002,6 +2073,7 @@ async function runOneTask(
   // Widened by hand: it is assigned inside the event hook, which the
   // compiler's flow analysis does not follow.
   const cutAt = firstCutTokens as number | undefined;
+  const cutBound = firstCutBoundTokens as number | undefined;
   if (
     cutAt !== undefined &&
     timeFittedCap !== undefined &&
@@ -2016,7 +2088,7 @@ async function runOneTask(
       capTokens: timeFittedCap,
       tokensPerSecond: options.localTokensPerSecond ?? 0,
       timeoutMs,
-      ...(reasoningBudgetTokens === undefined ? {} : { reasoningBudgetTokens }),
+      ...(cutBound === undefined ? {} : { reasoningBudgetTokens: cutBound }),
     });
     result = {
       ...result,

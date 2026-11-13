@@ -205,7 +205,7 @@ describe("runWorkerTasks", () => {
   });
 
   it("bounds a local worker's thinking per turn: the workerReasoning level, or the default when unset", async () => {
-    const run = async (extra: { localLeg?: boolean; workerReasoning?: "low" | "medium" | "high" }) => {
+    const run = async (extra: { localLeg?: boolean; workerReasoning?: "low" | "medium" | "high" | "unbounded" }) => {
       const { deps, calls } = harness(async () => turnResult());
       await runWorkerTasks(deps, {
         ...BASE,
@@ -224,8 +224,19 @@ describe("runWorkerTasks", () => {
     const high = await run({ localLeg: true, workerReasoning: "high" });
     expect(high).toMatchObject({ reasoningBudgetTokens: 4096, reasoningEffort: "high" });
     // A cloud leg keeps the provider's own reasoning: no grammar bound.
-    expect(await run({ workerReasoning: "low" })).not.toHaveProperty("reasoningBudgetTokens");
+    // Its turn is pinned to the leg, and a pinned request never falls
+    // over (llm-fallback-seam), so no step of it reaches a local grammar
+    // link that would want one.
+    const cloud = await run({ workerReasoning: "low" });
+    expect(cloud).not.toHaveProperty("reasoningBudgetTokens");
+    expect(cloud.providerId).toBe(BASE.providerId);
     expect(await run({})).not.toHaveProperty("reasoningBudgetTokens");
+    // The opt-out: the local turn's bound is lifted (0), and no effort
+    // goes to any provider, since "unbounded" is not one.
+    const unbounded = await run({ localLeg: true, workerReasoning: "unbounded" });
+    expect(unbounded.reasoningBudgetTokens).toBe(0);
+    expect(unbounded).not.toHaveProperty("reasoningEffort");
+    expect(await run({ workerReasoning: "unbounded" })).not.toHaveProperty("reasoningEffort");
   });
 
   it("runs on a fresh session id, never the parent's — that would deadlock", async () => {
@@ -842,12 +853,12 @@ describe("runWorkerTasks", () => {
         maxWorkers: 1,
         signal,
       });
-      // This fake worker writes the same file again in its self-check
-      // grace turn (`chart.png` was missing), so the hit is on it twice.
+      // No self-check grace after a replaced input: a second turn would
+      // only repeat the damage, and it is the orchestrator's to handle.
       expect(failed).toMatchObject({
         status: "failed",
         error: "declared file chart.png does not exist after the task",
-        replacedInputs: [{ path: "sales.csv" }, { path: "sales.csv" }],
+        replacedInputs: [{ path: "sales.csv" }],
       });
     } finally {
       rmSync(dir, { recursive: true, force: true });

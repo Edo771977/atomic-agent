@@ -10,6 +10,11 @@ import {
 } from "./contract.js";
 import type { DelegateTask } from "./delegate-args.js";
 import type { WorkerTaskResult } from "./worker-result.js";
+import {
+  knownSecretsFromEnv,
+  maskSecrets,
+  type KnownSecret,
+} from "../../error-reporting/secret-detector.js";
 
 /**
  * What the disk says about the contract once the workers are done.
@@ -344,15 +349,48 @@ function checkOutput(result: ContractCheckResult, headText: string): string | un
   return tailClip(text.trim(), CHECK_OUTPUT_CHARS);
 }
 
+/** `result`'s texts with their secrets masked (`maskSecrets`). */
+function maskResult(
+  result: ContractCheckResult,
+  known: readonly KnownSecret[],
+): ContractCheckResult {
+  const mask = (text: string | undefined): { value?: string } =>
+    text === undefined ? {} : { value: maskSecrets(text, known) };
+  const summary = mask(result.summary).value;
+  const error = mask(result.error).value;
+  const stderrTail = mask(result.stderrTail).value;
+  const stdoutTail = mask(result.stdoutTail).value;
+  return {
+    ok: result.ok,
+    ...(summary === undefined ? {} : { summary }),
+    ...(error === undefined ? {} : { error }),
+    ...(stderrTail === undefined ? {} : { stderrTail }),
+    ...(stdoutTail === undefined ? {} : { stdoutTail }),
+  };
+}
+
 /**
  * Run the contract's checks through the wired runner. Never throws and
  * never invents a pass: no runner, an aborted turn or a runner that
  * threw all come back as `checksSkipped` with the reason.
+ *
+ * The runner is called directly, not through the tool registry, so
+ * nothing has masked its output (ATO-1077). Every text it returns is
+ * masked here, whole, before any of it is cut to a head or a tail: a
+ * key the clip cut in half matches no shape and no exact value, and its
+ * other half would reach the orchestrator, a worker's notice and a
+ * judge's retry brief (the same order `compressToolResult` keeps,
+ * ATO-1176). `knownSecrets` are the agent's own keys; absent, the
+ * environment's.
  */
 export async function runContractChecks(
   checks: readonly ContractCheck[],
   runner: ContractCheckRunner | undefined,
-  ctx: { workingDir: string; signal: AbortSignal },
+  ctx: {
+    workingDir: string;
+    signal: AbortSignal;
+    knownSecrets?: readonly KnownSecret[];
+  },
 ): Promise<{ outcomes: ContractCheckOutcome[]; checksSkipped?: string }> {
   if (checks.length === 0) return { outcomes: [] };
   const plural = `${checks.length} check${checks.length === 1 ? "" : "s"}`;
@@ -366,21 +404,28 @@ export async function runContractChecks(
     return { outcomes: [], checksSkipped: `${plural} not run — the turn was cancelled` };
   }
   const specs = checks.map(({ task: _task, ...spec }) => spec);
+  const known = ctx.knownSecrets ?? knownSecretsFromEnv();
   let results: readonly ContractCheckResult[];
   try {
-    results = (await runner(specs, ctx)).results;
+    results = (
+      await runner(specs, { workingDir: ctx.workingDir, signal: ctx.signal })
+    ).results;
   } catch (error) {
     return {
       outcomes: [],
-      checksSkipped: `${plural} not run — the check runner failed: ${error instanceof Error ? error.message : String(error)}`,
+      checksSkipped: maskSecrets(
+        `${plural} not run — the check runner failed: ${error instanceof Error ? error.message : String(error)}`,
+        known,
+      ),
     };
   }
   const outcomes = checks.map((check, i): ContractCheckOutcome => {
-    const result = results[i];
+    const raw = results[i];
     const task = check.task === undefined ? {} : { task: check.task };
-    if (result === undefined) {
+    if (raw === undefined) {
       return { ...task, ok: false, detail: "the runner returned no result" };
     }
+    const result = maskResult(raw, known);
     // The head is the summary before its output tails, on one line;
     // the tails ride separately, whitespace kept, so the assertion is
     // not lost behind "verify.run command: FAILED … exit 1 after N ms".
