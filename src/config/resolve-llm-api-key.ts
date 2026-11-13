@@ -49,6 +49,24 @@ export function resolveLlmProviderApiKey(
   return undefined;
 }
 
+/**
+ * The shared variable that holds a key this entry would use if the shared
+ * key were sent to its endpoint, when it is not (`maySendSharedOpenAiKey`):
+ * an `openai-compatible` entry with no `apiKey` and no `apiKeyEnvVar` of
+ * its own, aimed at plain http:// off this machine or at another computer
+ * on the network. `undefined` otherwise. Readiness checks use it to say why
+ * a set OPENAI_API_KEY does not count for that entry.
+ */
+export function sharedOpenAiKeyNotSent(
+  entry: Pick<UserLlmProviderEntry, "kind" | "baseUrl" | "apiKey" | "apiKeyEnvVar">,
+): string | undefined {
+  if (entry.kind !== "openai-compatible" && entry.kind !== "qwen-openai-compatible") return undefined;
+  if (entry.apiKey || entry.apiKeyEnvVar) return undefined;
+  const shared = sharedOpenAiKey();
+  if (shared === undefined || maySendSharedOpenAiKey(entry.baseUrl)) return undefined;
+  return shared.name;
+}
+
 /** The shared per-kind variables, in the order they are read. */
 const SHARED_OPENAI_KEY_VARS = [
   "OPENAI_COMPAT_API_KEY",
