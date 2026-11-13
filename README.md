@@ -400,6 +400,7 @@ To see which local model fits this machine:
 
 ```bash
 atomic-agent models recommend           # RAM, GPU memory, free disk, and a fast, balanced and quality pick
+atomic-agent models recommend --role worker  # the model for fusion workers, and why
 atomic-agent models upgrade --dry-run   # what upgrade would download, without downloading it
 atomic-agent models upgrade             # fetch the quality pick in the background; it never switches models
 atomic-agent models use <id>            # switch once the download has landed

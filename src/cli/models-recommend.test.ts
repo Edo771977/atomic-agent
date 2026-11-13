@@ -1,7 +1,16 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { decideModelUpgrade, recommendModelTiers } from "../local-llm/catalog/model-upgrade.js";
-import { describeRecommendation, recommendJson, type RecommendSnapshot } from "./models-recommend.js";
+import {
+  describeRecommendation,
+  describeWorkerRecommendation,
+  readRoleFlag,
+  recommendJson,
+  runModelsRecommend,
+  workerJson,
+  workerRecommendation,
+  type RecommendSnapshot,
+} from "./models-recommend.js";
 
 function snapshot(activeModelId: string | null): RecommendSnapshot {
   const machine = { ramGb: 32, gpuBudgetGb: 24, freeDiskGb: 120, cpuOnly: false };
@@ -49,5 +58,71 @@ describe("models recommend (text)", () => {
     expect(text).toMatch(/fast\s+\S+/);
     expect(text).toMatch(/quality\s+gemma-4-26b-a4b/);
     expect(text).toContain("models upgrade");
+  });
+});
+
+describe("models recommend --role worker", () => {
+  it("reads the role flag in both spellings and refuses an unknown role", () => {
+    expect(readRoleFlag([])).toBe("default");
+    expect(readRoleFlag(["--json"])).toBe("default");
+    expect(readRoleFlag(["--role", "worker"])).toBe("worker");
+    expect(readRoleFlag(["--role=worker", "--json"])).toBe("worker");
+    expect(readRoleFlag(["--role", "default"])).toBe("default");
+    expect(readRoleFlag(["--role", "orchestrator"])).toBeNull();
+    expect(readRoleFlag(["--role"])).toBeNull();
+  });
+
+  it("exits 2 on an unknown role before probing the machine", async () => {
+    const err = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    try {
+      expect(await runModelsRecommend(["--role", "boss"])).toBe(2);
+      expect(String(err.mock.calls[0]?.[0])).toContain("--role takes default or worker");
+    } finally {
+      err.mockRestore();
+    }
+  });
+
+  it("picks the rated worker model where the default picks by rank, and says why", () => {
+    const snap = snapshot("qwen-3.5-2b");
+    const pick = workerRecommendation(snap.machine, 2);
+    expect(pick?.model.id).toBe("qwen-3.5-9b");
+    const text = describeWorkerRecommendation(snap, pick);
+    expect(text).toContain("32 GB RAM");
+    expect(text).toContain("worker model for fusion (2 worker slots):");
+    expect(text).toMatch(/qwen-3\.5-9b\s+5\.3 GB/);
+    expect(text).toMatch(/why: rated ok as a fusion worker: GAIA L1 52\.8%/);
+    expect(text).toMatch(/fits 2 worker slots: needs about [\d.]+ GB of 32 GB/);
+    expect(text).toContain("catalog rank 7");
+    expect(text).toContain("models pull qwen-3.5-9b");
+    // The default text still names the rank-order quality pick.
+    expect(describeRecommendation(snap)).toMatch(/quality\s+gemma-4-26b-a4b/);
+  });
+
+  it("follows the configured slot count, and auto keeps the default", () => {
+    const machine = { ramGb: 64, gpuBudgetGb: 48, freeDiskGb: 200, cpuOnly: false };
+    expect(workerRecommendation(machine, "auto")?.slotsWanted).toBe(2);
+    expect(workerRecommendation(machine, 4)?.slotsWanted).toBe(4);
+  });
+
+  it("adds role and worker to the JSON without changing the default fields", () => {
+    const snap = snapshot("qwen-3.5-2b");
+    const worker = workerJson(workerRecommendation(snap.machine, 2));
+    expect(worker).toMatchObject({
+      model: { id: "qwen-3.5-9b" },
+      rating: "ok",
+      slots: 2,
+      slotsWanted: 2,
+    });
+    expect((worker!.why as string[]).length).toBe(3);
+    expect(workerJson(null)).toBeNull();
+  });
+
+  it("says when nothing fits", () => {
+    const tiny = { ramGb: 4, gpuBudgetGb: null, freeDiskGb: 100, cpuOnly: true };
+    const snap = { ...snapshot(null), machine: tiny };
+    expect(workerRecommendation(tiny, 2)).toBeNull();
+    expect(describeWorkerRecommendation(snap, null)).toContain(
+      "worker model for fusion: none fits this machine",
+    );
   });
 });
