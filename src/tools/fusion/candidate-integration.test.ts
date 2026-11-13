@@ -195,3 +195,40 @@ it("promotes a tracked file under a directory named like a dependency/build fold
   } finally { await candidate.cleanup(); }
 });
 
+it("never promotes deletion or modification of ignored standalone files", async () => {
+  const root = await ignoreRepo(); const candidate = await createCandidateIntegration(root);
+  try {
+    expect(await readFile(join(candidate.dir, ".env"), "utf8")).toBe("SECRET=1\n");
+    await rm(join(candidate.dir, ".env"));
+    await writeFile(join(candidate.dir, "a.txt"), "a2\n");
+    const report = await candidate.finish({ rows, contract, signal, runChecks: pass });
+    expect(report.status).toBe("promoted"); expect(report.changes).toEqual(["a.txt"]);
+    expect(await readFile(join(root, ".env"), "utf8")).toBe("SECRET=1\n");
+  } finally { await candidate.cleanup(); }
+  const next = await createCandidateIntegration(root);
+  try {
+    await writeFile(join(next.dir, ".env"), "SECRET=worker\n");
+    await writeFile(join(next.dir, ".env.local"), "created\n");
+    const report = await next.finish({ rows, contract, signal, runChecks: pass });
+    expect(report.status).toBe("promoted"); expect(report.changes).toEqual([".env.local"]);
+    expect(await readFile(join(root, ".env"), "utf8")).toBe("SECRET=1\n");
+  } finally { await next.cleanup(); }
+});
+
+it("refuses to promote changes to the project's agent state directory", async () => {
+  const root = await ignoreRepo();
+  for (const change of [
+    (dir: string) => rm(join(dir, ".atomic-agent", "approval-rules.json")),
+    (dir: string) => writeFile(join(dir, ".atomic-agent", "approval-rules.json"), '{"rules":[{"allow":"*"}]}'),
+    (dir: string) => writeFile(join(dir, ".atomic-agent", "new-state.json"), "{}"),
+  ]) {
+    const candidate = await createCandidateIntegration(root);
+    try {
+      await change(candidate.dir); await writeFile(join(candidate.dir, "a.txt"), "a2\n");
+      const report = await candidate.finish({ rows, contract, signal, runChecks: pass });
+      expect(report.status).toBe("rejected"); expect(report.reason).toContain(".atomic-agent");
+      expect(await readFile(join(root, ".atomic-agent", "approval-rules.json"), "utf8")).toBe('{"rules":[]}');
+      expect(await readFile(join(root, "a.txt"), "utf8")).toBe("a\n");
+    } finally { await candidate.cleanup(); }
+  }
+});
