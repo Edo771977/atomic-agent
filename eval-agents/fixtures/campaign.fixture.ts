@@ -10,12 +10,15 @@ vi.mock("../harness/environment-lock.js", () => ({
 const fixtureAdapter = vi.hoisted(() => (id: string): AgentAdapter => ({
       id, label: id,
       probeRequirements: () => id === "missing" ? ["fixture executable unavailable"] : [],
-      runQuestion: async ({ row }) => ({
+      runQuestion: async ({ row }) => {
+        if (process.env.GAIA_FIXTURE_THROW_AGENT === id) throw new Error("fixture adapter exploded");
+        return ({
         rawReply: `FINAL ANSWER: ${row["Final answer"]}`,
         metrics: { stepCount: 1, promptTokens: 0, predictedTokens: 0,
           toolErrors: 0, wallClockMs: 1, timedOut: false, exitCode: 0 },
         exitCode: 0, timedOut: false, error: null,
-      }),
+        });
+      },
 }));
 vi.mock("../adapters/atomic-agent-adapter.js", () => ({ createAtomicAgentAdapter: () => fixtureAdapter("ready") }));
 vi.mock("../adapters/hermes-adapter.js", () => ({ createHermesAdapter: () => fixtureAdapter("missing") }));

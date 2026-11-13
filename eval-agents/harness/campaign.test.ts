@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,6 +11,7 @@ afterAll(() => rmSync(scratch, { recursive: true, force: true }));
 
 function campaign(name: string, extra: Record<string, string>, forwarded: string[] = []) {
   const reportDir = join(scratch, name);
+  if (extra.GAIA_FIXTURE_BLOCK_CSV === "1") mkdirSync(join(reportDir, "matrix.csv"), { recursive: true });
   const result = spawnSync(process.execPath, [
     join(root, "node_modules/vitest/vitest.mjs"), "run", "--config",
     "eval-agents/fixtures/campaign.vitest.ts", "--reporter=default", "--reporter=json",
@@ -31,6 +32,27 @@ function campaign(name: string, extra: Record<string, string>, forwarded: string
 }
 
 describe("actual GAIA campaign wiring (hermetic child Vitest)", () => {
+  it("records an adapter exception as an attempted failed case alongside completed cases", () => {
+    const result = campaign("adapter-throws", { ATOMIC_AGENT_EVAL_AGENTS: "ready,other", GAIA_FIXTURE_THROW_AGENT: "ready" });
+    expect(result.status, result.output).toBe(1);
+    const summary = JSON.parse(readFileSync(join(result.reportDir, "campaign.json"), "utf8"));
+    expect(summary).toMatchObject({ selected: 2, executed: 2, attempted: 2, completed: 1, failed: 1, skipped: 0, reportErrors: 0 });
+    const rows = readFileSync(join(result.reportDir, "matrix.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    expect(rows).toHaveLength(2);
+    expect(rows[0].result).toMatchObject({ agentId: "ready", correct: false, skipped: false, error: "case exception: fixture adapter exploded" });
+    expect(rows[1].result).toMatchObject({ agentId: "other", correct: true, error: null });
+  });
+
+  it("retains invocation counters and the other report when a real CSV write fails", () => {
+    const result = campaign("report-write-fails", { GAIA_FIXTURE_BLOCK_CSV: "1" });
+    expect(result.status, result.output).toBe(1);
+    const summary = JSON.parse(readFileSync(join(result.reportDir, "campaign.json"), "utf8"));
+    expect(summary).toMatchObject({ selected: 1, executed: 1, attempted: 1, completed: 1, failed: 0, skipped: 0, reportErrors: 1 });
+    expect(summary.errors[0]).toMatchObject({ stage: "csv-report", agentId: "ready", taskId: "smoke-001" });
+    const record = JSON.parse(readFileSync(join(result.reportDir, "matrix.jsonl"), "utf8"));
+    expect(record.result).toMatchObject({ agentId: "ready", correct: true });
+  });
+
   it("fails and persists a summary when the Vitest title filter selects no cases", () => {
     const result = campaign("no-title-match", {}, ["-t", "nonexistent name"]);
     expect(result.status, result.output).toBe(1);

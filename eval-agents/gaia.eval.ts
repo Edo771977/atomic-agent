@@ -12,6 +12,7 @@ import { appendCsvRow, appendJsonlRow } from "./harness/append-report.js";
 import { captureEnvironmentSnapshot } from "./harness/environment-lock.js";
 import { loadGaiaRows } from "./harness/load-gaia-rows.js";
 import { runGaiaCase } from "./harness/run-gaia-case.js";
+import type { GaiaAgentRunResult } from "./harness/gaia-types.js";
 
 const HERE = fileURLToPath(new URL(".", import.meta.url));
 const TIMESTAMP = new Date().toISOString().replace(/[:.]/g, "-");
@@ -68,15 +69,30 @@ beforeAll(async () => {
 describe("GAIA multi-agent matrix", () => {
   const rows = loadRows();
   const adapters = listAgentAdapters(parseAgentFilter());
-  const campaign = { selected: rows.length * adapters.length, executed: 0, skipped: 0 };
+  const campaign = {
+    selected: rows.length * adapters.length,
+    // executed is retained as an alias of actual adapter invocations.
+    executed: 0, attempted: 0, completed: 0, failed: 0, skipped: 0, reportErrors: 0,
+    errors: [] as Array<{ stage: string; agentId: string; taskId: string; message: string }>,
+  };
+  const persistCampaign = () => {
+    try {
+      writeFileSync(resolve(REPORT_DIR, "campaign.json"), `${JSON.stringify(campaign, null, 2)}\n`, "utf8");
+    } catch (error) {
+      // If the destination itself is unusable, stderr still carries the
+      // counters; the write error fails the campaign rather than hiding work.
+      console.error(`[GAIA campaign report failure] ${JSON.stringify(campaign)}`);
+      throw error;
+    }
+  };
   // Collection runs even when Vitest skips every test by title. Persist the
   // initial zero counters before hooks so that skipped campaigns stay visible.
   mkdirSync(REPORT_DIR, { recursive: true });
-  writeFileSync(resolve(REPORT_DIR, "campaign.json"), `${JSON.stringify(campaign, null, 2)}\n`, "utf8");
+  persistCampaign();
 
   afterAll(() => {
-    writeFileSync(resolve(REPORT_DIR, "campaign.json"), `${JSON.stringify(campaign, null, 2)}\n`, "utf8");
-    console.error(`[GAIA campaign] selected=${campaign.selected} executed=${campaign.executed} skipped=${campaign.skipped}`);
+    persistCampaign();
+    console.error(`[GAIA campaign] ${JSON.stringify(campaign)}`);
     if (campaign.selected > 0) {
       expect(campaign.executed, "no GAIA agent cases executed; all selected cases were skipped or filtered out").toBeGreaterThan(0);
     }
@@ -94,29 +110,51 @@ describe("GAIA multi-agent matrix", () => {
       for (const row of rows) {
         const title = `[L${row.Level}] ${row.task_id}`;
         test(title, async (context) => {
-          if (!chatUrl) {
-            expect.fail("ATOMIC_AGENT_EVAL_LLAMA_URL is required for agent runs");
+          let result: GaiaAgentRunResult;
+          const started = Date.now();
+          try {
+            if (!chatUrl) throw new Error("ATOMIC_AGENT_EVAL_LLAMA_URL is required for agent runs");
+            result = await runGaiaCase({
+              adapter, row, chatUrl, embedUrl,
+              maxSteps: Number(process.env.ATOMIC_AGENT_GAIA_MAX_STEPS ?? "30"),
+              timeoutMs: Number(process.env.ATOMIC_AGENT_GAIA_TIMEOUT_MS ?? "600000"),
+              tracesOutDir: TRACES_DIR,
+              onAttempt: () => { campaign.attempted += 1; campaign.executed += 1; },
+              onComplete: () => { campaign.completed += 1; },
+            });
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            campaign.errors.push({ stage: "case", agentId: adapter.id, taskId: row.task_id, message });
+            result = {
+              agentId: adapter.id, taskId: row.task_id, rawReply: "", extractedAnswer: "", correct: false,
+              skipped: false, skipReason: null, error: `case exception: ${message}`,
+              metrics: { stepCount: null, promptTokens: null, predictedTokens: null, toolErrors: null,
+                wallClockMs: Date.now() - started, timedOut: false, exitCode: null },
+            };
           }
-
-          const result = await runGaiaCase({
-            adapter,
-            row,
-            chatUrl,
-            embedUrl,
-            maxSteps: Number(process.env.ATOMIC_AGENT_GAIA_MAX_STEPS ?? "30"),
-            timeoutMs: Number(process.env.ATOMIC_AGENT_GAIA_TIMEOUT_MS ?? "600000"),
-            tracesOutDir: TRACES_DIR,
-          });
-
-          appendCsvRow(CSV_PATH, row, result);
-          appendJsonlRow(JSONL_PATH, row, result);
+          if (result.skipped) campaign.skipped += 1;
+          else if (result.error !== null || !result.correct) campaign.failed += 1;
+          // Save invocation accounting before either matrix write can fail.
+          persistCampaign();
+          const reportErrorsBefore = campaign.reportErrors;
+          for (const [stage, append] of [
+            ["csv-report", () => appendCsvRow(CSV_PATH, row, result)],
+            ["jsonl-report", () => appendJsonlRow(JSONL_PATH, row, result)],
+          ] as const) {
+            try { append(); }
+            catch (error) {
+              campaign.reportErrors += 1;
+              campaign.errors.push({ stage, agentId: adapter.id, taskId: row.task_id,
+                message: error instanceof Error ? error.message : String(error) });
+            }
+          }
+          persistCampaign();
+          expect(campaign.reportErrors, "GAIA matrix report writes failed; see campaign.json errors").toBe(reportErrorsBefore);
 
           if (result.skipped) {
-            campaign.skipped += 1;
             expect(result.skipReason, "skipped cases must report a reason").toBeTruthy();
             context.skip();
           }
-          campaign.executed += 1;
 
           expect.soft(result.error, result.error ?? "no error").toBeNull();
           expect(result.correct, `extracted=${result.extractedAnswer} gold=${row["Final answer"]}`).toBe(

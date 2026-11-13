@@ -65,7 +65,14 @@ Each run writes `eval-agents/reports/run-<ISO>/`:
 
 - `matrix.csv` / `matrix.jsonl` — per (agent × question) row
 - `environment.json` — pinned model, sampling, git SHA
-- `campaign.json` — selected, executed and skipped case counts
+- `campaign.json` — selected, attempted, completed, failed and skipped case
+  counts, plus report-write errors and case error provenance. `executed` is
+  retained as an alias of `attempted`: an adapter invocation that throws is
+  still an execution. `completed` counts adapter calls that returned;
+  `failed` counts case errors/wrong answers separately from report failures.
+  An exception gets a failed JSONL/CSV case row; independent matrix writers
+  preserve whichever output remains writable. Counters are saved before
+  matrix writes, and an unusable summary destination also emits them to stderr.
 
 An intended campaign fails if its dataset/task filters select no rows, its
 agent filter selects no adapters, or no selected agent case executes. Missing
