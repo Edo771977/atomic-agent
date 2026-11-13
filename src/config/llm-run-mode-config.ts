@@ -51,7 +51,9 @@ export type UserLlmFusionConfig = {
    */
   workerModel?: string;
   /**
-   * Default fan-out width, 1..8. Default 2.
+   * Default fan-out width, 1..8. Default 2 on a cloud worker leg; on a
+   * local (slot-affine) leg an unset value means one worker at a time,
+   * and only a value written here raises that (`workersPinned`).
    *
    * **Not a ceiling.** The orchestrator sizes each `fusion.delegate`
    * call itself — it is the party that knows how divisible the job is,
@@ -84,9 +86,12 @@ export type UserLlmFusionConfig = {
    * write a worker makes (~10K tokens) or it re-creates the 8192 wall.
    */
   workerMaxOutputTokens?: number;
-  /** Step ceiling per worker turn. Default 40. */
+  /** Step ceiling per worker turn. Default 60 (`DEFAULT_FUSION_WORKER_MAX_STEPS`). */
   workerMaxSteps?: number;
-  /** Wall-clock ceiling per worker turn, in ms. Default 600 000. */
+  /**
+   * Wall-clock ceiling per worker turn, in ms. Default 2 700 000, 45 min
+   * (`DEFAULT_FUSION_WORKER_TIMEOUT_MS`).
+   */
   workerTimeoutMs?: number;
   /**
    * How many consecutive read-only orchestrator steps without a
