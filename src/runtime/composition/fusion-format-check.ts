@@ -3,6 +3,7 @@ import { runGrammarSmoke } from "../../llm/grammar/grammar-smoke.js";
 import type { ModelProfile } from "../../llm/model-profile.js";
 import type { CompletionRequest, CompletionResult } from "../../llm/provider/completion-types.js";
 import type { LlmProviderConfigEntry } from "../../llm/provider/index.js";
+import { readLaunchRecord, readRunningPid } from "../../local-llm/index.js";
 import { resolveServerTemplatePolicy } from "../../llm/server-template-policy.js";
 import type { LocalGrammarProbe } from "../../tools/fusion/local-grammar-smoke.js";
 
@@ -18,6 +19,24 @@ export interface FusionFormatCheckDeps {
   /** The main local server's live profile and model id. */
   getProfile: () => ModelProfile;
   getModelId: () => string | null;
+  /**
+   * Which launch of the server answers: a new value is a new server (a
+   * restart, an upgrade) and asks afresh. Defaults to
+   * {@link managedServerGeneration}.
+   */
+  getServerGeneration?: () => string | null;
+}
+
+/**
+ * The managed daemon's launch, as `<pid>@<launchedAt>` from its launch
+ * record; `null` for an external server, or when no record matches the
+ * live pid. Read per check: the daemon can restart between fan-outs.
+ */
+export function managedServerGeneration(config: AtomicAgentConfig): string | null {
+  if (config.localModels.mode !== "managed") return null;
+  const dataDir = config.paths.localModelsDataDir;
+  const record = readLaunchRecord(dataDir, readRunningPid(dataDir));
+  return record === null ? null : `${record.pid}@${record.launchedAt}`;
 }
 
 /**
@@ -28,7 +47,10 @@ export interface FusionFormatCheckDeps {
  * same rule `probeLocalHealthFor` follows. The probe sends its one
  * completion through the leg's own provider (so its key, URL and
  * server-template rendering are the worker's), and its cache key is the
- * server URL, the model id and the profile id at the time of the check.
+ * server URL, the model id, the profile id and the server's launch
+ * generation at the time of the check (`external` when nothing tells
+ * one launch from the next: the kept failure's time limit covers that
+ * case). An unknown model id gives no key, so nothing is kept.
  */
 export function createFusionFormatProbeFor(
   deps: FusionFormatCheckDeps,
@@ -39,7 +61,12 @@ export function createFusionFormatProbeFor(
     const main = deps.getConfig().localModels.url;
     if (entry.url !== undefined && normalise(entry.url) !== normalise(main)) return undefined;
     const profile = deps.getProfile();
-    const key = [normalise(main), deps.getModelId() ?? "?", profile.id].join("\u0000");
+    const modelId = deps.getModelId();
+    const generation =
+      (deps.getServerGeneration ?? (() => managedServerGeneration(deps.getConfig())))() ??
+      "external";
+    const key =
+      modelId === null ? null : [normalise(main), modelId, profile.id, generation].join("\u0000");
     return {
       key,
       run: (signal) =>

@@ -20,20 +20,30 @@ import {
  * with the breaker's own protocol-mismatch words and instruction, and
  * the trip is noted on the turn like any blocker.
  *
- * Asked at most once per (server, model, profile) for the process: a
- * pass or a failure is kept under the probe's `key`; a timeout, a
- * cancel or an unreachable server keeps nothing, so the next fan-out
- * asks again. Not asked on a leg where a worker already finished with a
- * tool call this session: that is the same answer, measured. Only a
- * local leg with a probe is ever asked (the runtime wires one for the
- * main local server alone), never a cloud leg, and the check is off with
+ * Asked at most once per (server, model, profile, server launch): a
+ * pass is kept under the probe's `key` for the process, a failure for
+ * {@link FORMAT_CHECK_FAIL_TTL_MS} (an upgraded server behind the same
+ * URL is asked again once it runs out, and a managed daemon's restart
+ * changes the key at once); a timeout, a cancel or an unreachable server
+ * keeps nothing, so the next fan-out asks again. A probe whose model id
+ * is unknown has no `key` and keeps nothing either: an unmanaged server
+ * that swaps its model would otherwise share one verdict between models.
+ * Not asked on a leg where a worker already finished with a tool call
+ * this session: that is the same answer, measured — and it drops a
+ * failure kept for that leg. Only a local leg with a probe is ever asked
+ * (the runtime wires one for the main local server alone), never a
+ * cloud leg, and the check is off with
  * `llm.runMode.fusion.localFormatCheck: false`.
  *
  * One instance per `fusion.delegate` tool, i.e. per runtime.
  */
 export interface LocalGrammarProbe {
-  /** What answers: server URL, model id and profile id, joined. */
-  key: string;
+  /**
+   * What answers: server URL, model id, profile id and the server's
+   * launch generation, joined. `null` when the model id is unknown:
+   * the verdict is then never kept.
+   */
+  key: string | null;
   run: (signal?: AbortSignal) => Promise<GrammarSmokeVerdict>;
 }
 
@@ -41,13 +51,38 @@ export type LocalGrammarCheck =
   | (GrammarSmokeVerdict & { cached: boolean })
   | { kind: "skipped"; why: "worker-succeeded" | "cancelled" };
 
-export class LocalGrammarSmoke {
-  private readonly verdicts = new Map<string, Promise<GrammarSmokeVerdict>>();
-  private readonly succeeded = new Set<string>();
+/** How long a failed check is kept: an upgraded server gets asked again. */
+export const FORMAT_CHECK_FAIL_TTL_MS = 10 * 60_000;
 
-  /** A worker on `leg` finished with at least one tool call, in `sessionId`. */
+interface KeptVerdict {
+  pending: Promise<GrammarSmokeVerdict>;
+  /** `Infinity` while in flight and for a pass. */
+  expiresAt: number;
+  /** Set once settled. */
+  settled?: GrammarSmokeVerdict;
+}
+
+export class LocalGrammarSmoke {
+  private readonly verdicts = new Map<string, KeptVerdict>();
+  private readonly succeeded = new Set<string>();
+  /** The keys each leg was checked under, so a worker's success can clear a failure. */
+  private readonly legKeys = new Map<string, Set<string>>();
+  private readonly now: () => number;
+
+  constructor(options: { now?: () => number } = {}) {
+    this.now = options.now ?? Date.now;
+  }
+
+  /**
+   * A worker on `leg` finished with at least one tool call, in
+   * `sessionId`: that leg is not asked again in the session, and a
+   * failure kept for it is dropped, since the format was just produced.
+   */
   noteWorkerSucceeded(sessionId: string, leg: string): void {
     this.succeeded.add(legKey(sessionId, leg));
+    for (const key of this.legKeys.get(leg) ?? []) {
+      if (this.verdicts.get(key)?.settled?.kind === "fail") this.verdicts.delete(key);
+    }
   }
 
   async check(
@@ -58,23 +93,39 @@ export class LocalGrammarSmoke {
       return { kind: "skipped", why: "worker-succeeded" };
     }
     if (at.signal?.aborted) return { kind: "skipped", why: "cancelled" };
-    const known = this.verdicts.get(probe.key);
-    if (known !== undefined) return { ...(await known), cached: true };
-    const pending = probe.run(at.signal).catch(
-      (err: unknown): GrammarSmokeVerdict => ({
-        kind: "inconclusive",
-        reason: "unreachable",
-        detail: err instanceof Error ? err.message : String(err),
-      }),
-    );
+    const key = probe.key;
+    if (key === null) return { ...(await ask(probe, at.signal)), cached: false };
+    let keys = this.legKeys.get(at.leg);
+    if (keys === undefined) this.legKeys.set(at.leg, (keys = new Set()));
+    keys.add(key);
+    const known = this.verdicts.get(key);
+    if (known !== undefined && known.expiresAt > this.now()) {
+      return { ...(await known.pending), cached: true };
+    }
     // Shared while in flight, so two fan-outs at once ask once.
-    this.verdicts.set(probe.key, pending);
-    const verdict = await pending;
-    if (verdict.kind === "inconclusive" && this.verdicts.get(probe.key) === pending) {
-      this.verdicts.delete(probe.key);
+    const kept: KeptVerdict = { pending: ask(probe, at.signal), expiresAt: Number.POSITIVE_INFINITY };
+    this.verdicts.set(key, kept);
+    const verdict = await kept.pending;
+    if (this.verdicts.get(key) === kept) {
+      if (verdict.kind === "inconclusive") {
+        this.verdicts.delete(key);
+      } else {
+        kept.settled = verdict;
+        if (verdict.kind === "fail") kept.expiresAt = this.now() + FORMAT_CHECK_FAIL_TTL_MS;
+      }
     }
     return { ...verdict, cached: false };
   }
+}
+
+function ask(probe: LocalGrammarProbe, signal: AbortSignal | undefined): Promise<GrammarSmokeVerdict> {
+  return probe.run(signal).catch(
+    (err: unknown): GrammarSmokeVerdict => ({
+      kind: "inconclusive",
+      reason: "unreachable",
+      detail: err instanceof Error ? err.message : String(err),
+    }),
+  );
 }
 
 function legKey(sessionId: string, leg: string): string {

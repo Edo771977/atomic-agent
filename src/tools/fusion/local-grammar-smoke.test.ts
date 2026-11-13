@@ -16,6 +16,7 @@ import {
 } from "./failure-breaker.js";
 import { buildFusionDelegateTool, type FusionDelegateDeps } from "./fusion-delegate.js";
 import {
+  FORMAT_CHECK_FAIL_TTL_MS,
   LocalGrammarSmoke,
   describeFormatCheckRefusal,
   formatCheckTrip,
@@ -55,6 +56,46 @@ describe("LocalGrammarSmoke", () => {
     const other = probe([{ kind: "pass" }], "a-other-model");
     await smoke.check(other.probe, at);
     expect(other.run).toHaveBeenCalledOnce();
+  });
+
+  it("keeps a failure for ten minutes only, then asks again", async () => {
+    let now = 1_000_000;
+    const smoke = new LocalGrammarSmoke({ now: () => now });
+    const p = probe([FAIL, { kind: "pass" }]);
+    const at = { sessionId: "s1", leg: "local-llama" };
+    expect(await smoke.check(p.probe, at)).toMatchObject({ kind: "fail", cached: false });
+    now += FORMAT_CHECK_FAIL_TTL_MS - 1;
+    expect(await smoke.check(p.probe, at)).toMatchObject({ kind: "fail", cached: true });
+    now += 1;
+    expect(await smoke.check(p.probe, at)).toEqual({ kind: "pass", cached: false });
+    // A pass is kept for the process.
+    now += 24 * 60 * 60_000;
+    expect(await smoke.check(p.probe, at)).toEqual({ kind: "pass", cached: true });
+    expect(p.run).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps nothing for a probe with no key (an unknown model id)", async () => {
+    const smoke = new LocalGrammarSmoke();
+    const p = probe([FAIL, { kind: "pass" }]);
+    const keyless: LocalGrammarProbe = { ...p.probe, key: null };
+    const at = { sessionId: "s1", leg: "local-llama" };
+    expect(await smoke.check(keyless, at)).toMatchObject({ kind: "fail", cached: false });
+    expect(await smoke.check(keyless, at)).toEqual({ kind: "pass", cached: false });
+    expect(p.run).toHaveBeenCalledTimes(2);
+  });
+
+  it("drops a kept failure once a worker on that leg finished with a tool call", async () => {
+    const smoke = new LocalGrammarSmoke();
+    const p = probe([FAIL, { kind: "pass" }]);
+    expect(await smoke.check(p.probe, { sessionId: "s1", leg: "local-llama" })).toMatchObject({
+      kind: "fail",
+    });
+    smoke.noteWorkerSucceeded("s1", "local-llama");
+    // Another session asks afresh instead of reading the stale failure.
+    expect(await smoke.check(p.probe, { sessionId: "s2", leg: "local-llama" })).toEqual({
+      kind: "pass",
+      cached: false,
+    });
   });
 
   it("keeps nothing from a timeout, so the next fan-out asks again", async () => {
