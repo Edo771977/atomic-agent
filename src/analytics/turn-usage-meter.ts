@@ -72,8 +72,28 @@ interface TurnBucket {
  * work during bootstrap, scheduler-driven turns, sub-runners firing
  * after their turn closed) are dropped rather than misfiled.
  */
+/** One completion folded into an open turn, as `TurnUsageMeterOptions.onRecord` sees it. */
+export interface TurnUsageRecord {
+  /** The link that served it (`recordServed`), when noted. */
+  providerId?: string;
+  usage: CompletionUsage;
+  /** Its spend, when the service billed it or the model is priced. */
+  costUsd?: number;
+}
+
+export interface TurnUsageMeterOptions {
+  /**
+   * Called for every completion folded into an open turn, after the
+   * bucket is updated. The fusion turn receipt reads the orchestrator's
+   * per-step usage here. A throwing observer is ignored.
+   */
+  onRecord?: (sessionId: string, record: TurnUsageRecord) => void;
+}
+
 export class TurnUsageMeter {
   private readonly buckets = new Map<string, TurnBucket>();
+
+  constructor(private readonly options: TurnUsageMeterOptions = {}) {}
 
   /**
    * Open a fresh bucket for `sessionId`, discarding any half-finished
@@ -140,9 +160,21 @@ export class TurnUsageMeter {
 
     // The service's own bill counts even for a model the table does not price.
     const usd = completionCostUsd(usage, params.model?.pricing);
-    if (usd === undefined) return;
-    bucket.sawPricedUsage = true;
-    bucket.costUsd += usd;
+    if (usd !== undefined) {
+      bucket.sawPricedUsage = true;
+      bucket.costUsd += usd;
+    }
+    if (this.options.onRecord !== undefined) {
+      try {
+        this.options.onRecord(params.sessionId, {
+          ...(bucket.servedProviderId === undefined ? {} : { providerId: bucket.servedProviderId }),
+          usage,
+          ...(usd === undefined ? {} : { costUsd: usd }),
+        });
+      } catch {
+        // An observer never takes the meter down.
+      }
+    }
   }
 
   /**

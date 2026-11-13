@@ -15,6 +15,7 @@ export type { AgentRuntime, CreateAgentRuntimeOptions, MemoryEmbeddingReconnect,
 export { managedLocalLlmHealthFailureHint } from "./composition/runtime-local-profile.js";
 import { createRuntimeObservability } from "./composition/runtime-observability.js";
 import { createRuntimeTraces } from "./composition/runtime-traces.js";
+import { createRuntimeFusionOutcomes } from "./composition/runtime-fusion-outcomes.js";
 import { prepareRuntimeLocalProfile, connectRuntimeLocalProfile } from "./composition/runtime-local-profile.js";
 import { connectRuntimeProviders, createRuntimeModelContext, connectRuntimeFallback, createRuntimeProviderReloads } from "./composition/runtime-inference.js";
 import { createRuntimeMemoryStores } from "./composition/runtime-memory-stores.js";
@@ -391,7 +392,15 @@ export async function createAgentRuntime(
   // should carry the shape of a turn for every install — and it stays
   // behind the same analytics opt-out, since nothing is emitted unless
   // `captureMessageSent` fires.
-  const turnUsageMeter = new TurnUsageMeter();
+  // The fusion outcome log and turn receipt: the meter feeds the
+  // orchestrator's per-step usage into the open fusion turn's ledger.
+  const fusionOutcomes = createRuntimeFusionOutcomes({
+    stateDir: config.paths.stateDir,
+    logger,
+    resolveRunMode: () => resolveCurrentRunMode(),
+    outcomeLogEnabled: () => resolveLlmConfig(getConfig()).runMode?.fusion?.outcomeLog !== false,
+  });
+  const turnUsageMeter = new TurnUsageMeter({ onRecord: fusionOutcomes.onUsageRecord });
   const fusionTurnBudget = new FusionTurnBudget();
   const fusionLiveWorkers = new FusionLiveWorkers();
   // Checkpoints of fan-outs (ATO-617), so one cut off by a restart can be
@@ -564,6 +573,7 @@ export async function createAgentRuntime(
         sessionId,
         turnUsageMeter.peekCostUsd(sessionId) ?? 0,
       );
+      fusionOutcomes.beginTurn(sessionId);
     },
     forgetDeclinedApprovals: (sessionId: string) => approvals.forgetDeclined(sessionId),
     denyPendingApprovals: (sessionId: string, reason: string) => {
@@ -670,7 +680,11 @@ export async function createAgentRuntime(
     // `emitAgentLoopEvent` resolves that from the per-turn ALS frame so
     // two concurrent sessions never cross-contaminate trace records or
     // per-submission hooks, and reports terminal LLM failures to Sentry.
-    onEvent: emitAgentLoopEvent,
+    // A fusion turn's receipt goes out just before its `turn_finished`.
+    onEvent: fusionOutcomes.wrapEventSink(
+      emitAgentLoopEvent,
+      () => turnContext.getStore()?.sessionId,
+    ),
     metrics,
     logger,
   };
@@ -794,6 +808,8 @@ export async function createAgentRuntime(
     sessionUsage,
     liveWorkers: fusionLiveWorkers,
     runCheckpoints: fusionRuns,
+    outcomeLog: fusionOutcomes.outcomeLog,
+    turnLedger: fusionOutcomes.ledger,
     steerWorker: (sessionId, text) => steeringInbox.push(sessionId, text),
     orchestratorTurnSpendUsd: (sessionId) => turnUsageMeter.peekCostUsd(sessionId),
   });
