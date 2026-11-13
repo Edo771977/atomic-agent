@@ -233,6 +233,13 @@ export interface WorkerTaskResult {
    * the row's `error` and made it `failed`.
    */
   syntax?: TaskSyntaxSummary;
+  /**
+   * The worker's self-check found something and it got its one notice
+   * (`worker-self-check.ts`). For the outcome log; nothing renders it.
+   */
+  selfCheckNotice?: true;
+  /** Escalations that reached the worker (advisor hints, a re-run), for the outcome log. */
+  escalations?: number;
 }
 
 export interface TaskCheckSummary {

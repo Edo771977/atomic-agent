@@ -144,7 +144,7 @@ describe("a worker's self-check before its reply closes the task", () => {
     expect(calls[1]!.message).toContain("Your reply did not close the task");
     expect(calls[1]!.message).toContain("- declared file out.txt does not exist");
     expect(calls[1]!.options.maxSteps).toBe(SELF_CHECK_GRACE_STEPS);
-    expect(row).toMatchObject({ status: "ok", reply: "Now out.txt is written", stepCount: 6 });
+    expect(row).toMatchObject({ status: "ok", reply: "Now out.txt is written", stepCount: 6, selfCheckNotice: true });
     expect(row!.notes).toContain(
       "self-check: its first reply left declared file out.txt missing; it was told once and given 4 more steps",
     );

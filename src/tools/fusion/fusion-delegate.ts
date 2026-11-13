@@ -68,6 +68,14 @@ import {
 } from "./task-tree.js";
 import type { FusionRunRecorder, FusionRunStore } from "./run-checkpoint.js";
 import {
+  rowCostUsd,
+  taskOutcomeRecord,
+  type FusionOutcomeSink,
+  type MergeOutcome,
+  type OutcomeLeg,
+} from "./outcome-log.js";
+import type { FusionTurnLedger } from "./turn-receipt.js";
+import {
   planResume,
   readResumeRequest,
   type ResumePlan,
@@ -202,6 +210,15 @@ export interface FusionDelegateDeps extends WorkerRunnerDeps {
    * leg is refused as a `model: "orchestrator"` target. Absent: none is.
    */
   cliToolsStayOn?: (providerId: string) => boolean;
+  /**
+   * The outcome log (`outcome-log.ts`): one line per task when the
+   * fan-out finishes. Absent, nothing is written; the sink itself reads
+   * `llm.runMode.fusion.outcomeLog`. A write failure never reaches the
+   * fan-out.
+   */
+  outcomeLog?: FusionOutcomeSink;
+  /** The turn receipt's per-turn tally (`turn-receipt.ts`). */
+  turnLedger?: Pick<FusionTurnLedger, "noteFanout">;
 }
 
 /**
@@ -1066,6 +1083,10 @@ export function buildFusionDelegateTool(
       // Inside a wave the tasks are split across the role legs (ATO-943).
       // A resumed run still owes the merges it was cut off with.
       const merges: MergeTaskSuggestion[] = [...(resumedFrom?.merges ?? [])];
+      // Under isolation, what became of each task's workspace, for the
+      // outcome log: merged (or conflicted), else held back. A task's
+      // last run (a judge's retry) wins.
+      const mergeOutcomes = new Map<string, MergeOutcome>();
       const runTasks = async (
         tasks: readonly DelegateTask[],
         contract: DelegateContract | undefined,
@@ -1126,6 +1147,15 @@ export function buildFusionDelegateTool(
           );
         }
         if (wave.inPlace !== undefined) gateState.noteInPlace();
+        else {
+          const conflicted = new Map(
+            wave.outcomes.map((o) => [o.taskId, o.conflicts.length > 0] as const),
+          );
+          for (const t of tasks) {
+            const c = conflicted.get(t.id);
+            mergeOutcomes.set(t.id, c === undefined ? "held" : c ? "conflict" : "merged");
+          }
+        }
         merges.push(...wave.merges);
         run?.recordMerges(wave.merges);
         for (const row of wave.results) {
@@ -1377,6 +1407,7 @@ export function buildFusionDelegateTool(
         return expanded;
       };
 
+      const fanoutStartedAt = Date.now();
       try {
         let results: WorkerTaskResult[];
         try {
@@ -1899,6 +1930,61 @@ export function buildFusionDelegateTool(
         // Workers that were never served or timed out before a single step
         // count as nothing delivered too (ATO-234).
         const outcome = delegateOutcome(results);
+        // The outcome log and the turn receipt (counts only, never the
+        // brief, the reply or an error's words). A task kept from
+        // starting never ran on its model and is left out.
+        try {
+          const ran = results.filter((r) => !(r.error ?? "").startsWith("not started:"));
+          const now = new Date();
+          const outcomeRows = ran.map((r) => {
+            const leg = taskLegs.get(r.id);
+            const providerId = leg?.providerId ?? workerProviderId;
+            const legKind: OutcomeLeg =
+              leg?.orchestrator === true
+                ? "orchestrator"
+                : deps.workerSupportsSlotAffinity(providerId)
+                  ? "local"
+                  : "cloud";
+            const pricing =
+              leg === undefined || leg.isWorkerLeg
+                ? workerPricing
+                : rolePricing.get(leg.providerId);
+            return {
+              row: r,
+              record: taskOutcomeRecord(
+                r,
+                {
+                  provider: providerId,
+                  model: leg?.model ?? workerModel,
+                  leg: legKind,
+                  role: leg?.orchestrator === true ? "orchestrator" : (leg?.role ?? null),
+                  attempt: autoReplan > 0 ? turnBudget.attempts(ctx.sessionId, r.id) : 1,
+                  pricing,
+                  merge:
+                    mode.isolation === "worktree" ? (mergeOutcomes.get(r.id) ?? null) : null,
+                },
+                ctx.sessionId,
+                now,
+              ),
+              pricing,
+            };
+          });
+          deps.outcomeLog?.append(outcomeRows.map((o) => o.record));
+          deps.turnLedger?.noteFanout(ctx.sessionId, {
+            tasks: outcomeRows.map(({ row, pricing }) => ({
+              ok: row.status === "ok",
+              tokens: (row.usage?.promptTokens ?? 0) + (row.usage?.completionTokens ?? 0),
+              durationMs: row.durationMs,
+              costUsd: rowCostUsd(row, pricing),
+            })),
+            wallMs: now.getTime() - fanoutStartedAt,
+            sideCostUsd: escalationSpendUsd + judgeSpendUsd,
+          });
+        } catch (err) {
+          deps.logger.warn("fusion: the fan-out's outcomes were not recorded", {
+            reason: err instanceof Error ? err.message : String(err),
+          });
+        }
         // What the fan-out cost on the worker leg, when its model is priced
         // (a cloud leg with a catalogue entry); a local leg resolves to no
         // pricing and the header says nothing.

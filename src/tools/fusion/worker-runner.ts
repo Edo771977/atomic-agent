@@ -1291,6 +1291,9 @@ async function runOneTask(
   let escalations = 0;
   let escalating = false;
   let replaceRequested = false;
+  // Escalations that reached the worker: an advisor hint or the re-run.
+  // Counted for the outcome log (`outcome-log.ts`), never read back.
+  let escalationsUsed = 0;
   const escalationNotes: string[] = [];
   const target = options.escalation?.target;
   const targetLabel = target?.model ?? target?.providerId ?? "";
@@ -1353,6 +1356,7 @@ async function runOneTask(
       deps.steerWorker?.(session.id, formatAdvisorSteer(targetLabel, outcome.hint)) ??
       false;
     const line = `escalated to ${targetLabel} as advisor (${describeTrigger(trigger)}): ${formatCost(outcome.costUsd)}${steered ? "" : " — the worker's turn had ended, so the hint was not used"}`;
+    escalationsUsed += 1;
     escalationNotes.push(line);
     announceEscalation(line, outcome.costUsd ?? undefined);
     return line;
@@ -1440,6 +1444,8 @@ async function runOneTask(
   );
 
   const selfCheckNotes: string[] = [];
+  // The worker got its one self-check notice (the outcome log's flag).
+  let selfCheckNoticed = false;
   /**
    * The worker replied: before that reply closes the task, ask what the
    * fan-out will ask afterwards — declared files present, this task's
@@ -1532,6 +1538,7 @@ async function runOneTask(
     }
     if (!hasFindings(finding) || stopped()) return first;
     selfCheckNotes.push(describeSelfCheck(finding, graceSteps));
+    selfCheckNoticed = true;
     const left =
       servedAt === null ? timeoutMs + queueBudgetMs : timeoutMs - (Date.now() - servedAt);
     inSelfCheckGrace = true;
@@ -1816,6 +1823,7 @@ async function runOneTask(
         steer: (text) => steerByPerson(replaceSession.id, text),
       },
     );
+    escalationsUsed += 1;
     announceEscalation(
       `re-running the task on ${targetLabel}: the advisor's hint did not unstick the local worker`,
     );
@@ -1976,6 +1984,8 @@ async function runOneTask(
   if (selfCheckNotes.length > 0) {
     result = { ...result, notes: [...(result.notes ?? []), ...selfCheckNotes] };
   }
+  if (selfCheckNoticed) result = { ...result, selfCheckNotice: true };
+  if (escalationsUsed > 0) result = { ...result, escalations: escalationsUsed };
 
   // A budget the orchestrator asked for and did not get is something it
   // has to know: it planned the task against the bigger number.

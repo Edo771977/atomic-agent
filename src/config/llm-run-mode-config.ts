@@ -213,6 +213,13 @@ export type UserLlmFusionConfig = {
    */
   mixLocalModels?: boolean;
   /**
+   * The outcome log (`<stateDir>/fusion/outcomes.ndjson`): one line of
+   * counts and categories per worker task and per fusion turn, read by
+   * `atomic-agent fusion report`. No prompt, reply or path is written.
+   * Default `true`; `false` writes nothing.
+   */
+  outcomeLog?: boolean;
+  /**
    * Branch isolation (ATO-946). `"worktree"`: every task of a fan-out
    * works in a workspace of its own (a detached git worktree inside a
    * git repo, a folder copy elsewhere); after its wave the changes are
@@ -651,6 +658,12 @@ function parseFusion(
       );
     }
     out.mixLocalModels = obj.mixLocalModels;
+  }
+  if (obj.outcomeLog !== undefined) {
+    if (typeof obj.outcomeLog !== "boolean") {
+      throw new ConfigValidationError(`${field}.outcomeLog`, "expected boolean");
+    }
+    out.outcomeLog = obj.outcomeLog;
   }
   if (obj.taskTree !== undefined) {
     out.taskTree = parseTaskTree(obj.taskTree, `${field}.taskTree`);
