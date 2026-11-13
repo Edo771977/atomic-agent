@@ -47,6 +47,11 @@ export function completionCostUsd(
  *
  * Output tokens the service left out of `completion_tokens` but counted
  * in its total (`unreportedOutputTokens`) are billed at the output rate.
+ *
+ * When `pricing.longContext` is set and the prompt is strictly larger
+ * than its `thresholdTokens`, every share uses that block's rates.
+ * `serviceTierMultipliers` are not applied here: the usage does not say
+ * which tier was requested (the request budget applies them).
  */
 export function estimateUsageCostUsd(
   usage: CompletionUsage,
@@ -55,26 +60,31 @@ export function estimateUsageCostUsd(
   const reported = reportedCostUsd(usage);
   if (reported !== undefined) return reported;
   if (pricing === undefined) return 0;
+  // A prompt above the long-context threshold is billed entirely at the
+  // long-context rates; unknown cache rates there fall back to its input.
+  const long = pricing.longContext;
+  const rates =
+    long !== undefined && usage.promptTokens > long.thresholdTokens
+      ? { input: long.input, output: long.output, cacheRead: long.cacheRead ?? long.input, cacheWrite: long.cacheWrite ?? long.input }
+      : { input: pricing.input, output: pricing.output, cacheRead: pricing.cacheRead ?? pricing.input, cacheWrite: pricing.cacheWrite ?? pricing.input };
   const cached = Math.min(
     Math.max(0, usage.cachedTokens ?? 0),
     Math.max(0, usage.promptTokens),
   );
-  const cacheReadRate = pricing.cacheRead ?? pricing.input;
   // Disjoint from the cached share: hits, writes and the uncached rest
   // sum to the prompt (Kimi documents it so).
   const written = Math.min(
     Math.max(0, usage.cacheWriteTokens ?? 0),
     Math.max(0, usage.promptTokens - cached),
   );
-  const cacheWriteRate = pricing.cacheWrite ?? pricing.input;
   const uncached = usage.promptTokens - cached - written;
   return (
-    (uncached / 1_000_000) * pricing.input +
-    (cached / 1_000_000) * cacheReadRate +
-    (written / 1_000_000) * cacheWriteRate +
+    (uncached / 1_000_000) * rates.input +
+    (cached / 1_000_000) * rates.cacheRead +
+    (written / 1_000_000) * rates.cacheWrite +
     ((usage.completionTokens + Math.max(0, usage.unreportedOutputTokens ?? 0)) /
       1_000_000) *
-      pricing.output
+      rates.output
   );
 }
 

@@ -184,6 +184,25 @@ export type UserModelEntry = {
     output: number;
     cacheRead?: number;
     cacheWrite?: number;
+    /**
+     * Rates above a prompt-size threshold (some vendors charge more once
+     * the prompt exceeds e.g. 200k tokens). Applied when the prompt is
+     * strictly larger than `thresholdTokens`; missing cache rates fall
+     * back to this block's `input`.
+     */
+    longContext?: {
+      thresholdTokens: number;
+      input: number;
+      output: number;
+      cacheRead?: number;
+      cacheWrite?: number;
+    };
+    /**
+     * Price multiplier per request `service_tier` (e.g. `{ priority: 2 }`).
+     * A USD turn cap refuses a body with any other tier than
+     * `default`/`auto` unless its multiplier is declared here.
+     */
+    serviceTierMultipliers?: Record<string, number>;
   };
   /**
    * Wire parameters for this model, merged into every OpenAI-compatible
@@ -562,7 +581,59 @@ function parseUserModelPricing(
   if (obj.cacheWrite !== undefined && obj.cacheWrite !== null) {
     pricing.cacheWrite = parseRate(obj.cacheWrite, `${field}.cacheWrite`);
   }
+  if (obj.longContext !== undefined && obj.longContext !== null) {
+    pricing.longContext = parseLongContextPricing(obj.longContext, `${field}.longContext`);
+  }
+  if (obj.serviceTierMultipliers !== undefined && obj.serviceTierMultipliers !== null) {
+    pricing.serviceTierMultipliers = parseServiceTierMultipliers(
+      obj.serviceTierMultipliers,
+      `${field}.serviceTierMultipliers`,
+    );
+  }
   return pricing;
+}
+
+function parseLongContextPricing(
+  raw: unknown,
+  field: string,
+): NonNullable<NonNullable<UserModelEntry["pricing"]>["longContext"]> {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new ConfigValidationError(field, "expected object");
+  }
+  const obj = raw as Record<string, unknown>;
+  const threshold = obj.thresholdTokens;
+  if (typeof threshold !== "number" || !Number.isFinite(threshold) || threshold <= 0) {
+    throw new ConfigValidationError(`${field}.thresholdTokens`, "expected a positive number");
+  }
+  const tier: NonNullable<NonNullable<UserModelEntry["pricing"]>["longContext"]> = {
+    thresholdTokens: threshold,
+    input: parseRate(obj.input, `${field}.input`),
+    output: parseRate(obj.output, `${field}.output`),
+  };
+  if (obj.cacheRead !== undefined && obj.cacheRead !== null) {
+    tier.cacheRead = parseRate(obj.cacheRead, `${field}.cacheRead`);
+  }
+  if (obj.cacheWrite !== undefined && obj.cacheWrite !== null) {
+    tier.cacheWrite = parseRate(obj.cacheWrite, `${field}.cacheWrite`);
+  }
+  return tier;
+}
+
+function parseServiceTierMultipliers(raw: unknown, field: string): Record<string, number> {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new ConfigValidationError(field, "expected object");
+  }
+  const out: Record<string, number> = {};
+  for (const [tier, value] of Object.entries(raw)) {
+    // defineProperty: a `__proto__` tier name stays an own data key.
+    Object.defineProperty(out, tier, {
+      value: parseRate(value, `${field}.${tier}`),
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
+  }
+  return out;
 }
 
 function parseUserModelEntry(raw: unknown, field: string): UserModelEntry {

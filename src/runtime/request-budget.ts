@@ -1,4 +1,4 @@
-import type { CompletionRequest, CompletionRequestBudget, CompletionResult } from "../llm/provider/completion-types.js";
+import type { CompletionRequest, CompletionRequestBudget, CompletionResult, CompletionUsage } from "../llm/provider/completion-types.js";
 import type { LlmProvider } from "../llm/provider/llm-provider.js";
 import type { LlmProviderConfigEntry } from "../llm/provider/registry/provider-types.js";
 import type { ResolvedModel } from "../llm/provider/model-resolver.js";
@@ -33,6 +33,40 @@ function addsProviderSideInput(body: Record<string, unknown>): boolean {
   return tools.some(tool => typeof tool !== "object" || tool === null || (tool as { type?: unknown }).type !== "function");
 }
 
+type ModelPricing = NonNullable<ResolvedModel["pricing"]>;
+
+/** Tiers billed at the configured base rates. */
+const BASE_SERVICE_TIERS = new Set(["default", "auto"]);
+
+function validRate(rate: unknown): boolean {
+  return typeof rate === "number" && Number.isFinite(rate) && rate >= 0;
+}
+
+/** Every rate the reservation or settlement may read is finite and >= 0. */
+function verifiablePricing(pricing: ModelPricing | undefined): pricing is ModelPricing {
+  if (pricing === undefined) return false;
+  if (![pricing.input, pricing.output, pricing.cacheWrite ?? 0, pricing.cacheRead ?? 0].every(validRate)) return false;
+  const long = pricing.longContext;
+  if (long !== undefined && !(typeof long.thresholdTokens === "number" && long.thresholdTokens > 0 && [long.input, long.output, long.cacheWrite ?? 0, long.cacheRead ?? 0].every(validRate))) return false;
+  const tiers = pricing.serviceTierMultipliers;
+  return tiers === undefined || Object.values(tiers).every(validRate);
+}
+
+/**
+ * Price multiplier of the body's `service_tier`. Absent, `null`,
+ * `default` and `auto` are the base rates; any other tier (OpenAI
+ * `priority` bills about 2x) needs a configured multiplier, so an
+ * unknown modifier refuses instead of being under-reserved.
+ */
+function serviceTierMultiplier(body: Record<string, unknown>, pricing: ModelPricing): number {
+  const tier = body.service_tier;
+  if (tier === undefined || tier === null) return 1;
+  if (typeof tier === "string" && BASE_SERVICE_TIERS.has(tier)) return 1;
+  const tiers = pricing.serviceTierMultipliers;
+  if (typeof tier === "string" && tiers !== undefined && Object.hasOwn(tiers, tier)) return tiers[tier]!;
+  throw new Error(`turn budget cannot price service_tier ${JSON.stringify(tier)}; declare it in the model's pricing.serviceTierMultipliers or remove it`);
+}
+
 export interface RequestBudgetScope extends CompletionRequestBudget {
   signal?: AbortSignal;
   finish(result?: CompletionResult): void;
@@ -55,7 +89,7 @@ export function createRequestBudgetScope(
   const unbilled = entry?.kind === "subscription-cli" || entry?.kind === "llama-server";
   const priceRequired = limits.usd !== undefined && !unbilled;
   const pricing = model?.pricing;
-  if (priceRequired && (pricing === undefined || ![pricing.input, pricing.output, pricing.cacheWrite ?? 0, pricing.cacheRead ?? 0].every(rate => Number.isFinite(rate) && rate >= 0))) {
+  if (priceRequired && !verifiablePricing(pricing)) {
     throw new Error(`turn budget cannot verify pricing for paid provider ${provider.id}; configure model pricing before sending`);
   }
   if (priceRequired && provider.supportsRequestBudget !== true) throw new Error(`turn budget cannot authorize physical requests for provider ${provider.id}`);
@@ -71,6 +105,8 @@ export function createRequestBudgetScope(
   const timer = timeLeft === undefined ? undefined : setTimeout(() => deadline.abort(new DOMException("the turn time cap stopped this request", "AbortError")), timeLeft);
   timer?.unref?.();
   let done = false;
+  // Multiplier of the most recent physical send; settlement prices usage with it.
+  let tierMultiplier = 1;
   return {
     signal,
     beforeSend(body) {
@@ -110,12 +146,20 @@ export function createRequestBudgetScope(
         }
         inputTokens = Math.max(bodyTokens, model!.contextWindow);
       }
-      const inputRate = Math.max(pricing!.input, pricing!.cacheWrite ?? pricing!.input, pricing!.cacheRead ?? pricing!.input);
+      const multiplier = serviceTierMultiplier(body, pricing!);
+      // The bound can cross a long-context threshold the real prompt does
+      // not: reserving the higher tier then only overestimates.
+      const long = pricing!.longContext !== undefined && inputTokens > pricing!.longContext.thresholdTokens ? pricing!.longContext : undefined;
+      const inputRates = [pricing!.input, pricing!.cacheWrite ?? pricing!.input, pricing!.cacheRead ?? pricing!.input];
+      if (long !== undefined) inputRates.push(long.input, long.cacheWrite ?? long.input, long.cacheRead ?? long.input);
+      const inputRate = Math.max(...inputRates);
+      const outputRate = long === undefined ? pricing!.output : Math.max(pricing!.output, long.output);
       const copies = [body.n, body.best_of].filter(value => value !== undefined);
       if (!copies.every(value => typeof value === "number" && Number.isInteger(value) && value > 0)) throw new Error("turn budget cannot verify the request's completion count");
       const outputCopies = Math.max(1, ...(copies as number[]));
-      const upperUsd = ((inputTokens * inputRate + ceiling * pricing!.output) * outputCopies) / 1_000_000;
+      const upperUsd = ((inputTokens * inputRate + ceiling * outputRate) * outputCopies * multiplier) / 1_000_000;
       held = budget.reserveRequest(sessionId, upperUsd);
+      tierMultiplier = multiplier;
     },
     onResponse(status) {
       // 408, other 5xx and network deaths remain ambiguous and retain their bound.
@@ -132,12 +176,17 @@ export function createRequestBudgetScope(
       }
     },
     finish(result) {
+      // Reported cost has already won above; only the estimate takes the tier.
+      const estimatedCostUsd = (usage: CompletionUsage): number | undefined => {
+        const usd = completionCostUsd(usage, pricing);
+        return usd === undefined ? undefined : usd * tierMultiplier;
+      };
       if (done) return;
       done = true;
       if (timer !== undefined) clearTimeout(timer);
       const usage = result?.usage;
       held?.settle(usage === undefined ? (priceRequired ? undefined : 0) : reportedCostUsd(usage) ??
-        (!priceRequired ? 0 : usage.incomplete === true ? undefined : completionCostUsd(usage, pricing)));
+        (!priceRequired ? 0 : usage.incomplete === true ? undefined : estimatedCostUsd(usage)));
       held = undefined;
     },
   };

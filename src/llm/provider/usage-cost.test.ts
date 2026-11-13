@@ -108,3 +108,27 @@ describe("completionCostUsd", () => {
     expect(completionCostUsd(base, undefined)).toBeUndefined();
   });
 });
+
+describe("long-context pricing", () => {
+  const pricing = { input: 3, output: 15, cacheRead: 0.3, longContext: { thresholdTokens: 200_000, input: 6, output: 22.5, cacheRead: 0.6 } };
+
+  it("prices a prompt above the threshold at the long-context rates", () => {
+    const usd = estimateUsageCostUsd(
+      { promptTokens: 300_000, completionTokens: 10_000, totalTokens: 310_000, cachedTokens: 100_000 },
+      pricing,
+    );
+    expect(usd).toBeCloseTo((200_000 * 6 + 100_000 * 0.6 + 10_000 * 22.5) / 1_000_000, 9);
+  });
+
+  it("keeps the base rates at or below the threshold", () => {
+    const usd = estimateUsageCostUsd(
+      { promptTokens: 200_000, completionTokens: 10_000, totalTokens: 210_000 },
+      pricing,
+    );
+    expect(usd).toBeCloseTo((200_000 * 3 + 10_000 * 15) / 1_000_000, 9);
+  });
+
+  it("still lets a reported bill win", () => {
+    expect(completionCostUsd({ promptTokens: 300_000, completionTokens: 0, totalTokens: 300_000, costUsd: 0.5 }, pricing)).toBe(0.5);
+  });
+});
