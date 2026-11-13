@@ -330,19 +330,19 @@ describe("judgeGrammarSmokeCompletion", () => {
 
   it("re-adds the prefilled open tag only where the prompt carried it", () => {
     const midThink = `checking</think>\n${OK_CALL}`;
-    expect(judgeGrammarSmokeCompletion({ content: midThink }, QWEN_THINK_PROFILE)).toEqual({
+    expect(judgeGrammarSmokeCompletion({ content: midThink, truncated: false }, QWEN_THINK_PROFILE)).toEqual({
       kind: "pass",
     });
     // Gemma emits its own open sentinel: nothing is added.
     expect(
       judgeGrammarSmokeCompletion(
-        { content: `<|channel>thought\nok<channel|>${OK_CALL}` },
+        { content: `<|channel>thought\nok<channel|>${OK_CALL}`, truncated: false },
         GEMMA4_THINK_PROFILE,
       ),
     ).toEqual({ kind: "pass" });
     // Thinking off: the completion starts on the call.
     expect(
-      judgeGrammarSmokeCompletion({ content: OK_CALL }, QWEN_THINK_PROFILE, { thinkingOff: true }),
+      judgeGrammarSmokeCompletion({ content: OK_CALL, truncated: false }, QWEN_THINK_PROFILE, { thinkingOff: true }),
     ).toEqual({ kind: "pass" });
   });
 
@@ -350,9 +350,9 @@ describe("judgeGrammarSmokeCompletion", () => {
     const cut = "a think that ran on";
     for (const end of [
       { truncated: true },
-      { finishReason: "length" },
-      { stopType: "limit" },
-      { stopType: "word" },
+      { truncated: false, finishReason: "length" },
+      { truncated: false, stopType: "limit" },
+      { truncated: false, stopType: "word" },
     ] as const) {
       expect(
         judgeGrammarSmokeCompletion({ content: cut, ...end }, QWEN_THINK_PROFILE).kind,
@@ -360,7 +360,7 @@ describe("judgeGrammarSmokeCompletion", () => {
       ).toBe("inconclusive");
     }
     expect(
-      judgeGrammarSmokeCompletion({ content: cut, stopType: "eos" }, QWEN_THINK_PROFILE),
+      judgeGrammarSmokeCompletion({ content: cut, truncated: false, stopType: "eos" }, QWEN_THINK_PROFILE),
     ).toMatchObject({ kind: "fail", cause: "reply-unparsed" });
   });
 });
