@@ -43,3 +43,29 @@ describe("uninstall shallow-root safety", () => {
     expect(isSafeToRemove(target, home, platform)).toBe(false);
   });
 });
+
+describe("Windows component aliases of home", () => {
+  const home = "C:\\Users\\operator";
+  it.each([
+    "C:\\Users\\operator.", "C:\\Users\\operator ", "C:\\Users\\operator. .", "C:\\Users.\\operator", "C:\\Users \\operator\\",
+    "C:\\Users\\operator::$DATA", "C:\\Users\\operator::$data", "C:\\Users.", "C:\\Users::$DATA",
+    "C:\\Users\\OPERAT~1", "C:\\USERS~1\\operator", "C:\\USERS~1",
+  ])("refuses %s lexically", target => {
+    expect(isSafeToRemove(target, home, "win32")).toBe(false);
+  });
+  it.each([
+    ["C:\\Users\\operator", "C:\\Users\\OPERAT~1"],
+    ["C:\\Users", "C:\\USERS~1\\operator"],
+    ["C:\\Users\\operator", "C:\\USERS~1\\OPERAT~1"],
+  ])("refuses %s when home %s holds a short name that may alias it", (target, shortHome) => {
+    expect(isSafeToRemove(target, shortHome, "win32")).toBe(false);
+  });
+  it("still allows targets deeper than a short-named home", () => {
+    expect(isSafeToRemove("C:\\Users\\OPERAT~1\\.atomic-agent", "C:\\Users\\OPERAT~1", "win32")).toBe(true);
+  });
+  it("still allows ordinary targets inside home and POSIX dot names", () => {
+    expect(isSafeToRemove("C:\\Users\\operator.\\.atomic-agent", home, "win32")).toBe(true);
+    expect(isSafeToRemove("C:\\Users\\operator2", home, "win32")).toBe(true);
+    expect(isSafeToRemove("/home/operator.", "/home/operator", "linux")).toBe(true);
+  });
+});

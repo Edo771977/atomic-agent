@@ -1,12 +1,13 @@
 import { createHash, randomBytes } from "node:crypto";
-import { createReadStream } from "node:fs";
-import { chmod, copyFile, lstat, mkdir, opendir, readlink, rename, rm, rmdir, symlink } from "node:fs/promises";
+import { createReadStream, type Stats } from "node:fs";
+import { chmod, copyFile, lstat, mkdir, open, opendir, readlink, rename, rm, rmdir, symlink } from "node:fs/promises";
 import { dirname, join, relative, sep } from "node:path";
 import { isInside } from "../../approval/fanout-scope.js";
+import { renameWithRetrySync, syncDirectoryBestEffort, writeFileSyncedSync } from "../../config/durable-write.js";
 import { resolveUserPath } from "../os/expand-home.js";
-import { inputPathIdentity } from "../os/fs/fs-input-path-identity.js";
+import { inputPathIdentity, windowsComponentIdentity } from "../os/fs/fs-input-path-identity.js";
 import { VERIFY_COPY_EXCLUDED, VERIFY_COPY_MAX_BYTES } from "../verify/verify-workspace-copy.js";
-import { createBranchSet, BRANCH_MERGE_DIR, ensureMergeDir, type BranchWorkspace, type CreateBranchSetOptions } from "./branch-workspace.js";
+import { createBranchSet, defaultGitExec, BRANCH_MERGE_DIR, ensureMergeDir, type BranchSet, type BranchWorkspace, type CreateBranchSetOptions, type GitExec } from "./branch-workspace.js";
 import { workspaceChanges, writeTaskPatch, type SavedTaskPatch } from "./branch-diff.js";
 import { resolveContractInputs } from "./contract-inputs.js";
 import { inspectContractProvides, runContractChecks, type ContractCheckRunner, type ContractReport } from "./contract-checks.js";
@@ -46,8 +47,51 @@ async function fileHash(path: string, bounds: InventoryBounds): Promise<string> 
   }
   return hash.digest("hex");
 }
-async function inventory(root: string, workspace: BranchWorkspace, bounds: InventoryBounds): Promise<Inventory> {
+/**
+ * Tracked paths of the snapshot and every ancestor directory. Git ignore
+ * rules and the dependency/build folder names never apply to these: the
+ * candidate copy carries every tracked file, so promotion must too.
+ */
+async function trackedPaths(set: BranchSet, git: GitExec): Promise<ReadonlySet<string>> {
+  if (set.method !== "worktree") return new Set();
+  const listed = await git(["ls-files", "--cached", "-z"], set.baseDir);
+  if (listed === null || listed.exitCode !== 0 || listed.timedOut || listed.truncated) throw new Error("Git could not list the candidate's tracked paths");
+  const out = new Set<string>();
+  for (const path of listed.stdout.split("\0").filter(Boolean)) {
+    for (let entry = path.split("/").join(sep); entry !== "." && !out.has(entry); entry = dirname(entry)) out.add(entry);
+  }
+  return out;
+}
+/** The project's own agent state (approval rules, merge artifacts): never promoted from a candidate. */
+const AGENT_STATE_DIR = dirname(BRANCH_MERGE_DIR);
+/**
+ * Conservative on every platform: the first component is compared as a
+ * case-insensitive (macOS, Windows) Win32 open reads it, trailing dots,
+ * spaces and `:stream` dropped, so `.ATOMIC-AGENT/` or `.atomic-agent./`
+ * cannot deliver state the runtime later loads as `.atomic-agent/`.
+ */
+const isAgentState = (rel: string): boolean => windowsComponentIdentity(rel.split(sep)[0] ?? "").toLowerCase() === AGENT_STATE_DIR.toLowerCase();
+/**
+ * An untracked path the inventory leaves out (ignore rules, dependency and
+ * build folder names): a top-level stamp only, never walked or hashed.
+ */
+interface DroppedEntry { kind: "file" | "symlink" | "directory"; size: number; mode: number }
+type Dropped = Map<string, DroppedEntry>;
+const droppedStamp = (info: Stats): DroppedEntry => ({ kind: info.isDirectory() ? "directory" : info.isSymbolicLink() ? "symlink" : "file", size: info.size, mode: info.mode & 0o777 });
+/**
+ * Dropped paths new in `after`, or standalone entries whose kind, size or
+ * mode moved. Not mtime: the base and the candidate are separate copies.
+ */
+function droppedChanges(before: Dropped, after: Dropped): string[] {
+  return [...after].filter(([path, entry]) => {
+    const prior = before.get(path);
+    if (prior === undefined) return true;
+    return entry.kind !== "directory" && (prior.kind !== entry.kind || prior.size !== entry.size || prior.mode !== entry.mode);
+  }).map(([path]) => path).sort();
+}
+async function inventory(root: string, workspace: BranchWorkspace, tracked: ReadonlySet<string>, bounds: InventoryBounds, dropped?: Dropped): Promise<Inventory> {
   const out: Inventory = new Map();
+  const leaves: { rel: string; info: Stats }[] = [];
   const walk = async (dir: string): Promise<void> => {
     bounds.signal?.throwIfAborted();
     const entries = [];
@@ -60,25 +104,138 @@ async function inventory(root: string, workspace: BranchWorkspace, bounds: Inven
     const ignored = await workspace.directoryIgnorePolicy?.(dirs, bounds.signal);
     for (const item of entries) {
       const rel = join(dir, item.name);
-      if (VERIFY_COPY_EXCLUDED.has(item.name) || rel === BRANCH_MERGE_DIR || rel.startsWith(`${BRANCH_MERGE_DIR}${sep}`) || workspace.excludedDirectories?.has(rel) || ignored?.has(rel)) continue;
+      if (item.name === ".git" || rel === BRANCH_MERGE_DIR || rel.startsWith(`${BRANCH_MERGE_DIR}${sep}`)) continue;
+      // Disposable dependency/build/ignored folders, unless they hold tracked paths.
+      if ((VERIFY_COPY_EXCLUDED.has(item.name) || workspace.excludedDirectories?.has(rel) || ignored?.has(rel)) && !tracked.has(rel)) {
+        if (dropped !== undefined) dropped.set(rel, droppedStamp(await lstat(join(root, rel))));
+        continue;
+      }
       bounds.signal?.throwIfAborted();
       if (--bounds.entries < 0) throw new Error("candidate inventory entry limit exceeded");
-      const path = join(root, rel); const info = await lstat(path);
-      if (info.isDirectory()) { out.set(rel, { kind: "directory", mode: info.mode & 0o777 }); await walk(rel); }
-      else if (info.isSymbolicLink()) out.set(rel, { kind: "symlink", mode: 0, hash: createHash("sha256").update(await readlink(path)).digest("hex") });
-      else if (info.isFile()) {
-        if (info.size > bounds.bytes) throw new Error("candidate inventory byte limit exceeded");
-        const hash = await fileHash(path, bounds); const after = await lstat(path);
-        if (!after.isFile() || after.size !== info.size || after.mtimeMs !== info.mtimeMs || after.ctimeMs !== info.ctimeMs) throw new Error(`file changed while snapshotting: ${rel}`);
-        out.set(rel, { kind: "file", mode: info.mode & 0o777, hash });
-      } else throw new Error(`unsupported candidate entry: ${rel}`);
+      const info = await lstat(join(root, rel));
+      if (info.isDirectory()) {
+        // The state folder itself may appear only to hold merge artifacts; its contents are inventoried.
+        if (rel !== AGENT_STATE_DIR) out.set(rel, { kind: "directory", mode: info.mode & 0o777 });
+        await walk(rel);
+      } else if (info.isSymbolicLink() || info.isFile()) leaves.push({ rel, info });
+      else throw new Error(`unsupported candidate entry: ${rel}`);
     }
   };
-  await walk(""); return out;
+  await walk("");
+  // Ignored standalone files (.env, logs) are private to the candidate: never
+  // compared or promoted. Ignore rules never apply to tracked paths.
+  const untracked = leaves.filter(leaf => !tracked.has(leaf.rel)).map(leaf => leaf.rel);
+  const ignoredFiles = untracked.length === 0 ? undefined : await workspace.directoryIgnorePolicy?.(untracked, bounds.signal);
+  for (const { rel, info } of leaves) {
+    if (ignoredFiles?.has(rel) === true) { dropped?.set(rel, droppedStamp(info)); continue; }
+    bounds.signal?.throwIfAborted();
+    const path = join(root, rel);
+    if (info.isSymbolicLink()) { out.set(rel, { kind: "symlink", mode: 0, hash: createHash("sha256").update(await readlink(path)).digest("hex") }); continue; }
+    if (info.size > bounds.bytes) throw new Error("candidate inventory byte limit exceeded");
+    const hash = await fileHash(path, bounds); const after = await lstat(path);
+    if (!after.isFile() || after.size !== info.size || after.mtimeMs !== info.mtimeMs || after.ctimeMs !== info.ctimeMs) throw new Error(`file changed while snapshotting: ${rel}`);
+    out.set(rel, { kind: "file", mode: info.mode & 0o777, hash });
+  }
+  return out;
 }
+const posixPath = (path: string): string => path.split(sep).join("/");
+/** Whether `path` is `root` or lies under it (both relative). */
+const atOrUnder = (path: string, root: string): boolean => path === root || path.startsWith(`${root}${sep}`);
+/**
+ * Why promotion would lose work to the ignore rules, or `undefined`:
+ * a declared `provides` path (`kind: "file"` name, or any `in`) that lies
+ * at or under a path the inventory drops; or a deleted tracked file whose
+ * bytes reappear in a new ignored standalone file (a rename onto an
+ * ignored name such as `notes.md` → `notes.log`). Renames into an
+ * existing ignored directory are not walked; they show in `ignoredChanges`.
+ */
+async function lostToIgnoreRules(changed: readonly string[], base: Inventory, final: Inventory, dropped: Dropped, fresh: readonly string[], input: CandidateFinishInput, dir: string, baseDir: string): Promise<string | undefined> {
+  const declared = (input.contract?.provides ?? []).flatMap(provide => [...(provide.kind === "file" ? [provide.name] : []), ...(provide.in === undefined ? [] : [provide.in])]).flatMap(path => {
+    let absolute: string;
+    try { absolute = resolveUserPath(path, dir); } catch { return []; }
+    return isInside(dir, absolute) ? [relative(dir, absolute)] : [];
+  });
+  const hidden = [...new Set(declared.filter(path => [...dropped.keys()].some(root => atOrUnder(path, root))))].sort();
+  if (hidden.length > 0) return `declared provides lie under ignored or disposable paths that are never promoted (${hidden.map(posixPath).join(", ")}); deliver them in tracked or unignored paths`;
+  const deleted = changed.filter(path => base.get(path)?.kind === "file" && !final.has(path));
+  if (deleted.length === 0) return undefined;
+  // Only a new ignored file of a deleted file's size is hashed.
+  const sizes = new Set<number>();
+  for (const path of deleted) sizes.add((await lstat(join(baseDir, path))).size);
+  const hashes = new Map(deleted.map(path => [base.get(path)!.hash!, path]));
+  const renamed: string[] = [];
+  for (const path of fresh) {
+    const entry = dropped.get(path);
+    if (entry?.kind !== "file" || !sizes.has(entry.size)) continue;
+    const hash = await fileHash(join(dir, path), { bytes: VERIFY_COPY_MAX_BYTES, entries: 1, signal: input.signal });
+    const source = hashes.get(hash);
+    if (source !== undefined) renamed.push(`${posixPath(source)} → ${posixPath(path)}`);
+  }
+  if (renamed.length > 0) return `tracked files would be deleted while their bytes survive only in ignored files that are never promoted (${renamed.join(", ")})`;
+  return undefined;
+}
+/** `rel` and each of its ancestor directories, nearest first. */
+const withAncestors = (rel: string): string[] => {
+  const out = [rel];
+  for (let parent = dirname(rel); parent !== "."; parent = dirname(parent)) out.push(parent);
+  return out;
+};
+/**
+ * One entry of a live tree, judged exactly like the inventory (never
+ * following links, hashing bytes); `undefined` when absent. A file must
+ * keep its lstat identity while it is hashed. The returned stat is the
+ * identity the caller re-checks immediately before replacing the entry.
+ */
+async function observeEntry(root: string, rel: string, bounds: InventoryBounds): Promise<{ entry: Entry | undefined; stat: Stats | undefined }> {
+  bounds.signal?.throwIfAborted();
+  const path = join(root, rel);
+  const info = await lstat(path).catch((err: NodeJS.ErrnoException) => { if (err.code === "ENOENT") return undefined; throw err; });
+  if (info === undefined) return { entry: undefined, stat: undefined };
+  if (info.isDirectory()) return { entry: { kind: "directory", mode: info.mode & 0o777 }, stat: info };
+  if (info.isSymbolicLink()) return { entry: { kind: "symlink", mode: 0, hash: createHash("sha256").update(await readlink(path)).digest("hex") }, stat: info };
+  if (!info.isFile()) throw new Error(`unsupported candidate entry: ${rel}`);
+  if (info.size > bounds.bytes) throw new Error("candidate inventory byte limit exceeded");
+  const hash = await fileHash(path, bounds); const after = await lstat(path);
+  if (!after.isFile() || after.size !== info.size || after.mtimeMs !== info.mtimeMs || after.ctimeMs !== info.ctimeMs) throw new Error(`file changed while snapshotting: ${rel}`);
+  return { entry: { kind: "file", mode: info.mode & 0o777, hash }, stat: info };
+}
+/** Same live entry as when it was hashed: identity, size, times and kind/permission bits. */
+const sameIdentity = (a: Stats | undefined, b: Stats | undefined): boolean =>
+  a === undefined || b === undefined ? a === b
+    : a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeMs === b.mtimeMs && a.ctimeMs === b.ctimeMs && a.mode === b.mode;
+/** fsync a regular file; file systems that cannot flush are tolerated. A read-only descriptor flushes on POSIX. */
+async function syncFile(path: string): Promise<void> {
+  const handle = await open(path, "r");
+  try { await handle.sync().catch((err: NodeJS.ErrnoException) => { if (!["EINVAL", "ENOTSUP", "EOPNOTSUPP"].includes(err.code ?? "")) throw err; }); } finally { await handle.close(); }
+}
+/** What a step verified: the target's stat (undefined when absent) and each ancestor directory's. */
+interface Verified { stat: Stats | undefined; parents: ReadonlyMap<string, Stats> }
 function differences(a: Inventory, b: Inventory): string[] {
   return [...new Set([...a.keys(), ...b.keys()])].filter(path => !equal(a.get(path), b.get(path))).sort();
 }
+
+/** What a promotion journal records about one entry (see the fusion README for recovery). */
+interface JournalEntry { kind: Entry["kind"]; mode: number; sha256?: string; linkTarget?: string }
+interface PromotionJournalStep {
+  path: string;
+  action: "write" | "delete" | "mkdir" | "rmdir";
+  /** `intent` is written before the change, `applied` after it. */
+  status: "intent" | "applied" | "not-applied" | "rolled-back" | "rollback-conflict";
+  original: JournalEntry | null;
+  promoted: JournalEntry | null;
+  /** Pre-image bytes of a modified or deleted file, relative to the merge folder. */
+  backup?: string;
+  /** Temp name (relative to the project) the new file or symlink is staged under before its rename; remove it if it is left behind. */
+  temp?: string;
+}
+interface PromotionJournal {
+  version: 1; candidate: string; project: string; startedAt: string;
+  /** `committed`: every step landed and was verified; nothing to undo, delete the journal. */
+  state: "promoting" | "committed" | "rolling-back" | "rolled-back-with-conflicts";
+  recovery: string;
+  steps: PromotionJournalStep[];
+}
+const JOURNAL_RECOVERY = "If state is 'committed', delivery completed and was verified: change nothing, just delete this journal and its backup folder. Otherwise steps run in order. 'applied' paths hold the promoted entry; an 'intent' path may hold either. To undo, restore each such path from 'original': a file from 'backup' with its mode, a symlink from 'linkTarget', a directory with its mode; remove the path if 'original' is null. Verify sha256 before trusting a backup. Delete any step's leftover 'temp' file (an .atag-candidate-* staging copy), then this journal and its backup folder.";
 
 export interface CandidateIntegrationReport {
   status: "promoted" | "rejected";
@@ -88,8 +245,22 @@ export interface CandidateIntegrationReport {
   /** Relative paths from the authoritative final snapshot; disposable directories excluded. */
   changes: string[];
   contract?: ContractReport;
+  /**
+   * New or restamped untracked paths the ignore rules (and dependency/build
+   * folder names) kept private to the candidate: never promoted. Top-level
+   * entries only; a directory is named once, not walked.
+   */
+  ignoredChanges?: string[];
   /** Concurrent edits prevent rollback of these paths; their current bytes were preserved. */
   rollbackConflicts?: string[];
+  /**
+   * Promotion journal left on disk, relative to the project (with its
+   * pre-image backup folder): after an incomplete rollback, or after a
+   * successful delivery whose journal could not be removed (see the note).
+   */
+  promotionJournal?: string;
+  /** Why `promotionJournal` remains and what to do with it. */
+  promotionJournalNote?: string;
   /** Recovery fallback if a bounded patch cannot be made; cleanup leaves this private workspace intact. */
   retainedWorkspace?: string;
   heldArtifactsDir?: string;
@@ -116,18 +287,27 @@ export interface CandidateIntegration {
  */
 export async function createCandidateIntegration(
   realDir: string,
-  options: CreateBranchSetOptions & { beforeApply?: (path: string, index: number) => Promise<void>; maxInventoryBytes?: number; maxInventoryEntries?: number; maxInventoryMs?: number } = {},
+  options: CreateBranchSetOptions & {
+    beforeApply?: (path: string, index: number) => Promise<void>;
+    /** Test-only: runs after a step verified its target, immediately before the identity re-check and the replace/remove. */
+    beforeCommit?: (path: string) => Promise<void>;
+    maxInventoryBytes?: number; maxInventoryEntries?: number; maxInventoryMs?: number } = {},
 ): Promise<CandidateIntegration> {
   const id = `candidate-${randomBytes(6).toString("hex")}`;
   const setupSignal = options.signal === undefined ? AbortSignal.timeout(120_000) : AbortSignal.any([options.signal, AbortSignal.timeout(120_000)]);
-  const set = await createBranchSet(realDir, [id], { ...options, signal: setupSignal });
+  const set = await createBranchSet(realDir, [id], { ...options, signal: setupSignal, privateDependencyDirectories: true });
   if (set === null) throw new Error("candidate workspace unavailable: private copies exceed the copy limit");
   const workspace = set.workspaces.get(id)!;
-  const snapshot = (root: string, signal?: AbortSignal): Promise<Inventory> => inventory(root, workspace, { bytes: options.maxInventoryBytes ?? options.maxCopyBytes ?? VERIFY_COPY_MAX_BYTES, entries: options.maxInventoryEntries ?? 100_000, signal: signal === undefined ? AbortSignal.timeout(options.maxInventoryMs ?? 30_000) : AbortSignal.any([signal, AbortSignal.timeout(options.maxInventoryMs ?? 30_000)]) });
+  let tracked: ReadonlySet<string>;
+  try { tracked = await trackedPaths(set, options.git ?? defaultGitExec); } catch (err) { await set.cleanup(); throw err; }
+  const snapshot = (root: string, signal?: AbortSignal, dropped?: Dropped): Promise<Inventory> => inventory(root, workspace, tracked, { bytes: options.maxInventoryBytes ?? options.maxCopyBytes ?? VERIFY_COPY_MAX_BYTES, entries: options.maxInventoryEntries ?? 100_000, signal: signal === undefined ? AbortSignal.timeout(options.maxInventoryMs ?? 30_000) : AbortSignal.any([signal, AbortSignal.timeout(options.maxInventoryMs ?? 30_000)]) }, dropped);
+  /** Bounds for re-verifying single live entries during delivery and rollback. */
+  const liveBounds = (signal: AbortSignal): InventoryBounds => ({ bytes: options.maxInventoryBytes ?? options.maxCopyBytes ?? VERIFY_COPY_MAX_BYTES, entries: 1, signal });
   let retain = false;
   let base: Inventory;
+  const baseDropped: Dropped = new Map();
   try {
-    base = await snapshot(set.baseDir, setupSignal);
+    base = await snapshot(set.baseDir, setupSignal, baseDropped);
     if (differences(base, await snapshot(set.realDir, setupSignal)).length > 0) throw new Error("original project changed while creating candidate");
     // A hard process stop cannot write a patch. Normal completion cleans
     // this marker; a stale sweep must preserve the only recovery copy.
@@ -174,17 +354,49 @@ export async function createCandidateIntegration(
     }
   };
 
-  // Same-directory rename never writes through an existing symlink. A fresh
-  // ancestor scan also refuses a parent replaced with a link during delivery.
-  const writeEntry = async (root: string, rel: string, expected: Entry | undefined): Promise<void> => {
-    const target = join(set.realDir, rel);
+  /**
+   * Each ancestor of `rel` must still be the real directory (same device and
+   * inode, not a link) this step verified, so no change lands through a
+   * parent swapped for a symlink to elsewhere.
+   */
+  const checkParents = async (rel: string, verified: Verified): Promise<void> => {
     for (let parent = dirname(rel); parent !== "."; parent = dirname(parent)) {
-      const info = await lstat(join(set.realDir, parent));
-      if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`delivery parent is no longer a directory: ${parent}`);
+      const info = await lstat(join(set.realDir, parent)).catch(() => undefined);
+      const then = verified.parents.get(parent);
+      if (info === undefined || then === undefined || !info.isDirectory() || info.dev !== then.dev || info.ino !== then.ino) throw new Error(`delivery parent is no longer the verified directory: ${posixPath(parent)}`);
     }
-    if (expected === undefined) { await rm(target); return; }
-    if (expected.kind === "directory") { await mkdir(target); await chmod(target, expected.mode); return; }
-    const tmp = join(dirname(target), `.atag-candidate-${randomBytes(8).toString("hex")}`);
+  };
+  /**
+   * The last check before a replace, remove or directory create/remove: the
+   * parent chain and the target must still be the very entries this step
+   * verified (the target possibly still absent). A user edit after the hash
+   * is a concurrent change. The call itself cannot compare-and-swap, so an
+   * edit landing between these lstats and that call is not detected.
+   */
+  const commitGuard = async (rel: string, verified: Verified): Promise<void> => {
+    await options.beforeCommit?.(rel);
+    await checkParents(rel, verified);
+    const now = await lstat(join(set.realDir, rel)).catch((err: NodeJS.ErrnoException) => { if (err.code === "ENOENT") return undefined; throw err; });
+    if (!sameIdentity(now, verified.stat)) throw new Error(`original project changed during candidate delivery: ${posixPath(rel)}`);
+  };
+  /** Live identities of `rel`'s ancestors (rollback's verification point). */
+  const liveParents = async (rel: string): Promise<Map<string, Stats>> => {
+    const parents = new Map<string, Stats>();
+    for (let parent = dirname(rel); parent !== "."; parent = dirname(parent)) parents.set(parent, await lstat(join(set.realDir, parent)));
+    return parents;
+  };
+  // Same-directory rename never writes through an existing symlink; the
+  // parent chain is re-checked before staging and again at commit.
+  /** A fresh sibling temp name for staging `rel`, relative to the project. */
+  const tempFor = (rel: string): string => join(dirname(rel), `.atag-candidate-${randomBytes(8).toString("hex")}`);
+  // `landed` runs right after the change itself, before any follow-up that
+  // can still fail (a directory's chmod), so rollback knows to undo it.
+  const writeEntry = async (root: string, rel: string, expected: Entry | undefined, verified: Verified, landed: () => void = () => undefined, tempRel = tempFor(rel)): Promise<void> => {
+    const target = join(set.realDir, rel);
+    await checkParents(rel, verified);
+    if (expected === undefined) { await commitGuard(rel, verified); await rm(target); landed(); syncDirectoryBestEffort(dirname(target)); return; }
+    if (expected.kind === "directory") { await commitGuard(rel, verified); await mkdir(target, { mode: expected.mode }); landed(); syncDirectoryBestEffort(dirname(target)); await chmod(target, expected.mode); return; }
+    const tmp = join(set.realDir, tempRel);
     try {
       if (expected.kind === "symlink") {
         const link = await readlink(join(root, rel));
@@ -193,10 +405,60 @@ export async function createCandidateIntegration(
       } else {
         await copyFile(join(root, rel), tmp);
         if (await fileHash(tmp, { bytes: options.maxInventoryBytes ?? VERIFY_COPY_MAX_BYTES, entries: 1, signal: AbortSignal.timeout(30_000) }) !== expected.hash) throw new Error(`candidate changed before delivery: ${rel}`);
+        // The bytes reach the disk before the name does.
+        await syncFile(tmp);
         await chmod(tmp, expected.mode);
       }
-      await rename(tmp, target);
+      await commitGuard(rel, verified);
+      await rename(tmp, target); landed(); syncDirectoryBestEffort(dirname(target));
     } finally { await rm(tmp, { force: true }); }
+  };
+
+  /**
+   * A durable record of promotion under the original's merge folder: every
+   * step is journaled with its original entry (and pre-image bytes of a
+   * modified or deleted file) before it is applied, and marked after, so
+   * a hard stop mid-delivery leaves enough to restore by hand.
+   */
+  const openJournal = async (): Promise<{ journal: PromotionJournal; file: string; backups: string; write(): void; step(path: string, original: Entry | undefined, promoted: Entry | undefined, temp?: string): Promise<PromotionJournalStep>; remove(): Promise<void> }> => {
+    const merge = await ensureMergeDir(set.realDir);
+    // ensureMergeDir may have just created `.atomic-agent/` and its merge
+    // folder: flush those new directory entries before relying on them.
+    syncDirectoryBestEffort(set.realDir); syncDirectoryBestEffort(dirname(merge)); syncDirectoryBestEffort(merge);
+    const file = join(merge, `${id}.promotion.json`), backups = join(merge, `${id}.promotion-backup`);
+    const journal: PromotionJournal = { version: 1, candidate: id, project: set.realDir, startedAt: new Date().toISOString(), state: "promoting", recovery: JOURNAL_RECOVERY, steps: [] };
+    const write = (): void => {
+      const tmp = `${file}.tmp`;
+      writeFileSyncedSync(tmp, `${JSON.stringify(journal, null, 2)}\n`, { mode: 0o600 });
+      renameWithRetrySync(tmp, file); syncDirectoryBestEffort(merge);
+    };
+    const describe = (entry: Entry | undefined, link?: string): JournalEntry | null => entry === undefined ? null
+      : { kind: entry.kind, mode: entry.mode, ...(entry.kind === "file" && entry.hash !== undefined ? { sha256: entry.hash } : {}), ...(link === undefined ? {} : { linkTarget: link }) };
+    try { await mkdir(backups, { mode: 0o700 }); await chmod(backups, 0o700); syncDirectoryBestEffort(merge); write(); }
+    catch (err) { await rm(backups, { recursive: true, force: true }).catch(() => undefined); await rm(file, { force: true }).catch(() => undefined); throw err; }
+    return {
+      journal, file, backups, write,
+      async step(path, original, promoted, temp) {
+        const index = journal.steps.length;
+        const action = original?.kind === "directory" && promoted === undefined ? "rmdir" : promoted === undefined ? "delete" : promoted.kind === "directory" ? "mkdir" : "write";
+        let backup: string | undefined;
+        if (original?.kind === "file") {
+          backup = join(`${id}.promotion-backup`, String(index));
+          const destination = join(merge, backup);
+          // Pre-images may be secrets: owner-only, whatever the source mode
+          // (recorded in `original.mode`). The folder is owner-only too.
+          await copyFile(join(set.baseDir, path), destination);
+          await chmod(destination, 0o600);
+          await syncFile(destination);
+          syncDirectoryBestEffort(backups);
+        }
+        const link = original?.kind === "symlink" ? await readlink(join(set.baseDir, path)) : undefined;
+        const step: PromotionJournalStep = { path: posixPath(path), action, status: "intent", original: describe(original, link), promoted: describe(promoted), ...(backup === undefined ? {} : { backup: posixPath(backup) }), ...(temp === undefined ? {} : { temp: posixPath(temp) }) };
+        journal.steps.push(step); write();
+        return step;
+      },
+      remove: async () => { await rm(file, { force: true }); await rm(backups, { recursive: true, force: true }); },
+    };
   };
 
   return {
@@ -206,6 +468,9 @@ export async function createCandidateIntegration(
       const applied: string[] = []; const rollbackConflicts: string[] = [];
       let final: Inventory | undefined;
       let artifactManifest: ArtifactManifest | undefined;
+      let ignoredChanges: string[] = [];
+      let journal: Awaited<ReturnType<typeof openJournal>> | undefined;
+      const steps = new Map<string, PromotionJournalStep>();
       try {
         input.signal.throwIfAborted();
         if (input.rows.length === 0 || input.rows.some(row => row.status !== "ok") || input.tasks?.some(task => !input.rows.some(row => row.id === task.id))) return await reject("candidate not promoted: every task must close with status ok");
@@ -224,8 +489,17 @@ export async function createCandidateIntegration(
         if (checked.checksSkipped !== undefined || checked.outcomes.length !== checks.length || checked.outcomes.some(check => !check.ok)) return await reject("candidate not promoted: final integration checks failed or could not be verified", { contract: evidence });
         if (provides.providesSkipped !== undefined || provides.findings.some(finding => !finding.present) || provides.findings.length !== (input.contract?.provides?.length ?? 0)) return await reject("candidate not promoted: declared provides are missing or uninspectable", { contract: evidence });
         input.signal.throwIfAborted();
-        final = await snapshot(workspace.dir, input.signal);
+        const finalDropped: Dropped = new Map();
+        final = await snapshot(workspace.dir, input.signal, finalDropped);
         const changed = differences(base, final);
+        // Ignore rules keep these private, so promotion would silently lose them.
+        ignoredChanges = droppedChanges(baseDropped, finalDropped);
+        const lost = await lostToIgnoreRules(changed, base, final, finalDropped, ignoredChanges, input, workspace.dir, set.baseDir);
+        if (lost !== undefined) return await reject(`candidate not promoted: ${lost}`, { contract: evidence, ignoredChanges: ignoredChanges.map(posixPath) });
+        // Approval rules and other project agent state are operator-owned: a
+        // worker cannot loosen or remove them by way of a promoted candidate.
+        const agentState = changed.filter(isAgentState);
+        if (agentState.length > 0) return await reject(`candidate not promoted: it changes the project's agent state directory ${AGENT_STATE_DIR}/ (${agentState.map(p => p.split(sep).join("/")).join(", ")}); only the operator may change it`, { contract: evidence });
         const artifacts: ArtifactObservation[] = changed.map(path => ({ path, source: "snapshot", change: !final!.has(path) ? "deleted" : !base.has(path) ? "new" : base.get(path)?.hash === final!.get(path)?.hash ? "mode" : "modified" }));
         const dependencies = (input.contract?.requires ?? []).flatMap<ArtifactManifestDependency>((requirement, requirementIndex) => {
           const providers = (input.contract?.provides ?? []).filter(provide => provide.name === requirement.name && provide.task !== requirement.task);
@@ -236,7 +510,8 @@ export async function createCandidateIntegration(
         if (differences(final, await snapshot(workspace.dir, input.signal)).length > 0) throw new Error("candidate changed during final evidence collection");
         // No untested three-way merge. Even unrelated new user paths change
         // the tested project state and hold the entire candidate back.
-        if (differences(base, await snapshot(set.realDir, input.signal)).length > 0) return await reject("candidate not promoted: original project changed since its snapshot", { contract: evidence });
+        const realDropped: Dropped = new Map();
+        if (differences(base, await snapshot(set.realDir, input.signal, realDropped)).length > 0) return await reject("candidate not promoted: original project changed since its snapshot", { contract: evidence });
         // The delegate rebases absolute inputs into the candidate. Restore
         // their original identity before comparing final delivery paths;
         // relative and already-original absolute helper inputs stay guarded too.
@@ -265,32 +540,98 @@ export async function createCandidateIntegration(
         const additions = changed.filter(p => final!.get(p)?.kind === "directory" && !base.has(p)).sort((a, b) => depth(a) - depth(b));
         const files = changed.filter(p => (final!.get(p) ?? base.get(p))?.kind !== "directory");
         const removals = changed.filter(p => base.get(p)?.kind === "directory" && !final!.has(p)).sort((a, b) => depth(b) - depth(a));
+        // Ignored/disposable entries are never delivered or removed, so a
+        // directory still holding one in the original cannot be removed.
+        const kept = [...realDropped.keys()].filter(entry => removals.some(dir => entry !== dir && atOrUnder(entry, dir))).sort();
+        if (kept.length > 0) return await reject(`candidate not promoted: it deletes directories that still hold ignored or disposable entries in the original, which are never promoted or removed (${kept.map(posixPath).join(", ")}); remove them in the original first or keep the directory`, { contract: evidence, ...(ignoredChanges.length === 0 ? {} : { ignoredChanges: ignoredChanges.map(posixPath) }) });
         const promotionSignal = AbortSignal.any([input.signal, AbortSignal.timeout(120_000)]);
+        // The full inventory above proved the original still equals the
+        // snapshot. Each step re-verifies only the paths it involves (the
+        // target and its ancestors) against base, overlaid with our own
+        // already-applied entries, so work stays O(changed bytes), not
+        // O(changed paths × tree bytes). A concurrent change there stops
+        // delivery and rolls back.
+        const appliedSet = new Set<string>();
+        const expectedAt = (path: string): Entry | undefined => appliedSet.has(path) ? final!.get(path) : base.get(path);
+        /** Returns the first path's verified stat and the others' (its ancestors), re-checked just before its write. */
+        const verifyPaths = async (paths: readonly string[], expected: (path: string) => Entry | undefined, message: string): Promise<Verified> => {
+          let first: Stats | undefined; const parents = new Map<string, Stats>();
+          for (const [index, path] of paths.entries()) {
+            const observed = await observeEntry(set.realDir, path, liveBounds(promotionSignal));
+            if (!equal(observed.entry, expected(path))) throw new Error(message);
+            if (index === 0) first = observed.stat;
+            else if (observed.stat !== undefined) parents.set(path, observed.stat);
+          }
+          return { stat: first, parents };
+        };
+        // Created before the first write; removed once delivery or a full rollback completes.
+        if (changed.length > 0) journal = await openJournal();
         for (const [index, path] of [...additions, ...files, ...removals].entries()) {
           promotionSignal.throwIfAborted(); await options.beforeApply?.(path, index); promotionSignal.throwIfAborted();
-          // Check the whole current state before each write, accounting only
-          // for our already-applied paths. Refuse concurrent user changes.
-          const expected = new Map(base); for (const appliedPath of applied) { const entry = final.get(appliedPath); if (entry === undefined) expected.delete(appliedPath); else expected.set(appliedPath, entry); }
-          if (differences(expected, await snapshot(set.realDir, promotionSignal)).length > 0) throw new Error("original project changed during candidate delivery");
-          if (base.get(path)?.kind === "directory" && !final.has(path)) await rmdir(join(set.realDir, path));
-          else await writeEntry(workspace.dir, path, final.get(path));
-          applied.push(path);
+          const verified = await verifyPaths(withAncestors(path), expectedAt, "original project changed during candidate delivery");
+          const staged = final.get(path)?.kind === "file" || final.get(path)?.kind === "symlink" ? tempFor(path) : undefined;
+          const step = await journal!.step(path, base.get(path), final.get(path), staged); steps.set(path, step);
+          const landed = (): void => { applied.push(path); appliedSet.add(path); };
+          if (base.get(path)?.kind === "directory" && !final.has(path)) { await commitGuard(path, verified); await rmdir(join(set.realDir, path)); landed(); syncDirectoryBestEffort(dirname(join(set.realDir, path))); }
+          else await writeEntry(workspace.dir, path, final.get(path), verified, landed, staged);
+          step.status = "applied"; journal!.write();
         }
         promotionSignal.throwIfAborted();
-        if (differences(final, await snapshot(set.realDir, promotionSignal)).length > 0) throw new Error("original project changed while completing candidate delivery");
-        return { status: "promoted", nonResumable: true, changes: changed.map(p => p.split(sep).join("/")), contract: evidence, artifactManifest };
+        // Final check of the touched paths only: each must now hold its candidate entry.
+        await verifyPaths([...new Set(changed.flatMap(withAncestors))], path => final!.get(path), "original project changed while completing candidate delivery");
+        // Delivery is complete and verified: nothing may roll it back now. The
+        // journal is durably marked committed first, so one left behind by a
+        // failed removal never reads as a crashed delivery to undo.
+        let leftover: Partial<CandidateIntegrationReport> = {};
+        if (journal !== undefined) {
+          const done = journal;
+          let committed = true;
+          try { done.journal.state = "committed"; done.write(); } catch { committed = false; }
+          await done.remove().catch(() => {
+            leftover = { promotionJournal: posixPath(relative(set.realDir, done.file)), promotionJournalNote: committed
+              ? "Promotion committed and verified, but its journal could not be removed. Nothing to restore: delete the journal and its .promotion-backup folder."
+              : "Promotion committed and verified, but its journal could neither be marked committed nor removed; it may still read 'promoting'. Nothing to restore: delete the journal and its .promotion-backup folder." };
+          });
+        }
+        return { status: "promoted", nonResumable: true, changes: changed.map(posixPath), contract: evidence, artifactManifest, ...(ignoredChanges.length === 0 ? {} : { ignoredChanges: ignoredChanges.map(posixPath) }), ...leftover };
       } catch (err) {
         // Roll back only bytes we still own. If a user edited a delivered
         // path, retain that edit and report it instead of overwriting it.
-        for (const path of applied.reverse()) {
-          try {
-            const current = await snapshot(set.realDir);
-            if (!equal(current.get(path), final?.get(path))) { rollbackConflicts.push(path); continue; }
-            if (final?.get(path)?.kind === "directory" && !base.has(path)) await rmdir(join(set.realDir, path));
-            else await writeEntry(set.baseDir, path, base.get(path));
-          } catch { rollbackConflicts.push(path); }
+        // The journal is best effort from here on: rollback must not stop for it.
+        const record = (): boolean => { try { journal?.write(); return true; } catch { return false; } };
+        let journalOk = true;
+        if (journal !== undefined) {
+          journal.journal.state = "rolling-back";
+          for (const [path, step] of steps) if (step.status === "intent" && !applied.includes(path)) step.status = "not-applied";
+          journalOk = record();
         }
-        return await reject(`candidate not promoted: ${err instanceof Error ? err.message : String(err)}`, { ...(evidence === undefined ? {} : { contract: evidence }), ...(artifactManifest === undefined ? {} : { artifactManifest }), ...(rollbackConflicts.length === 0 ? {} : { rollbackConflicts }) });
+        for (const path of applied.reverse()) {
+          const step = steps.get(path);
+          try {
+            const current = await observeEntry(set.realDir, path, liveBounds(AbortSignal.timeout(options.maxInventoryMs ?? 30_000)));
+            // A directory we created is ours whatever its mode (its chmod may
+            // be what failed); rmdir removes it only while it is empty.
+            const created = final?.get(path)?.kind === "directory" && !base.has(path);
+            if (created ? current.entry?.kind !== "directory" : !equal(current.entry, final?.get(path))) { rollbackConflicts.push(path); if (step !== undefined) step.status = "rollback-conflict"; journalOk = record() && journalOk; continue; }
+            const live: Verified = { stat: current.stat, parents: await liveParents(path) };
+            if (created) { await commitGuard(path, live); await rmdir(join(set.realDir, path)); }
+            else {
+              // Restoring a file or symlink stages a temp too: journal it first.
+              const staged = base.get(path)?.kind === "file" || base.get(path)?.kind === "symlink" ? tempFor(path) : undefined;
+              if (step !== undefined && staged !== undefined) { step.temp = posixPath(staged); journalOk = record() && journalOk; }
+              await writeEntry(set.baseDir, path, base.get(path), live, undefined, staged);
+            }
+            if (step !== undefined) step.status = "rolled-back";
+          } catch { rollbackConflicts.push(path); if (step !== undefined) step.status = "rollback-conflict"; }
+          journalOk = record() && journalOk;
+        }
+        let promotionJournal: string | undefined;
+        if (journal !== undefined) {
+          // Fully restored: nothing left to recover. Otherwise keep the record.
+          if (rollbackConflicts.length === 0 && journalOk) await journal.remove().catch(() => undefined);
+          else { journal.journal.state = "rolled-back-with-conflicts"; record(); promotionJournal = posixPath(relative(set.realDir, journal.file)); }
+        }
+        return await reject(`candidate not promoted: ${err instanceof Error ? err.message : String(err)}`, { ...(evidence === undefined ? {} : { contract: evidence }), ...(artifactManifest === undefined ? {} : { artifactManifest }), ...(rollbackConflicts.length === 0 ? {} : { rollbackConflicts }), ...(promotionJournal === undefined ? {} : { promotionJournal }) });
       }
     },
   };

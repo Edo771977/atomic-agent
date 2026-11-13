@@ -1578,14 +1578,24 @@ export function buildFusionDelegateTool(
           // artifact is usable. Verify providers before releasing consumers,
           // including rows carried from a checkpoint. Retry policy is separate.
           const verifiedProviders = new Set<string>();
+          // A `no_changes` provider whose required artifacts already exist
+          // and pass the same verification as an `ok` one releases its
+          // dependents; its own row stays `no_changes`.
+          const releasedNoChanges = new Set<string>();
           const previouslyReleased = new Set<string>();
           const verifyProvider = async (id: string): Promise<void> => {
             if (verifiedProviders.has(id)) return;
             verifiedProviders.add(id);
             const rechecking = previouslyReleased.has(id);
             previouslyReleased.add(id);
-            let row = finished.get(id);
-            if (row?.status !== "ok") return;
+            const original = finished.get(id);
+            const noChanges = original?.status === "no_changes";
+            if (original === undefined || (original.status !== "ok" && !noChanges)) return;
+            // A candidate promotes only all-ok rows, so a released consumer's
+            // work could never be delivered: hold it instead.
+            if (noChanges && candidate !== undefined) return;
+            let row: WorkerTaskResult | undefined = noChanges ? { ...original, status: "ok" } : original;
+            let ranEvidence = false;
             const names = new Set((parsed.contract?.requires ?? []).map((r) => r.name));
             const required = (parsed.contract?.provides ?? []).filter(
               (p) => p.task === id && names.has(p.name),
@@ -1596,6 +1606,8 @@ export function buildFusionDelegateTool(
             // ordering. They are never evidence that an artifact exists.
             const verifiable = required.filter((p) => p.kind !== "other" ||
               provideSearchPaths(p, parsed.contract!, task).length > 0);
+            // Advisory tokens are no evidence for a worker that wrote nothing.
+            if (noChanges && verifiable.length < required.length) return;
             const report = await inspectContractProvides(
               { ...parsed.contract, provides: verifiable }, [task], ctx.workingDir,
               { results: [row], signal: runSignal },
@@ -1623,6 +1635,7 @@ export function buildFusionDelegateTool(
                 if (outcome !== undefined) dependencyCheckOutcomes.set(c.index, outcome);
               });
               row = applyPostMergeChecks([row], checks.outcomes, previous)[0]!;
+              ranEvidence ||= checks.checksSkipped === undefined && checks.outcomes.length > 0 && checks.outcomes.length === own.length && checks.outcomes.every((o) => o.ok);
               if (checks.checksSkipped !== undefined) {
                 row = { ...row, status: "needs_orchestrator", error: `dependency: ${checks.checksSkipped}` };
               }
@@ -1637,6 +1650,14 @@ export function buildFusionDelegateTool(
                 runner: deps.syntaxCheck, workingDir: ctx.workingDir, roots: syntaxRoots, signal: runSignal,
                 ...(deps.knownSecrets === undefined ? {} : { knownSecrets: deps.knownSecrets() }),
               });
+              const syntax = row!.syntax;
+              ranEvidence ||= syntax !== undefined && syntax.error === undefined && syntax.checked > 0 && syntax.failedFiles.length === 0;
+            }
+            if (noChanges) {
+              // Artifact presence alone is no evidence: at least one own check
+              // or syntax check must actually have run here and passed.
+              if (row!.status === "ok" && ranEvidence) releasedNoChanges.add(id);
+              return;
             }
             if (row!.status !== "ok") gateState.verdicts.delete(id);
             finished.set(id, row!);
@@ -1646,6 +1667,7 @@ export function buildFusionDelegateTool(
             // An intervening worker can change check inputs through a shell,
             // even with no file-tool telemetry. Deduplicate only this release.
             verifiedProviders.clear();
+            releasedNoChanges.clear();
             for (const id of wave) {
               for (const provider of plan.dependencies.get(id) ?? []) await verifyProvider(provider);
             }
@@ -1665,7 +1687,7 @@ export function buildFusionDelegateTool(
                     !finished.has(id) &&
                     (plan.dependencies.get(id) ?? []).some((provider) => {
                       const done = finished.get(provider);
-                      return done?.status !== "ok";
+                      return done?.status !== "ok" && !releasedNoChanges.has(provider);
                     }),
                   );
             for (const id of held) {
@@ -1673,7 +1695,7 @@ export function buildFusionDelegateTool(
               const waitingOn = (plan.dependencies.get(id) ?? []).filter(
                 (provider) => {
                   const done = finished.get(provider);
-                  return done?.status !== "ok";
+                  return done?.status !== "ok" && !releasedNoChanges.has(provider);
                 },
               );
               finished.set(
@@ -2367,7 +2389,7 @@ function rebaseCandidateValue<T>(value: T, roots: readonly string[], to: string)
 
 function candidateToolResult(result: CompressedToolResult, report: CandidateIntegrationReport, candidateDir: string, originalDir: string, cap: number): CompressedToolResult {
   const note = report.status === "promoted" ? "Candidate promoted after final integration checks." : `Candidate rejected; file promotion did not complete. ${report.reason ?? ""}`;
-  const recovery = (report.patch === undefined ? "" : ` Changes retained at ${report.patch.path}${report.patch.filesDir === undefined ? "" : ` and ${report.patch.filesDir}`}.`) + (report.retainedWorkspace === undefined ? "" : ` Recovery workspace retained at ${report.retainedWorkspace}; remove it manually after recovery.`) + (report.heldArtifactsDir === undefined ? "" : ` Held task artifacts: ${report.heldArtifactsDir}.`) + (report.rollbackConflicts === undefined ? "" : ` Rollback left these concurrently changed or unwritable paths for review: ${report.rollbackConflicts.join(", ")}.`);
+  const recovery = (report.patch === undefined ? "" : ` Changes retained at ${report.patch.path}${report.patch.filesDir === undefined ? "" : ` and ${report.patch.filesDir}`}.`) + (report.retainedWorkspace === undefined ? "" : ` Recovery workspace retained at ${report.retainedWorkspace}; remove it manually after recovery.`) + (report.heldArtifactsDir === undefined ? "" : ` Held task artifacts: ${report.heldArtifactsDir}.`) + (report.rollbackConflicts === undefined ? "" : ` Rollback left these concurrently changed or unwritable paths for review: ${report.rollbackConflicts.join(", ")}.`) + (report.ignoredChanges === undefined ? "" : ` Ignored or disposable paths kept private to the candidate, never promoted: ${report.ignoredChanges.join(", ")}.`);
   const details = rebaseCandidateValue(result.details, [candidateDir, candidateDir.replace(/\\/g, "/")], originalDir);
   delete details.runId;
   return compressToolResult({ tool: result.tool, status: report.status === "rejected" ? "error" : result.status, output: `${note}${recovery} Candidate mode is non-resumable.\n\n${rebaseText(result.fullOutput ?? result.summary, [candidateDir, candidateDir.replace(/\\/g, "/")], originalDir)}`, details: { ...details, candidateIntegration: report } }, { maxSummaryLength: cap + 800, maxTailLines: 2000 });

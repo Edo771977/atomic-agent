@@ -916,6 +916,7 @@ export async function openAiFetch(
     // fetch threw without an HTTP response: DNS failure, refused
     // connection, TLS error, socket reset. Which of those it was lives
     // in the errno — keep it, and the original error with it.
+    request.requestBudget?.onSendFailed?.(err);
     const detail = err instanceof Error ? err.message : String(err);
     throw new OpenAiHttpError(
       `openai provider network error: ${detail}`,
@@ -942,13 +943,18 @@ async function httpErrorFromResponse(
   const timeout = new AbortController();
   const signal = request?.signal === undefined ? timeout.signal : AbortSignal.any([request.signal, timeout.signal]);
   const timeoutMs = request?.requestTimeoutMs ?? deps.requestTimeoutMs;
-  const timer = setTimeout(() => timeout.abort(new OpenAiHttpError(
-    `openai provider error body timed out after ${timeoutMs}ms: ${deps.baseUrl}${path}`,
-    res.status, `${deps.baseUrl}${path}`, true, null, deps.label,
-  )), timeoutMs);
+  const timer = setTimeout(() => timeout.abort(new DOMException("error body read timed out", "TimeoutError")), timeoutMs);
   timer.unref?.();
   let text: string;
   try { text = await readErrorBody(res, signal); }
+  catch (error) {
+    // The status already arrived and is authoritative: a stalled body only
+    // loses the diagnostic. A timeout flag would turn a 401 into "slow
+    // provider" for retry, fallback and credential checks. Caller
+    // cancellation (including the turn deadline) still propagates.
+    if (request?.signal?.aborted === true || !timeout.signal.aborted) throw error;
+    text = `(error body read timed out after ${timeoutMs}ms)`;
+  }
   finally { clearTimeout(timer); }
   // The standard `retry-after` header wins; some providers advertise
   // their cooldown only inside the error JSON (Gemini's OpenAI-compat

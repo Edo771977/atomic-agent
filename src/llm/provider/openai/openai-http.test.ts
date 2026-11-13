@@ -9,6 +9,7 @@ import {
   type OpenAiHttpDeps,
 } from "./openai-http.js";
 import { classifyFailure } from "../../reliability/classify-failure.js";
+import { isCredentialRejection } from "../../fallback/link-failure-kind.js";
 import { parseProviderErrorBody } from "./parse-provider-error-body.js";
 
 function depsWith(
@@ -412,6 +413,25 @@ describe("openAiPostJson", () => {
     expect(err).toBeInstanceOf(OpenAiHttpError);
     expect((err as OpenAiHttpError).timedOut).toBe(true);
     expect((err as OpenAiHttpError).status).toBeNull();
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the received status authoritative when its error body stalls past the timeout", async () => {
+    const fetchImpl = vi.fn(async () => new Response(new ReadableStream<Uint8Array>({ start(controller) {
+      controller.enqueue(new TextEncoder().encode('{"error":"inval'));
+    } }), { status: 401 }));
+    const err = await openAiPostJson(
+      depsWith(fetchImpl as unknown as typeof fetch, 20),
+      "/x",
+      {},
+      {},
+    ).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(OpenAiHttpError);
+    expect((err as OpenAiHttpError).status).toBe(401);
+    // A timeout flag would make the fallback read a key rejection as a slow provider.
+    expect((err as OpenAiHttpError).timedOut).toBe(false);
+    expect((err as OpenAiHttpError).message).toMatch(/^openai provider 401: .*error body read timed out after 20ms/);
+    expect(isCredentialRejection(err)).toBe(true);
     expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 

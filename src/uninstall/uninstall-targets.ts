@@ -170,12 +170,12 @@ export function isSafeToRemove(
   platform: NodeJS.Platform = process.platform,
 ): boolean {
   const path = pathFor(platform);
-  const target = path.resolve(input);
-  const home = path.resolve(homeDir);
   // Device/extended namespaces do not share ordinary DOS/UNC root and
   // alias semantics. Reject them for either operand rather than risk
   // comparing a protected home with a spelling of a different root.
-  if (platform === "win32" && [input, homeDir, target, home].some(isWindowsNamespace)) return false;
+  if (platform === "win32" && [input, homeDir, path.resolve(input), path.resolve(homeDir)].some(isWindowsNamespace)) return false;
+  const target = platform === "win32" ? windowsOpenedPath(input) : path.resolve(input);
+  const home = platform === "win32" ? windowsOpenedPath(homeDir) : path.resolve(homeDir);
   const fromHome = path.relative(home, target);
   if (fromHome.length === 0) return false;
   const toHome = path.relative(target, home);
@@ -190,5 +190,35 @@ export function isSafeToRemove(
   // never something we installed.
   const insideHome = !path.isAbsolute(fromHome) && fromHome !== ".." && !fromHome.startsWith(`..${path.sep}`);
   if (segments.length < 2 && !insideHome) return false;
+  // An 8.3 short name (`OPERAT~1`) cannot be resolved lexically: at or above
+  // home's depth it might be home or one of its ancestors, so refuse it, in
+  // the target or in home itself (a short-named home's long name is home).
+  if (platform === "win32" && segments.length <= homeDepth(home) && [...segments, ...homeSegments(home)].some((part) => SHORT_NAME.test(part))) return false;
   return true;
+}
+
+const SHORT_NAME = /~\d+(?:\.[^.]{0,3})?$/;
+
+function homeSegments(home: string): string[] {
+  return pathWin32.relative(pathWin32.parse(home).root, home).split(pathWin32.sep).filter((part) => part.length > 0);
+}
+
+function homeDepth(home: string): number {
+  return homeSegments(home).length;
+}
+
+/**
+ * The path a Win32 open reaches: trailing dots and spaces of each
+ * component are dropped, and a `:stream` suffix (`::$DATA` or a named
+ * stream) still names the same file or folder.
+ */
+function windowsOpenedPath(value: string): string {
+  const resolved = pathWin32.resolve(value);
+  const { root } = pathWin32.parse(resolved);
+  const parts = resolved.slice(root.length).split("\\").filter((part) => part.length > 0).map((part) => {
+    const colon = part.indexOf(":");
+    const name = (colon === -1 ? part : part.slice(0, colon)).replace(/[. ]+$/, "");
+    return name.length === 0 ? part : name;
+  });
+  return root + parts.join("\\");
 }

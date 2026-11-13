@@ -1,6 +1,7 @@
 import type { CompletionResult, CompletionUsage } from "../completion-types.js";
 import type { ReasoningFormat } from "../llm-provider.js";
 import { createReasoningExtractor } from "./reasoning-extractor.js";
+import { readServiceTier } from "./parse-sse-chunk.js";
 
 export function normaliseOpenAiChatResponse(
   json: Record<string, unknown>,
@@ -20,9 +21,11 @@ export function normaliseOpenAiChatResponse(
   const reasoningContent = createReasoningExtractor(
     reasoningFormat,
   ).extractFromMessage(message);
-  const usage = normaliseOpenAiUsage(
-    json.usage as Record<string, unknown> | undefined,
-  );
+  // The tier that served the request rides on the usage it priced.
+  const usage = {
+    ...normaliseOpenAiUsage(json.usage as Record<string, unknown> | undefined),
+    ...readServiceTier(json.service_tier),
+  };
   return {
     content,
     reasoningContent,
@@ -64,20 +67,23 @@ export function normaliseOpenAiUsage(
 ): CompletionUsage {
   const usage = raw ?? {};
   const details = usage.prompt_tokens_details;
-  const cached =
-    details !== null && typeof details === "object"
-      ? (details as Record<string, unknown>).cached_tokens
-      : usage.cache_read_input_tokens;
+  const hasDetails = details !== null && typeof details === "object";
+  const cached = hasDetails
+    ? (details as Record<string, unknown>).cached_tokens
+    : usage.cache_read_input_tokens;
   // Kimi reports cache writes beside the hits (ATO-912); they are billed
-  // at their own rate, so keep the count for the cost estimate.
-  const written =
-    details !== null && typeof details === "object"
-      ? (details as Record<string, unknown>).cache_write_tokens
-      : undefined;
-  const promptTokens = Number(usage.prompt_tokens ?? 0);
+  // at their own rate, so keep the count for the cost estimate. An
+  // Anthropic-shaped block names them `cache_creation_input_tokens`.
+  const written = hasDetails
+    ? (details as Record<string, unknown>).cache_write_tokens
+    : usage.cache_creation_input_tokens;
+  const reportedPrompt = Number(usage.prompt_tokens ?? 0);
   const reportedCompletion = Number(usage.completion_tokens ?? 0);
   const totalTokens = Number(usage.total_tokens ?? 0);
-  const output = readOutputTokens(usage, promptTokens, reportedCompletion, totalTokens);
+  const output = readOutputTokens(usage, reportedPrompt, reportedCompletion, totalTokens);
+  const promptTokens = hasDetails
+    ? reportedPrompt
+    : reportedPrompt + anthropicCacheOutsidePrompt(cached, written, reportedPrompt, reportedCompletion, totalTokens);
   return {
     ...([usage.prompt_tokens, usage.completion_tokens].every(value => typeof value === "number" && Number.isFinite(value) && value >= 0)
       ? {} : { incomplete: true as const }),
@@ -97,6 +103,35 @@ export function normaliseOpenAiUsage(
       ? { costUsd: usage.cost }
       : {}),
   };
+}
+
+/** A token count the service reported: finite and not negative, else 0. */
+function countOf(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+/**
+ * The Anthropic-shaped cache counts (`cache_read_input_tokens`,
+ * `cache_creation_input_tokens`) to add to `prompt_tokens`, or 0 when
+ * they are already inside it. Anthropic's own `input_tokens` excludes
+ * both, so they are outside unless `total_tokens` is reported and is
+ * smaller than prompt + completion + cache (it then counts them once,
+ * inside the prompt). The whole prompt is what a long-context threshold
+ * and the cache shares are measured against (`CompletionUsage` keeps
+ * the cache counts a subset of `promptTokens`).
+ */
+function anthropicCacheOutsidePrompt(
+  cached: unknown,
+  written: unknown,
+  prompt: number,
+  completion: number,
+  total: number,
+): number {
+  const cache = countOf(cached) + countOf(written);
+  if (cache === 0) return 0;
+  const totalReported = Number.isFinite(total) && total > 0;
+  if (totalReported && total < prompt + completion + cache && cache <= prompt) return 0;
+  return cache;
 }
 
 /**

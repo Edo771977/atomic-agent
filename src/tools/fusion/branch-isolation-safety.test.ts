@@ -1,11 +1,15 @@
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { runIsolatedWave } from "./branch-merge.js";
-import { createBranchSet, defaultGitExec } from "./branch-workspace.js";
+import { createBranchSet, defaultGitExec, touchedPaths } from "./branch-workspace.js";
 import type { DelegateTask } from "./delegate-args.js";
 import type { WorkerTaskResult } from "./worker-result.js";
+import { runWorkerTasks, type WorkerRunnerDeps } from "./worker-runner.js";
+import type { RunTurnResult } from "../../agent/agent-loop.js";
+import { createEmptySessionState } from "../../session/session-state.js";
+import { FUSION_WORKER_ID_PREFIX, type FusionWorkerMeta } from "../../session/fusion-worker-session.js";
 import { makeGitRepo, runGitRaw, writeRepoFile } from "../os/git/test-helpers.js";
 
 const cleanup: string[] = [];
@@ -13,8 +17,115 @@ afterEach(async () => {
   for (const dir of cleanup.splice(0)) await rm(dir, { recursive: true, force: true });
 });
 
+describe("shared dependency directories", () => {
+  it("isolates a repo whose ignored node_modules exceeds the copy budget across tasks", async () => {
+    const repo = await makeGitRepo("atag-shared-deps-");
+    cleanup.push(repo);
+    await writeRepoFile(repo, ".gitignore", "node_modules/\n");
+    await writeRepoFile(repo, "tracked.txt", "tracked\n");
+    await runGitRaw(repo, ["add", "-A"]);
+    await runGitRaw(repo, ["commit", "-q", "-m", "init"]);
+    await writeRepoFile(repo, "node_modules/dep/index.js", "x".repeat(300_000));
+    const { root } = await fixture();
+    const set = await createBranchSet(repo, ["t1", "t2", "t3"], { tmpRoot: root, maxCopyBytes: 100_000 });
+    expect(set).not.toBeNull();
+    try {
+      for (const id of ["t1", "t2", "t3"]) {
+        const dir = set!.workspaces.get(id)!.dir;
+        expect((await readFile(join(dir, "node_modules/dep/index.js"), "utf8")).length).toBe(300_000);
+        expect(await realpath(join(dir, "node_modules"))).toBe(await realpath(join(repo, "node_modules")));
+        expect([...set!.workspaces.get(id)!.manifest.keys()].some((p) => p.startsWith("node_modules"))).toBe(false);
+      }
+    } finally { await set?.cleanup(); }
+    expect(await readFile(join(repo, "node_modules/dep/index.js"), "utf8")).toHaveLength(300_000);
+  });
+
+  it("links ignored folders inside a dependency directory that keeps a tracked placeholder", async () => {
+    const repo = await makeGitRepo("atag-shared-gitkeep-");
+    cleanup.push(repo);
+    await writeRepoFile(repo, ".gitignore", "node_modules/*\n!node_modules/.gitkeep\n");
+    await writeRepoFile(repo, "node_modules/.gitkeep", "");
+    await runGitRaw(repo, ["add", "-A"]);
+    await runGitRaw(repo, ["commit", "-q", "-m", "init"]);
+    await writeRepoFile(repo, "node_modules/big/x.bin", "x".repeat(300_000));
+    await writeRepoFile(repo, "node_modules/big/node_modules/inner/y.bin", "y".repeat(300_000));
+    const { root } = await fixture();
+    const set = await createBranchSet(repo, ["t1", "t2"], { tmpRoot: root, maxCopyBytes: 100_000 });
+    expect(set).not.toBeNull();
+    try {
+      for (const id of ["t1", "t2"]) {
+        const dir = set!.workspaces.get(id)!.dir;
+        expect(await readFile(join(dir, "node_modules/.gitkeep"), "utf8")).toBe("");
+        expect((await lstat(join(dir, "node_modules"))).isSymbolicLink()).toBe(false);
+        expect(await realpath(join(dir, "node_modules/big"))).toBe(await realpath(join(repo, "node_modules/big")));
+        expect(await touchedPaths(set!.workspaces.get(id)!)).toEqual([]);
+      }
+    } finally { await set?.cleanup(); }
+  });
+
+  it("does not copy node_modules, target or .venv wholesale in the folder-copy fallback", async () => {
+    const { root, dir } = await fixture();
+    for (const name of ["node_modules", "target", ".venv"]) {
+      await mkdir(join(dir, name));
+      await writeFile(join(dir, name, "big.bin"), Buffer.alloc(300_000));
+    }
+    const set = await createBranchSet(dir, ["t1", "t2", "t3"], { tmpRoot: root, git: async () => null, maxCopyBytes: 100_000 });
+    expect(set).not.toBeNull();
+    try {
+      const one = set!.workspaces.get("t1")!.dir;
+      for (const name of ["node_modules", "target", ".venv"]) {
+        expect((await lstat(join(one, name))).isSymbolicLink()).toBe(true);
+        expect(await realpath(join(one, name))).toBe(await realpath(join(dir, name)));
+      }
+      expect(await readFile(join(one, "input.txt"), "utf8")).toBe("the user's original\n");
+    } finally { await set?.cleanup(); }
+  });
+});
+
+describe("tracked paths under excluded directory names", () => {
+  it("merges a tracked change under a directory named build and still skips untracked dist", async () => {
+    const repo = await makeGitRepo("atag-tracked-build-");
+    cleanup.push(repo);
+    await writeRepoFile(repo, ".gitignore", "dist/\n");
+    await writeRepoFile(repo, "scripts/build/pack.sh", "echo old\n");
+    await runGitRaw(repo, ["add", "-A"]);
+    await runGitRaw(repo, ["commit", "-q", "-m", "init"]);
+    await writeRepoFile(repo, "dist/out.js", "old build\n");
+    const { root } = await fixture();
+    const result = await runIsolatedWave({
+      realDir: repo, tasks: [task("one")], writeScope: [repo], inputs: [],
+      options: { tmpRoot: root },
+      run: async (_tasks, workspace) => {
+        const dir = workspace!("one")!.workingDir;
+        await writeFile(join(dir, "scripts/build/pack.sh"), "echo new\n");
+        await writeFile(join(dir, "scripts/build/extra.sh"), "echo extra\n");
+        await writeFile(join(dir, "dist/out.js"), "private build\n");
+        return [row("one")];
+      },
+    });
+    expect(result.outcomes[0]!.applied).toEqual(["scripts/build/extra.sh", "scripts/build/pack.sh"]);
+    expect(await readFile(join(repo, "scripts/build/pack.sh"), "utf8")).toBe("echo new\n");
+    expect(await readFile(join(repo, "dist/out.js"), "utf8")).toBe("old build\n");
+  });
+
+  it("reports a tracked change under a directory named build as touched for the recovery patch", async () => {
+    const repo = await makeGitRepo("atag-tracked-build-touched-");
+    cleanup.push(repo);
+    await writeRepoFile(repo, "scripts/build/pack.sh", "echo old\n");
+    await runGitRaw(repo, ["add", "-A"]);
+    await runGitRaw(repo, ["commit", "-q", "-m", "init"]);
+    const { root } = await fixture();
+    const set = await createBranchSet(repo, ["one"], { tmpRoot: root });
+    try {
+      const ws = set!.workspaces.get("one")!;
+      await writeFile(join(ws.dir, "scripts/build/pack.sh"), "echo changed and longer\n");
+      expect(await touchedPaths(ws)).toEqual([join("scripts", "build", "pack.sh")]);
+    } finally { await set?.cleanup(); }
+  });
+});
+
 describe("private branch dependencies", () => {
-  it("keeps ignored dependencies readable without sharing a failed task's writes", async () => {
+  it("keeps ignored caches private and dependencies readable without sharing a failed task's cache writes", async () => {
     const repo = await makeGitRepo("atag-private-ignored-");
     cleanup.push(repo);
     await writeRepoFile(repo, ".gitignore", "cache/\nnode_modules/\n");
@@ -34,7 +145,8 @@ describe("private branch dependencies", () => {
         expect(await readFile(join(dir, "cache/state.txt"), "utf8")).toBe("original cache\n");
         expect(await readFile(join(dir, "node_modules/dependency/index.js"), "utf8")).toBe("original dependency\n");
         await writeFile(join(dir, "cache/state.txt"), "bad cache\n");
-        await writeFile(join(dir, "node_modules/dependency/index.js"), "bad dependency\n");
+        // Shared with the original by a link, never copied or merged.
+        expect(await realpath(join(dir, "node_modules"))).toBe(await realpath(join(repo, "node_modules")));
         expect(await readFile(join(repo, "cache/state.txt"), "utf8")).toBe("original cache\n");
         return [{ ...row("failed"), status: "failed" }];
       },
@@ -45,21 +157,21 @@ describe("private branch dependencies", () => {
     expect(await readFile(join(repo, "node_modules/dependency/index.js"), "utf8")).toBe("original dependency\n");
   });
 
-  it("copies excluded directories privately outside git and does not share git metadata", async () => {
+  it("copies non-dependency excluded directories privately outside git and does not share git metadata", async () => {
     const { root, dir } = await fixture();
     await mkdir(join(dir, ".git"));
     await writeFile(join(dir, ".git", "marker"), "original git metadata");
-    await mkdir(join(dir, "node_modules"));
-    await writeFile(join(dir, "node_modules", "dependency.js"), "dependency\n");
+    await mkdir(join(dir, "dist"));
+    await writeFile(join(dir, "dist", "dependency.js"), "dependency\n");
     const set = await createBranchSet(dir, ["one", "two"], { tmpRoot: root, git: async () => null });
     expect(set).not.toBeNull();
     try {
       const one = set!.workspaces.get("one")!.dir;
       const two = set!.workspaces.get("two")!.dir;
-      expect(await readFile(join(one, "node_modules/dependency.js"), "utf8")).toBe("dependency\n");
-      await writeFile(join(one, "node_modules/dependency.js"), "changed\n");
-      expect(await readFile(join(two, "node_modules/dependency.js"), "utf8")).toBe("dependency\n");
-      expect(await readFile(join(dir, "node_modules/dependency.js"), "utf8")).toBe("dependency\n");
+      expect(await readFile(join(one, "dist/dependency.js"), "utf8")).toBe("dependency\n");
+      await writeFile(join(one, "dist/dependency.js"), "changed\n");
+      expect(await readFile(join(two, "dist/dependency.js"), "utf8")).toBe("dependency\n");
+      expect(await readFile(join(dir, "dist/dependency.js"), "utf8")).toBe("dependency\n");
       expect(await readdir(one)).not.toContain(".git");
     } finally { await set?.cleanup(); }
   });
@@ -67,15 +179,15 @@ describe("private branch dependencies", () => {
   it("counts ignored directory data against the copy limit before any worker starts", async () => {
     const repo = await makeGitRepo("atag-private-limit-");
     cleanup.push(repo);
-    await writeRepoFile(repo, ".gitignore", "node_modules/\n");
+    await writeRepoFile(repo, ".gitignore", "cache/\n");
     await runGitRaw(repo, ["add", ".gitignore"]);
     await runGitRaw(repo, ["commit", "-q", "-m", "init"]);
-    await writeRepoFile(repo, "node_modules/dependency.js", "large dependency".repeat(10));
+    await writeRepoFile(repo, "cache/state.bin", "large cache".repeat(10));
     const { root } = await fixture();
     let runs = 0;
     const result = await runIsolatedWave({
       realDir: repo, tasks: [task("one")], writeScope: [repo], inputs: [],
-      options: { tmpRoot: root, maxCopyBytes: 10 },
+      options: { tmpRoot: root, maxCopyBytes: 60 },
       run: async () => { runs += 1; return [row("one")]; },
     });
     expect(runs).toBe(0);
@@ -208,5 +320,62 @@ describe("required branch isolation", () => {
     } finally {
       await set!.cleanup();
     }
+  });
+});
+
+describe("declared-file status in a fresh private workspace", () => {
+  async function runIdle(method: "copy" | "worktree", act?: (dir: string) => Promise<void>): Promise<WorkerTaskResult> {
+    const repo = await makeGitRepo("atag-fresh-stamp-");
+    cleanup.push(repo);
+    await writeRepoFile(repo, "core.js", "export const core = 1;\n");
+    // An original written long ago: only the copy into the workspace is fresh.
+    const past = new Date(Date.now() - 3_600_000);
+    await utimes(join(repo, "core.js"), past, past);
+    await runGitRaw(repo, ["add", "-A"]);
+    await runGitRaw(repo, ["commit", "-q", "-m", "init"]);
+    const { root } = await fixture();
+    const set = await createBranchSet(repo, ["core"], { tmpRoot: root, ...(method === "copy" ? { git: async () => null } : {}) });
+    expect(set?.method).toBe(method);
+    try {
+      const ws = set!.workspaces.get("core")!.dir;
+      const deps: WorkerRunnerDeps = {
+        runTurn: async (session) => {
+          await act?.(ws);
+          return { session, reason: "reply", stepCount: 1 } as RunTurnResult;
+        },
+        createEphemeralSession: (meta: FusionWorkerMeta, workingDir?: string) =>
+          createEmptySessionState({ id: `${FUSION_WORKER_ID_PREFIX}${meta.taskId}`, workingDir: workingDir ?? repo, metadata: { fusionWorker: { ...meta } } }),
+        approvals: { setSessionPolicy: () => undefined, clearSessionPolicy: () => undefined },
+        emitEvent: () => undefined,
+        workingDir: repo,
+      };
+      const [result] = await runWorkerTasks(deps, {
+        parentSessionId: "s-parent", providerId: "local-llama", workerModel: "m", workerMaxSteps: 3, workerTimeoutMs: 60_000,
+        tasks: [{ id: "core", title: "Core", instructions: "provide core", files: ["core.js"] }],
+        maxWorkers: 1,
+        signal: new AbortController().signal,
+        taskWorkspace: () => ({ workingDir: ws, writeScope: [ws] }),
+      });
+      return result!;
+    } finally { await set?.cleanup(); }
+  }
+
+  it.each(["copy", "worktree"] as const)("reports no_changes for an idle worker in a %s workspace made just before it ran", async (method) => {
+    const result = await runIdle(method);
+    expect(result.status).toBe("no_changes");
+    expect(result.notes).toContain("core.js unchanged by this task");
+  });
+
+  it.each(["copy", "worktree"] as const)("still sees an immediate same-size shell edit in a %s workspace", async (method) => {
+    const result = await runIdle(method, async (ws) => {
+      const file = join(ws, "core.js");
+      const before = await stat(file);
+      await writeFile(file, "export const core = 2;\n");
+      const after = await stat(file);
+      expect(after.size).toBe(before.size);
+      expect(after.mtimeMs).not.toBe(before.mtimeMs);
+    });
+    expect(result.status).toBe("ok");
+    expect(result.notes ?? []).not.toContain("core.js unchanged by this task");
   });
 });

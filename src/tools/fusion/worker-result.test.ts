@@ -145,6 +145,43 @@ describe("WorkerRunCollector", () => {
     expect(sumWorkerBilling([fullyBilled, fullyBilled])).toBeUndefined();
   });
 
+  // Long-context rates are per request: a sum of steps that each stayed
+  // below the threshold is not one long prompt.
+  describe("long-context pricing of a multi-step worker", () => {
+    const pricing = { input: 3, output: 15, longContext: { thresholdTokens: 200_000, input: 6, output: 22.5 } };
+    const step = (promptTokens: number) => completed({ promptTokens, completionTokens: 1_000, totalTokens: promptTokens + 1_000 });
+
+    it("prices sub-threshold steps summed above the threshold at the base rates", () => {
+      const c = new WorkerRunCollector({ pricing });
+      for (let i = 0; i < 10; i++) c.observe(step(30_000));
+      const result = c.finish({ id: "t", title: "T", reason: "reply", stepCount: 10, durationMs: 1 });
+      expect(result.usage?.promptTokens).toBe(300_000);
+      const base = (300_000 * 3 + 10_000 * 15) / 1_000_000;
+      expect(taskSpendUsd(result, pricing)).toBeCloseTo(base, 9);
+      expect(fanoutSpend([result], pricing, "m").usd).toBeCloseTo(base, 9);
+      // A row without the collector's split (an older checkpoint) is a
+      // sum too: base rates, never the long-context switch on the total.
+      expect(taskSpendUsd({ usage: result.usage }, pricing)).toBeCloseTo(base, 9);
+    });
+
+    it("prices only the step above the threshold at the long-context rates", () => {
+      const c = new WorkerRunCollector({ pricing });
+      c.observe(step(250_000));
+      c.observe(step(50_000));
+      const result = c.finish({ id: "t", title: "T", reason: "reply", stepCount: 2, durationMs: 1 });
+      const long = (250_000 * 6 + 1_000 * 22.5) / 1_000_000;
+      const base = (50_000 * 3 + 1_000 * 15) / 1_000_000;
+      expect(taskSpendUsd(result, pricing)).toBeCloseTo(long + base, 9);
+      // A split parent keeps the per-step pricing of its rows.
+      const other = new WorkerRunCollector({ pricing });
+      other.observe(step(250_000));
+      const otherRow = other.finish({ id: "u", title: "U", reason: "reply", stepCount: 1, durationMs: 1 });
+      const summed = sumWorkerBilling([result, otherRow]);
+      expect(summed).toBeDefined();
+      expect(summed!.billedUsd + taskSpendUsd({ usage: summed!.unbilled }, pricing)).toBeCloseTo(2 * long + base, 9);
+    });
+  });
+
   it("leaves a fully billed or fully unbilled worker without a billing split", () => {
     const billed = new WorkerRunCollector();
     billed.observe(completed({ promptTokens: 10, completionTokens: 1, totalTokens: 11, costUsd: 0.1 }));

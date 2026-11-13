@@ -19,3 +19,18 @@ it("deduplicates registry identities using native case rules and retains the fir
   const registry = new DeclaredInputsRegistry(); registry.declare("worker", [upper, lower]);
   expect(registry.inputsOf("worker")).toEqual(process.platform === "win32" ? [upper] : [upper, lower]);
 });
+
+it("folds Windows trailing dots/spaces and NTFS stream suffixes into the file's identity", () => {
+  const input = inputPathIdentity("C:\\proj\\input.txt", "win32");
+  for (const alias of ["C:\\proj\\input.txt.", "C:\\proj\\input.txt ", "C:\\proj\\input.txt. .", "C:\\proj.\\input.txt", "C:\\PROJ \\Input.TXT",
+    "C:\\proj\\input.txt::$DATA", "C:\\proj\\input.txt::$data", "C:\\proj\\input.txt:extra", "C:\\proj\\input.txt:extra:$DATA", "c:/proj/input.txt.::$DATA"]) {
+    expect(inputPathIdentity(alias, "win32"), alias).toBe(input);
+  }
+  expect(inputPathIdentity("C:\\proj\\input.txt2", "win32")).not.toBe(input);
+  expect(inputPathIdentity("C:\\proj\\.input.txt", "win32")).not.toBe(input);
+});
+
+it("keeps trailing dots, spaces and colons significant on POSIX", () => {
+  expect(inputPathIdentity("/proj/input.txt.", "linux")).not.toBe(inputPathIdentity("/proj/input.txt", "linux"));
+  expect(inputPathIdentity("/proj/input.txt::$DATA", "linux")).not.toBe(inputPathIdentity("/proj/input.txt", "linux"));
+});
