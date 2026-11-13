@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { isLocalProviderUrl } from "../presets/is-local-provider-url.js";
+import { classifiableHostOf } from "../url-host.js";
 import { isLocalServerUrl } from "./local-server-url.js";
 import {
   describeOtherComputerUnreachable,
@@ -119,6 +120,33 @@ describe("address classification edge cases", () => {
     expect(isLocalProviderUrl("http://[::ffff:127.0.0.1]:8080")).toBe(true);
     expect(isLocalServerUrl("http://[::ffff:8.8.8.8]")).toBe(false);
     expect(isOtherComputerOnNetworkUrl("http://[::ffff:8.8.8.8]")).toBe(false);
+  });
+
+  it("classifies other IPv6 forms that carry an IPv4 address by that address", () => {
+    // IPv4-translated (::ffff:0:a.b.c.d), NAT64 well-known (64:ff9b::/96),
+    // IPv4-compatible (::a.b.c.d) and 6to4 (2002:AABB:CCDD::/48), dotted
+    // and in the hex form Node rewrites them to.
+    for (const url of [
+      "https://[::ffff:0:192.168.1.5]",
+      "https://[::ffff:0:c0a8:105]",
+      "https://[64:ff9b::192.168.1.5]",
+      "https://[64:ff9b::c0a8:105]",
+      "https://[::192.168.1.5]",
+      "https://[::c0a8:105]",
+      "https://[2002:c0a8:105::]",
+      "https://[2002:c0a8:105:1::1]",
+      "https://[2002:0a00::1]",
+    ]) {
+      expect(classifiableHostOf(url), url).toMatch(/^(192\.168\.1\.5|10\.0\.0\.0)$/);
+      expect(isOtherComputerOnNetworkUrl(url), url).toBe(true);
+    }
+    expect(classifiableHostOf("https://[64:ff9b::808:808]")).toBe("8.8.8.8");
+    expect(classifiableHostOf("https://[2002:808:808::]")).toBe("8.8.8.8");
+    // Not an embedded address: loopback, unspecified and ordinary IPv6.
+    expect(classifiableHostOf("http://[::1]")).toBe("::1");
+    expect(classifiableHostOf("http://[::]")).toBe("::");
+    expect(classifiableHostOf("http://[2001:db8::1]")).toBe("2001:db8::1");
+    expect(classifiableHostOf("http://[64:ff9b:1::c0a8:105]")).toBe("64:ff9b:1::c0a8:105");
   });
 
   it("counts the Tailscale / CGNAT block 100.64.0.0/10 as the operator's network", () => {
