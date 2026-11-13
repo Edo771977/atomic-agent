@@ -70,7 +70,25 @@ const AGENT_STATE_DIR = dirname(BRANCH_MERGE_DIR);
  * cannot deliver state the runtime later loads as `.atomic-agent/`.
  */
 const isAgentState = (rel: string): boolean => windowsComponentIdentity(rel.split(sep)[0] ?? "").toLowerCase() === AGENT_STATE_DIR.toLowerCase();
-async function inventory(root: string, workspace: BranchWorkspace, tracked: ReadonlySet<string>, bounds: InventoryBounds): Promise<Inventory> {
+/**
+ * An untracked path the inventory leaves out (ignore rules, dependency and
+ * build folder names): a top-level stamp only, never walked or hashed.
+ */
+interface DroppedEntry { kind: "file" | "symlink" | "directory"; size: number; mode: number }
+type Dropped = Map<string, DroppedEntry>;
+const droppedStamp = (info: Stats): DroppedEntry => ({ kind: info.isDirectory() ? "directory" : info.isSymbolicLink() ? "symlink" : "file", size: info.size, mode: info.mode & 0o777 });
+/**
+ * Dropped paths new in `after`, or standalone entries whose kind, size or
+ * mode moved. Not mtime: the base and the candidate are separate copies.
+ */
+function droppedChanges(before: Dropped, after: Dropped): string[] {
+  return [...after].filter(([path, entry]) => {
+    const prior = before.get(path);
+    if (prior === undefined) return true;
+    return entry.kind !== "directory" && (prior.kind !== entry.kind || prior.size !== entry.size || prior.mode !== entry.mode);
+  }).map(([path]) => path).sort();
+}
+async function inventory(root: string, workspace: BranchWorkspace, tracked: ReadonlySet<string>, bounds: InventoryBounds, dropped?: Dropped): Promise<Inventory> {
   const out: Inventory = new Map();
   const leaves: { rel: string; info: Stats }[] = [];
   const walk = async (dir: string): Promise<void> => {
@@ -87,7 +105,10 @@ async function inventory(root: string, workspace: BranchWorkspace, tracked: Read
       const rel = join(dir, item.name);
       if (item.name === ".git" || rel === BRANCH_MERGE_DIR || rel.startsWith(`${BRANCH_MERGE_DIR}${sep}`)) continue;
       // Disposable dependency/build/ignored folders, unless they hold tracked paths.
-      if ((VERIFY_COPY_EXCLUDED.has(item.name) || workspace.excludedDirectories?.has(rel) || ignored?.has(rel)) && !tracked.has(rel)) continue;
+      if ((VERIFY_COPY_EXCLUDED.has(item.name) || workspace.excludedDirectories?.has(rel) || ignored?.has(rel)) && !tracked.has(rel)) {
+        if (dropped !== undefined) dropped.set(rel, droppedStamp(await lstat(join(root, rel))));
+        continue;
+      }
       bounds.signal?.throwIfAborted();
       if (--bounds.entries < 0) throw new Error("candidate inventory entry limit exceeded");
       const info = await lstat(join(root, rel));
@@ -105,7 +126,7 @@ async function inventory(root: string, workspace: BranchWorkspace, tracked: Read
   const untracked = leaves.filter(leaf => !tracked.has(leaf.rel)).map(leaf => leaf.rel);
   const ignoredFiles = untracked.length === 0 ? undefined : await workspace.directoryIgnorePolicy?.(untracked, bounds.signal);
   for (const { rel, info } of leaves) {
-    if (ignoredFiles?.has(rel) === true) continue;
+    if (ignoredFiles?.has(rel) === true) { dropped?.set(rel, droppedStamp(info)); continue; }
     bounds.signal?.throwIfAborted();
     const path = join(root, rel);
     if (info.isSymbolicLink()) { out.set(rel, { kind: "symlink", mode: 0, hash: createHash("sha256").update(await readlink(path)).digest("hex") }); continue; }
@@ -115,6 +136,42 @@ async function inventory(root: string, workspace: BranchWorkspace, tracked: Read
     out.set(rel, { kind: "file", mode: info.mode & 0o777, hash });
   }
   return out;
+}
+const posixPath = (path: string): string => path.split(sep).join("/");
+/** Whether `path` is `root` or lies under it (both relative). */
+const atOrUnder = (path: string, root: string): boolean => path === root || path.startsWith(`${root}${sep}`);
+/**
+ * Why promotion would lose work to the ignore rules, or `undefined`:
+ * a declared `provides` path (`kind: "file"` name, or any `in`) that lies
+ * at or under a path the inventory drops; or a deleted tracked file whose
+ * bytes reappear in a new ignored standalone file (a rename onto an
+ * ignored name such as `notes.md` → `notes.log`). Renames into an
+ * existing ignored directory are not walked; they show in `ignoredChanges`.
+ */
+async function lostToIgnoreRules(changed: readonly string[], base: Inventory, final: Inventory, dropped: Dropped, fresh: readonly string[], input: CandidateFinishInput, dir: string, baseDir: string): Promise<string | undefined> {
+  const declared = (input.contract?.provides ?? []).flatMap(provide => [...(provide.kind === "file" ? [provide.name] : []), ...(provide.in === undefined ? [] : [provide.in])]).flatMap(path => {
+    let absolute: string;
+    try { absolute = resolveUserPath(path, dir); } catch { return []; }
+    return isInside(dir, absolute) ? [relative(dir, absolute)] : [];
+  });
+  const hidden = [...new Set(declared.filter(path => [...dropped.keys()].some(root => atOrUnder(path, root))))].sort();
+  if (hidden.length > 0) return `declared provides lie under ignored or disposable paths that are never promoted (${hidden.map(posixPath).join(", ")}); deliver them in tracked or unignored paths`;
+  const deleted = changed.filter(path => base.get(path)?.kind === "file" && !final.has(path));
+  if (deleted.length === 0) return undefined;
+  // Only a new ignored file of a deleted file's size is hashed.
+  const sizes = new Set<number>();
+  for (const path of deleted) sizes.add((await lstat(join(baseDir, path))).size);
+  const hashes = new Map(deleted.map(path => [base.get(path)!.hash!, path]));
+  const renamed: string[] = [];
+  for (const path of fresh) {
+    const entry = dropped.get(path);
+    if (entry?.kind !== "file" || !sizes.has(entry.size)) continue;
+    const hash = await fileHash(join(dir, path), { bytes: VERIFY_COPY_MAX_BYTES, entries: 1, signal: input.signal });
+    const source = hashes.get(hash);
+    if (source !== undefined) renamed.push(`${posixPath(source)} → ${posixPath(path)}`);
+  }
+  if (renamed.length > 0) return `tracked files would be deleted while their bytes survive only in ignored files that are never promoted (${renamed.join(", ")})`;
+  return undefined;
 }
 function differences(a: Inventory, b: Inventory): string[] {
   return [...new Set([...a.keys(), ...b.keys()])].filter(path => !equal(a.get(path), b.get(path))).sort();
@@ -128,6 +185,12 @@ export interface CandidateIntegrationReport {
   /** Relative paths from the authoritative final snapshot; disposable directories excluded. */
   changes: string[];
   contract?: ContractReport;
+  /**
+   * New or restamped untracked paths the ignore rules (and dependency/build
+   * folder names) kept private to the candidate: never promoted. Top-level
+   * entries only; a directory is named once, not walked.
+   */
+  ignoredChanges?: string[];
   /** Concurrent edits prevent rollback of these paths; their current bytes were preserved. */
   rollbackConflicts?: string[];
   /** Recovery fallback if a bounded patch cannot be made; cleanup leaves this private workspace intact. */
@@ -165,11 +228,12 @@ export async function createCandidateIntegration(
   const workspace = set.workspaces.get(id)!;
   let tracked: ReadonlySet<string>;
   try { tracked = await trackedPaths(set, options.git ?? defaultGitExec); } catch (err) { await set.cleanup(); throw err; }
-  const snapshot = (root: string, signal?: AbortSignal): Promise<Inventory> => inventory(root, workspace, tracked, { bytes: options.maxInventoryBytes ?? options.maxCopyBytes ?? VERIFY_COPY_MAX_BYTES, entries: options.maxInventoryEntries ?? 100_000, signal: signal === undefined ? AbortSignal.timeout(options.maxInventoryMs ?? 30_000) : AbortSignal.any([signal, AbortSignal.timeout(options.maxInventoryMs ?? 30_000)]) });
+  const snapshot = (root: string, signal?: AbortSignal, dropped?: Dropped): Promise<Inventory> => inventory(root, workspace, tracked, { bytes: options.maxInventoryBytes ?? options.maxCopyBytes ?? VERIFY_COPY_MAX_BYTES, entries: options.maxInventoryEntries ?? 100_000, signal: signal === undefined ? AbortSignal.timeout(options.maxInventoryMs ?? 30_000) : AbortSignal.any([signal, AbortSignal.timeout(options.maxInventoryMs ?? 30_000)]) }, dropped);
   let retain = false;
   let base: Inventory;
+  const baseDropped: Dropped = new Map();
   try {
-    base = await snapshot(set.baseDir, setupSignal);
+    base = await snapshot(set.baseDir, setupSignal, baseDropped);
     if (differences(base, await snapshot(set.realDir, setupSignal)).length > 0) throw new Error("original project changed while creating candidate");
     // A hard process stop cannot write a patch. Normal completion cleans
     // this marker; a stale sweep must preserve the only recovery copy.
@@ -248,6 +312,7 @@ export async function createCandidateIntegration(
       const applied: string[] = []; const rollbackConflicts: string[] = [];
       let final: Inventory | undefined;
       let artifactManifest: ArtifactManifest | undefined;
+      let ignoredChanges: string[] = [];
       try {
         input.signal.throwIfAborted();
         if (input.rows.length === 0 || input.rows.some(row => row.status !== "ok") || input.tasks?.some(task => !input.rows.some(row => row.id === task.id))) return await reject("candidate not promoted: every task must close with status ok");
@@ -266,8 +331,13 @@ export async function createCandidateIntegration(
         if (checked.checksSkipped !== undefined || checked.outcomes.length !== checks.length || checked.outcomes.some(check => !check.ok)) return await reject("candidate not promoted: final integration checks failed or could not be verified", { contract: evidence });
         if (provides.providesSkipped !== undefined || provides.findings.some(finding => !finding.present) || provides.findings.length !== (input.contract?.provides?.length ?? 0)) return await reject("candidate not promoted: declared provides are missing or uninspectable", { contract: evidence });
         input.signal.throwIfAborted();
-        final = await snapshot(workspace.dir, input.signal);
+        const finalDropped: Dropped = new Map();
+        final = await snapshot(workspace.dir, input.signal, finalDropped);
         const changed = differences(base, final);
+        // Ignore rules keep these private, so promotion would silently lose them.
+        ignoredChanges = droppedChanges(baseDropped, finalDropped);
+        const lost = await lostToIgnoreRules(changed, base, final, finalDropped, ignoredChanges, input, workspace.dir, set.baseDir);
+        if (lost !== undefined) return await reject(`candidate not promoted: ${lost}`, { contract: evidence, ignoredChanges: ignoredChanges.map(posixPath) });
         // Approval rules and other project agent state are operator-owned: a
         // worker cannot loosen or remove them by way of a promoted candidate.
         const agentState = changed.filter(isAgentState);
@@ -324,7 +394,7 @@ export async function createCandidateIntegration(
         }
         promotionSignal.throwIfAborted();
         if (differences(final, await snapshot(set.realDir, promotionSignal)).length > 0) throw new Error("original project changed while completing candidate delivery");
-        return { status: "promoted", nonResumable: true, changes: changed.map(p => p.split(sep).join("/")), contract: evidence, artifactManifest };
+        return { status: "promoted", nonResumable: true, changes: changed.map(posixPath), contract: evidence, artifactManifest, ...(ignoredChanges.length === 0 ? {} : { ignoredChanges: ignoredChanges.map(posixPath) }) };
       } catch (err) {
         // Roll back only bytes we still own. If a user edited a delivered
         // path, retain that edit and report it instead of overwriting it.

@@ -212,6 +212,7 @@ it("never promotes deletion or modification of ignored standalone files", async 
     await writeFile(join(next.dir, ".env.local"), "created\n");
     const report = await next.finish({ rows, contract, signal, runChecks: pass });
     expect(report.status).toBe("promoted"); expect(report.changes).toEqual([".env.local"]);
+    expect(report.ignoredChanges).toEqual([".env"]);
     expect(await readFile(join(root, ".env"), "utf8")).toBe("SECRET=1\n");
   } finally { await next.cleanup(); }
 });
@@ -279,5 +280,50 @@ it.each([".ATOMIC-AGENT", ".Atomic-Agent", ".atomic-agent.", ".atomic-agent "])(
     const report = await candidate.finish({ rows, contract, signal, runChecks: pass });
     expect(report.status).toBe("rejected"); expect(report.reason).toContain("agent state");
     await expect(lstat(join(root, name))).rejects.toThrow();
+  } finally { await candidate.cleanup(); }
+});
+
+async function droppedRepo() {
+  const repo = await makeGitRepo("atag-candidate-dropped-"); roots.push(repo);
+  await writeRepoFile(repo, ".gitignore", "*.log\nout/\n");
+  await writeRepoFile(repo, "src/notes.md", "keep me\n");
+  await writeRepoFile(repo, "a.txt", "a\n");
+  await runGitRaw(repo, ["add", "-A"]); await runGitRaw(repo, ["commit", "-qm", "fixture"]);
+  return repo;
+}
+
+it("rejects a tracked file renamed onto an ignored name instead of silently deleting it", async () => {
+  const root = await droppedRepo(); const candidate = await createCandidateIntegration(root);
+  try {
+    await writeFile(join(candidate.dir, "src", "notes.log"), await readFile(join(candidate.dir, "src", "notes.md")));
+    await rm(join(candidate.dir, "src", "notes.md"));
+    const report = await candidate.finish({ rows, contract, signal, runChecks: pass });
+    expect(report.status).toBe("rejected");
+    expect(report.reason).toContain("src/notes.md"); expect(report.reason).toContain("src/notes.log");
+    expect(await readFile(join(root, "src", "notes.md"), "utf8")).toBe("keep me\n");
+  } finally { await candidate.cleanup(); }
+});
+
+it("rejects a declared provide that only exists under an ignored path", async () => {
+  const root = await droppedRepo(); const candidate = await createCandidateIntegration(root);
+  try {
+    await mkdir(join(candidate.dir, "out")); await writeFile(join(candidate.dir, "out", "bundle.js"), "export {}\n");
+    await writeFile(join(candidate.dir, "a.txt"), "a2\n");
+    const tasks = [{ id: "api", title: "api", instructions: "build" }] as never;
+    const report = await candidate.finish({ rows, tasks, contract: { ...contract, provides: [{ task: "api", kind: "file", name: "out/bundle.js" }] } as never, signal, runChecks: pass });
+    expect(report.status).toBe("rejected"); expect(report.reason).toContain("out/bundle.js");
+    expect(await readFile(join(root, "a.txt"), "utf8")).toBe("a\n");
+  } finally { await candidate.cleanup(); }
+});
+
+it("promotes but reports new ignored paths it kept private", async () => {
+  const root = await droppedRepo(); const candidate = await createCandidateIntegration(root);
+  try {
+    await writeFile(join(candidate.dir, "a.txt"), "a2\n");
+    await writeFile(join(candidate.dir, "run.log"), "log\n");
+    await mkdir(join(candidate.dir, "out")); await writeFile(join(candidate.dir, "out", "x.js"), "x\n");
+    const report = await candidate.finish({ rows, contract, signal, runChecks: pass });
+    expect(report.status).toBe("promoted"); expect(report.changes).toEqual(["a.txt"]);
+    expect(report.ignoredChanges).toEqual(["out", "run.log"]);
   } finally { await candidate.cleanup(); }
 });
