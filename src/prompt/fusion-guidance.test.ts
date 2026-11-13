@@ -328,3 +328,13 @@ describe("task sizing per worker leg", () => {
   });
 });
 
+
+describe("the orchestrator as a task target", () => {
+  it("sends hard parts and twice-failed ones to model \"orchestrator\", the bulk to workers", () => {
+    for (const block of [FUSION_GUIDANCE, buildFusionGuidance(FACTS)]) {
+      expect(block).toContain(
+        'Hard parts, or one that failed twice, go to `model: "orchestrator"` (a worker turn on your model); keep the bulk on workers.',
+      );
+    }
+  });
+});

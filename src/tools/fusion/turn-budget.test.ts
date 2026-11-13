@@ -410,3 +410,66 @@ describe("auto-replan after a breaker trip (ATO-1406)", () => {
     expect(result.details.replan).toBeUndefined();
   });
 });
+
+describe("model: \"orchestrator\" tasks count like any priced worker", () => {
+  const hard = (i: number) => ({
+    id: `h${i}`,
+    instructions: `the hard part ${i}`,
+    model: "orchestrator",
+  });
+
+  it("pins each to the orchestrator leg, prices it there and counts it toward the spend cap", async () => {
+    const budget = new FusionTurnBudget();
+    budget.begin("s-parent");
+    const pins: Array<string | undefined> = [];
+    const priced: Array<[string, string]> = [];
+    const d = deps({
+      resolveRunMode: () => mode({ turnBudgetUsd: 1.5 }),
+      turnBudget: budget,
+      resolveWorkerPricing: (providerId, model) => {
+        priced.push([providerId, model]);
+        return { input: 1, output: 4, cacheRead: 0.1 };
+      },
+    });
+    const inner = d.runTurn;
+    d.runTurn = (async (session, message, options) => {
+      pins.push(options.providerId);
+      return inner(session, message, options);
+    }) as FusionDelegateDeps["runTurn"];
+    const result = await buildFusionDelegateTool(d).run(
+      { tasks: [hard(1), hard(2), hard(3)] },
+      ctx(),
+    );
+    // $1 each on the orchestrator leg: the second crosses $1.50.
+    expect(d.turns).toBe(2);
+    expect(pins).toEqual(["openrouter", "openrouter"]);
+    expect(priced).toContainEqual(["openrouter", "big"]);
+    const rows = result.details.tasks as Array<{
+      id: string;
+      status: string;
+      model?: string;
+      notes?: string[];
+      error?: string;
+    }>;
+    expect(rows[0]).toMatchObject({ model: "big" });
+    expect(rows[0]!.notes).toContain("ran on big (the orchestrator's model)");
+    expect(rows[2]).toMatchObject({ id: "h3", status: "cancelled" });
+    expect(rows[2]!.error).toMatch(/^not started: the spend cap/);
+    expect(result.details.turnBudget).toMatchObject({ kind: "usd" });
+  });
+
+  it("counts against maxTasksPerTurn like worker tasks", async () => {
+    const budget = new FusionTurnBudget();
+    budget.begin("s-parent");
+    const d = deps({
+      resolveRunMode: () => mode({ maxTasksPerTurn: 2 }),
+      turnBudget: budget,
+    });
+    const result = await buildFusionDelegateTool(d).run(
+      { tasks: [hard(1), { id: "w", instructions: "bulk" }, hard(2)] },
+      ctx(),
+    );
+    expect(d.turns).toBe(0);
+    expect(result.details).toMatchObject({ reason: "turn-count", kind: "tasks" });
+  });
+});

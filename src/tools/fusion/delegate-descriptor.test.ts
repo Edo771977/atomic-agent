@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { getDefaultArgsJsonSchema } from "../../prompt/default-tool-args-schemas.js";
 import { getToolDescriptorByName } from "../../prompt/tool-descriptors.js";
 import { MAX_DELEGATE_TASKS, parseDelegateArgs } from "./delegate-args.js";
+import { ORCHESTRATOR_TASK_MODEL } from "./role-models.js";
 
 /**
  * The `fusion.delegate` descriptor teaches the orchestrator the call; the
@@ -143,5 +144,24 @@ describe("fusion.delegate descriptor and schema agree", () => {
     expect(descriptor.summary).toContain(
       "A local worker's brief quotes only the first ~6,000 chars of the request, so there `instructions` must also carry whatever beyond those the task needs.",
     );
+  });
+});
+
+describe("fusion.delegate task model \"orchestrator\"", () => {
+  it("is taught by the descriptor, accepted by the schema and kept by the parser", () => {
+    expect(descriptor.argsSchema).toContain(`"${ORCHESTRATOR_TASK_MODEL}"`);
+    const args = {
+      tasks: [
+        {
+          id: "hard",
+          instructions: "Fix the parser edge case in src/p.ts in place.",
+          model: ORCHESTRATOR_TASK_MODEL,
+        },
+      ],
+    };
+    expect(violations(args, schema)).toEqual([]);
+    const parsed = parseDelegateArgs(args);
+    expect(parsed.ok).toBe(true);
+    expect(parsed.ok && parsed.tasks[0]!.model).toBe(ORCHESTRATOR_TASK_MODEL);
   });
 });

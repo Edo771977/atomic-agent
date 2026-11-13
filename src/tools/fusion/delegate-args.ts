@@ -127,7 +127,8 @@ export interface DelegateTask {
   role?: FusionRole;
   /**
    * A model the planner picked for this task by name (ATO-943): one of
-   * the role models or the worker leg's, by model name or provider id.
+   * the role models or the worker leg's, by model name or provider id,
+   * or `"orchestrator"` for a worker turn on the orchestrator leg.
    * Checked against that list by the tool, not here (the parser has no
    * run mode); a name outside it refuses the call.
    */

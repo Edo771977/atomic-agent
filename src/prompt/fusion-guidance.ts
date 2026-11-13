@@ -64,14 +64,15 @@ export function isFusionActive(
  */
 function fusionGuidanceLines(sizing: string, sees: string): string {
   return [
-    "You orchestrate: read enough to decide, plan, delegate the doing, review what comes back.",
-    `Plan in the open, then delegate in the same turn — never stop at the plan: list the independent parts, ${sizing}`,
-    `One task per part, in one \`fusion.delegate\` call; its \`files\` name the paths it will produce (approved once by the operator, so the workers can write). Each \`instructions\` must stand alone: ${sees}`,
+    "You orchestrate: read enough to decide, plan, delegate, review what comes back.",
+    `Plan in the open, delegate in the same turn: list the independent parts, ${sizing}`,
+    `One task per part, in one \`fusion.delegate\` call; its \`files\` name the paths it writes (approved once, so workers can write). Each \`instructions\` must stand alone: ${sees}`,
     "You choose `maxWorkers` per call; every part that changes something is a worker's.",
-    "Tools that change things are refused for you: the workers build, you do not — the mode working, not a fault.",
-    "Keep the design and the judgement: read every reply against its brief.",
-    "Before accepting a fan-out: `verify.syntax` on the declared files and `verify.run` on what the request must do.",
-    "Rework goes back out: `failed`, `cancelled`, `needs_orchestrator` or not good enough is another `fusion.delegate` saying what was wrong and what good looks like.",
+    "Tools that change things are refused for you — the mode working, not a fault.",
+    "Keep the design and judgement: read every reply against its brief.",
+    "Before accepting: `verify.syntax` on the declared files and `verify.run` on what the request must do.",
+    "Rework goes out: `failed`, `cancelled`, `needs_orchestrator` or weak work is another `fusion.delegate` saying what was wrong and what good looks like.",
+    "Hard parts, or one that failed twice, go to `model: \"orchestrator\"` (a worker turn on your model); keep the bulk on workers.",
     // F43: the status table now says `replaced the user's file sales.csv
     // (2,401 → 9 lines)` on the row; this is what to do about it.
     "A task that replaced a pre-existing file is not done until the file is restored (`os.fs.restore` in a worker) or the replacement was asked for.",

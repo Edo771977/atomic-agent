@@ -671,7 +671,10 @@ const DEFAULT_TOOL_ARGS_SCHEMAS: ReadonlyMap<string, Schema> = new Map<
               maxSteps: { type: "integer", minimum: 1 },
               timeoutMs: { type: "integer", minimum: 1 },
               // Models by role (ATO-943): the task runs on that role's
-              // model, or on the named one from the `### fusion` list.
+              // model, or on the named one from the `### fusion` list;
+              // `"orchestrator"` is always allowed in fusion (a worker
+              // turn on the orchestrator leg). A free string, since the
+              // role models are configuration.
               role: {
                 type: "string",
                 enum: ["plan", "build", "review", "explore", "utility"],

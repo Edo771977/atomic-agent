@@ -333,11 +333,30 @@ export function buildFusionDelegateTool(
       // refuses the call; without `roles` every task is on the worker
       // leg, as before.
       const workerLegRef = { providerId: workerProviderId, model: workerModel };
-      const modelProblem = unknownModels(parsed.tasks, workerLegRef, mode.roles);
+      // `model: "orchestrator"`: a worker turn on the orchestrator's own
+      // leg, under every worker rule, priced and capped like a role leg.
+      const orchestratorLegRef =
+        mode.orchestratorProviderId === null
+          ? undefined
+          : {
+              providerId: mode.orchestratorProviderId,
+              model: mode.orchestratorModel ?? mode.orchestratorProviderId,
+            };
+      const modelProblem = unknownModels(
+        parsed.tasks,
+        workerLegRef,
+        mode.roles,
+        orchestratorLegRef,
+      );
       if (modelProblem !== undefined) {
         return error(modelProblem, { field: "tasks", reason: "unknown-model" });
       }
-      const taskLegs = resolveTaskLegs(parsed.tasks, workerLegRef, mode.roles);
+      const taskLegs = resolveTaskLegs(
+        parsed.tasks,
+        workerLegRef,
+        mode.roles,
+        orchestratorLegRef,
+      );
       // Tasks sized past what a small local worker does well: run as
       // asked, never refused. Said on the approval line (before any
       // worker starts, when a person is asked) and on the result (the
@@ -1537,7 +1556,7 @@ export function buildFusionDelegateTool(
             ...(leg.isWorkerLeg
               ? []
               : [
-                  `ran on ${leg.model}${leg.role === undefined ? "" : ` (role ${leg.role})`}`,
+                  `ran on ${leg.model}${leg.orchestrator === true ? " (the orchestrator's model)" : leg.role === undefined ? "" : ` (role ${leg.role})`}`,
                 ]),
           ];
           return {
