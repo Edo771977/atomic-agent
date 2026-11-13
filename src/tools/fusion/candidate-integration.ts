@@ -154,7 +154,7 @@ export async function createCandidateIntegration(
 ): Promise<CandidateIntegration> {
   const id = `candidate-${randomBytes(6).toString("hex")}`;
   const setupSignal = options.signal === undefined ? AbortSignal.timeout(120_000) : AbortSignal.any([options.signal, AbortSignal.timeout(120_000)]);
-  const set = await createBranchSet(realDir, [id], { ...options, signal: setupSignal });
+  const set = await createBranchSet(realDir, [id], { ...options, signal: setupSignal, privateDependencyDirectories: true });
   if (set === null) throw new Error("candidate workspace unavailable: private copies exceed the copy limit");
   const workspace = set.workspaces.get(id)!;
   let tracked: ReadonlySet<string>;

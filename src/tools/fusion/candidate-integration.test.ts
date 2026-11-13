@@ -1,7 +1,8 @@
-import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, realpath, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, expect, it } from "vitest";
+import { createBranchSet } from "./branch-workspace.js";
 import { createCandidateIntegration } from "./candidate-integration.js";
 import type { WorkerTaskResult } from "./worker-result.js";
 import { makeGitRepo, runGitRaw, writeRepoFile } from "../os/git/test-helpers.js";
@@ -231,4 +232,41 @@ it("refuses to promote changes to the project's agent state directory", async ()
       expect(await readFile(join(root, "a.txt"), "utf8")).toBe("a\n");
     } finally { await candidate.cleanup(); }
   }
+});
+
+it("keeps worker writes under a shared dependency folder private to the candidate, even after rejection", async () => {
+  const root = await ignoreRepo(); const candidate = await createCandidateIntegration(root);
+  try {
+    // The candidate's dependency folder is its own copy, never a link to the original.
+    expect((await lstat(join(candidate.dir, "node_modules"))).isSymbolicLink()).toBe(false);
+    expect(await readFile(join(candidate.dir, "node_modules", "dep.js"), "utf8")).toBe("dep\n");
+    // Per-task workspaces made inside the candidate share the candidate's copy.
+    const inner = await createBranchSet(candidate.dir, ["worker"]);
+    expect(inner).not.toBeNull();
+    try {
+      const task = inner!.workspaces.get("worker")!;
+      expect(await realpath(join(task.dir, "node_modules"))).toBe(await realpath(join(candidate.dir, "node_modules")));
+      await writeFile(join(task.dir, "node_modules", "dep.js"), "worker write\n");
+      await writeFile(join(task.dir, "node_modules", "added.js"), "worker add\n");
+    } finally { await inner!.cleanup(); }
+    expect(await readFile(join(root, "node_modules", "dep.js"), "utf8")).toBe("dep\n");
+    await expect(lstat(join(root, "node_modules", "added.js"))).rejects.toThrow();
+    const report = await candidate.finish({ rows, contract, signal, runChecks: async () => ({ ok: false, results: [{ ok: false }] }) });
+    expect(report.status).toBe("rejected");
+    expect(await readFile(join(root, "node_modules", "dep.js"), "utf8")).toBe("dep\n");
+    await expect(lstat(join(root, "node_modules", "added.js"))).rejects.toThrow();
+  } finally { await candidate.cleanup(); }
+  expect(await readFile(join(root, "node_modules", "dep.js"), "utf8")).toBe("dep\n");
+});
+
+it("gives a folder-copy candidate its own dependency folder too", async () => {
+  const root = await project();
+  await mkdir(join(root, "node_modules")); await writeFile(join(root, "node_modules", "dep.js"), "dep\n");
+  const candidate = await createCandidateIntegration(root);
+  try {
+    expect((await lstat(join(candidate.dir, "node_modules"))).isSymbolicLink()).toBe(false);
+    await writeFile(join(candidate.dir, "node_modules", "dep.js"), "worker write\n");
+    expect((await candidate.reject("test")).status).toBe("rejected");
+  } finally { await candidate.cleanup(); }
+  expect(await readFile(join(root, "node_modules", "dep.js"), "utf8")).toBe("dep\n");
 });
