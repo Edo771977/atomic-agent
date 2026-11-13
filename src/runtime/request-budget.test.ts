@@ -43,6 +43,31 @@ describe("request budget scope", () => {
     expect(() => setup(bound * 1.001).scope().beforeSend(body())).not.toThrow();
 });
 
+  // A 200k window at the $3.75 cache-write rate alone holds $0.75.
+  it.each<[string, Record<string, unknown>]>([
+    ["OpenRouter plugins", { plugins: [{ id: "web" }] }],
+    ["an :online model id", { model: "m:online" }],
+    ["web_search_options", { web_search_options: {} }],
+    ["a non-function tool", { tools: [{ type: "web_search_preview" }] }],
+  ])("reserves the context window for provider-side input added by %s", (_label, extra) => {
+    const body = () => ({ model: "m", messages: [{ role: "user", content: "hi" }], ...extra });
+    expect(() => setup(0.75).scope().beforeSend(body())).toThrow(/budget|cap/i);
+    expect(() => setup(0.82).scope().beforeSend(body())).not.toThrow();
+  });
+
+  it("refuses provider-side input when the context window is not verified", () => {
+    const budget = new FusionTurnBudget();
+    budget.begin("p", 0, { usd: 10 });
+    const req = { sessionId: "p", prompt: "hi", maxOutputTokens: 4096 } as CompletionRequest;
+    const s = createRequestBudgetScope(budget, req, provider, entry, { ...model, source: "default" })!;
+    expect(() => s.beforeSend({ model: "m", messages: [], plugins: [{ id: "web" }] })).toThrow(/provider-side input/);
+  });
+
+  it("keeps the byte-sized input reservation for function tools", () => {
+    const body = { model: "m", messages: [], tools: [{ type: "function", function: { name: "f", parameters: {} } }] };
+    expect(() => setup(0.1).scope().beforeSend(body)).not.toThrow();
+  });
+
   function refused(code: string): Error {
     const error = new TypeError("fetch failed") as TypeError & { cause?: unknown };
     error.cause = Object.assign(new Error(`connect ${code}`), { code });

@@ -17,6 +17,22 @@ const RELEASED_STATUSES = new Set([400, 401, 402, 403, 404, 405, 413, 415, 422, 
 // stays charged.
 const UNSENT_ERRNOS = new Set(["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN"]);
 
+/**
+ * True when the provider can add prompt input the serialized body does not
+ * contain: OpenRouter `plugins` (e.g. web) or `:online` models, OpenAI
+ * `web_search_options`, or any tool that is not a client-side function.
+ */
+function addsProviderSideInput(body: Record<string, unknown>): boolean {
+  const plugins = body.plugins;
+  if (plugins !== undefined && plugins !== null && !(Array.isArray(plugins) && plugins.length === 0)) return true;
+  if (typeof body.model === "string" && body.model.endsWith(":online")) return true;
+  if (body.web_search_options !== undefined && body.web_search_options !== null) return true;
+  const tools = body.tools;
+  if (tools === undefined || tools === null) return false;
+  if (!Array.isArray(tools)) return true;
+  return tools.some(tool => typeof tool !== "object" || tool === null || (tool as { type?: unknown }).type !== "function");
+}
+
 export interface RequestBudgetScope extends CompletionRequestBudget {
   signal?: AbortSignal;
   finish(result?: CompletionResult): void;
@@ -77,9 +93,18 @@ export function createRequestBudgetScope(
       // Every tokenizer emits at most one token per UTF-8 byte of text, so
       // the serialized body bounds the prompt; JSON keys/escaping and a fixed
       // framing allowance deliberately overestimate the server's template.
-      // The context window is not a floor: it would reserve a full window
-      // for every short request and starve parallel workers.
-      const inputTokens = Buffer.byteLength(JSON.stringify(body), "utf8") + 1024;
+      // The context window is not a floor for ordinary bodies: it would
+      // reserve a full window for every short request and starve parallel
+      // workers. It is the floor when the provider adds input of its own
+      // (web search results, server tools) that the body cannot bound.
+      const bodyTokens = Buffer.byteLength(JSON.stringify(body), "utf8") + 1024;
+      let inputTokens = bodyTokens;
+      if (addsProviderSideInput(body)) {
+        if (model?.source === "default" || !Number.isFinite(model?.contextWindow) || model!.contextWindow <= 0) {
+          throw new Error("turn budget cannot bound provider-side input (web search plugins or server tools) without a verified model context window");
+        }
+        inputTokens = Math.max(bodyTokens, model!.contextWindow);
+      }
       const inputRate = Math.max(pricing!.input, pricing!.cacheWrite ?? pricing!.input, pricing!.cacheRead ?? pricing!.input);
       const copies = [body.n, body.best_of].filter(value => value !== undefined);
       if (!copies.every(value => typeof value === "number" && Number.isInteger(value) && value > 0)) throw new Error("turn budget cannot verify the request's completion count");
