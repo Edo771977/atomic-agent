@@ -233,6 +233,39 @@ describe("a worker's self-check before its reply closes the task", () => {
     expect(row!.status).toBe("ok");
   });
 
+  it("masks secrets in a failing check's output before the notice reaches the worker", async () => {
+    const leaky = {
+      ok: false,
+      summary: "verify.run command: FAILED\nexit 1 after 40 ms",
+      stderrTail:
+        "Error: connect ECONNREFUSED DATABASE_URL=postgres://app:hunter2-pw-9@db:5432/app\n" +
+        "using token ghp_abcdefghijklmnopqrstuvwxyz0123456789 and key custom-known-value-77",
+    };
+    const runChecks = vi.fn<ContractCheckRunner>(async (specs) => ({
+      ok: false,
+      results: specs.map(() => leaky),
+    }));
+    const { deps, calls } = harness(dir, (call) => {
+      say(call, "done");
+      return {};
+    }, runChecks);
+    deps.knownSecrets = () => [{ label: "MY_API_KEY", value: "custom-known-value-77" }];
+    await runWorkerTasks(deps, {
+      ...BASE,
+      tasks: [{ id: "t", title: "T", instructions: "x" }],
+      contract: CHECKED,
+      signal: new AbortController().signal,
+    });
+    expect(calls).toHaveLength(2);
+    const notice = calls[1]!.message;
+    expect(notice).toContain("- your check");
+    expect(notice).not.toContain("hunter2-pw-9");
+    expect(notice).not.toContain("ghp_abcdefghijklmnopqrstuvwxyz0123456789");
+    expect(notice).not.toContain("custom-known-value-77");
+    expect(notice).toContain("postgres://app:[redacted:password]@db");
+    expect(notice).toContain("[redacted:MY_API_KEY]");
+  });
+
   it("runSelfCheck reports a check run it cut at the cap as not run, never as failed", async () => {
     const out = await runSelfCheck({
       task: { id: "t", title: "T", instructions: "x" },

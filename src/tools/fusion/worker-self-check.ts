@@ -8,6 +8,10 @@ import {
 import type { ContractCheck, DelegateContract } from "./contract.js";
 import type { DelegateTask } from "./delegate-args.js";
 import { inspectDeclaredFiles, type DegenerateFile } from "./declared-files.js";
+import {
+  maskSecrets,
+  type KnownSecret,
+} from "../../error-reporting/secret-detector.js";
 
 /**
  * A worker checks its own work before its reply closes the task.
@@ -143,10 +147,18 @@ function describeSpec(check: ContractCheck): string {
   return json.length > CHECK_SPEC_CHARS ? `${json.slice(0, CHECK_SPEC_CHARS)}…` : json;
 }
 
-/** The one notice the worker gets, as the next message of its conversation. */
+/**
+ * The one notice the worker gets, as the next message of its
+ * conversation. Masked whole with the shared detector before it is sent
+ * (`known`: the agent's own keys, as the tool registry masks with,
+ * ATO-1077): the check ran outside the registry, and its output — a
+ * `DATABASE_URL`, a token a test printed — would otherwise reach the
+ * worker's model, its session and its trace as it was.
+ */
 export function renderSelfCheckNotice(
   finding: SelfCheckFinding,
   graceSteps: number,
+  known: readonly KnownSecret[] = [],
 ): string {
   const lines = [
     "Your reply did not close the task: the runtime checked your work and it is not done yet.",
@@ -167,7 +179,7 @@ export function renderSelfCheckNotice(
   lines.push(
     `Fix exactly this now; you have ${graceSteps} more steps. ${finding.missing.length + finding.degenerate.length > 0 ? "Write each declared file with its full content. " : ""}${finding.failed.length > 0 ? "Re-run the failing check with verify.run until it passes. " : ""}If the cause is a file another task owns, do not write it: say so in your reply. Then reply with what you changed.`,
   );
-  return lines.join("\n");
+  return maskSecrets(lines.join("\n"), known);
 }
 
 /** The row's note: what the worker was told, so the orchestrator knows it had its second chance. */

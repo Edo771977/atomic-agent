@@ -61,6 +61,10 @@ import {
 import { hasSplitProposal, splitSteer } from "./task-tree.js";
 import type { ContractCheckRunner } from "./contract-checks.js";
 import {
+  knownSecretsFromEnv,
+  type KnownSecret,
+} from "../../error-reporting/secret-detector.js";
+import {
   SELF_CHECK_GRACE_STEPS,
   SELF_CHECK_MAX_MS,
   SELF_CHECK_MIN_GRACE_STEPS,
@@ -535,6 +539,14 @@ export interface WorkerRunnerDeps {
    * are reported as not run and never assumed to have passed.
    */
   runChecks?: ContractCheckRunner;
+  /**
+   * The agent's own secrets (exact values: `.env`, the config's keys),
+   * for masking check output that reaches a worker outside the tool
+   * registry — the same list the registry masks tool results with
+   * (ATO-1077). Absent: the environment's (`knownSecretsFromEnv`); the
+   * detector's shape rules apply either way.
+   */
+  knownSecrets?: () => readonly KnownSecret[];
 }
 
 /** Escalations one worker may get, automatic and manual together. */
@@ -1473,7 +1485,11 @@ async function runOneTask(
     try {
       grace = await deps.runTurn(
         first.session,
-        renderSelfCheckNotice(finding, graceSteps),
+        renderSelfCheckNotice(
+          finding,
+          graceSteps,
+          deps.knownSecrets?.() ?? knownSecretsFromEnv(),
+        ),
         runTurnOptions(graceSteps, Math.max(1, left)),
       );
     } finally {
