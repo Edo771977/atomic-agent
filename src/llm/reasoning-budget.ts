@@ -72,11 +72,14 @@ export function effectiveReasoningBudgetTokens(budgetTokens: number): number {
  * per-request grammar bound (`withReasoningBudget`); a cloud leg keeps
  * reading the effort from the body builder instead.
  *
- * Picked from the fusion bench above (500–7,152 reasoning tokens per
- * tool step): `low` keeps the routine steps at the bench's low end,
- * `medium` lets a typical step finish its thought and cuts the long
- * tail that made workers miss their time limit, and `high` leaves room
- * for a hard step while still stopping a runaway one.
+ * Placed against the fusion bench above, which recorded a range of
+ * 500–7,152 reasoning tokens per tool step and no per-step distribution
+ * (no median or percentile): `low` sits at about the bench's low end,
+ * `medium` at about three times it, well under the top, so the long
+ * steps that made workers miss their time limit are cut, and `high`
+ * leaves about four-sevenths of the longest recorded step. Steps that
+ * needed more than a level allows are cut mid-thought; the bench cannot
+ * say how many that is.
  */
 export const LOCAL_WORKER_REASONING_BUDGET_TOKENS: Readonly<Record<ReasoningEffort, number>> = {
   low: 512,
