@@ -104,3 +104,35 @@ describe("describeOtherComputerUnreachable", () => {
     expect(describeOtherComputerUnreachable(undefined, "fetch failed")).toBeNull();
   });
 });
+
+describe("address classification edge cases", () => {
+  it("classifies an IPv4-mapped IPv6 address by the IPv4 inside it", () => {
+    // Node rewrites `[::ffff:192.168.1.20]` to `[::ffff:c0a8:114]`.
+    for (const url of ["http://[::ffff:192.168.1.20]:8080", "http://[::ffff:c0a8:114]:8080", "http://[::ffff:10.0.0.5]"]) {
+      expect(isOtherComputerOnNetworkUrl(url), url).toBe(true);
+      expect(isLocalServerUrl(url), url).toBe(true);
+    }
+    for (const url of ["http://[::ffff:127.0.0.1]:8080", "http://[::ffff:7f00:2]"]) {
+      expect(isOtherComputerOnNetworkUrl(url), url).toBe(false);
+      expect(isLocalServerUrl(url), url).toBe(true);
+    }
+    expect(isLocalProviderUrl("http://[::ffff:127.0.0.1]:8080")).toBe(true);
+    expect(isLocalServerUrl("http://[::ffff:8.8.8.8]")).toBe(false);
+    expect(isOtherComputerOnNetworkUrl("http://[::ffff:8.8.8.8]")).toBe(false);
+  });
+
+  it("counts the Tailscale / CGNAT block 100.64.0.0/10 as the operator's network", () => {
+    for (const url of ["http://100.64.0.1:8080", "http://100.100.1.2:8080", "http://100.127.255.254"]) {
+      expect(isOtherComputerOnNetworkUrl(url), url).toBe(true);
+    }
+    for (const url of ["http://100.63.255.255", "http://100.128.0.1"]) {
+      expect(isLocalServerUrl(url), url).toBe(false);
+    }
+  });
+
+  it("treats the IPv6 unspecified address like 0.0.0.0: this machine", () => {
+    expect(isLocalProviderUrl("http://[::]:8080")).toBe(true);
+    expect(isLocalServerUrl("http://[::]:8080")).toBe(true);
+    expect(isOtherComputerOnNetworkUrl("http://[::]:8080")).toBe(false);
+  });
+});

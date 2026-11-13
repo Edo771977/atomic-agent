@@ -12,6 +12,7 @@ export function isLocalProviderUrl(baseUrl: string | undefined): boolean {
     host === "localhost" ||
     host === "127.0.0.1" ||
     host === "0.0.0.0" ||
+    host === "::" ||
     host === "::1" ||
     host.endsWith(".localhost")
   );
