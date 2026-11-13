@@ -487,3 +487,18 @@ it("keeps promotion backups owner-only while recording the original mode in the 
   expect(seen).toEqual({ folder: 0o700, backup: 0o600, recorded: 0o644 });
   expect((await stat(join(root, "secret.env"))).mode & 0o777).toBe(0o644);
 });
+
+it("rolls back a directory it created even when setting its mode fails", async () => {
+  const root = await project();
+  faults.chmod = path => path === join(root, "made");
+  const candidate = await createCandidateIntegration(root);
+  try {
+    await mkdir(join(candidate.dir, "made")); await chmod(join(candidate.dir, "made"), 0o750);
+    await writeFile(join(candidate.dir, "made", "x.txt"), "x");
+    const report = await candidate.finish({ rows, contract, signal, runChecks: pass });
+    expect(report.status).toBe("rejected"); expect(report.reason).toMatch(/injected chmod failure/);
+    expect(report.rollbackConflicts).toBeUndefined();
+    await expect(lstat(join(root, "made"))).rejects.toThrow();
+    expect(await promotionFiles(root)).toEqual([]);
+  } finally { await candidate.cleanup(); }
+});

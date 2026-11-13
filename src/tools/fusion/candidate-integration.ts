@@ -358,14 +358,16 @@ export async function createCandidateIntegration(
   };
   // Same-directory rename never writes through an existing symlink. A fresh
   // ancestor scan also refuses a parent replaced with a link during delivery.
-  const writeEntry = async (root: string, rel: string, expected: Entry | undefined, verified: Stats | undefined): Promise<void> => {
+  // `landed` runs right after the change itself, before any follow-up that
+  // can still fail (a directory's chmod), so rollback knows to undo it.
+  const writeEntry = async (root: string, rel: string, expected: Entry | undefined, verified: Stats | undefined, landed: () => void = () => undefined): Promise<void> => {
     const target = join(set.realDir, rel);
     for (let parent = dirname(rel); parent !== "."; parent = dirname(parent)) {
       const info = await lstat(join(set.realDir, parent));
       if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`delivery parent is no longer a directory: ${parent}`);
     }
-    if (expected === undefined) { await commitGuard(rel, verified); await rm(target); return; }
-    if (expected.kind === "directory") { await commitGuard(rel, verified); await mkdir(target); await chmod(target, expected.mode); return; }
+    if (expected === undefined) { await commitGuard(rel, verified); await rm(target); landed(); return; }
+    if (expected.kind === "directory") { await commitGuard(rel, verified); await mkdir(target, { mode: expected.mode }); landed(); await chmod(target, expected.mode); return; }
     const tmp = join(dirname(target), `.atag-candidate-${randomBytes(8).toString("hex")}`);
     try {
       if (expected.kind === "symlink") {
@@ -378,7 +380,7 @@ export async function createCandidateIntegration(
         await chmod(tmp, expected.mode);
       }
       await commitGuard(rel, verified);
-      await rename(tmp, target);
+      await rename(tmp, target); landed();
     } finally { await rm(tmp, { force: true }); }
   };
 
@@ -529,9 +531,9 @@ export async function createCandidateIntegration(
           promotionSignal.throwIfAborted(); await options.beforeApply?.(path, index); promotionSignal.throwIfAborted();
           const verified = await verifyPaths(withAncestors(path), expectedAt, "original project changed during candidate delivery");
           const step = await journal!.step(path, base.get(path), final.get(path)); steps.set(path, step);
-          if (base.get(path)?.kind === "directory" && !final.has(path)) { await commitGuard(path, verified); await rmdir(join(set.realDir, path)); }
-          else await writeEntry(workspace.dir, path, final.get(path), verified);
-          applied.push(path); appliedSet.add(path);
+          const landed = (): void => { applied.push(path); appliedSet.add(path); };
+          if (base.get(path)?.kind === "directory" && !final.has(path)) { await commitGuard(path, verified); await rmdir(join(set.realDir, path)); landed(); }
+          else await writeEntry(workspace.dir, path, final.get(path), verified, landed);
           step.status = "applied"; journal!.write();
         }
         promotionSignal.throwIfAborted();
@@ -567,8 +569,11 @@ export async function createCandidateIntegration(
           const step = steps.get(path);
           try {
             const current = await observeEntry(set.realDir, path, liveBounds(AbortSignal.timeout(options.maxInventoryMs ?? 30_000)));
-            if (!equal(current.entry, final?.get(path))) { rollbackConflicts.push(path); if (step !== undefined) step.status = "rollback-conflict"; journalOk = record() && journalOk; continue; }
-            if (final?.get(path)?.kind === "directory" && !base.has(path)) { await commitGuard(path, current.stat); await rmdir(join(set.realDir, path)); }
+            // A directory we created is ours whatever its mode (its chmod may
+            // be what failed); rmdir removes it only while it is empty.
+            const created = final?.get(path)?.kind === "directory" && !base.has(path);
+            if (created ? current.entry?.kind !== "directory" : !equal(current.entry, final?.get(path))) { rollbackConflicts.push(path); if (step !== undefined) step.status = "rollback-conflict"; journalOk = record() && journalOk; continue; }
+            if (created) { await commitGuard(path, current.stat); await rmdir(join(set.realDir, path)); }
             else await writeEntry(set.baseDir, path, base.get(path), current.stat);
             if (step !== undefined) step.status = "rolled-back";
           } catch { rollbackConflicts.push(path); if (step !== undefined) step.status = "rollback-conflict"; }
