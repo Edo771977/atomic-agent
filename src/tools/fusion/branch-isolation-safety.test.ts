@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { runIsolatedWave } from "./branch-merge.js";
-import { createBranchSet, defaultGitExec } from "./branch-workspace.js";
+import { createBranchSet, defaultGitExec, touchedPaths } from "./branch-workspace.js";
 import type { DelegateTask } from "./delegate-args.js";
 import type { WorkerTaskResult } from "./worker-result.js";
 import { makeGitRepo, runGitRaw, writeRepoFile } from "../os/git/test-helpers.js";
@@ -51,6 +51,48 @@ describe("shared dependency directories", () => {
         expect(await realpath(join(one, name))).toBe(await realpath(join(dir, name)));
       }
       expect(await readFile(join(one, "input.txt"), "utf8")).toBe("the user's original\n");
+    } finally { await set?.cleanup(); }
+  });
+});
+
+describe("tracked paths under excluded directory names", () => {
+  it("merges a tracked change under a directory named build and still skips untracked dist", async () => {
+    const repo = await makeGitRepo("atag-tracked-build-");
+    cleanup.push(repo);
+    await writeRepoFile(repo, ".gitignore", "dist/\n");
+    await writeRepoFile(repo, "scripts/build/pack.sh", "echo old\n");
+    await runGitRaw(repo, ["add", "-A"]);
+    await runGitRaw(repo, ["commit", "-q", "-m", "init"]);
+    await writeRepoFile(repo, "dist/out.js", "old build\n");
+    const { root } = await fixture();
+    const result = await runIsolatedWave({
+      realDir: repo, tasks: [task("one")], writeScope: [repo], inputs: [],
+      options: { tmpRoot: root },
+      run: async (_tasks, workspace) => {
+        const dir = workspace!("one")!.workingDir;
+        await writeFile(join(dir, "scripts/build/pack.sh"), "echo new\n");
+        await writeFile(join(dir, "scripts/build/extra.sh"), "echo extra\n");
+        await writeFile(join(dir, "dist/out.js"), "private build\n");
+        return [row("one")];
+      },
+    });
+    expect(result.outcomes[0]!.applied).toEqual(["scripts/build/extra.sh", "scripts/build/pack.sh"]);
+    expect(await readFile(join(repo, "scripts/build/pack.sh"), "utf8")).toBe("echo new\n");
+    expect(await readFile(join(repo, "dist/out.js"), "utf8")).toBe("old build\n");
+  });
+
+  it("reports a tracked change under a directory named build as touched for the recovery patch", async () => {
+    const repo = await makeGitRepo("atag-tracked-build-touched-");
+    cleanup.push(repo);
+    await writeRepoFile(repo, "scripts/build/pack.sh", "echo old\n");
+    await runGitRaw(repo, ["add", "-A"]);
+    await runGitRaw(repo, ["commit", "-q", "-m", "init"]);
+    const { root } = await fixture();
+    const set = await createBranchSet(repo, ["one"], { tmpRoot: root });
+    try {
+      const ws = set!.workspaces.get("one")!;
+      await writeFile(join(ws.dir, "scripts/build/pack.sh"), "echo changed and longer\n");
+      expect(await touchedPaths(ws)).toEqual([join("scripts", "build", "pack.sh")]);
     } finally { await set?.cleanup(); }
   });
 });

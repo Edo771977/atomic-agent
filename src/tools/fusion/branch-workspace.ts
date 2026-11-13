@@ -165,6 +165,8 @@ export interface BranchWorkspace {
   readonly excludedDirectories?: ReadonlySet<string>;
   /** Frozen rules also classify ignored directories created after dispatch. */
   readonly directoryIgnorePolicy?: DirectoryIgnorePolicy;
+  /** Tracked files and their ancestor directories: never excluded by name or ignore rule. */
+  readonly trackedPaths?: ReadonlySet<string>;
 }
 
 export interface BranchSet {
@@ -264,13 +266,16 @@ function isUnderMergeDir(rel: string): boolean {
  * Every regular file and symlink under `root` with its size, mtime and
  * mode. Symlinks are stamped, not followed; the copy exclusions (`.git`,
  * `node_modules`, …) and the merge folder are skipped: none of it is
- * merged back.
+ * merged back. A path in `trackedPaths` (a tracked file or one of its
+ * ancestors, e.g. `scripts/build`) is kept despite its name or an ignore
+ * rule: a tracked change there is a deliverable.
  */
 export async function stampTree(
   root: string,
   excludedDirectories: ReadonlySet<string> = new Set(),
   directoryIgnorePolicy?: DirectoryIgnorePolicy,
   signal?: AbortSignal,
+  trackedPaths: ReadonlySet<string> = new Set(),
 ): Promise<Map<string, FileStamp>> {
   signal?.throwIfAborted();
   const out = new Map<string, FileStamp>();
@@ -289,9 +294,10 @@ export async function stampTree(
     }
     for (const entry of entries) {
       signal?.throwIfAborted();
-      if (VERIFY_COPY_EXCLUDED.has(entry.name)) continue;
       const full = join(dir, entry.name);
       const rel = relative(root, full);
+      if (entry.name === ".git") continue;
+      if (VERIFY_COPY_EXCLUDED.has(entry.name) && !trackedPaths.has(rel)) continue;
       if (isUnderMergeDir(rel) || excludedDirectories.has(rel)) continue;
       if (entry.isDirectory()) {
         directories.push(rel);
@@ -319,6 +325,7 @@ export async function stampTree(
   if (ignored !== undefined && ignored.size > 0) {
     for (const rel of out.keys()) {
       signal?.throwIfAborted();
+      if (trackedPaths.has(rel)) continue;
       for (let dir = dirname(rel); dir !== "."; dir = dirname(dir)) {
         if (ignored.has(dir)) { out.delete(rel); break; }
       }
@@ -580,6 +587,10 @@ export async function createBranchSet(
         .filter((path) => path.endsWith("/"))
         .map((path) => path.slice(0, -1).split("/").join(sep)),
     );
+    const trackedPaths = new Set<string>();
+    for (const path of snapshot?.tracked ?? []) {
+      for (let rel = path.split("/").join(sep); rel !== "." && !trackedPaths.has(rel); rel = dirname(rel)) trackedPaths.add(rel);
+    }
     const workspaces = new Map<string, BranchWorkspace>();
     for (const [index, taskId] of taskIds.entries()) {
       const name = workspaceName(index, taskId);
@@ -589,8 +600,9 @@ export async function createBranchSet(
         taskId,
         name,
         dir,
-        manifest: await stampTree(dir, excludedDirectories, directoryIgnorePolicy, options.signal),
+        manifest: await stampTree(dir, excludedDirectories, directoryIgnorePolicy, options.signal, trackedPaths),
         excludedDirectories,
+        trackedPaths,
         ...(directoryIgnorePolicy === undefined ? {} : { directoryIgnorePolicy }),
       });
     }
@@ -611,7 +623,7 @@ export async function touchedPaths(
   workspace: BranchWorkspace,
   signal?: AbortSignal,
 ): Promise<string[]> {
-  const now = await stampTree(workspace.dir, workspace.excludedDirectories, workspace.directoryIgnorePolicy, signal);
+  const now = await stampTree(workspace.dir, workspace.excludedDirectories, workspace.directoryIgnorePolicy, signal, workspace.trackedPaths);
   const out: string[] = [];
   for (const [rel, stamp] of now) {
     signal?.throwIfAborted();
