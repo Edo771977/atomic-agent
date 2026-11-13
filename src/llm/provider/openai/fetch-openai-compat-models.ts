@@ -6,6 +6,7 @@
 
 import {
   buildOpenAiAuthHeaders,
+  redirectRefusal,
   type OpenAiCompatAuth,
 } from "./openai-auth-headers.js";
 import { normalizeOpenAiBaseUrl } from "./normalize-openai-base-url.js";
@@ -74,7 +75,15 @@ export async function fetchOpenAiCompatModels(
   const res = await fetch(`${base}/v1/models`, {
     headers: buildOpenAiAuthHeaders(apiKey, auth),
     signal: AbortSignal.timeout(10_000),
+    // On a cross-origin redirect fetch drops Authorization but forwards a
+    // custom key header (`apiKeyHeader`): never follow one with a key.
+    redirect: "manual",
   });
+  const redirect = redirectRefusal(res);
+  if (redirect) {
+    await res.body?.cancel().catch(() => undefined);
+    throw new Error(`http ${res.status}: ${redirect}`);
+  }
   if (!res.ok) throw await modelListHttpError(res, apiKey);
   const json = (await res.json()) as { data?: readonly { id?: unknown }[] };
   const ids = (json.data ?? [])

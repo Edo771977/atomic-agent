@@ -67,3 +67,17 @@ export function buildOpenAiAuthHeaders(
   }
   return out;
 }
+
+/**
+ * Why a 3xx answer to a request that carries the API key is refused, or
+ * `null` for any other answer. Shared with the chat transport so both
+ * say the same.
+ */
+export function redirectRefusal(res: Pick<Response, "status" | "headers">): string | null {
+  if (!(res.status >= 300 && res.status < 400)) return null;
+  const location = res.headers?.get?.("location");
+  return (
+    `the server redirected${location ? ` to ${location}` : ""}; requests that carry the API key do not follow redirects, ` +
+    "so set the base URL to the address it redirects to"
+  );
+}

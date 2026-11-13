@@ -1,6 +1,6 @@
 import { isAsciiOnly } from "./ascii-header-guard.js";
 import type { CompletionRequestBudget } from "../completion-types.js";
-import { buildOpenAiAuthHeaders } from "./openai-auth-headers.js";
+import { buildOpenAiAuthHeaders, redirectRefusal } from "./openai-auth-headers.js";
 import { readErrnoCode } from "../../errno-code.js";
 import {
   groqRequestTooLargeSentence,
@@ -886,8 +886,24 @@ export async function openAiFetch(
       headers,
       ...(body && method === "POST" ? { body: JSON.stringify(body) } : {}),
       signal: controller.signal,
+      // On a cross-origin redirect fetch drops Authorization but forwards
+      // a custom key header (`apiKeyHeader`) to the new server: a request
+      // that carries the key never follows a redirect.
+      redirect: "manual",
     });
     request.requestBudget?.onResponse(res.status);
+    const redirect = redirectRefusal(res);
+    if (redirect) {
+      await res.body?.cancel().catch(() => undefined);
+      throw new OpenAiHttpError(
+        `openai provider: ${redirect}`,
+        res.status,
+        `${deps.baseUrl}${path}`,
+        false,
+        null,
+        deps.label,
+      );
+    }
     if (deps.onResponseHeaders && res.headers) {
       try {
         deps.onResponseHeaders(res.headers);
@@ -897,6 +913,8 @@ export async function openAiFetch(
     }
     return res;
   } catch (err) {
+    // The refused redirect above: an answer, not a network failure.
+    if (err instanceof OpenAiHttpError) throw err;
     // Caller cancellation must stay a cancellation — rethrow untouched
     // so the classifier keeps reporting it as `cancelled`, not as a
     // provider failure.
