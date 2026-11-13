@@ -50,7 +50,8 @@ export function renderVerifyRunSummary(r: VerifyRunResult): string {
   const checks = r.checks ?? [];
   const failing = checks.filter((c) => !c.ok);
   const passing = checks.filter((c) => c.ok);
-  const head = `verify.run ${r.kind}: ${r.ok ? "ok" : "FAILED"}${r.isolated ? "" : " (ran in place — not isolated)"}`;
+  const isolation = r.isolated ? "" : r.errorCode === "workspace-unavailable" || r.errorCode === "cancelled" ? " (not started)" : " (not isolated)";
+  const head = `verify.run ${r.kind}: ${r.ok ? "ok" : "FAILED"}${isolation}`;
   const lines: string[] = [head, ...failing.map(checkLine), outcomeLine(r)];
   if (r.hint !== undefined) lines.push(`note: ${r.hint}`);
   lines.push(...listLines("uncaught errors", r.errors));

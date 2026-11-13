@@ -24,7 +24,7 @@ import type { AtomicAgentConfig } from "../../config/index.js";
 import type { ShellGuardPolicy } from "../os/shell-command-guard/index.js";
 import type { ToolDefinition } from "../tool-registry.js";
 import type { BrowserLauncher } from "./run-page-kind.js";
-import { runVerify } from "./run-verify.js";
+import { runVerify, type VerifyRunContext } from "./run-verify.js";
 import { parseVerifyRunArgs, type VerifyRunArgs } from "./verify-run-args.js";
 import { needsShellInterpretation } from "../os/shell/shell-interpretation.js";
 import {
@@ -45,6 +45,8 @@ export interface VerifyRunToolOptions extends DangerousToolOptions {
   shellPolicy?: ShellGuardPolicy;
   /** Test seam: replaces the real browser launch. */
   launchBrowser?: BrowserLauncher;
+  /** Test/embedder seam; unavailable copies are refused by runVerify. */
+  workspace?: VerifyRunContext["workspace"];
 }
 
 /** What the operator is asked to approve, in one line. */
@@ -147,6 +149,7 @@ export function buildVerifyRunTool(options: VerifyRunToolOptions): ToolDefinitio
         config: options.config,
         signal: ctx.signal,
         ...(options.launchBrowser === undefined ? {} : { launchBrowser: options.launchBrowser }),
+        ...(options.workspace === undefined ? {} : { workspace: options.workspace }),
       });
       const { summary, ...details } = result;
       return {

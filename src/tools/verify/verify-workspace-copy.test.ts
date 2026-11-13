@@ -71,9 +71,11 @@ describe("createVerifyWorkspace", () => {
     expect(await readFile(join(work, "node_modules", "dep", "index.js"), "utf8")).toBe("module.exports = 1;");
   });
 
-  it("runs in place, not isolated, when the tree is over the byte limit", async () => {
+  it("refuses the workspace when the tree is over the byte limit", async () => {
     const ws = await createVerifyWorkspace(work, { platform: "linux", tmpRoot, maxBytes: 10 });
-    expect(ws).toMatchObject({ dir: work, isolated: false, method: "in-place" });
+    expect(ws).toMatchObject({ isolated: false, method: "unavailable" });
+    expect(ws.dir).not.toBe(work);
+    expect(ws.error).toContain("copy limit");
     await ws.cleanup();
     expect(await readdir(work)).toContain("index.html");
   });

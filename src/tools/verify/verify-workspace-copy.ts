@@ -10,7 +10,7 @@
  * nothing is excluded. Elsewhere: a plain copy with `node_modules`,
  * `.git`, `dist`, `build`, `target`, `.venv` left out and symlinked into
  * the copy instead; a tree over 2 GB (those excluded) is not copied at
- * all — the run happens in place and the result says `isolated: false`.
+ * all — verification is refused rather than run in the original.
  * On the copy path the symlinked `.git` is the real one: a command that
  * commits inside the copy commits for real.
  */
@@ -41,10 +41,12 @@ export const VERIFY_COPY_EXCLUDED: ReadonlySet<string> = new Set([
 export const VERIFY_COPY_MAX_BYTES = 2 * 1024 * 1024 * 1024;
 
 export interface VerifyWorkspace {
-  /** Where the run happens: the copy, or the working directory itself. */
+  /** The copy's path. An unavailable workspace must never be executed. */
   readonly dir: string;
   readonly isolated: boolean;
-  readonly method: "clonefile" | "copy" | "in-place";
+  /** `in-place` is retained for legacy embedders; execution refuses it. */
+  readonly method: "clonefile" | "copy" | "unavailable" | "in-place";
+  readonly error?: string;
   cleanup(): Promise<void>;
 }
 
@@ -123,7 +125,7 @@ export async function copyTreeWithExclusions(src: string, dest: string): Promise
   }
 }
 
-/** Create the workspace for one run. Never throws for a copy that cannot be made — falls back to in place. */
+/** Create a copy or report why it is unavailable; never fall back to in-place execution. */
 export async function createVerifyWorkspace(
   workingDir: string,
   options: CreateWorkspaceOptions = {},
@@ -134,7 +136,12 @@ export async function createVerifyWorkspace(
     `atag-verify-${randomBytes(4).toString("hex")}`,
   );
   const cleanup = async (): Promise<void> => {
-    await rm(dest, { recursive: true, force: true });
+    try {
+      await rm(dest, { recursive: true, force: true });
+    } catch (err) {
+      // A bad temp root can be a file: no destination was created there.
+      if ((err as NodeJS.ErrnoException).code !== "ENOTDIR") throw err;
+    }
   };
   if (platform === "darwin") {
     const cloned = await (options.clone ?? cloneWithCp)(workingDir, dest);
@@ -143,13 +150,14 @@ export async function createVerifyWorkspace(
   }
   const limit = options.maxBytes ?? VERIFY_COPY_MAX_BYTES;
   if ((await measureTree(workingDir, limit)) > limit) {
-    return { dir: workingDir, isolated: false, method: "in-place", cleanup: async () => {} };
+    return { dir: dest, isolated: false, method: "unavailable", error: `workspace exceeds the ${limit}-byte copy limit`, cleanup };
   }
   try {
     await copyTreeWithExclusions(workingDir, dest);
-  } catch {
+  } catch (err) {
     await cleanup();
-    return { dir: workingDir, isolated: false, method: "in-place", cleanup: async () => {} };
+    const reason = err instanceof Error ? err.message : String(err);
+    return { dir: dest, isolated: false, method: "unavailable", error: `could not copy workspace: ${reason}`, cleanup: async () => {} };
   }
   return { dir: dest, isolated: true, method: "copy", cleanup };
 }
