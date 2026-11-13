@@ -1578,14 +1578,20 @@ export function buildFusionDelegateTool(
           // artifact is usable. Verify providers before releasing consumers,
           // including rows carried from a checkpoint. Retry policy is separate.
           const verifiedProviders = new Set<string>();
+          // A `no_changes` provider whose required artifacts already exist
+          // and pass the same verification as an `ok` one releases its
+          // dependents; its own row stays `no_changes`.
+          const releasedNoChanges = new Set<string>();
           const previouslyReleased = new Set<string>();
           const verifyProvider = async (id: string): Promise<void> => {
             if (verifiedProviders.has(id)) return;
             verifiedProviders.add(id);
             const rechecking = previouslyReleased.has(id);
             previouslyReleased.add(id);
-            let row = finished.get(id);
-            if (row?.status !== "ok") return;
+            const original = finished.get(id);
+            const noChanges = original?.status === "no_changes";
+            if (original === undefined || (original.status !== "ok" && !noChanges)) return;
+            let row: WorkerTaskResult | undefined = noChanges ? { ...original, status: "ok" } : original;
             const names = new Set((parsed.contract?.requires ?? []).map((r) => r.name));
             const required = (parsed.contract?.provides ?? []).filter(
               (p) => p.task === id && names.has(p.name),
@@ -1596,6 +1602,8 @@ export function buildFusionDelegateTool(
             // ordering. They are never evidence that an artifact exists.
             const verifiable = required.filter((p) => p.kind !== "other" ||
               provideSearchPaths(p, parsed.contract!, task).length > 0);
+            // Advisory tokens are no evidence for a worker that wrote nothing.
+            if (noChanges && verifiable.length < required.length) return;
             const report = await inspectContractProvides(
               { ...parsed.contract, provides: verifiable }, [task], ctx.workingDir,
               { results: [row], signal: runSignal },
@@ -1638,6 +1646,10 @@ export function buildFusionDelegateTool(
                 ...(deps.knownSecrets === undefined ? {} : { knownSecrets: deps.knownSecrets() }),
               });
             }
+            if (noChanges) {
+              if (row!.status === "ok") releasedNoChanges.add(id);
+              return;
+            }
             if (row!.status !== "ok") gateState.verdicts.delete(id);
             finished.set(id, row!);
             run?.recordTask(row!);
@@ -1646,6 +1658,7 @@ export function buildFusionDelegateTool(
             // An intervening worker can change check inputs through a shell,
             // even with no file-tool telemetry. Deduplicate only this release.
             verifiedProviders.clear();
+            releasedNoChanges.clear();
             for (const id of wave) {
               for (const provider of plan.dependencies.get(id) ?? []) await verifyProvider(provider);
             }
@@ -1665,7 +1678,7 @@ export function buildFusionDelegateTool(
                     !finished.has(id) &&
                     (plan.dependencies.get(id) ?? []).some((provider) => {
                       const done = finished.get(provider);
-                      return done?.status !== "ok";
+                      return done?.status !== "ok" && !releasedNoChanges.has(provider);
                     }),
                   );
             for (const id of held) {
@@ -1673,7 +1686,7 @@ export function buildFusionDelegateTool(
               const waitingOn = (plan.dependencies.get(id) ?? []).filter(
                 (provider) => {
                   const done = finished.get(provider);
-                  return done?.status !== "ok";
+                  return done?.status !== "ok" && !releasedNoChanges.has(provider);
                 },
               );
               finished.set(

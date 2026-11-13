@@ -17,16 +17,19 @@
  * Git metadata only: tracked paths are overlaid from the original's
  * actual bytes into the base, then from that frozen base into each
  * task, bypassing clean/smudge filters and Git's stat cache. Untracked files are
- * copied in; ignored directories (`node_modules`, build output) and
- * ignored files are copied privately so a test run still finds them.
+ * copied in; ignored directories and ignored files are copied privately
+ * so a test run still finds them, except the shared dependency
+ * directories (`node_modules`, `target`, `.venv`), which are symlinked
+ * to the original's and cost no copy budget.
  * Outside git, or when git cannot snapshot
  * (no commit yet, a merge in progress, no git binary), a workspace is
  * a private folder copy without the original's git metadata. Copying
  * is bounded across the base and every task. A tree too large to copy is not
  * isolated at all; the caller refuses the wave before any worker starts.
  *
- * Dependencies and build outputs are readable but their private writes
- * are not merged. Existing user symlinks retain their targets; this is
+ * Dependencies and build outputs are readable but never merged; private
+ * copies keep a task's writes to them disposable, while writes through a
+ * shared dependency link land in the original (as on `verify.run`). Existing user symlinks retain their targets; this is
  * workspace isolation, not a process sandbox. Submodules are not checked
  * out in a worktree.
  */
@@ -47,7 +50,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, relative, sep } from "node:path";
+import { basename, dirname, join, relative, sep } from "node:path";
 import { runCommand, type CommandResult } from "../../sandbox/command-runner.js";
 import { buildCommandEnv } from "../../sandbox/command-env.js";
 import { VERIFY_COPY_EXCLUDED, VERIFY_COPY_MAX_BYTES } from "../verify/verify-workspace-copy.js";
@@ -162,6 +165,8 @@ export interface BranchWorkspace {
   readonly excludedDirectories?: ReadonlySet<string>;
   /** Frozen rules also classify ignored directories created after dispatch. */
   readonly directoryIgnorePolicy?: DirectoryIgnorePolicy;
+  /** Tracked files and their ancestor directories: never excluded by name or ignore rule. */
+  readonly trackedPaths?: ReadonlySet<string>;
 }
 
 export interface BranchSet {
@@ -261,13 +266,16 @@ function isUnderMergeDir(rel: string): boolean {
  * Every regular file and symlink under `root` with its size, mtime and
  * mode. Symlinks are stamped, not followed; the copy exclusions (`.git`,
  * `node_modules`, …) and the merge folder are skipped: none of it is
- * merged back.
+ * merged back. A path in `trackedPaths` (a tracked file or one of its
+ * ancestors, e.g. `scripts/build`) is kept despite its name or an ignore
+ * rule: a tracked change there is a deliverable.
  */
 export async function stampTree(
   root: string,
   excludedDirectories: ReadonlySet<string> = new Set(),
   directoryIgnorePolicy?: DirectoryIgnorePolicy,
   signal?: AbortSignal,
+  trackedPaths: ReadonlySet<string> = new Set(),
 ): Promise<Map<string, FileStamp>> {
   signal?.throwIfAborted();
   const out = new Map<string, FileStamp>();
@@ -286,9 +294,10 @@ export async function stampTree(
     }
     for (const entry of entries) {
       signal?.throwIfAborted();
-      if (VERIFY_COPY_EXCLUDED.has(entry.name)) continue;
       const full = join(dir, entry.name);
       const rel = relative(root, full);
+      if (entry.name === ".git") continue;
+      if (VERIFY_COPY_EXCLUDED.has(entry.name) && !trackedPaths.has(rel)) continue;
       if (isUnderMergeDir(rel) || excludedDirectories.has(rel)) continue;
       if (entry.isDirectory()) {
         directories.push(rel);
@@ -316,6 +325,7 @@ export async function stampTree(
   if (ignored !== undefined && ignored.size > 0) {
     for (const rel of out.keys()) {
       signal?.throwIfAborted();
+      if (trackedPaths.has(rel)) continue;
       for (let dir = dirname(rel); dir !== "."; dir = dirname(dir)) {
         if (ignored.has(dir)) { out.delete(rel); break; }
       }
@@ -337,7 +347,21 @@ class PrivateCopyLimitError extends Error {
 
 interface PrivateCopyBudget { left: number; signal?: AbortSignal }
 
-/** Copy entries without creating links back to the source or sharing its git metadata. */
+/**
+ * Dependency and build-cache directories shared with the original by a
+ * symlink instead of copied: they are routinely far larger than the
+ * project itself (hundreds of MB, 100k+ files), and copying them into
+ * the base and every task both blew the copy limit and refused isolation
+ * for ordinary repos. Never stamped or merged (`VERIFY_COPY_EXCLUDED`).
+ * Writes through the link reach the original, as for `verify.run`.
+ */
+export const SHARED_DEPENDENCY_DIRECTORIES: ReadonlySet<string> = new Set(["node_modules", "target", ".venv"]);
+
+/**
+ * Copy entries without sharing the source's git metadata. Only links
+ * created here point back at the source: a shared dependency directory
+ * (`SHARED_DEPENDENCY_DIRECTORIES`), which costs no copy budget.
+ */
 async function copyPrivateEntry(
   from: string,
   to: string,
@@ -347,7 +371,10 @@ async function copyPrivateEntry(
   budget.signal?.throwIfAborted();
   if (isUnderMergeDir(rel)) return;
   const info = await lstat(from);
-  if (info.isDirectory()) {
+  if (info.isDirectory() && rel.length > 0 && SHARED_DEPENDENCY_DIRECTORIES.has(basename(rel))) {
+    await mkdir(dirname(to), { recursive: true });
+    await symlink(await realpath(from), to, "dir");
+  } else if (info.isDirectory()) {
     await mkdir(to, { recursive: true });
     for (const name of await readdir(from)) {
       if (name === ".git") continue;
@@ -560,6 +587,10 @@ export async function createBranchSet(
         .filter((path) => path.endsWith("/"))
         .map((path) => path.slice(0, -1).split("/").join(sep)),
     );
+    const trackedPaths = new Set<string>();
+    for (const path of snapshot?.tracked ?? []) {
+      for (let rel = path.split("/").join(sep); rel !== "." && !trackedPaths.has(rel); rel = dirname(rel)) trackedPaths.add(rel);
+    }
     const workspaces = new Map<string, BranchWorkspace>();
     for (const [index, taskId] of taskIds.entries()) {
       const name = workspaceName(index, taskId);
@@ -569,8 +600,9 @@ export async function createBranchSet(
         taskId,
         name,
         dir,
-        manifest: await stampTree(dir, excludedDirectories, directoryIgnorePolicy, options.signal),
+        manifest: await stampTree(dir, excludedDirectories, directoryIgnorePolicy, options.signal, trackedPaths),
         excludedDirectories,
+        trackedPaths,
         ...(directoryIgnorePolicy === undefined ? {} : { directoryIgnorePolicy }),
       });
     }
@@ -591,7 +623,7 @@ export async function touchedPaths(
   workspace: BranchWorkspace,
   signal?: AbortSignal,
 ): Promise<string[]> {
-  const now = await stampTree(workspace.dir, workspace.excludedDirectories, workspace.directoryIgnorePolicy, signal);
+  const now = await stampTree(workspace.dir, workspace.excludedDirectories, workspace.directoryIgnorePolicy, signal, workspace.trackedPaths);
   const out: string[] = [];
   for (const [rel, stamp] of now) {
     signal?.throwIfAborted();
