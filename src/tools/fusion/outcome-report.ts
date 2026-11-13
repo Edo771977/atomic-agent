@@ -157,8 +157,9 @@ function taskCheckEvidence(row: TaskOutcomeRecord): "passed" | "failed" | "unver
       row.judgeRetried !== false || row.escalations !== 0 ||
       typeof row.selfCheckNotice !== "boolean" || row.syntaxDemoted !== false ||
       (row.merge !== null && row.merge !== "merged") ||
-      (row.judge !== "off" && row.judge !== "green")) return "unverified";
-  if (row.acceptance === "checks-passed" && row.status === "ok" && row.failure === null) return "passed";
+      !["off", "green", "red", "unverified"].includes(row.judge)) return "unverified";
+  if (row.acceptance === "checks-passed" && row.status === "ok" && row.failure === null &&
+      (row.judge === "off" || row.judge === "green")) return "passed";
   if (row.acceptance === "checks-failed" && row.status === "failed" && row.failure === "checks") return "failed";
   return "unverified";
 }
@@ -171,7 +172,7 @@ function modelStats(rows: TaskOutcomeRecord[]): ModelStats {
   );
   const failures = new Map<FailureCategory, number>();
   for (const r of rows) {
-    if (r.failure !== null) failures.set(r.failure, (failures.get(r.failure) ?? 0) + 1);
+    if (typeof r.failure === "string") failures.set(r.failure, (failures.get(r.failure) ?? 0) + 1);
   }
   const noticed = rows.filter((r) => r.selfCheckNotice);
   const fixed = noticed.filter((r) => r.status === "ok");

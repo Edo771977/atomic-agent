@@ -113,6 +113,12 @@ describe("fusion report", () => {
     expect(aggregateOutcomes([checked, failed, replan]).workers[0]).toMatchObject({
       green: 2, firstPassGreen: 1, checksPassed: 2, checksFailed: 1, checksUnverified: 0,
     });
+    const judgedFailure = taskOutcomeRecord({ ...row, status: "failed", checks: { total: 1, failed: 1 },
+      judge: { green: false, total: 1, failed: 1, retried: false, costUsd: null, items: [] },
+    }, context, "session", NOW);
+    expect(aggregateOutcomes([judgedFailure]).workers[0]).toMatchObject({
+      checksPassed: 0, checksFailed: 1, checksUnverified: 0,
+    });
   });
 
   it("keeps legacy, missing and contradictory check evidence unverified", () => {
@@ -122,6 +128,7 @@ describe("fusion report", () => {
       { ...accepted, acceptanceScope: undefined },
       { ...accepted, status: "timeout" as const },
       { ...accepted, failure: "checks" as const },
+      { ...accepted, failure: undefined },
       { ...accepted, merge: "held" as const },
       { ...accepted, merge: "conflict" as const },
       { ...accepted, merge: undefined },
