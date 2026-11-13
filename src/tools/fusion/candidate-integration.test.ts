@@ -17,6 +17,7 @@ vi.mock("node:fs", async importOriginal => {
   }) as typeof actual.createReadStream;
   // Fault seam: a test may refuse to open a path (journal writes use openSync).
   const openSync = ((path: Parameters<typeof actual.openSync>[0], ...rest: unknown[]) => {
+    fsEvents.push(["openSync", String(path)]);
     if (faults.openSync?.(String(path)) === true) throw Object.assign(new Error(`injected openSync failure: ${String(path)}`), { code: "EIO" });
     return (actual.openSync as (...args: unknown[]) => unknown)(path, ...rest);
   }) as typeof actual.openSync;
@@ -501,4 +502,21 @@ it("rolls back a directory it created even when setting its mode fails", async (
     await expect(lstat(join(root, "made"))).rejects.toThrow();
     expect(await promotionFiles(root)).toEqual([]);
   } finally { await candidate.cleanup(); }
+});
+
+it("flushes a delivered temp file before renaming it and the merge folder's new parents", async () => {
+  const root = await project();
+  const candidate = await createCandidateIntegration(root);
+  try {
+    await writeFile(join(candidate.dir, "api.json"), "promoted api");
+    fsEvents.length = 0;
+    expect((await candidate.finish({ rows, contract, signal, runChecks: pass })).status).toBe("promoted");
+  } finally { await candidate.cleanup(); }
+  const renameAt = fsEvents.findIndex(([kind, path]) => kind === "rename" && dirname(path) === root && path.includes(".atag-candidate-"));
+  expect(renameAt).toBeGreaterThan(-1);
+  const tmp = fsEvents[renameAt]![1];
+  expect(fsEvents.slice(0, renameAt).some(([kind, path]) => kind === "sync" && path === tmp)).toBe(true);
+  // The project root and .atomic-agent gained new entries: both are flushed.
+  const opened = fsEvents.filter(([kind]) => kind === "openSync").map(([, path]) => path);
+  expect(opened).toContain(root); expect(opened).toContain(join(root, ".atomic-agent"));
 });

@@ -203,6 +203,11 @@ async function observeEntry(root: string, rel: string, bounds: InventoryBounds):
 const sameIdentity = (a: Stats | undefined, b: Stats | undefined): boolean =>
   a === undefined || b === undefined ? a === b
     : a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeMs === b.mtimeMs && a.ctimeMs === b.ctimeMs && a.mode === b.mode;
+/** fsync a regular file; file systems that cannot flush are tolerated. A read-only descriptor flushes on POSIX. */
+async function syncFile(path: string): Promise<void> {
+  const handle = await open(path, "r");
+  try { await handle.sync().catch((err: NodeJS.ErrnoException) => { if (!["EINVAL", "ENOTSUP", "EOPNOTSUPP"].includes(err.code ?? "")) throw err; }); } finally { await handle.close(); }
+}
 function differences(a: Inventory, b: Inventory): string[] {
   return [...new Set([...a.keys(), ...b.keys()])].filter(path => !equal(a.get(path), b.get(path))).sort();
 }
@@ -366,8 +371,8 @@ export async function createCandidateIntegration(
       const info = await lstat(join(set.realDir, parent));
       if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`delivery parent is no longer a directory: ${parent}`);
     }
-    if (expected === undefined) { await commitGuard(rel, verified); await rm(target); landed(); return; }
-    if (expected.kind === "directory") { await commitGuard(rel, verified); await mkdir(target, { mode: expected.mode }); landed(); await chmod(target, expected.mode); return; }
+    if (expected === undefined) { await commitGuard(rel, verified); await rm(target); landed(); syncDirectoryBestEffort(dirname(target)); return; }
+    if (expected.kind === "directory") { await commitGuard(rel, verified); await mkdir(target, { mode: expected.mode }); landed(); syncDirectoryBestEffort(dirname(target)); await chmod(target, expected.mode); return; }
     const tmp = join(dirname(target), `.atag-candidate-${randomBytes(8).toString("hex")}`);
     try {
       if (expected.kind === "symlink") {
@@ -377,10 +382,12 @@ export async function createCandidateIntegration(
       } else {
         await copyFile(join(root, rel), tmp);
         if (await fileHash(tmp, { bytes: options.maxInventoryBytes ?? VERIFY_COPY_MAX_BYTES, entries: 1, signal: AbortSignal.timeout(30_000) }) !== expected.hash) throw new Error(`candidate changed before delivery: ${rel}`);
+        // The bytes reach the disk before the name does.
+        await syncFile(tmp);
         await chmod(tmp, expected.mode);
       }
       await commitGuard(rel, verified);
-      await rename(tmp, target); landed();
+      await rename(tmp, target); landed(); syncDirectoryBestEffort(dirname(target));
     } finally { await rm(tmp, { force: true }); }
   };
 
@@ -392,6 +399,9 @@ export async function createCandidateIntegration(
    */
   const openJournal = async (): Promise<{ journal: PromotionJournal; file: string; backups: string; write(): void; step(path: string, original: Entry | undefined, promoted: Entry | undefined): Promise<PromotionJournalStep>; remove(): Promise<void> }> => {
     const merge = await ensureMergeDir(set.realDir);
+    // ensureMergeDir may have just created `.atomic-agent/` and its merge
+    // folder: flush those new directory entries before relying on them.
+    syncDirectoryBestEffort(set.realDir); syncDirectoryBestEffort(dirname(merge)); syncDirectoryBestEffort(merge);
     const file = join(merge, `${id}.promotion.json`), backups = join(merge, `${id}.promotion-backup`);
     const journal: PromotionJournal = { version: 1, candidate: id, project: set.realDir, startedAt: new Date().toISOString(), state: "promoting", recovery: JOURNAL_RECOVERY, steps: [] };
     const write = (): void => {
@@ -401,7 +411,7 @@ export async function createCandidateIntegration(
     };
     const describe = (entry: Entry | undefined, link?: string): JournalEntry | null => entry === undefined ? null
       : { kind: entry.kind, mode: entry.mode, ...(entry.kind === "file" && entry.hash !== undefined ? { sha256: entry.hash } : {}), ...(link === undefined ? {} : { linkTarget: link }) };
-    await mkdir(backups, { mode: 0o700 }); await chmod(backups, 0o700); write();
+    await mkdir(backups, { mode: 0o700 }); await chmod(backups, 0o700); syncDirectoryBestEffort(merge); write();
     return {
       journal, file, backups, write,
       async step(path, original, promoted) {
@@ -415,8 +425,7 @@ export async function createCandidateIntegration(
           // (recorded in `original.mode`). The folder is owner-only too.
           await copyFile(join(set.baseDir, path), destination);
           await chmod(destination, 0o600);
-          const handle = await open(destination, "r+");
-          try { await handle.sync().catch((err: NodeJS.ErrnoException) => { if (!["EINVAL", "ENOTSUP", "EOPNOTSUPP"].includes(err.code ?? "")) throw err; }); } finally { await handle.close(); }
+          await syncFile(destination);
           syncDirectoryBestEffort(backups);
         }
         const link = original?.kind === "symlink" ? await readlink(join(set.baseDir, path)) : undefined;
@@ -532,7 +541,7 @@ export async function createCandidateIntegration(
           const verified = await verifyPaths(withAncestors(path), expectedAt, "original project changed during candidate delivery");
           const step = await journal!.step(path, base.get(path), final.get(path)); steps.set(path, step);
           const landed = (): void => { applied.push(path); appliedSet.add(path); };
-          if (base.get(path)?.kind === "directory" && !final.has(path)) { await commitGuard(path, verified); await rmdir(join(set.realDir, path)); landed(); }
+          if (base.get(path)?.kind === "directory" && !final.has(path)) { await commitGuard(path, verified); await rmdir(join(set.realDir, path)); landed(); syncDirectoryBestEffort(dirname(join(set.realDir, path))); }
           else await writeEntry(workspace.dir, path, final.get(path), verified, landed);
           step.status = "applied"; journal!.write();
         }
