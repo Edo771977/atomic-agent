@@ -109,7 +109,9 @@ describe("renderWorkerBrief", () => {
     expect(brief).toContain("→ its result");
     expect(at("  ASSUMPTIONS:")).toBeGreaterThan(at("  CHECKS RUN:"));
     expect(brief).toMatch(/runtime's own list of the files you changed/);
-    expect(brief).toMatch(/reads only your first line/);
+    // What a green task's compact row keeps, and nothing contradicting it.
+    expect(brief).toMatch(/reads only your STATUS line, your ASSUMPTIONS and any line naming something you provided differently/);
+    expect(brief).not.toMatch(/must be in the reply/);
   });
 });
 

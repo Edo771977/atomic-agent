@@ -12,6 +12,7 @@ import {
 import {
   formatDelegateOutput,
   GREEN_REPLY_CHARS,
+  GREEN_REPLY_KEPT_CHARS,
   WorkerRunCollector,
   type WorkerTaskResult,
 } from "./worker-result.js";
@@ -168,6 +169,51 @@ describe("the delegate result: runtime changed line and compact green replies", 
     });
     expect(out).toContain("reply: STATUS: done, the parser is in place …");
     expect(out).not.toContain("long explanation");
+  });
+
+  it("keeps a green row's assumptions and contract deviations, bounded", () => {
+    const reply = [
+      "STATUS: done, parser in place",
+      "CHANGED: src/parse.ts",
+      "CHECKS RUN: npm test → pass",
+      "ASSUMPTIONS:",
+      "- input is UTF-8",
+      "- empty lines are skipped",
+      "PROVIDED:",
+      "function parseRows src/parse.ts",
+      "function parseAll provided differently: named parseEverything",
+      "could not provide function stream",
+      "long explanation ".repeat(50),
+    ].join("\n");
+    const out = formatDelegateOutput([row({ reply })], 20_000, { declaredFiles: new Set(["t1"]) });
+    expect(out).toContain(
+      [
+        "reply: STATUS: done, parser in place …",
+        "ASSUMPTIONS:",
+        "- input is UTF-8",
+        "- empty lines are skipped",
+        "function parseAll provided differently: named parseEverything",
+        "could not provide function stream",
+      ].join("\n"),
+    );
+    expect(out).not.toContain("parseRows");
+    expect(out).not.toContain("long explanation");
+    // "none" says nothing: only the status line is kept.
+    const plain = formatDelegateOutput(
+      [row({ reply: "STATUS: done\nCHANGED: a.ts\nASSUMPTIONS: none\n" })],
+      20_000,
+      { declaredFiles: new Set(["t1"]) },
+    );
+    expect(plain).toContain("reply: STATUS: done …");
+    expect(plain).not.toContain("ASSUMPTIONS");
+    // Bounded: a long assumptions section is cut.
+    const long = formatDelegateOutput(
+      [row({ reply: `STATUS: done\nASSUMPTIONS: ${"y".repeat(1000)}` })],
+      20_000,
+      { declaredFiles: new Set(["t1"]) },
+    );
+    const kept = long.slice(long.indexOf("reply: "));
+    expect(kept.length).toBeLessThanOrEqual(GREEN_REPLY_KEPT_CHARS + "reply: ".length + 2);
   });
 
   it("clips a long first line to GREEN_REPLY_CHARS", () => {

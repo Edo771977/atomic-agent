@@ -196,9 +196,10 @@ export const BROWSER_CODE_RULE =
 /**
  * The reply's layout. The orchestrator is the expensive model: it reads
  * the runtime's own `changed:` line (`worker-changes.ts`) and, for a
- * green task with files, only the reply's first line, so the first line
- * carries the status and the rest is what the disk cannot say. The
- * runtime line never depends on a worker following this.
+ * green task with files, only what `compactGreenReply` keeps (the
+ * status line, the assumptions, contract deviations), so those carry
+ * what the disk cannot say. The runtime line never depends on a worker
+ * following this.
  */
 export const WORKER_REPLY_RULE = [
   `- Finish with \`reply\` (about ${WORKER_REPLY_CHAR_BUDGET} characters at most), laid out as:`,
@@ -206,7 +207,7 @@ export const WORKER_REPLY_RULE = [
   "  CHANGED: each file you wrote and what changed in it",
   "  CHECKS RUN: each command or check you ran → its result",
   "  ASSUMPTIONS: what you assumed, or none",
-  "  The orchestrator also gets the runtime's own list of the files you changed, and for a finished task with files it reads only your first line. Findings, decisions and anything it needs to merge your part that are not in a file must be in the reply.",
+  "  The orchestrator also gets the runtime's own list of the files you changed. For a finished task with files it reads only your STATUS line, your ASSUMPTIONS and any line naming something you provided differently from the contract or could not provide, so put there anything it needs to merge your part that is not in a file.",
 ].join("\n");
 
 /**

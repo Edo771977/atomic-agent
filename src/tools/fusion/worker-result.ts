@@ -1024,18 +1024,32 @@ export interface DelegateOutputExtras {
   waves?: readonly (readonly string[])[];
   /**
    * The ids of the tasks that declared `files`. A green row among them
-   * shows only the first line of its worker's reply: its result is on
-   * disk and in its `changed:` line, and the prose is the worker's own
+   * shows only its reply's status line, assumptions and contract
+   * deviations (`compactGreenReply`): its result is on disk and in its
+   * `changed:` line, and the rest of the prose is the worker's own
    * account of it. Absent, every reply is shown whole.
    */
   declaredFiles?: ReadonlySet<string>;
 }
 
-/** How much of a green row's reply its block keeps (`compactReply`). */
+/** How much of a green row's first (STATUS) line its block keeps (`compactReply`). */
 export const GREEN_REPLY_CHARS = 200;
 
+/** How much of a green row's reply its block keeps in all (`compactGreenReply`). */
+export const GREEN_REPLY_KEPT_CHARS = 400;
+
+/** A reply-skeleton header: `STATUS:`, `CHECKS RUN:`, `**ASSUMPTIONS:**`. */
+const REPLY_HEADER = /^[\s*_#>-]*([A-Z][A-Z ]{2,}?)[*_]*:[*_]*\s*(.*)$/;
+
+/** A line saying the worker provided something other than the contract asked. */
+const CONTRACT_DEVIATION =
+  /\b(?:differently|instead of|deviat\w*|not provided|could ?n[o']t provide|cannot provide|can't provide)\b/i;
+
+/** An ASSUMPTIONS section that says nothing. */
+const NO_ASSUMPTIONS = /^[\s*_.-]*(?:none|n\/a|nothing)?[\s*_.]*$/i;
+
 /**
- * Whether a row's block shows only the first line of its reply: the
+ * Whether a row's block shows only `compactGreenReply` of its reply: the
  * row is green (`ok`) and its task declared files. A row that is not
  * green keeps the whole reply (it is the evidence of what went wrong),
  * and so does a task that declared no files (its reply IS the result:
@@ -1048,13 +1062,52 @@ function compactReply(
   return result.status === "ok" && extra.declaredFiles?.has(result.id) === true;
 }
 
-/** The reply's first non-blank line, at most `GREEN_REPLY_CHARS`, marked when cut. */
-export function replyFirstLine(reply: string): string {
-  const trimmed = reply.trim();
-  const first = trimmed.split(/\r?\n/).find((line) => line.trim().length > 0)?.trim() ?? "";
+/**
+ * What a green row with files keeps of its reply: the first non-blank
+ * (STATUS) line, at most `GREEN_REPLY_CHARS`, marked ` …` when anything
+ * was left out; then its ASSUMPTIONS section unless it says none, and
+ * every other line naming a deviation from the contract ("provided
+ * differently", "could not provide"). The disk and the `changed:` line
+ * say what was written; these are what they cannot say. At most
+ * `GREEN_REPLY_KEPT_CHARS` in all.
+ */
+export function compactGreenReply(reply: string): string {
+  const lines = reply.trim().split(/\r?\n/).map((line) => line.trimEnd());
+  const nonBlank = lines.filter((line) => line.trim().length > 0).length;
+  const firstIndex = lines.findIndex((line) => line.trim().length > 0);
+  if (firstIndex < 0) return "";
+  const first = lines[firstIndex]!.trim();
   const cut = first.length > GREEN_REPLY_CHARS;
-  const line = cut ? first.slice(0, GREEN_REPLY_CHARS) : first;
-  return cut || line.length < trimmed.length ? `${line} …` : line;
+  const head = cut ? first.slice(0, GREEN_REPLY_CHARS) : first;
+  const kept: string[] = [];
+  let assumptions: string[] | undefined;
+  const closeAssumptions = (): void => {
+    if (assumptions === undefined) return;
+    const said = assumptions.join(" ").replace(REPLY_HEADER, "$2");
+    if (!NO_ASSUMPTIONS.test(said)) kept.push(...assumptions);
+    assumptions = undefined;
+  };
+  for (const raw of lines.slice(firstIndex + 1)) {
+    const line = raw.trim();
+    const header = line.match(REPLY_HEADER);
+    if (line.length === 0 || header !== null) closeAssumptions();
+    if (line.length === 0) continue;
+    if (header?.[1]?.trim().toUpperCase() === "ASSUMPTIONS") {
+      assumptions = [line];
+      continue;
+    }
+    if (assumptions !== undefined) {
+      assumptions.push(line);
+      continue;
+    }
+    if (CONTRACT_DEVIATION.test(line)) kept.push(line);
+  }
+  closeAssumptions();
+  const omitted = cut || kept.length + 1 < nonBlank;
+  const text = [omitted ? `${head} …` : head, ...kept].join("\n");
+  return text.length > GREEN_REPLY_KEPT_CHARS
+    ? `${text.slice(0, GREEN_REPLY_KEPT_CHARS - 1)}…`
+    : text;
 }
 
 /** `analyze → organize, index` — waves in order, each wave's tasks together. */
@@ -1198,7 +1251,7 @@ function renderBlock(
     result.reply.length === 0
       ? NO_REPLY
       : compact
-        ? `reply: ${replyFirstLine(result.reply)}`
+        ? `reply: ${compactGreenReply(result.reply)}`
         : result.reply;
   const clipped =
     body.length > bodyCap
