@@ -443,6 +443,38 @@ describe("a worker's self-check before its reply closes the task", () => {
     });
   });
 
+  it("keeps a reply the grace wrote on its forced final step out of `ok`", async () => {
+    const { deps, calls } = harness(dir, (call, i) => {
+      say(call, i === 0 ? "Wrote out.txt" : "I could not finish writing out.txt");
+      return i === 0 ? {} : { stopCause: "step_ceiling", stepCount: SELF_CHECK_GRACE_STEPS };
+    });
+    writeFileSync(join(dir, "out.txt"), "");
+    const task: DelegateTask = { id: "t", title: "T", instructions: "x", files: ["out.txt", "more.txt"] };
+    const [row] = await runWorkerTasks(deps, { ...BASE, tasks: [task], signal: new AbortController().signal });
+    expect(calls).toHaveLength(2);
+    // The declared-file check still turns it `failed`; what matters
+    // here is that the forced reply was never upgraded to `ok`.
+    expect(row!.status).not.toBe("ok");
+    expect(row!.notes).toContainEqual(
+      "self-check: the grace ran out of its 4 steps; the last reply was written on the forced final step",
+    );
+
+    // With nothing else wrong after it, the forced reply stays `max_steps`.
+    const done = harness(dir, (call, i) => {
+      if (i === 1) writeFileSync(join(dir, "late.txt"), "the result");
+      say(call, "done");
+      return i === 0 ? {} : { stopCause: "step_ceiling", stepCount: SELF_CHECK_GRACE_STEPS };
+    });
+    const [late] = await runWorkerTasks(done.deps, {
+      ...BASE,
+      tasks: [{ id: "t", title: "T", instructions: "x", files: ["late.txt"] }],
+      signal: new AbortController().signal,
+    });
+    expect(done.calls).toHaveLength(2);
+    expect(late!.status).toBe("max_steps");
+    expect(late!.stepCount).toBe(3 + SELF_CHECK_GRACE_STEPS);
+  });
+
   it("runSelfCheck reports a check run it cut at the cap as not run, never as failed", async () => {
     const out = await runSelfCheck({
       task: { id: "t", title: "T", instructions: "x" },

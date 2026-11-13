@@ -822,12 +822,12 @@ describe("runWorkerTasks", () => {
         maxWorkers: 1,
         signal,
       });
-      // This fake worker writes the same file again in its self-check
-      // grace turn (`chart.png` was missing), so the hit is on it twice.
+      // No self-check grace after a replaced input: a second turn would
+      // only repeat the damage, and it is the orchestrator's to handle.
       expect(failed).toMatchObject({
         status: "failed",
         error: "declared file chart.png does not exist after the task",
-        replacedInputs: [{ path: "sales.csv" }, { path: "sales.csv" }],
+        replacedInputs: [{ path: "sales.csv" }],
       });
     } finally {
       rmSync(dir, { recursive: true, force: true });

@@ -1460,6 +1460,10 @@ async function runOneTask(
       durationMs: 0,
     });
     if (provisional.status !== "ok") return first;
+    // A worker that already replaced one of the operator's inputs is the
+    // orchestrator's to handle (`replacedInputs` on the row): a second
+    // turn of the same worker on the same files only repeats the damage.
+    if ((provisional.replacedInputs?.length ?? 0) > 0) return first;
     if (mayPropose && hasSplitProposal(provisional.reply)) return first;
     const stepsLeft = stepBudget.value - first.stepCount;
     const graceSteps = Math.min(SELF_CHECK_GRACE_STEPS, stepsLeft);
@@ -1525,24 +1529,20 @@ async function runOneTask(
       inSelfCheckGrace = false;
     }
     countUnreadNotes(session.id, grace.undelivered);
-    // The grace's own step cap is not the worker's: a forced final step
-    // there says the grace ran out, not the task's budget. The fan-out's
-    // checks still decide whether the fix held.
-    const ownCeiling =
-      grace.stopCause === "step_ceiling" && graceSteps < stepsLeft;
-    // Read here: a grace that ended on its forced final step with a
-    // reply is reported like any reply; one with no reply at all keeps
-    // its `max_steps`.
-    if (ownCeiling) {
+    // A grace that ran out of its steps ended on a forced final step:
+    // its reply is what the worker was made to say, not its claim of
+    // done, so it keeps the `step_ceiling` cause and the row stays
+    // `max_steps`, as any forced reply does. Nothing after the waves
+    // turns a row `ok` (the checks and the declared files only ever
+    // demote one), so stripping the cause here would have been the only
+    // thing calling an unfinished fix done. The note says the ceiling was
+    // the grace's, not the task's whole budget.
+    if (grace.stopCause === "step_ceiling") {
       selfCheckNotes.push(
         `self-check: the grace ran out of its ${graceSteps} steps; the last reply was written on the forced final step`,
       );
     }
-    const { stopCause: _cause, ...rest } = grace;
-    return {
-      ...(ownCeiling && grace.reason === "reply" ? rest : grace),
-      stepCount: first.stepCount + grace.stepCount,
-    };
+    return { ...grace, stepCount: first.stepCount + grace.stepCount };
   };
   let result: WorkerTaskResult;
   try {
