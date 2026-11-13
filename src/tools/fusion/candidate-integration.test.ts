@@ -594,3 +594,21 @@ it("re-checks parent identity at commit, refusing a rename through a parent swap
   } finally { await candidate.cleanup(); }
   expect((await readdir(moved!)).sort()).toEqual(["a.ts"]);
 });
+
+it("refuses to delete a directory that still holds ignored or disposable original entries, naming them", async () => {
+  const repo = await makeGitRepo("atag-candidate-dropped-"); roots.push(repo);
+  await writeRepoFile(repo, ".gitignore", "*.log\n");
+  await writeRepoFile(repo, "old/x.ts", "x\n"); await writeRepoFile(repo, "keep.txt", "k\n");
+  await runGitRaw(repo, ["add", "-A"]); await runGitRaw(repo, ["commit", "-qm", "fixture"]);
+  await writeFile(join(repo, "old", "debug.log"), "log\n");
+  await mkdir(join(repo, "old", "node_modules")); await writeFile(join(repo, "old", "node_modules", "dep.js"), "dep\n");
+  const candidate = await createCandidateIntegration(repo);
+  try {
+    await rm(join(candidate.dir, "old"), { recursive: true });
+    const report = await candidate.finish({ rows, contract, signal, runChecks: pass });
+    expect(report.status).toBe("rejected");
+    expect(report.reason).toMatch(/old\/debug\.log, old\/node_modules/); expect(report.reason).not.toMatch(/ENOTEMPTY/);
+  } finally { await candidate.cleanup(); }
+  expect(await readFile(join(repo, "old", "x.ts"), "utf8")).toBe("x\n");
+  expect(await readFile(join(repo, "old", "debug.log"), "utf8")).toBe("log\n");
+});

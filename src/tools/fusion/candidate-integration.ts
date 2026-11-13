@@ -510,7 +510,8 @@ export async function createCandidateIntegration(
         if (differences(final, await snapshot(workspace.dir, input.signal)).length > 0) throw new Error("candidate changed during final evidence collection");
         // No untested three-way merge. Even unrelated new user paths change
         // the tested project state and hold the entire candidate back.
-        if (differences(base, await snapshot(set.realDir, input.signal)).length > 0) return await reject("candidate not promoted: original project changed since its snapshot", { contract: evidence });
+        const realDropped: Dropped = new Map();
+        if (differences(base, await snapshot(set.realDir, input.signal, realDropped)).length > 0) return await reject("candidate not promoted: original project changed since its snapshot", { contract: evidence });
         // The delegate rebases absolute inputs into the candidate. Restore
         // their original identity before comparing final delivery paths;
         // relative and already-original absolute helper inputs stay guarded too.
@@ -539,6 +540,10 @@ export async function createCandidateIntegration(
         const additions = changed.filter(p => final!.get(p)?.kind === "directory" && !base.has(p)).sort((a, b) => depth(a) - depth(b));
         const files = changed.filter(p => (final!.get(p) ?? base.get(p))?.kind !== "directory");
         const removals = changed.filter(p => base.get(p)?.kind === "directory" && !final!.has(p)).sort((a, b) => depth(b) - depth(a));
+        // Ignored/disposable entries are never delivered or removed, so a
+        // directory still holding one in the original cannot be removed.
+        const kept = [...realDropped.keys()].filter(entry => removals.some(dir => entry !== dir && atOrUnder(entry, dir))).sort();
+        if (kept.length > 0) return await reject(`candidate not promoted: it deletes directories that still hold ignored or disposable entries in the original, which are never promoted or removed (${kept.map(posixPath).join(", ")}); remove them in the original first or keep the directory`, { contract: evidence, ...(ignoredChanges.length === 0 ? {} : { ignoredChanges: ignoredChanges.map(posixPath) }) });
         const promotionSignal = AbortSignal.any([input.signal, AbortSignal.timeout(120_000)]);
         // The full inventory above proved the original still equals the
         // snapshot. Each step re-verifies only the paths it involves (the
