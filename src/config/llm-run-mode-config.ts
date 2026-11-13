@@ -15,12 +15,19 @@ import { ConfigValidationError } from "./config-validation-error.js";
  */
 export type RunModeName = "local" | "cloud" | "fusion";
 
-/** `llm.runMode.fusion.workerReasoning` — same levels as `ReasoningEffort`. */
-export type FusionWorkerReasoning = "low" | "medium" | "high";
+/**
+ * `llm.runMode.fusion.workerReasoning` — the `ReasoningEffort` levels,
+ * plus `unbounded`: the opt-out of a local worker's think-block bound
+ * (no effort is sent to a cloud leg either). Additive and unversioned: an
+ * older build reads `unbounded` as unset (ATO-1241), which bounds a local
+ * worker at the default.
+ */
+export type FusionWorkerReasoning = "low" | "medium" | "high" | "unbounded";
 export const FUSION_WORKER_REASONING_LEVELS: readonly FusionWorkerReasoning[] = [
   "low",
   "medium",
   "high",
+  "unbounded",
 ];
 /** Upper bound on `workerMaxOutputTokens`; anything larger is a typo. */
 export const FUSION_WORKER_MAX_OUTPUT_TOKENS_MAX = 1_000_000;
@@ -75,7 +82,10 @@ export type UserLlmFusionConfig = {
    * provider family (OpenRouter `reasoning.effort`, OpenAI-compatible
    * `reasoning_effort`). Unset by default: the provider's own default.
    * A run spent 87 % of its worker output on hidden reasoning and 41K
-   * tokens deciding to read a file; this is the knob for that.
+   * tokens deciding to read a file; this is the knob for that. On a
+   * local leg it bounds each worker step's thinking instead
+   * (`localWorkerReasoningBudgetTokens`); `unbounded` sends no effort and
+   * lifts that bound.
    */
   workerReasoning?: FusionWorkerReasoning;
   /**

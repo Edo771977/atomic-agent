@@ -205,7 +205,7 @@ describe("runWorkerTasks", () => {
   });
 
   it("bounds a local worker's thinking per turn: the workerReasoning level, or the default when unset", async () => {
-    const run = async (extra: { localLeg?: boolean; workerReasoning?: "low" | "medium" | "high" }) => {
+    const run = async (extra: { localLeg?: boolean; workerReasoning?: "low" | "medium" | "high" | "unbounded" }) => {
       const { deps, calls } = harness(async () => turnResult());
       await runWorkerTasks(deps, {
         ...BASE,
@@ -231,6 +231,12 @@ describe("runWorkerTasks", () => {
     expect(cloud).not.toHaveProperty("reasoningBudgetTokens");
     expect(cloud.providerId).toBe(BASE.providerId);
     expect(await run({})).not.toHaveProperty("reasoningBudgetTokens");
+    // The opt-out: the local turn's bound is lifted (0), and no effort
+    // goes to any provider, since "unbounded" is not one.
+    const unbounded = await run({ localLeg: true, workerReasoning: "unbounded" });
+    expect(unbounded.reasoningBudgetTokens).toBe(0);
+    expect(unbounded).not.toHaveProperty("reasoningEffort");
+    expect(await run({ workerReasoning: "unbounded" })).not.toHaveProperty("reasoningEffort");
   });
 
   it("runs on a fresh session id, never the parent's — that would deadlock", async () => {

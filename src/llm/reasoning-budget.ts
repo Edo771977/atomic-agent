@@ -97,15 +97,26 @@ export const DEFAULT_LOCAL_WORKER_REASONING_BUDGET_TOKENS = LOCAL_WORKER_REASONI
 
 /**
  * The reasoning bound, in budget tokens, for every step of a fusion
- * worker on a local leg. An explicit `workerReasoning` level wins. Unset,
- * a configured `localModels.reasoningBudgetTokens` (positive) is kept,
- * since the person chose it; otherwise the worker default. Never `0`:
- * a local worker is always bounded.
+ * worker on a local leg; `0` is no bound.
+ *
+ * - An explicit `workerReasoning` level wins, over a stricter configured
+ *   bound too (`low` is 512 with `localModels.reasoningBudgetTokens: 256`):
+ *   it is the fusion worker's own setting, the more specific of the two,
+ *   and a level that meant different things on different machines would
+ *   not be a level.
+ * - `unbounded` is the opt-out: `0`, whatever the config says. It is the
+ *   only way to an unbounded worker, since a configured `0` is also the
+ *   default (config v78) and cannot say it was chosen.
+ * - Unset, a positive `localModels.reasoningBudgetTokens` is used as set,
+ *   not capped at the default: since v78 migrated the old written default
+ *   away, a positive value is a choice the person made for their model,
+ *   larger ones included. Otherwise the worker default.
  */
 export function localWorkerReasoningBudgetTokens(
-  level: ReasoningEffort | undefined,
+  level: ReasoningEffort | "unbounded" | undefined,
   configuredBudgetTokens: number,
 ): number {
+  if (level === "unbounded") return 0;
   if (level !== undefined) return LOCAL_WORKER_REASONING_BUDGET_TOKENS[level];
   const configured = effectiveReasoningBudgetTokens(configuredBudgetTokens);
   return configured > 0 ? configured : DEFAULT_LOCAL_WORKER_REASONING_BUDGET_TOKENS;

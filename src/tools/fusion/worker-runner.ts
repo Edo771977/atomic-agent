@@ -43,6 +43,7 @@ import {
 } from "./worker-result.js";
 import type { StructuredLogger } from "../../tracing/index.js";
 import { getConfig } from "../../config/index.js";
+import type { FusionWorkerReasoning } from "../../config/llm-run-mode-config.js";
 import { localWorkerReasoningBudgetTokens } from "../../llm/reasoning-budget.js";
 import {
   FUSION_WORKER_APPROVAL_REFUSED,
@@ -568,8 +569,9 @@ export interface RunWorkerTasksOptions {
    * local leg, which has no such parameter, it picks the think-block
    * bound of every non-final worker step instead
    * (`localWorkerReasoningBudgetTokens`), bounded by default when unset.
+   * `unbounded` sends no effort and lifts the local bound.
    */
-  workerReasoning?: ReasoningEffort;
+  workerReasoning?: FusionWorkerReasoning;
   /**
    * `runMode.fusion.workerMaxOutputTokens`, the per-step output cap. A
    * measured local leg may send less: what fits the worker's time
@@ -1397,7 +1399,7 @@ async function runOneTask(
       taskMaxDurationMs: timeoutMs + queueBudgetMs,
       toolFilter: isWorkerVisibleTool,
       toolRole: WORKER_TOOL_ROLE,
-      ...(options.workerReasoning === undefined
+      ...(options.workerReasoning === undefined || options.workerReasoning === "unbounded"
         ? {}
         : { reasoningEffort: options.workerReasoning }),
       ...(replyCap === undefined ? {} : { maxOutputTokens: replyCap }),

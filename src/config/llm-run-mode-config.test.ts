@@ -330,6 +330,10 @@ describe("workerReasoning / workerMaxOutputTokens (F20)", () => {
     );
     expect(parsed.fusion).toEqual({ workerReasoning: "low", workerMaxOutputTokens: 12_000 });
     expect(parseLlmRunModeConfig({ fusion: {} }, providers, "llm.runMode").fusion).toEqual({});
+    // The opt-out of the local worker's think-block bound is a level too.
+    expect(
+      parseLlmRunModeConfig({ fusion: { workerReasoning: "unbounded" } }, providers, "llm.runMode").fusion,
+    ).toEqual({ workerReasoning: "unbounded" });
     // ATO-1241: a level a newer build added reads as unset; a non-string is still rejected.
     expect(
       parseLlmRunModeConfig({ fusion: { workerReasoning: "max" } }, providers, "llm.runMode").fusion,
