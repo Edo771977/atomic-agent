@@ -46,6 +46,8 @@ function emptyOutcome(): DrainOutcome {
     blocked: 0,
     cancelled: 0,
     retried: 0,
+    retryPending: 0,
+    nextRetryAt: null,
   };
 }
 

@@ -11,7 +11,7 @@ Validation rejects forbidden multi-call combinations. A terminal can occur only 
 
 The executor synchronously checks and records non-terminal calls in index order before invocation, so a duplicate sibling sees the earlier call. It then groups survivors by resource class. Pure reads fan out inside their group; serial resource groups run in order. Outcomes and state effects retain batch-index order regardless of completion order.
 
-A tail terminal waits for non-terminal groups. A tool error does not cancel siblings or suppress that terminal. Terminals are never loop-gated. Cancellation must stop remaining serial work.
+A tail terminal waits for non-terminal groups. A tool error does not cancel siblings or suppress that terminal. Terminals are never loop-gated. Cancellation must stop remaining serial work. Once a cancellation is seen, the batch waits for groups still running for at most `BATCH_CANCEL_GRACE_MS` (a few seconds), so a tool that ignores the signal cannot hold the step or the session lock; calls still running then read cancelled, and the batch is closed: a late result writes no slot and fires no `onCallFinished`. When the turn's signal is aborted the batch reports cancelled even if another group failed with a non-cancel error; that error is rethrown only for a batch that was not cancelled.
 
 ## Reply versus progress
 

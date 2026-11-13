@@ -219,6 +219,18 @@ describe("TaskStore", () => {
     expect(claimedAgain?.attempts).toBe(2);
   });
 
+  it("markRetry leaves the row due only once its backoff has passed", () => {
+    const t = store.create(
+      { sessionId: "s-1", userMessage: "hi", origin: "cli", maxAttempts: 3 },
+      1_000,
+    );
+    store.markRunning(t.id, 1_500);
+    const retried = store.markRetry(t.id, { category: "transport", message: "boom" }, 2_000, 62_000);
+    expect(retried.scheduledFor).toBe(62_000);
+    expect(store.listDue(61_999).map((r) => r.id)).toEqual([]);
+    expect(store.listDue(62_000).map((r) => r.id)).toEqual([t.id]);
+  });
+
   it("markFailed records category and message, clamping oversized errors", () => {
     const t = store.create(
       { sessionId: "s-1", userMessage: "hi", origin: "cli", maxAttempts: 1 },

@@ -2,8 +2,36 @@ import type { CompletionUsage } from "./completion-types.js";
 import type { ResolvedModel } from "./model-resolver.js";
 
 /**
- * Estimated spend of one completion, in USD, from its usage and the
- * model's per-million-token prices.
+ * What the service itself billed for a completion (OpenRouter
+ * `usage.cost`), when it reported a usable figure: finite and not
+ * negative. `undefined` otherwise.
+ */
+export function reportedCostUsd(usage: CompletionUsage): number | undefined {
+  const cost = usage.costUsd;
+  return typeof cost === "number" && Number.isFinite(cost) && cost >= 0 ? cost : undefined;
+}
+
+/**
+ * Spend of one completion, in USD, or `undefined` when there is nothing
+ * to price it with: the service's own bill (`usage.costUsd`) when it
+ * reported one, even for a model the price table does not know; else
+ * the estimate at `pricing`; else `undefined` (an unpriced model).
+ */
+export function completionCostUsd(
+  usage: CompletionUsage,
+  pricing: NonNullable<ResolvedModel["pricing"]> | undefined,
+): number | undefined {
+  const reported = reportedCostUsd(usage);
+  if (reported !== undefined) return reported;
+  return pricing === undefined ? undefined : estimateUsageCostUsd(usage, pricing);
+}
+
+/**
+ * Spend of one completion, in USD. The service's own bill
+ * (`usage.costUsd`) wins when it reported one, priced model or not, so
+ * spend caps see an unpriced model's real cost. Otherwise it is
+ * estimated from the usage and the model's per-million-token prices;
+ * an unpriced model with no reported bill counts `0`.
  *
  * Cached prompt tokens are a subset of `promptTokens`: they are billed at
  * the model's `cacheRead` rate when the catalog or the operator names
@@ -22,8 +50,11 @@ import type { ResolvedModel } from "./model-resolver.js";
  */
 export function estimateUsageCostUsd(
   usage: CompletionUsage,
-  pricing: NonNullable<ResolvedModel["pricing"]>,
+  pricing: NonNullable<ResolvedModel["pricing"]> | undefined,
 ): number {
+  const reported = reportedCostUsd(usage);
+  if (reported !== undefined) return reported;
+  if (pricing === undefined) return 0;
   const cached = Math.min(
     Math.max(0, usage.cachedTokens ?? 0),
     Math.max(0, usage.promptTokens),

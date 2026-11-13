@@ -325,6 +325,7 @@ export class TaskStore {
           SET status = 'pending',
               updated_at = @now,
               started_at = NULL,
+              scheduled_for = @scheduled_for,
               last_error = @last_error,
               last_error_cat = @last_error_cat
         WHERE id = @id AND status = 'running'`,
@@ -612,19 +613,23 @@ export class TaskStore {
   }
 
   /**
-   * Move a `running` task back to `pending` so the next drain picks it
-   * up. Used when the failure category is retryable and the attempt
-   * budget is not yet exhausted. The `running` -> `pending` arrow is
-   * the one legal "backward" transition in the lifecycle.
+   * Move a `running` task back to `pending`, due again at `retryAt`
+   * (`scheduled_for`; default `now`, due at once), so a drain picks it
+   * up only once its backoff has passed. Used when the failure category
+   * is retryable and the attempt budget is not yet exhausted. The
+   * `running` -> `pending` arrow is the one legal "backward" transition
+   * in the lifecycle.
    */
   markRetry(
     id: string,
     failure: TaskFailureInput,
     now: number = Date.now(),
+    retryAt: number = now,
   ): TaskRecord {
     const result = this.markRetryStmt.run({
       id,
       now,
+      scheduled_for: retryAt,
       last_error: truncateError(failure.message),
       last_error_cat: failure.category,
     }) as { changes: number };

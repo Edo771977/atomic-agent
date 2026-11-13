@@ -157,8 +157,9 @@ export interface TaskRunnerOptions {
   approvalLevel?: () => number;
   metrics?: AgentMetrics;
   /**
-   * Test seam for the inter-attempt sleep. Production uses the real
-   * `setTimeout`; tests substitute a fake to keep the suite fast.
+   * Test seam for the crash-resume backoff wait (`backOffResume`; a
+   * retry waits as durable `scheduled_for` instead). Production uses the
+   * real `setTimeout`; tests substitute a fake to keep the suite fast.
    */
   sleep?: (ms: number) => Promise<void>;
   /**
@@ -202,6 +203,15 @@ export interface DrainOutcome {
   blocked: number;
   cancelled: number;
   retried: number;
+  /**
+   * Tasks the drain left `pending` waiting out a retry backoff (failed
+   * retryably in this drain, or already waiting when it began). No drain
+   * sleeps through a backoff, so these are not finished: they run when
+   * due (`nextRetryAt`) on the scheduler's tick or a later drain.
+   */
+  retryPending: number;
+  /** When the earliest of `retryPending` is due (epoch ms); `null` when none. */
+  nextRetryAt: number | null;
 }
 
 /**
@@ -362,6 +372,59 @@ export class TaskRunner {
 
     const claimed = this.options.store.markRunning(resolvedTask.id);
     if (!claimed) return this.options.store.get(resolvedTask.id);
+    // Anything that throws after the claim (saving the wake reason or a
+    // recreated session, starting the snapshot sink) must not leave the
+    // row `running` with nobody on it: it ends like a failed run.
+    try {
+      return await this.runClaimed(task, claimed, runtimeSignal);
+    } catch (err) {
+      return this.failAfterClaim(claimed, err, runtimeSignal);
+    }
+  }
+
+  /**
+   * A throw out of a claimed attempt outside its turn: failed or retried
+   * on the usual curve, unless the row already ended elsewhere. When the
+   * store cannot record even that, the error is logged and the row is
+   * left for the boot sweep, rather than rejecting the whole drain.
+   */
+  private failAfterClaim(
+    claimed: TaskRecord,
+    err: unknown,
+    runtimeSignal: AbortSignal | undefined,
+  ): TaskRecord | null {
+    this.options.logger?.warn("task run threw outside its turn", {
+      taskId: claimed.id,
+      sessionId: claimed.sessionId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    try {
+      if (this.endedElsewhere(claimed)) return this.options.store.get(claimed.id);
+      // The agent stopping or the drain aborted is what ended it, not the
+      // task: put back like any interrupted run (`handleCancelled`), not
+      // filed as a transport retry; a recurring task is rearmed for its
+      // next firing.
+      if (this.interrupted(runtimeSignal)) {
+        return this.handleCancelled(claimed, err, true);
+      }
+      // Infrastructure around the turn, not the task's own request: retried
+      // on the usual curve, failed once its attempts run out.
+      return this.handleFailure(claimed, "transport", err);
+    } catch (storeErr) {
+      this.options.logger?.warn("task failure could not be recorded", {
+        taskId: claimed.id,
+        error: storeErr instanceof Error ? storeErr.message : String(storeErr),
+      });
+      return null;
+    }
+  }
+
+  /** One claimed attempt of `task` (`claimed` is its row after the claim). */
+  private async runClaimed(
+    task: TaskRecord,
+    claimed: TaskRecord,
+    runtimeSignal: AbortSignal | undefined,
+  ): Promise<TaskRecord | null> {
 
     this.options.metrics?.recordTaskStarted({
       taskId: claimed.id,
@@ -459,7 +522,10 @@ export class TaskRunner {
       userMessage: claimed.userMessage,
       startedAt: claimed.startedAt ?? Date.now(),
     };
-    const snapshots =
+    // Started inside the run's try below, so its `finally` stops the
+    // timer whatever ends the run.
+    let snapshots: ReturnType<typeof startTaskSnapshots> | null = null;
+    const startSnapshots = (): ReturnType<typeof startTaskSnapshots> | null =>
       collector && this.options.snapshotSink
         ? startTaskSnapshots({
             sink: this.options.snapshotSink,
@@ -543,6 +609,7 @@ export class TaskRunner {
       this.live.set(claimed.id, { ...liveInfo, collector });
     }
     try {
+      snapshots = startSnapshots();
       let result: RunTurnResult;
       try {
         await this.backOffResume(plan, run.signal);
@@ -861,9 +928,10 @@ export class TaskRunner {
 
   /**
    * Pull every `pending` task (optionally filtered by `sessionId`),
-   * group by session, and drain each group sequentially. Per-session
-   * tasks see their backoff applied between attempts on the *same*
-   * task. Cross-session groups run in parallel; `TurnController`
+   * group by session, and drain each group sequentially. A task still
+   * waiting out a retry backoff is skipped (it is due later), and a
+   * task that fails retryably in this drain is not run again in it
+   * unless no backoff applies. Cross-session groups run in parallel; `TurnController`
    * enforces at most one concurrent `runTurn` per session, which
    * naturally serialises this loop with any user-facing turn that lands
    * mid-drain.
@@ -919,8 +987,28 @@ export class TaskRunner {
       let current: TaskRecord | null = task;
       while (current && current.status === "pending") {
         if (signal?.aborted || this.stopping) return;
-        const before = current;
-        current = await this.runOne(current.id, signal);
+        // A retry still waiting out its backoff (`markRetry` set its
+        // `scheduled_for`) is not run early by any drain, this one
+        // included: it is due again later.
+        if (awaitingRetry(current, Date.now())) {
+          outcome.retryPending += 1;
+          const due = current.scheduledFor!;
+          if (outcome.nextRetryAt === null || due < outcome.nextRetryAt) outcome.nextRetryAt = due;
+          break;
+        }
+        const attempted: TaskRecord = current;
+        try {
+          current = await this.runOne(attempted.id, signal);
+        } catch (err) {
+          // One task's throw (before its claim, e.g. the store) must not
+          // reject the whole drain and strand the other sessions' groups.
+          this.options.logger?.warn("task drain skipped a task that threw", {
+            taskId: attempted.id,
+            sessionId: attempted.sessionId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          break;
+        }
         outcome.drained += 1;
         if (!current) break;
         if (current.status === "completed") outcome.completed += 1;
@@ -948,10 +1036,10 @@ export class TaskRunner {
             outcome.completed += 1;
             break;
           }
+          // A retry: run again in this drain only when its backoff is
+          // already over (none configured); otherwise it is left due
+          // later, without holding the drain (or the scheduler's tick).
           outcome.retried += 1;
-          const delay = nextDelayMs(current.attempts, this.options.backoff);
-          if (delay > 0) await this.sleep(delay);
-          void before;
         }
       }
     }
@@ -981,7 +1069,13 @@ export class TaskRunner {
       });
       return terminal;
     }
-    const retried = this.options.store.markRetry(task.id, failure);
+    // The backoff is durable state, not a sleep: the row is due again
+    // only at `retryAt`, so no drainer (the next tick, the auto-drain
+    // after a create, an HTTP or CLI drain) runs it early, and no drain
+    // holds the scheduler's tick while it waits.
+    const now = Date.now();
+    const retryAt = now + nextDelayMs(task.attempts, this.options.backoff);
+    const retried = this.options.store.markRetry(task.id, failure, now, retryAt);
     this.options.metrics?.recordTaskRetry({
       taskId: retried.id,
       sessionId: retried.sessionId ?? "<unassigned>",
@@ -994,6 +1088,7 @@ export class TaskRunner {
       category,
       attempt: retried.attempts,
       maxAttempts: retried.maxAttempts,
+      retryAt,
     });
     return retried;
   }
@@ -1255,6 +1350,25 @@ function isPermanent(category: LlmFailureCategory): boolean {
   return category === "grammar" || category === "tool";
 }
 
+/**
+ * A row put back by `markRetry` whose backoff has not passed yet: an
+ * attempt already ran and its `scheduled_for` is still ahead. A fresh
+ * one-shot scheduled for later (no attempt yet) is not one, and neither
+ * is a run put back as interrupted (`markInterrupted`, category
+ * `cancelled`): it keeps whatever `scheduled_for` it had, but nothing
+ * failed, so the next drain runs it as it would a fresh task.
+ */
+function awaitingRetry(task: TaskRecord, now: number): boolean {
+  return (
+    task.status === "pending" &&
+    task.attempts > 0 &&
+    task.lastErrorCategory !== null &&
+    task.lastErrorCategory !== "cancelled" &&
+    task.scheduledFor !== null &&
+    task.scheduledFor > now
+  );
+}
+
 function defaultSleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -1267,6 +1381,8 @@ function emptyOutcome(): DrainOutcome {
     blocked: 0,
     cancelled: 0,
     retried: 0,
+    retryPending: 0,
+    nextRetryAt: null,
   };
 }
 

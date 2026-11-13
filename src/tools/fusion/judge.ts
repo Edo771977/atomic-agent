@@ -1,6 +1,6 @@
 import { readFile, stat } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
-import { estimateUsageCostUsd } from "../../llm/provider/usage-cost.js";
+import { completionCostUsd } from "../../llm/provider/usage-cost.js";
 import type { DelegateTask } from "./delegate-args.js";
 import { describeProvide, type DelegateContract } from "./contract.js";
 import type {
@@ -372,8 +372,8 @@ export async function judgeTask(input: {
       signal: input.signal,
     });
     content = answer.content;
-    if (input.pricing !== undefined && answer.usage !== undefined) {
-      costUsd = estimateUsageCostUsd(answer.usage, input.pricing);
+    if (answer.usage !== undefined) {
+      costUsd = completionCostUsd(answer.usage, input.pricing) ?? null;
     }
   } catch (err) {
     return {

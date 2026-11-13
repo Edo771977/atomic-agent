@@ -70,7 +70,7 @@ import {
 import type { DelegateTask } from "./delegate-args.js";
 import { resolveTaskLegs, unknownModels, type TaskLeg } from "./role-models.js";
 import type { DelegateContract } from "./contract.js";
-import { estimateUsageCostUsd } from "../../llm/provider/usage-cost.js";
+import { completionCostUsd, estimateUsageCostUsd } from "../../llm/provider/usage-cost.js";
 import {
   FusionTurnBudget,
   TURN_BUDGET_INSTRUCTION,
@@ -91,6 +91,7 @@ import {
   delegateOutcome,
   fanoutSpend,
   formatDelegateOutput,
+  taskSpendUsd,
   type WorkerPricing,
   type WorkerTaskResult,
 } from "./worker-result.js";
@@ -693,11 +694,10 @@ export function buildFusionDelegateTool(
                 _taskId: string,
                 usage: Parameters<typeof estimateUsageCostUsd>[0],
               ): void => {
-                if (pricing !== undefined) {
-                  turnBudget.addWorkerSpend(
-                    ctx.sessionId,
-                    estimateUsageCostUsd(usage, pricing),
-                  );
+                // The service's own bill counts even for an unpriced worker.
+                const usd = completionCostUsd(usage, pricing);
+                if (usd !== undefined) {
+                  turnBudget.addWorkerSpend(ctx.sessionId, usd);
                 }
                 const stop = budgetStop();
                 if (stop !== undefined) stopForBudget(stop);
@@ -791,10 +791,8 @@ export function buildFusionDelegateTool(
               onWorkerTool: (taskId: string, tool: string): void =>
                 run.noteTool(taskId, tool),
               onTaskFinished: (result: WorkerTaskResult): void => {
-                const costUsd =
-                  pricing !== undefined && result.usage !== undefined
-                    ? estimateUsageCostUsd(result.usage, pricing)
-                    : 0;
+                // Per call, as the turn budget was charged.
+                const costUsd = taskSpendUsd(result, pricing);
                 // A proposal is not an answer: its row is written once the
                 // split closed (`expandWave`), its spend now. Under isolation
                 // nothing has reached the folder yet: `runTasks` writes the

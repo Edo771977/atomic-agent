@@ -1,5 +1,5 @@
 import type { CompletionUsage } from "../../llm/provider/completion-types.js";
-import { estimateUsageCostUsd } from "../../llm/provider/usage-cost.js";
+import { completionCostUsd } from "../../llm/provider/usage-cost.js";
 import type { FusionEscalationTarget } from "../../llm/run-mode/index.js";
 import type { WorkerPricing } from "./worker-result.js";
 
@@ -136,9 +136,9 @@ export async function requestAdvice(input: {
       signal: input.signal,
     });
     const costUsd =
-      pricing === undefined || answer.usage === undefined
+      answer.usage === undefined
         ? null
-        : estimateUsageCostUsd(answer.usage, pricing);
+        : (completionCostUsd(answer.usage, pricing) ?? null);
     const hint = answer.content.trim();
     if (hint.length === 0) {
       return { ok: false, reason: "the escalation model sent no answer", costUsd };

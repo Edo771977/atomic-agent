@@ -29,6 +29,11 @@ import { getAppVersion } from "../version.js";
 interface ActiveSession {
   session: SessionState;
   runtime: AgentRuntime;
+  /**
+   * Aborts the `send_message` turns submitted since the last `cancel`:
+   * the running one and those queued behind it. `cancel` replaces it,
+   * so a message sent afterwards runs on a live signal.
+   */
   controller: AbortController;
   eventSink: (event: AgentLoopEvent) => void;
 }
@@ -330,10 +335,14 @@ export async function bootstrapSidecar(): Promise<{
     // has already mutated `active.session`, and the queued body
     // must pick up that updated state instead of the stale value
     // captured at request-handler entry.
+    // Captured now: a `cancel` aborts this signal and installs a fresh
+    // controller, so this turn (running or still queued) stops while a
+    // message sent after the cancel runs normally.
+    const { signal } = active.controller;
     const result = await runtime.turnController.enqueue({
       sessionId,
       origin: "sidecar",
-      signal: active.controller.signal,
+      signal,
       run: async () => {
         if (!active || active.session.id !== sessionId) {
           throw new Error(
@@ -349,7 +358,7 @@ export async function bootstrapSidecar(): Promise<{
           // `typeof` rather than `=== undefined`: a JSON client may send
           // `null`, which the old `??` also treated as "not given".
           ...(typeof maxSteps === "number" ? { maxSteps } : {}),
-          signal: active.controller.signal,
+          signal,
           // The desktop app: picks the reply's `### answer-style`.
           origin: "sidecar",
         });
@@ -401,7 +410,12 @@ export async function bootstrapSidecar(): Promise<{
       if (!active) return { cancelled: false };
       const compacting = active.runtime.cancelSessionCompaction(request.payload.sessionId);
       if (active.session.id !== request.payload.sessionId) return { cancelled: compacting };
+      // Stops the running turn and the ones queued behind it (as the
+      // TUI's Esc drops its parked messages), then re-arms the session.
+      // Reusing the aborted controller made every later `send_message`
+      // reject before it ran.
       active.controller.abort();
+      active.controller = new AbortController();
       return { cancelled: true };
     },
   );

@@ -18,6 +18,8 @@ import {
 } from "./declared-files.js";
 import {
   deliveredNothing,
+  addCompletionUsage,
+  sumWorkerBilling,
   type WorkerTaskResult,
   type WorkerTaskStatus,
 } from "./worker-result.js";
@@ -666,7 +668,8 @@ async function closeParent(
   );
   const tools = sumTools(row, children);
   const usage = sumUsage([row, ...children]);
-  const { error: _parentError, ...parentRow } = row;
+  const billing = sumWorkerBilling([row, ...children]);
+  const { error: _parentError, billing: _parentBilling, ...parentRow } = row;
   let closed: WorkerTaskResult = {
     ...parentRow,
     status,
@@ -678,6 +681,7 @@ async function closeParent(
     durationMs: Math.max(row.durationMs, Date.now() - startedAt),
     tools,
     ...(usage === undefined ? {} : { usage }),
+    ...(billing === undefined ? {} : { billing }),
     notes: [
       ...(row.notes ?? []).filter((n) => !FILE_CHECK_NOTE.test(n)),
       `split into ${children.length} subtasks: ${children.map((c) => `${c.id} ${c.status}`).join(", ")}`,
@@ -726,21 +730,7 @@ function sumTools(
 function sumUsage(rows: readonly WorkerTaskResult[]): CompletionUsage | undefined {
   let usage: CompletionUsage | undefined;
   for (const r of rows) {
-    if (r.usage === undefined) continue;
-    usage =
-      usage === undefined
-        ? { ...r.usage }
-        : {
-            promptTokens: usage.promptTokens + r.usage.promptTokens,
-            completionTokens: usage.completionTokens + r.usage.completionTokens,
-            totalTokens: usage.totalTokens + r.usage.totalTokens,
-            ...(usage.cachedTokens === undefined && r.usage.cachedTokens === undefined
-              ? {}
-              : {
-                  cachedTokens:
-                    (usage.cachedTokens ?? 0) + (r.usage.cachedTokens ?? 0),
-                }),
-          };
+    if (r.usage !== undefined) usage = addCompletionUsage(usage, r.usage);
   }
   return usage;
 }

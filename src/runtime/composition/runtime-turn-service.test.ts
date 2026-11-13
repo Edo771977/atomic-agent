@@ -306,6 +306,27 @@ describe("runtime turn ownership recipes", () => {
     expect(silent.usage).toBeUndefined();
   });
 
+  it("a turn queued behind a running one does not reset the running turn's usage", async () => {
+    const meter = fixture.deps.telemetry.turnUsageMeter;
+    const gate = deferred<void>();
+    fixture.loop.runTurn.mockImplementationOnce(async (value: SessionState, options: RunTurnOptions) => {
+      meter.record({ sessionId: value.id, usage: { promptTokens: 100, completionTokens: 10, totalTokens: 110 } });
+      await gate.promise;
+      meter.record({ sessionId: value.id, usage: { promptTokens: 20, completionTokens: 2, totalTokens: 22 } });
+      return result(value, options);
+    }).mockImplementationOnce(async (value: SessionState, options: RunTurnOptions) => {
+      meter.record({ sessionId: value.id, usage: { promptTokens: 7, completionTokens: 1, totalTokens: 8 } });
+      return result(value, options);
+    });
+    const first = fixture.service.runTurn(session("busy"), "first");
+    await flushNaming();
+    const second = fixture.service.runTurn(session("busy"), "second");
+    await flushNaming();
+    gate.resolve();
+    expect((await first).usage).toEqual({ promptTokens: 120, completionTokens: 12 });
+    expect((await second).usage).toEqual({ promptTokens: 7, completionTokens: 1 });
+  });
+
   // ATO-277: after a fallover, message_sent names the provider and model
   // that answered, not the configured active ones.
   it("telemetry reports the provider that served the turn and its fallbacks", async () => {

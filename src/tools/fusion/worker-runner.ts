@@ -8,7 +8,7 @@ import type { DelegateTask } from "./delegate-args.js";
 import type { DelegateContract } from "./contract.js";
 import type { CompletionUsage } from "../../llm/provider/completion-types.js";
 import type { FusionEscalationTarget } from "../../llm/run-mode/index.js";
-import { estimateUsageCostUsd } from "../../llm/provider/usage-cost.js";
+import { completionCostUsd, estimateUsageCostUsd } from "../../llm/provider/usage-cost.js";
 import {
   describeTrigger,
   formatAdvisorSteer,
@@ -1424,9 +1424,7 @@ async function runOneTask(
             options.onWorkerUsage?.(task.id, completed.usage);
             addSpend(
               completed.usage.promptTokens + completed.usage.completionTokens,
-              options.workerPricing === undefined
-                ? null
-                : estimateUsageCostUsd(completed.usage, options.workerPricing),
+              completionCostUsd(completed.usage, options.workerPricing) ?? null,
             );
           } else {
             addSpend(

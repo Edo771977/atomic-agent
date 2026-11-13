@@ -70,11 +70,7 @@ function estimateCost(
   if (!usage) return 0;
   // The service's own bill (OpenRouter `usage.cost`) beats a price-table
   // guess, and counts even for a model the table does not price (ATO-1289).
-  if (typeof usage.costUsd === "number" && Number.isFinite(usage.costUsd) && usage.costUsd >= 0) {
-    return usage.costUsd;
-  }
-  if (!model?.pricing) return 0;
-  return estimateUsageCostUsd(usage, model.pricing);
+  return estimateUsageCostUsd(usage, model?.pricing);
 }
 
 function utcDayKey(now: Date, resetHourUtc: number): string {

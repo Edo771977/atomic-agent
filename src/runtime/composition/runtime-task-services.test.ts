@@ -112,7 +112,7 @@ describe("runtime task service phases", () => {
   it("constructs the scheduler without starting it; the caller chooses first tick after channel connection", async () => {
     const { runner } = runnerFixture(); vi.useFakeTimers();
     config.tasks.schedulerTickMs = 100; config.tasks.schedulerBatch = 3;
-    const due = vi.spyOn(runner, "runDue").mockResolvedValue({ drained: 0, completed: 0, failed: 0, blocked: 0, cancelled: 0, retried: 0 });
+    const due = vi.spyOn(runner, "runDue").mockResolvedValue({ drained: 0, completed: 0, failed: 0, blocked: 0, cancelled: 0, retried: 0, retryPending: 0, nextRetryAt: null });
     scheduler = createRuntimeScheduler({ config, taskRunner: runner, logger, metrics });
     expect(scheduler).not.toBeNull(); expect(vi.getTimerCount()).toBe(0);
     await vi.advanceTimersByTimeAsync(200); expect(due).not.toHaveBeenCalled();
@@ -124,7 +124,7 @@ describe("runtime task service phases", () => {
   // ATO-416: the desktop's `atag serve` and the TUI share the state dir;
   // only one of them drains due tasks.
   describe("scheduler leadership across processes sharing the state dir", () => {
-    const outcome = { drained: 0, completed: 0, failed: 0, blocked: 0, cancelled: 0, retried: 0 };
+    const outcome = { drained: 0, completed: 0, failed: 0, blocked: 0, cancelled: 0, retried: 0, retryPending: 0, nextRetryAt: null };
     const wantedTelegram = { hasToken: () => true, state: () => "down" as const };
 
     it("drains and holds scheduler.lock when it is the only process", async () => {

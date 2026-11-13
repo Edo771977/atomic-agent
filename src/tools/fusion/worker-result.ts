@@ -1,6 +1,6 @@
 import type { FusionRole } from "../../config/llm-run-mode-config.js";
 import type { CompletionUsage } from "../../llm/provider/completion-types.js";
-import { estimateUsageCostUsd } from "../../llm/provider/usage-cost.js";
+import { estimateUsageCostUsd, reportedCostUsd } from "../../llm/provider/usage-cost.js";
 import type {
   AgentLoopEvent,
   AgentLoopReason,
@@ -172,6 +172,13 @@ export interface WorkerTaskResult {
   tools: WorkerToolStats;
   usage?: CompletionUsage;
   /**
+   * Present only when some of the worker's completions carried the
+   * service's bill and some did not: `usage.costUsd` is then absent (a
+   * partial sum would undercount), and the row is priced per call the
+   * way the turn budget counted it (`taskSpendUsd`).
+   */
+  billing?: WorkerBilling;
+  /**
    * What went wrong, in the failing layer's own words: the thrown turn,
    * the worker loop's last provider/loop error, or the declared-file
    * check. Rendered on the task's head line.
@@ -253,6 +260,11 @@ export class WorkerRunCollector {
   private writes = 0;
   private readonly byTool: Record<string, number> = {};
   private usage: CompletionUsage | undefined;
+  /** The service's bill over the completions that reported one. */
+  private billedUsd = 0;
+  private anyBilled = false;
+  /** Σ usage of the completions that reported no bill. */
+  private unbilled: CompletionUsage | undefined;
   private lastLoopError: string | undefined;
   private lastWaitReason: string | undefined;
   /** The last few tool results, one line each — what a hand-back reports. */
@@ -319,25 +331,16 @@ export class WorkerRunCollector {
     }
     if (inner.type === "llm_completed" && inner.completion.usage) {
       const next = inner.completion.usage;
-      const prev = this.usage;
-      this.usage =
-        prev === undefined
-          ? { ...next }
-          : {
-              promptTokens: prev.promptTokens + next.promptTokens,
-              completionTokens: prev.completionTokens + next.completionTokens,
-              totalTokens: prev.totalTokens + next.totalTokens,
-              // Kept through the sum (ATO-918): dropping it priced every
-              // cached prompt token at the full input rate, which on a
-              // multi-step worker overstated its cost about threefold.
-              ...(prev.cachedTokens === undefined &&
-              next.cachedTokens === undefined
-                ? {}
-                : {
-                    cachedTokens:
-                      (prev.cachedTokens ?? 0) + (next.cachedTokens ?? 0),
-                  }),
-            };
+      this.usage = addCompletionUsage(this.usage, next);
+      // Per call, as the turn budget counts it (`onWorkerUsage`): the
+      // service's bill where it sent one, the tokens otherwise.
+      const billed = reportedCostUsd(next);
+      if (billed !== undefined) {
+        this.billedUsd += billed;
+        this.anyBilled = true;
+      } else {
+        this.unbilled = addCompletionUsage(this.unbilled, next);
+      }
     }
   }
 
@@ -425,6 +428,9 @@ export class WorkerRunCollector {
         byTool: { ...this.byTool },
       },
       ...(this.usage ? { usage: this.usage } : {}),
+      ...(this.anyBilled && this.unbilled !== undefined
+        ? { billing: { billedUsd: this.billedUsd, unbilled: this.unbilled } }
+        : {}),
       ...(error === undefined ? {} : { error }),
       ...(hint === undefined ? {} : { hint }),
       ...(notes.length === 0 ? {} : { notes }),
@@ -830,14 +836,85 @@ export interface FanoutSpend {
   cachedTokens?: number;
 }
 
-/** One task's cost at `pricing`, cache discount included (`estimateUsageCostUsd`). */
+/**
+ * A worker's spend split for pricing when only some completions carried
+ * the service's bill: the billed sum, and the usage of the rest.
+ */
+export interface WorkerBilling {
+  billedUsd: number;
+  unbilled: CompletionUsage;
+}
+
+/**
+ * One task's cost at `pricing`, cache discount included
+ * (`estimateUsageCostUsd`). Priced per call as the turn budget counts
+ * it: the service's bill where a completion carried one, the estimate
+ * for the others (`billing`), so a checkpoint's spend and a resume's
+ * carried spend agree with what the turn's cap was charged.
+ */
 export function taskSpendUsd(
-  result: Pick<WorkerTaskResult, "usage">,
-  pricing: WorkerPricing,
+  result: Pick<WorkerTaskResult, "usage" | "billing">,
+  pricing: WorkerPricing | undefined,
 ): number {
-  return result.usage === undefined
-    ? 0
-    : estimateUsageCostUsd(result.usage, pricing);
+  if (result.usage === undefined) return 0;
+  if (result.billing !== undefined) {
+    return result.billing.billedUsd + estimateUsageCostUsd(result.billing.unbilled, pricing);
+  }
+  return estimateUsageCostUsd(result.usage, pricing);
+}
+
+/**
+ * Two usages summed. Cached tokens are kept through the sum (ATO-918):
+ * dropping them priced every cached prompt token at the full input rate.
+ * The service's bill sums only while both carry one; a partial sum would
+ * undercount (`billing` carries the split instead).
+ */
+export function addCompletionUsage(
+  prev: CompletionUsage | undefined,
+  next: CompletionUsage,
+): CompletionUsage {
+  if (prev === undefined) return { ...next };
+  return {
+    promptTokens: prev.promptTokens + next.promptTokens,
+    completionTokens: prev.completionTokens + next.completionTokens,
+    totalTokens: prev.totalTokens + next.totalTokens,
+    ...(prev.cachedTokens === undefined && next.cachedTokens === undefined
+      ? {}
+      : { cachedTokens: (prev.cachedTokens ?? 0) + (next.cachedTokens ?? 0) }),
+    ...(prev.costUsd !== undefined && next.costUsd !== undefined
+      ? { costUsd: prev.costUsd + next.costUsd }
+      : {}),
+  };
+}
+
+/**
+ * The billing split of several rows summed (a split task's parent and
+ * its children): `undefined` unless some of their completions were
+ * billed and some were not.
+ */
+export function sumWorkerBilling(
+  rows: readonly Pick<WorkerTaskResult, "usage" | "billing">[],
+): WorkerBilling | undefined {
+  let billedUsd = 0;
+  let anyBilled = false;
+  let unbilled: CompletionUsage | undefined;
+  for (const r of rows) {
+    if (r.usage === undefined) continue;
+    if (r.billing !== undefined) {
+      billedUsd += r.billing.billedUsd;
+      anyBilled = true;
+      unbilled = addCompletionUsage(unbilled, r.billing.unbilled);
+      continue;
+    }
+    const billed = reportedCostUsd(r.usage);
+    if (billed !== undefined) {
+      billedUsd += billed;
+      anyBilled = true;
+    } else {
+      unbilled = addCompletionUsage(unbilled, r.usage);
+    }
+  }
+  return anyBilled && unbilled !== undefined ? { billedUsd, unbilled } : undefined;
 }
 
 /**

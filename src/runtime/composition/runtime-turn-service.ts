@@ -16,7 +16,7 @@ import { previousReplyText, workerRequestRecord } from "../../prompt/request-sec
 import { pickOriginalRequest } from "../../tools/fusion/index.js";
 import type { ToolRole } from "../../tools/tool-roles.js";
 import type { ShellJobRegistry } from "../../tools/os/shell/shell-jobs.js";
-import { captureMessageSent, type AnalyticsStateStore, type LocalEngine, type TurnUsageMeter } from "../../analytics/index.js";
+import { captureMessageSent, type AnalyticsStateStore, type LocalEngine, type TurnUsageMeter, type TurnUsageSnapshot } from "../../analytics/index.js";
 import type { SessionUsageLedger } from "../../session/usage-meter.js";
 import { providerIdIsLlamaServer } from "../../llm/provider/registry/active-text-provider.js";
 import type { StructuredLogger } from "../../tracing/structured-logger.js";
@@ -701,14 +701,13 @@ export function createRuntimeTurnService(
     // The provider the turn is meant for: its pin, else the active one.
     // Completions served by another link (a fallover) are counted.
     const intendedProviderId = runOptions.providerId ?? providerRegistry.activeText.id;
-    turnUsageMeter.begin(session.id, intendedProviderId);
     // ATO-277: provider, model and engine name the link that actually
     // served the turn, read from the meter at settlement. Read at the end
     // rather than the start, because a fallback only shows up once a
     // completion has landed; a turn that served nothing reports the
     // provider it was meant for.
-    const servedContext = () => {
-      const { servedProviderId, ...usage } = turnUsageMeter.snapshot(session.id);
+    const servedContext = (snapshot: TurnUsageSnapshot) => {
+      const { servedProviderId, ...usage } = snapshot;
       const providerId = servedProviderId ?? intendedProviderId;
       const provider = providerRegistry.getProvider(providerId) ?? providerRegistry.activeText;
       const localEngine = resolveTurnLocalEngine(getConfig(), provider.id);
@@ -719,11 +718,28 @@ export function createRuntimeTurnService(
         ...usage,
       };
     };
+    // The meter's bucket is opened and closed inside the lock: a turn
+    // queued behind a running one on the same session must not reset
+    // the running turn's bucket (and with it the fusion turn budget's
+    // baseline) when it is submitted. `undefined` while the turn never
+    // ran (cancelled in the queue): it then reports no usage.
+    let snapshot: TurnUsageSnapshot | undefined;
+    const metered = {
+      ...submission,
+      run: async () => {
+        turnUsageMeter.begin(session.id, intendedProviderId);
+        try {
+          return await submission.run();
+        } finally {
+          // One snapshot only: snapshot() empties the turn's bucket, so
+          // the analytics event and the caller's usage both read from it.
+          snapshot = turnUsageMeter.snapshot(session.id);
+        }
+      },
+    };
     try {
-      const result = await turnController.enqueue(submission);
-      // One snapshot only: snapshot() empties the turn's bucket, so the
-      // analytics event and the caller's usage both read from `context`.
-      const context = servedContext();
+      const result = await turnController.enqueue(metered);
+      const context = servedContext(snapshot ?? {});
       captureMessageSent(observability.getAnalytics(), analyticsStateStore, {
         ...context,
         latencyMs: Date.now() - startedAt,
@@ -737,7 +753,7 @@ export function createRuntimeTurnService(
         : result;
     } catch (error) {
       captureMessageSent(observability.getAnalytics(), analyticsStateStore, {
-        ...servedContext(),
+        ...servedContext(snapshot ?? {}),
         latencyMs: Date.now() - startedAt,
         outcome: "failed",
       });

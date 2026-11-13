@@ -280,7 +280,9 @@ export function createRunTaskHandler(): HttpHandler {
  * `POST /api/tasks/drain` — drain every pending task. Optional
  * `?session=` query restricts the drain to one session. Resolves once
  * all in-scope work has settled into a non-`pending` state (or hit
- * the per-task max-attempt budget).
+ * the per-task max-attempt budget), except retries waiting out their
+ * backoff: those stay `pending` and are counted in `retryPending`, with
+ * the earliest due time in `nextRetryAt`.
  */
 export function createDrainTasksHandler(): HttpHandler {
   return async (req, res, ctx) => {

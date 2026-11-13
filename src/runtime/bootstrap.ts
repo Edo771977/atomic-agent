@@ -1,4 +1,4 @@
-import { estimateUsageCostUsd } from "../llm/provider/usage-cost.js";
+import { completionCostUsd } from "../llm/provider/usage-cost.js";
 import { resolveServerTemplatePolicy } from "../llm/server-template-policy.js";
 import { createContextCompaction, logCompactionOutcome } from "./context-compaction.js";
 import { enhancePrompt, promptEnhancePartition } from "./prompt-enhancer.js";
@@ -489,7 +489,7 @@ export async function createAgentRuntime(
   const compactionSideSlot = () => slotManager.sideCallSlotId();
   const compactionCost = (result: CompletionResult, providerId: string) => {
     const pricing = resolveModelPricing(result.modelId, providerId)?.pricing;
-    return pricing && result.usage ? estimateUsageCostUsd(result.usage, pricing) : undefined;
+    return result.usage ? completionCostUsd(result.usage, pricing) : undefined;
   };
   const compaction = createContextCompaction({
     config: () => getConfig().agent.compaction,
