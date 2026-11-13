@@ -143,3 +143,31 @@ describe("normaliseOpenAiChatResponse: served service tier", () => {
     expect(result.usage).not.toHaveProperty("serviceTier");
   });
 });
+
+describe("normaliseOpenAiUsage: Anthropic-shaped cache counts", () => {
+  const pricing = { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75, longContext: { thresholdTokens: 200_000, input: 6, output: 22.5, cacheRead: 0.6, cacheWrite: 7.5 } };
+
+  it("adds cache reads and writes reported outside prompt_tokens to the prompt", () => {
+    // Anthropic's `input_tokens` excludes both cache counts.
+    const usage = normaliseOpenAiUsage({ prompt_tokens: 5_000, completion_tokens: 100, cache_read_input_tokens: 150_000, cache_creation_input_tokens: 60_000 });
+    expect(usage).toMatchObject({ promptTokens: 215_000, cachedTokens: 150_000, cacheWriteTokens: 60_000 });
+    // 215k crosses the 200k long-context threshold though prompt_tokens alone does not.
+    expect(estimateUsageCostUsd(usage, pricing)).toBeCloseTo((5_000 * 6 + 150_000 * 0.6 + 60_000 * 7.5 + 100 * 22.5) / 1_000_000, 9);
+  });
+
+  it("treats them as outside when total_tokens counts them separately", () => {
+    const usage = normaliseOpenAiUsage({ prompt_tokens: 150_000, completion_tokens: 100, total_tokens: 250_100, cache_read_input_tokens: 100_000 });
+    expect(usage.promptTokens).toBe(250_000);
+    expect(usage.cachedTokens).toBe(100_000);
+  });
+
+  it("keeps the prompt when total_tokens says they are already inside it", () => {
+    const usage = normaliseOpenAiUsage({ prompt_tokens: 150_000, completion_tokens: 100, total_tokens: 150_100, cache_read_input_tokens: 100_000, cache_creation_input_tokens: 20_000 });
+    expect(usage).toMatchObject({ promptTokens: 150_000, cachedTokens: 100_000, cacheWriteTokens: 20_000 });
+  });
+
+  it("reads OpenAI's prompt_tokens_details as part of the prompt, as before", () => {
+    const usage = normaliseOpenAiUsage({ prompt_tokens: 150_000, completion_tokens: 100, prompt_tokens_details: { cached_tokens: 100_000 } });
+    expect(usage).toMatchObject({ promptTokens: 150_000, cachedTokens: 100_000 });
+  });
+});

@@ -52,6 +52,9 @@ export function completionCostUsd(
  * than its `thresholdTokens`, every share uses that block's rates. The
  * usage must be ONE completion's: a sum goes to
  * `estimateSummedUsageCostUsd`.
+ * The threshold is compared with `promptTokens`, the whole prompt: the
+ * OpenAI-compatible normaliser folds Anthropic-shaped cache counts
+ * reported outside `prompt_tokens` into it (`normaliseOpenAiUsage`).
  * `serviceTierMultipliers` are not applied here: the usage does not say
  * which tier was requested (the request budget applies them).
  */
