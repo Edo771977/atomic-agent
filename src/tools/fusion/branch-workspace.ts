@@ -525,8 +525,10 @@ async function addWorktree(
   }
   for (const entry of snapshot.ignored) {
     const isDir = entry.endsWith("/");
-    const path = isDir ? entry.slice(0, -1) : entry;
-    await copyPrivateEntry(join(realDir, path), join(dir, path), budget, path);
+    const path = (isDir ? entry.slice(0, -1) : entry).split("/").join(sep);
+    // Git lists ignored children (`node_modules/big/`) when a tracked
+    // placeholder keeps the dependency directory itself unignored.
+    await copyPrivateEntry(join(realDir, path), join(dir, path), budget, path, isDir && underSharedDependencyDirectory(path));
   }
   return dir;
 }
