@@ -177,24 +177,58 @@ function formatCount(n: number): string {
 }
 
 /**
+ * The note a worker brief puts right after a clipped quote
+ * (`worker-prompt.ts`). Here so `### request` can find it and replace
+ * it when it cuts the quote further.
+ */
+export function quotedRequestTruncationNote(total: number, quoted: number): string {
+  return `(truncated: the original request is ${formatCount(total)} chars; only the first ${formatCount(quoted)} are quoted above.)`;
+}
+
+/** {@link quotedRequestTruncationNote} on the line after the END marker. */
+const BRIEF_TRUNCATION_NOTE =
+  /\n\(truncated: the original request is ([\d,]+) chars; only the first [\d,]+ are quoted above\.\)/y;
+
+/**
  * A worker brief over the budget, clipped inside its quoted ORIGINAL
  * REQUEST block: the task, rules and closing reminder around the block
  * are the worker's own instructions and are kept whole. `null` when the
  * text has no complete block, or when what surrounds the block alone is
  * over the budget (then the plain head clip applies: the brief puts the
  * task first, so the head is the part to keep).
+ *
+ * A brief that already clipped its quote says so after the END marker
+ * ("only the first 16,000 are quoted"); that note is taken out, since
+ * it no longer holds, and its count of the whole request kept, so the
+ * section's one note says how long the request is and how much of it
+ * is still quoted.
  */
-function clipQuotedRequest(text: string, budget: number): string | null {
+function clipQuotedRequest(
+  text: string,
+  budget: number,
+): { text: string; total: number; quoted: number } | null {
   const begin = text.indexOf(ORIGINAL_REQUEST_BEGIN_MARKER);
   if (begin === -1) return null;
   const start = begin + ORIGINAL_REQUEST_BEGIN_MARKER.length;
   const end = text.indexOf(ORIGINAL_REQUEST_END_MARKER, start);
   if (end === -1) return null;
   const head = text.slice(0, start);
-  const tail = text.slice(end);
+  const afterEnd = end + ORIGINAL_REQUEST_END_MARKER.length;
+  BRIEF_TRUNCATION_NOTE.lastIndex = afterEnd;
+  const briefNote = BRIEF_TRUNCATION_NOTE.exec(text);
+  const tail =
+    briefNote === null
+      ? text.slice(end)
+      : `${ORIGINAL_REQUEST_END_MARKER}${text.slice(afterEnd + briefNote[0].length)}`;
   const room = budget - head.length - tail.length;
   if (room < 0) return null;
-  return `${head}${text.slice(start, end).slice(0, room)}${tail}`;
+  const quote = text.slice(start, end);
+  const kept = quote.slice(0, room);
+  const total =
+    briefNote === null
+      ? quote.trim().length
+      : Number(briefNote[1]!.replaceAll(",", ""));
+  return { text: `${head}${kept}${tail}`, total, quoted: kept.trim().length };
 }
 
 /** The `### request` body: the record, clipped, with a one-line frame. */
@@ -205,7 +239,7 @@ export function renderRequestSection(request: string): string {
       ? clipQuotedRequest(text, REQUEST_SECTION_CHAR_BUDGET)
       : null;
   const clipped =
-    quotedClip ??
+    quotedClip?.text ??
     (text.length > REQUEST_SECTION_CHAR_BUDGET
       ? text.slice(0, REQUEST_SECTION_CHAR_BUDGET)
       : text);
@@ -215,7 +249,7 @@ export function renderRequestSection(request: string): string {
   ];
   if (quotedClip !== null) {
     lines.push(
-      `(truncated: the request is ${formatCount(text.length)} chars; the quoted ORIGINAL REQUEST was cut to fit ${formatCount(REQUEST_SECTION_CHAR_BUDGET)}, the task and rules are whole.)`,
+      `(truncated: the original request is ${formatCount(quotedClip.total)} chars; only the first ${formatCount(quotedClip.quoted)} are quoted above; the task and rules are whole.)`,
     );
   } else if (clipped.length < text.length) {
     lines.push(

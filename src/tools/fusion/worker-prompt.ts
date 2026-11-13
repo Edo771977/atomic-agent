@@ -8,6 +8,7 @@ import {
   ORIGINAL_REQUEST_END_MARKER,
   REQUEST_FOLLOW_UP_MARKER,
   neutraliseRequestMarkers,
+  quotedRequestTruncationNote,
 } from "../../prompt/request-section.js";
 import type { DelegateTask } from "./delegate-args.js";
 import {
@@ -86,10 +87,6 @@ export function originalRequestCharBudget(localLeg: boolean): number {
  */
 export const FOLLOW_UP_MAX_CHARS = 280;
 
-function formatCount(n: number): string {
-  return n.toLocaleString("en-US");
-}
-
 /**
  * The request to quote in the briefs of a turn's fan-outs.
  *
@@ -152,7 +149,7 @@ function quoteOriginalRequest(request: string, budget: number): string[] {
   ];
   if (clipped.length < safe.length) {
     lines.push(
-      `(truncated: the original request is ${formatCount(safe.length)} chars; only the first ${formatCount(budget)} are quoted above.)`,
+      quotedRequestTruncationNote(safe.length, budget),
     );
   }
   return lines;

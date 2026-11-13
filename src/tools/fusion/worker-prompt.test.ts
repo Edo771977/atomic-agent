@@ -232,7 +232,14 @@ describe("renderWorkerBrief — the original request", () => {
     expect(section).toContain("----- END ORIGINAL REQUEST -----");
     expect(section).toContain("Your part is TASK t1 (Map the auth routes) above");
     expect(section).not.toContain("TAIL-OF-SPEC");
-    expect(section).toContain("the quoted ORIGINAL REQUEST was cut to fit 16,000, the task and rules are whole.");
+    // One note, with the request's real length and what is still quoted:
+    // the brief's own "first 16,000" note no longer holds once the
+    // section cuts the quote further.
+    expect(section.match(/\(truncated:/g)).toHaveLength(1);
+    const note = /\(truncated: the original request is ([\d,]+) chars; only the first ([\d,]+) are quoted above; the task and rules are whole\.\)/.exec(section);
+    expect(note?.[1]).toBe(huge.length.toLocaleString("en-US"));
+    expect(Number(note?.[2]?.replaceAll(",", ""))).toBe(quotedRequestText(section).trim().length);
+    expect(section.trimEnd().endsWith(note![0])).toBe(true);
     // The body (frame line and note aside) fits the budget.
     const body = section.split("\n").slice(1, -1).join("\n");
     expect(body.length).toBeLessThanOrEqual(REQUEST_SECTION_CHAR_BUDGET);
