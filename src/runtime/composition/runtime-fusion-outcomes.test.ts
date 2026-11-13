@@ -54,7 +54,7 @@ describe("runtime fusion outcomes: the turn receipt", () => {
       phase: "finished",
       taskId: "fusion.turn",
       model: "strong",
-      summary: "fusion receipt · strong unpriced, 2 requests, cache hit 85%",
+      summary: "fusion receipt · strong unpriced (subscription), 2 requests, cache hit 85%",
     });
     const lines = readFileSync(outcomeLogPath(dir), "utf8").trim().split("\n");
     expect(lines).toHaveLength(1);

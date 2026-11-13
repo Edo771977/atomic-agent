@@ -55,6 +55,9 @@ function turn(over: Partial<TurnOutcomeRecord["orchestrator"]> = {}, ts = "2026-
       tokensOut: 500,
       cachedTokens: 8_000,
       costUsd: null,
+      requestCostUsd: over.costUsd ?? null,
+      judgeCostUsd: 0,
+      escalationCostUsd: 0,
       steps: [
         { in: 2_000, cached: 1_000 },
         { in: 8_000, cached: 7_000 },
@@ -63,6 +66,7 @@ function turn(over: Partial<TurnOutcomeRecord["orchestrator"]> = {}, ts = "2026-
     },
     fanouts: 1,
     tasks: { total: 2, ok: 1, failed: 1 },
+    orchestratorTasks: { total: 0, costUsd: null },
     workerTokens: 2_000,
     workerMs: 20_000,
     workerCostUsd: null,
@@ -122,6 +126,18 @@ describe("fusion report", () => {
     const cloud = report.orchestrator.find((o) => o.provider === "openrouter")!;
     expect(cloud).toMatchObject({ cacheHitPct: null, avgStepCacheHitPct: null, costUsd: 0.5 });
     expect(report.strongSpendUsd).toBe(0.5);
+    // The claude-cli turn and the orchestrator-target task were not priced.
+    expect(report.strongSpendPartial).toBe(true);
+  });
+
+  it("does not read a priced judge as a priced orchestrator", () => {
+    const judged = turn({ costUsd: 0.03, requestCostUsd: null, judgeCostUsd: 0.03 });
+    const report = aggregateOutcomes([judged], { now: NOW });
+    expect(report.orchestrator[0]).toMatchObject({ costUsd: 0.03, unpricedTurns: 1 });
+    expect(report.strongSpendPartial).toBe(true);
+    const text = formatFusionReport(report);
+    expect(text).toMatch(/claude-cli\s+1\s+4\s+10\.0k\/500\s+80%\s+69%\s+\$0\.03 \(\+1 unpriced\)/);
+    expect(text).toContain("Strong-side spend: $0.03 + unpriced (subscription or no price known)");
   });
 
   it("filters by model or provider and by window", () => {
@@ -138,7 +154,7 @@ describe("fusion report", () => {
     expect(text).toContain("syntax 2, max_steps 1");
     expect(text).toContain("Tasks sent to the orchestrator's model");
     expect(text).toMatch(/claude-cli\s+1\s+4\s+10\.0k\/500\s+80%\s+69%\s+unpriced/);
-    expect(text).toContain("Strong-side spend: $0.50");
+    expect(text).toContain("Strong-side spend: $0.50 + unpriced (subscription or no price known)");
   });
 
   it("says so when nothing is recorded", () => {
