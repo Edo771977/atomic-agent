@@ -784,7 +784,12 @@ async function runOneTask(
   const workingDir = isolated?.workingDir ?? deps.workingDir;
   // Changed paths are kept relative to it, so they name the same files
   // in the folder once a workspace is merged back.
-  const collector = new WorkerRunCollector({ workingDir });
+  // With the price, a long-context step is priced on its own: the sum
+  // of a worker's steps cannot apply a per-request threshold.
+  const collector = new WorkerRunCollector({
+    workingDir,
+    ...(options.workerPricing === undefined ? {} : { pricing: options.workerPricing }),
+  });
   // The worker always runs in this folder (the parent's, in every model
   // mode, #1121); only an isolated or cloud worker inherits a workspace.
   const inheritWorkspace = isolated !== undefined || deps.inheritWorkspace === true;
@@ -1814,7 +1819,7 @@ async function runOneTask(
       inheritWorkspace,
     );
     armWorkerSession(replaceSession.id);
-    const replaceCollector = new WorkerRunCollector({ workingDir });
+    const replaceCollector = new WorkerRunCollector({ workingDir, pricing });
     const capAbort = new AbortController();
     const replaceTimer = setTimeout(
       () => capAbort.abort(new Error("time limit")),

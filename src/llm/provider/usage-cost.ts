@@ -49,13 +49,47 @@ export function completionCostUsd(
  * in its total (`unreportedOutputTokens`) are billed at the output rate.
  *
  * When `pricing.longContext` is set and the prompt is strictly larger
- * than its `thresholdTokens`, every share uses that block's rates.
+ * than its `thresholdTokens`, every share uses that block's rates. The
+ * usage must be ONE completion's: a sum goes to
+ * `estimateSummedUsageCostUsd`.
  * `serviceTierMultipliers` are not applied here: the usage does not say
  * which tier was requested (the request budget applies them).
  */
 export function estimateUsageCostUsd(
   usage: CompletionUsage,
   pricing: NonNullable<ResolvedModel["pricing"]> | undefined,
+): number {
+  return estimate(usage, pricing, true);
+}
+
+/**
+ * `estimateUsageCostUsd` for a SUM of completions (a worker's steps, a
+ * split task's rows). The long-context threshold is per request: a sum
+ * above it says nothing about any one prompt, so the sum is priced at
+ * the base rates. A caller that may hold long-context completions
+ * prices those per call before summing (`WorkerRunCollector`) and
+ * passes only the rest here.
+ */
+export function estimateSummedUsageCostUsd(
+  usage: CompletionUsage,
+  pricing: NonNullable<ResolvedModel["pricing"]> | undefined,
+): number {
+  return estimate(usage, pricing, false);
+}
+
+/** True when one completion's prompt is billed at `pricing.longContext`. */
+export function isLongContextUsage(
+  usage: CompletionUsage,
+  pricing: NonNullable<ResolvedModel["pricing"]> | undefined,
+): boolean {
+  const long = pricing?.longContext;
+  return long !== undefined && usage.promptTokens > long.thresholdTokens;
+}
+
+function estimate(
+  usage: CompletionUsage,
+  pricing: NonNullable<ResolvedModel["pricing"]> | undefined,
+  oneCompletion: boolean,
 ): number {
   const reported = reportedCostUsd(usage);
   if (reported !== undefined) return reported;
@@ -64,7 +98,7 @@ export function estimateUsageCostUsd(
   // long-context rates; unknown cache rates there fall back to its input.
   const long = pricing.longContext;
   const rates =
-    long !== undefined && usage.promptTokens > long.thresholdTokens
+    long !== undefined && oneCompletion && isLongContextUsage(usage, pricing)
       ? { input: long.input, output: long.output, cacheRead: long.cacheRead ?? long.input, cacheWrite: long.cacheWrite ?? long.input }
       : { input: pricing.input, output: pricing.output, cacheRead: pricing.cacheRead ?? pricing.input, cacheWrite: pricing.cacheWrite ?? pricing.input };
   const cached = Math.min(

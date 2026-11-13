@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { completionCostUsd, estimateUsageCostUsd } from "./usage-cost.js";
+import { completionCostUsd, estimateSummedUsageCostUsd, estimateUsageCostUsd } from "./usage-cost.js";
 
 describe("estimateUsageCostUsd", () => {
   it("prices cached prompt tokens at the cacheRead rate", () => {
@@ -126,6 +126,13 @@ describe("long-context pricing", () => {
       pricing,
     );
     expect(usd).toBeCloseTo((200_000 * 3 + 10_000 * 15) / 1_000_000, 9);
+  });
+
+  it("prices a sum of sub-threshold completions at the base rates", () => {
+    // Two 150k-token prompts summed to 300k: neither request was long.
+    const summed = { promptTokens: 300_000, completionTokens: 10_000, totalTokens: 310_000 };
+    expect(estimateSummedUsageCostUsd(summed, pricing)).toBeCloseTo((300_000 * 3 + 10_000 * 15) / 1_000_000, 9);
+    expect(estimateSummedUsageCostUsd({ ...summed, costUsd: 0.5 }, pricing)).toBe(0.5);
   });
 
   it("still lets a reported bill win", () => {
