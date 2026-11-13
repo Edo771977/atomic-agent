@@ -1300,610 +1300,617 @@ export function buildFusionDelegateTool(
         return expanded;
       };
 
-      let results: WorkerTaskResult[];
       try {
-        // A resume starts with what finished before the restart, and with
-        // the tasks that wait for the person's yes; neither runs here.
-        const finished = new Map<string, WorkerTaskResult>(
-          resume === undefined
-            ? []
-            : [...resume.carried, ...resume.needsConfirmation].map((r) => [
-                r.id,
-                r,
-              ]),
-        );
-        // Workers are about to start: this round counts toward the
-        // turn's caps (ATO-1406), with only the tasks it will run — a
-        // resume's finished ones are not counted twice.
-        if (tracksTurn) {
-          turnBudget.noteRound(
-            ctx.sessionId,
-            parsed.tasks.filter((t) => !finished.has(t.id)).length,
+        let results: WorkerTaskResult[];
+        try {
+          // A resume starts with what finished before the restart, and with
+          // the tasks that wait for the person's yes; neither runs here.
+          const finished = new Map<string, WorkerTaskResult>(
+            resume === undefined
+              ? []
+              : [...resume.carried, ...resume.needsConfirmation].map((r) => [
+                  r.id,
+                  r,
+                ]),
           );
-        }
-        for (const [waveIndex, wave] of plan.waves.entries()) {
-          waveWarnings.push(
-            ...dependencyWarnings(wave, plan.dependencies, finished),
-          );
-          // Fresh each wave, not accumulated: the notes are recomputed
-          // from everything finished so far, so appending them to the
-          // running warning list would repeat every earlier wave.
-          const contract = contractForWave(parsed.contract, [
-            ...waveWarnings,
-            ...completedWaveNotes(finished),
-          ]);
-          // With autoReplan on (ATO-941), a task whose provider did not
-          // close is held for the replan rather than run against inputs
-          // that are not there; its own dependents are held with it.
-          const held =
-            autoReplan > 0
-              ? wave.filter((id) =>
-                  !finished.has(id) &&
-                  (plan.dependencies.get(id) ?? []).some((provider) => {
-                    const done = finished.get(provider);
-                    return (
-                      done !== undefined &&
-                      UNDELIVERED_STATUSES.has(done.status)
-                    );
-                  }),
-                )
-              : [];
-          for (const id of held) {
-            const task = parsed.tasks.find((t) => t.id === id)!;
-            const waitingOn = (plan.dependencies.get(id) ?? []).filter(
-              (provider) => {
-                const done = finished.get(provider);
-                return done !== undefined && UNDELIVERED_STATUSES.has(done.status);
-              },
-            );
-            finished.set(
-              id,
-              notStartedResult(
-                task,
-                `held for the replan: it depends on ${waitingOn.join(", ")}, which did not close`,
-              ),
+          // Workers are about to start: this round counts toward the
+          // turn's caps (ATO-1406), with only the tasks it will run — a
+          // resume's finished ones are not counted twice.
+          if (tracksTurn) {
+            turnBudget.noteRound(
+              ctx.sessionId,
+              parsed.tasks.filter((t) => !finished.has(t.id)).length,
             );
           }
-          const waveTasks = parsed.tasks.filter(
-            (t) =>
-              wave.includes(t.id) &&
-              !held.includes(t.id) &&
-              !finished.has(t.id),
+          for (const [waveIndex, wave] of plan.waves.entries()) {
+            waveWarnings.push(
+              ...dependencyWarnings(wave, plan.dependencies, finished),
+            );
+            // Fresh each wave, not accumulated: the notes are recomputed
+            // from everything finished so far, so appending them to the
+            // running warning list would repeat every earlier wave.
+            const contract = contractForWave(parsed.contract, [
+              ...waveWarnings,
+              ...completedWaveNotes(finished),
+            ]);
+            // With autoReplan on (ATO-941), a task whose provider did not
+            // close is held for the replan rather than run against inputs
+            // that are not there; its own dependents are held with it.
+            const held =
+              autoReplan > 0
+                ? wave.filter((id) =>
+                    !finished.has(id) &&
+                    (plan.dependencies.get(id) ?? []).some((provider) => {
+                      const done = finished.get(provider);
+                      return (
+                        done !== undefined &&
+                        UNDELIVERED_STATUSES.has(done.status)
+                      );
+                    }),
+                  )
+                : [];
+            for (const id of held) {
+              const task = parsed.tasks.find((t) => t.id === id)!;
+              const waitingOn = (plan.dependencies.get(id) ?? []).filter(
+                (provider) => {
+                  const done = finished.get(provider);
+                  return done !== undefined && UNDELIVERED_STATUSES.has(done.status);
+                },
+              );
+              finished.set(
+                id,
+                notStartedResult(
+                  task,
+                  `held for the replan: it depends on ${waitingOn.join(", ")}, which did not close`,
+                ),
+              );
+            }
+            const waveTasks = parsed.tasks.filter(
+              (t) =>
+                wave.includes(t.id) &&
+                !held.includes(t.id) &&
+                !finished.has(t.id),
+            );
+            const waveResults = await expandWave(
+              waveTasks,
+              await runTasks(waveTasks, contract, waveSuffix, true),
+            );
+            for (const result of waveResults) finished.set(result.id, result);
+            run?.recordWave(waveIndex + 1);
+          }
+          // In the caller's task order, whatever wave each ran in.
+          results = parsed.tasks.flatMap((t) => {
+            const result = finished.get(t.id);
+            return result === undefined ? [] : [result];
+          });
+        } catch (err) {
+          // `runWorkerTasks` is written not to throw; if it ever does, the
+          // orchestrator still gets a readable result rather than a dead turn.
+          // The checkpoint stays: what finished can still be resumed.
+          run?.finish("interrupted");
+          await releaseKept();
+          return error(
+            `the fan-out failed: ${err instanceof Error ? err.message : String(err)}`,
+            { reason: "fan-out-failed" },
           );
-          const waveResults = await expandWave(
-            waveTasks,
-            await runTasks(waveTasks, contract, waveSuffix, true),
-          );
-          for (const result of waveResults) finished.set(result.id, result);
-          run?.recordWave(waveIndex + 1);
+        } finally {
+          if (budgetTimer !== undefined) clearTimeout(budgetTimer);
         }
-        // In the caller's task order, whatever wave each ran in.
-        results = parsed.tasks.flatMap((t) => {
-          const result = finished.get(t.id);
-          return result === undefined ? [] : [result];
-        });
-      } catch (err) {
-        // `runWorkerTasks` is written not to throw; if it ever does, the
-        // orchestrator still gets a readable result rather than a dead turn.
-        // The checkpoint stays: what finished can still be resumed.
-        run?.finish("interrupted");
-        await releaseKept();
-        return error(
-          `the fan-out failed: ${err instanceof Error ? err.message : String(err)}`,
-          { reason: "fan-out-failed" },
-        );
-      } finally {
-        if (budgetTimer !== undefined) clearTimeout(budgetTimer);
-      }
-      // Each task this call actually started is one attempt at it this
-      // turn; the replan bound (ATO-941) is counted against these. A task
-      // held or kept from starting has not been tried.
-      if (autoReplan > 0) {
-        // Rows carried from before a restart (ATO-617) were not run now.
-        const carried = new Set(resume?.carried.map((r) => r.id) ?? []);
-        // One round per family: a split's continuations (`t3.a`, `t3.b`)
-        // count once, on the task they continue.
-        turnBudget.noteRoundAttempts(
-          ctx.sessionId,
-          results
-            .filter(
-              (r) =>
-                !(r.error ?? "").startsWith("not started:") && !carried.has(r.id),
-            )
-            .map((r) => r.id),
-        );
-      }
-      // What the failure breakers saw (ATO-1406): remembered for the
-      // rest of the turn, so the next round on a broken leg is refused.
-      const trips: BreakerTrip[] = [...breakers.values()]
-        .map((b) => b.tripped())
-        .filter((t): t is BreakerTrip => t !== undefined);
-      // One trip per error per round: two legs stopping on the same
-      // repeat are one round's evidence, not two.
-      const seen = new Set<string>();
-      for (const trip of trips) {
-        if (seen.has(trip.signature)) continue;
-        seen.add(trip.signature);
-        turnBudget.noteTrip(ctx.sessionId, trip);
-      }
-      // Rows a cap cut short say so, so a cancelled worker is not read
-      // as the operator's doing.
-      const budgetStopped = stoppedBy as TurnBudgetStop | undefined;
-      if (budgetStopped !== undefined && !ctx.signal.aborted) {
-        results = results.map((r) =>
-          r.status === "cancelled" && !r.error?.startsWith("not started:")
-            ? {
-                ...r,
-                notes: [
-                  ...(r.notes ?? []),
-                  `stopped by the turn's cap: ${budgetStopped.message}`,
-                ],
-              }
-            : r,
-        );
-      }
+        // Each task this call actually started is one attempt at it this
+        // turn; the replan bound (ATO-941) is counted against these. A task
+        // held or kept from starting has not been tried.
+        if (autoReplan > 0) {
+          // Rows carried from before a restart (ATO-617) were not run now.
+          const carried = new Set(resume?.carried.map((r) => r.id) ?? []);
+          // One round per family: a split's continuations (`t3.a`, `t3.b`)
+          // count once, on the task they continue.
+          turnBudget.noteRoundAttempts(
+            ctx.sessionId,
+            results
+              .filter(
+                (r) =>
+                  !(r.error ?? "").startsWith("not started:") && !carried.has(r.id),
+              )
+              .map((r) => r.id),
+          );
+        }
+        // What the failure breakers saw (ATO-1406): remembered for the
+        // rest of the turn, so the next round on a broken leg is refused.
+        const trips: BreakerTrip[] = [...breakers.values()]
+          .map((b) => b.tripped())
+          .filter((t): t is BreakerTrip => t !== undefined);
+        // One trip per error per round: two legs stopping on the same
+        // repeat are one round's evidence, not two.
+        const seen = new Set<string>();
+        for (const trip of trips) {
+          if (seen.has(trip.signature)) continue;
+          seen.add(trip.signature);
+          turnBudget.noteTrip(ctx.sessionId, trip);
+        }
+        // Rows a cap cut short say so, so a cancelled worker is not read
+        // as the operator's doing.
+        const budgetStopped = stoppedBy as TurnBudgetStop | undefined;
+        if (budgetStopped !== undefined && !ctx.signal.aborted) {
+          results = results.map((r) =>
+            r.status === "cancelled" && !r.error?.startsWith("not started:")
+              ? {
+                  ...r,
+                  notes: [
+                    ...(r.notes ?? []),
+                    `stopped by the turn's cap: ${budgetStopped.message}`,
+                  ],
+                }
+              : r,
+          );
+        }
 
-      // The contract's verdict, from the disk and the check runner, folded
-      // into the rows BEFORE the head line counts them: a task whose
-      // declared check failed is `failed` in the table the orchestrator
-      // reads, not `ok` with a footnote.
-      let contract: ContractReport | undefined;
-      // Check outcomes in `contract.checks` order, for the judge.
-      let checkOutcomes: readonly (ContractCheckOutcome | undefined)[] = [];
-      // Folds the disk and the check runner into `rows`. Run once after
-      // the waves and, for the tasks a judge sent back, once after their
-      // retry — on the retried rows only, so nothing is applied twice.
-      const evaluateContract = async (
-        rows: WorkerTaskResult[],
-        allRows: WorkerTaskResult[],
-      ): Promise<WorkerTaskResult[]> => {
-        if (parsed.contract === undefined) return rows;
-        // `allRows` goes in so a task that never ran is not accused of
-        // failing to provide: a cancelled fan-out leaves the disk empty
-        // for reasons that are not the worker's.
-        const provides = await inspectContractProvides(
-          parsed.contract,
-          parsed.tasks,
-          ctx.workingDir,
-          { results: allRows, signal: ctx.signal },
-        );
-        let out = applyContractFindings(rows, provides.findings);
-        // A check a gate already ran in its task's workspace (isolation)
-        // is not run again unless what reached the folder since differs
-        // (`MergeGateState`: a three-way merge, a later merge into the
-        // task's files, a wave in place); the rest run here, on the
-        // merged folder.
-        const allChecks = parsed.contract.checks ?? [];
-        const stale = gateState.staleCheckIndices();
-        const pending = allChecks.flatMap((check, index) =>
-          gateState.checkOutcomes.has(index) && !stale.has(index) ? [] : [{ check, index }],
-        );
-        const checks = await runContractChecks(
-          pending.map((p) => p.check),
-          deps.runChecks,
-          {
+        // The contract's verdict, from the disk and the check runner, folded
+        // into the rows BEFORE the head line counts them: a task whose
+        // declared check failed is `failed` in the table the orchestrator
+        // reads, not `ok` with a footnote.
+        let contract: ContractReport | undefined;
+        // Check outcomes in `contract.checks` order, for the judge.
+        let checkOutcomes: readonly (ContractCheckOutcome | undefined)[] = [];
+        // Folds the disk and the check runner into `rows`. Run once after
+        // the waves and, for the tasks a judge sent back, once after their
+        // retry — on the retried rows only, so nothing is applied twice.
+        const evaluateContract = async (
+          rows: WorkerTaskResult[],
+          allRows: WorkerTaskResult[],
+        ): Promise<WorkerTaskResult[]> => {
+          if (parsed.contract === undefined) return rows;
+          // `allRows` goes in so a task that never ran is not accused of
+          // failing to provide: a cancelled fan-out leaves the disk empty
+          // for reasons that are not the worker's.
+          const provides = await inspectContractProvides(
+            parsed.contract,
+            parsed.tasks,
+            ctx.workingDir,
+            { results: allRows, signal: ctx.signal },
+          );
+          let out = applyContractFindings(rows, provides.findings);
+          // A check a gate already ran in its task's workspace (isolation)
+          // is not run again unless what reached the folder since differs
+          // (`MergeGateState`: a three-way merge, a later merge into the
+          // task's files, a wave in place); the rest run here, on the
+          // merged folder.
+          const allChecks = parsed.contract.checks ?? [];
+          const stale = gateState.staleCheckIndices();
+          const pending = allChecks.flatMap((check, index) =>
+            gateState.checkOutcomes.has(index) && !stale.has(index) ? [] : [{ check, index }],
+          );
+          const checks = await runContractChecks(
+            pending.map((p) => p.check),
+            deps.runChecks,
+            {
+              workingDir: ctx.workingDir,
+              signal: ctx.signal,
+              ...(deps.knownSecrets === undefined
+                ? {}
+                : { knownSecrets: deps.knownSecrets() }),
+            },
+          );
+          const ran = checks.outcomes.length === pending.length;
+          out = applyPostMergeChecks(
+            out,
+            checks.outcomes,
+            ran
+              ? pending.flatMap((p) =>
+                  stale.has(p.index) ? [gateState.checkOutcomes.get(p.index)!] : [],
+                )
+              : [],
+          );
+          const byIndex = new Map(gateState.checkOutcomes);
+          if (ran) {
+            pending.forEach((p, i) => {
+              const outcome = checks.outcomes[i]!;
+              byIndex.set(p.index, outcome);
+              if (!stale.has(p.index)) return;
+              gateState.checkOutcomes.set(p.index, outcome);
+              // Its gate verdict was green on files the folder no longer has.
+              if (!outcome.ok && outcome.task !== undefined) {
+                gateState.verdicts.delete(outcome.task);
+              }
+            });
+          } else {
+            // A stale verdict is no verdict.
+            for (const index of stale) byIndex.delete(index);
+          }
+          const allOutcomes = allChecks.flatMap((_, i) => {
+            const outcome = byIndex.get(i);
+            return outcome === undefined ? [] : [outcome];
+          });
+          checkOutcomes =
+            allOutcomes.length === allChecks.length ? allOutcomes : [];
+          // What the call was run with despite the contract — a require
+          // nobody provides, a provide nothing can check, a cycle in the
+          // requires, a provider that had not delivered when its dependent
+          // ran. The workers read it in their block; the orchestrator
+          // reads it here, on the line and in the details.
+          const warnings = [...(parsed.contract.warnings ?? []), ...waveWarnings];
+          contract = {
+            findings: provides.findings,
+            ...(provides.providesSkipped === undefined
+              ? {}
+              : { providesSkipped: provides.providesSkipped }),
+            checks: allOutcomes,
+            ...(checks.checksSkipped === undefined
+              ? {}
+              : { checksSkipped: checks.checksSkipped }),
+            ...(warnings.length === 0 ? {} : { warnings }),
+          };
+          return out;
+        };
+        // The delegate's own syntax pass (`syntax-pass.ts`): the green
+        // rows' changed files through `verify.syntax`'s checker, inside the
+        // session's read scope, before the judge and the head line see
+        // them. A failure demotes the row as a failed check does.
+        // Under isolation the gate already ran it in each merged task's
+        // workspace (`merge-gate.ts`); here it covers the rest (a wave
+        // that ran in place, isolation off).
+        const syntaxPass = async (
+          rows: readonly WorkerTaskResult[],
+        ): Promise<WorkerTaskResult[]> => {
+          const pending = rows.filter(
+            (r) => !gateState.syntaxGated.has(r.id) || gateState.isStale(r.id),
+          );
+          // Re-checked on the folder from here on.
+          gateState.settle(rows.map((r) => r.id));
+          if (pending.length === 0) return [...rows];
+          const checked = await runSyntaxPass(pending, parsed.tasks, {
+            runner: deps.syntaxCheck,
             workingDir: ctx.workingDir,
+            roots: syntaxRoots,
             signal: ctx.signal,
             ...(deps.knownSecrets === undefined
               ? {}
               : { knownSecrets: deps.knownSecrets() }),
-          },
-        );
-        const ran = checks.outcomes.length === pending.length;
-        out = applyPostMergeChecks(
-          out,
-          checks.outcomes,
-          ran
-            ? pending.flatMap((p) =>
-                stale.has(p.index) ? [gateState.checkOutcomes.get(p.index)!] : [],
-              )
-            : [],
-        );
-        const byIndex = new Map(gateState.checkOutcomes);
-        if (ran) {
-          pending.forEach((p, i) => {
-            const outcome = checks.outcomes[i]!;
-            byIndex.set(p.index, outcome);
-            if (!stale.has(p.index)) return;
-            gateState.checkOutcomes.set(p.index, outcome);
-            // Its gate verdict was green on files the folder no longer has.
-            if (!outcome.ok && outcome.task !== undefined) {
-              gateState.verdicts.delete(outcome.task);
-            }
           });
-        } else {
-          // A stale verdict is no verdict.
-          for (const index of stale) byIndex.delete(index);
-        }
-        const allOutcomes = allChecks.flatMap((_, i) => {
-          const outcome = byIndex.get(i);
-          return outcome === undefined ? [] : [outcome];
-        });
-        checkOutcomes =
-          allOutcomes.length === allChecks.length ? allOutcomes : [];
-        // What the call was run with despite the contract — a require
-        // nobody provides, a provide nothing can check, a cycle in the
-        // requires, a provider that had not delivered when its dependent
-        // ran. The workers read it in their block; the orchestrator
-        // reads it here, on the line and in the details.
-        const warnings = [...(parsed.contract.warnings ?? []), ...waveWarnings];
-        contract = {
-          findings: provides.findings,
-          ...(provides.providesSkipped === undefined
-            ? {}
-            : { providesSkipped: provides.providesSkipped }),
-          checks: allOutcomes,
-          ...(checks.checksSkipped === undefined
-            ? {}
-            : { checksSkipped: checks.checksSkipped }),
-          ...(warnings.length === 0 ? {} : { warnings }),
-        };
-        return out;
-      };
-      // The delegate's own syntax pass (`syntax-pass.ts`): the green
-      // rows' changed files through `verify.syntax`'s checker, inside the
-      // session's read scope, before the judge and the head line see
-      // them. A failure demotes the row as a failed check does.
-      // Under isolation the gate already ran it in each merged task's
-      // workspace (`merge-gate.ts`); here it covers the rest (a wave
-      // that ran in place, isolation off).
-      const syntaxPass = async (
-        rows: readonly WorkerTaskResult[],
-      ): Promise<WorkerTaskResult[]> => {
-        const pending = rows.filter(
-          (r) => !gateState.syntaxGated.has(r.id) || gateState.isStale(r.id),
-        );
-        // Re-checked on the folder from here on.
-        gateState.settle(rows.map((r) => r.id));
-        if (pending.length === 0) return [...rows];
-        const checked = await runSyntaxPass(pending, parsed.tasks, {
-          runner: deps.syntaxCheck,
-          workingDir: ctx.workingDir,
-          roots: syntaxRoots,
-          signal: ctx.signal,
-          ...(deps.knownSecrets === undefined
-            ? {}
-            : { knownSecrets: deps.knownSecrets() }),
-        });
-        for (const row of checked) {
-          if (row.status === "failed" && gateState.syntaxGated.has(row.id)) {
-            gateState.verdicts.delete(row.id);
-          }
-        }
-        return rows.map((r) => checked.find((c) => c.id === r.id) ?? r);
-      };
-      results = await syntaxPass(await evaluateContract(results, results));
-
-      // The judge (ATO-944): a task closes on a green acceptance list, a
-      // red list is re-run once with the findings, and a list still red
-      // after that is a failed task, item by item. Its spend counts
-      // toward the turn's cap.
-      if (judging && judgeTarget !== null) {
-        const judgeRows = async (
-          rows: readonly WorkerTaskResult[],
-        ): Promise<Map<string, JudgeVerdict>> => {
-          const verdicts = new Map<string, JudgeVerdict>();
-          for (const row of rows) {
-            // Already ruled on in its workspace, before its merge.
-            const gated = gateState.verdicts.get(row.id);
-            if (gated !== undefined) {
-              verdicts.set(row.id, gated);
-              continue;
+          for (const row of checked) {
+            if (row.status === "failed" && gateState.syntaxGated.has(row.id)) {
+              gateState.verdicts.delete(row.id);
             }
-            if (!judgeable(row)) continue;
-            const task = parsed.tasks.find((t) => t.id === row.id)!;
-            verdicts.set(
-              row.id,
-              await judgeOne({
-                task,
-                items: acceptance.get(row.id) ?? [],
-                facts: {
-                  checkOutcomes,
-                  findings: contract?.findings ?? [],
-                },
-                reply: row.reply,
-                contract: parsed.contract,
-                workingDir: ctx.workingDir,
-                // No snapshot of the folder before the wave: file heads.
-                changes: [],
-              }),
-            );
           }
-          return verdicts;
+          return rows.map((r) => checked.find((c) => c.id === r.id) ?? r);
         };
-        const first = await judgeRows(results);
-        const red = [...first].filter(
-          ([, v]) => !v.green && v.unverified === undefined,
-        );
-        const retryIds = new Set(
-          budgetStop() === undefined && !ctx.signal.aborted
-            ? red.map(([id]) => id)
-            : [],
-        );
-        let second = new Map<string, JudgeVerdict>();
-        if (retryIds.size > 0) {
-          const findings = new Map(
-            red.map(([id, verdict]) => [
-              id,
-              renderRetryFindings(acceptance.get(id) ?? [], verdict),
-            ]),
+        results = await syntaxPass(await evaluateContract(results, results));
+
+        // The judge (ATO-944): a task closes on a green acceptance list, a
+        // red list is re-run once with the findings, and a list still red
+        // after that is a failed task, item by item. Its spend counts
+        // toward the turn's cap.
+        if (judging && judgeTarget !== null) {
+          const judgeRows = async (
+            rows: readonly WorkerTaskResult[],
+          ): Promise<Map<string, JudgeVerdict>> => {
+            const verdicts = new Map<string, JudgeVerdict>();
+            for (const row of rows) {
+              // Already ruled on in its workspace, before its merge.
+              const gated = gateState.verdicts.get(row.id);
+              if (gated !== undefined) {
+                verdicts.set(row.id, gated);
+                continue;
+              }
+              if (!judgeable(row)) continue;
+              const task = parsed.tasks.find((t) => t.id === row.id)!;
+              verdicts.set(
+                row.id,
+                await judgeOne({
+                  task,
+                  items: acceptance.get(row.id) ?? [],
+                  facts: {
+                    checkOutcomes,
+                    findings: contract?.findings ?? [],
+                  },
+                  reply: row.reply,
+                  contract: parsed.contract,
+                  workingDir: ctx.workingDir,
+                  // No snapshot of the folder before the wave: file heads.
+                  changes: [],
+                }),
+              );
+            }
+            return verdicts;
+          };
+          const first = await judgeRows(results);
+          const red = [...first].filter(
+            ([, v]) => !v.green && v.unverified === undefined,
           );
-          // The retry keeps the right to split: a task judged red for being
-          // too big would only fail again in one piece.
-          const retryTasks = parsed.tasks.filter((t) => retryIds.has(t.id));
-          // Under isolation the retry works on in the workspace it was
-          // judged red in, so its first attempt is there to fix; the
-          // retry's own gate rules on it before it merges.
-          for (const id of retryIds) gateState.verdicts.delete(id);
-          retryRound = true;
-          const retried = await expandWave(
-            retryTasks,
-            await runTasks(
+          const retryIds = new Set(
+            budgetStop() === undefined && !ctx.signal.aborted
+              ? red.map(([id]) => id)
+              : [],
+          );
+          let second = new Map<string, JudgeVerdict>();
+          if (retryIds.size > 0) {
+            const findings = new Map(
+              red.map(([id, verdict]) => [
+                id,
+                renderRetryFindings(acceptance.get(id) ?? [], verdict),
+              ]),
+            );
+            // The retry keeps the right to split: a task judged red for being
+            // too big would only fail again in one piece.
+            const retryTasks = parsed.tasks.filter((t) => retryIds.has(t.id));
+            // Under isolation the retry works on in the workspace it was
+            // judged red in, so its first attempt is there to fix; the
+            // retry's own gate rules on it before it merges.
+            for (const id of retryIds) gateState.verdicts.delete(id);
+            retryRound = true;
+            const retried = await expandWave(
               retryTasks,
-              contractForWave(parsed.contract, [...waveWarnings]),
-              (taskId) =>
-                [waveSuffix?.(taskId), findings.get(taskId)]
-                  .filter((part): part is string => part !== undefined)
-                  .join("\n\n"),
-              true,
-            ),
-          );
-          const merged = results.map(
-            (r) => retried.find((x) => x.id === r.id) ?? r,
-          );
-          // The retried rows, and any task the retry's merges made stale.
-          const evaluated = await syntaxPass(
-            await evaluateContract(
-              merged.filter((r) => retryIds.has(r.id) || gateState.isStale(r.id)),
-              merged,
-            ),
-          );
-          results = merged.map(
-            (r) => evaluated.find((x) => x.id === r.id) ?? r,
-          );
-          second = await judgeRows(results.filter((r) => retryIds.has(r.id)));
+              await runTasks(
+                retryTasks,
+                contractForWave(parsed.contract, [...waveWarnings]),
+                (taskId) =>
+                  [waveSuffix?.(taskId), findings.get(taskId)]
+                    .filter((part): part is string => part !== undefined)
+                    .join("\n\n"),
+                true,
+              ),
+            );
+            const merged = results.map(
+              (r) => retried.find((x) => x.id === r.id) ?? r,
+            );
+            // The retried rows, and any task the retry's merges made stale.
+            const evaluated = await syntaxPass(
+              await evaluateContract(
+                merged.filter((r) => retryIds.has(r.id) || gateState.isStale(r.id)),
+                merged,
+              ),
+            );
+            results = merged.map(
+              (r) => evaluated.find((x) => x.id === r.id) ?? r,
+            );
+            second = await judgeRows(results.filter((r) => retryIds.has(r.id)));
+          }
+          results = results.map((r) => {
+            if (retryIds.has(r.id)) {
+              const verdict = second.get(r.id);
+              // A retry that did not come back judgeable (it failed or was
+              // cancelled) keeps its own status; the first verdict stands
+              // beside it.
+              if (verdict !== undefined) return applyJudgeVerdict(r, verdict, true);
+              const before = first.get(r.id)!;
+              return {
+                ...r,
+                notes: [
+                  ...(r.notes ?? []),
+                  `judge: ${redItems(before).length} of ${before.items.length} acceptance items were not met before the retry; the retry ended ${r.status} and was not judged`,
+                ],
+              };
+            }
+            const verdict = first.get(r.id);
+            return verdict === undefined ? r : applyJudgeVerdict(r, verdict, false);
+          });
         }
-        results = results.map((r) => {
-          if (retryIds.has(r.id)) {
-            const verdict = second.get(r.id);
-            // A retry that did not come back judgeable (it failed or was
-            // cancelled) keeps its own status; the first verdict stands
-            // beside it.
-            if (verdict !== undefined) return applyJudgeVerdict(r, verdict, true);
-            const before = first.get(r.id)!;
+        // Workspaces kept for a retry are done with, retried or not.
+        await releaseKept();
+        // Automatic replanning (ATO-941): what did not close, from the
+        // facts above, with the attempts it has left. The planner's next
+        // step is held to `fusion.delegate` by the loop while any task is
+        // pending (`fusion-replan.ts`); exhausted tasks are to be reported.
+        // A task waiting for the person's yes after a restart is theirs to
+        // decide: held to `fusion.delegate`, the planner could only repeat
+        // the commands the question exists to guard.
+        const awaitingYes = new Set(
+          resume?.needsConfirmation.map((r) => r.id) ?? [],
+        );
+        const replan =
+          autoReplan > 0 &&
+          stoppedBy === undefined &&
+          trips.length === 0 &&
+          !ctx.signal.aborted
+            ? describeReplan(
+                results.filter((r) => !awaitingYes.has(r.id)),
+                (id) => turnBudget.attempts(ctx.sessionId, id),
+                autoReplan,
+                (id) => taskLegs.get(id)?.orchestrator === true,
+              )
+            : undefined;
+        const contractLine =
+          contract === undefined ? undefined : renderContractLine(contract);
+        // The run ended here. Stopped by the person or by a quit, its file
+        // stays for a resume, and so it does while a task waits for the
+        // person's yes: the confirm call resumes from it. Otherwise there
+        // is nothing left to resume.
+        run?.finish(
+          ctx.signal.aborted || (resume?.needsConfirmation.length ?? 0) > 0
+            ? "interrupted"
+            : "complete",
+        );
+        const resumeNote =
+          resume === undefined
+            ? ""
+            : `\n\nResumed run ${resume.runId}: ${resume.carried.length} task${resume.carried.length === 1 ? "" : "s"} reported from before the restart, ${resume.rerun.length} run again${
+                resume.needsConfirmation.length === 0
+                  ? ""
+                  : `, ${resume.needsConfirmation.length} not run again until the person agrees (${resume.needsConfirmation.map((r) => r.id).join(", ")})`
+              }.`;
+
+        // Where each task ran (ATO-943): the model and role on the row, and
+        // a note when it is not the worker leg or not where it asked to be.
+        // Without roles and without a task naming a model, rows are as before.
+        if (mode.roles !== undefined || roleLegs.size > 0) {
+          results = results.map((r) => {
+            const leg = taskLegs.get(r.id);
+            if (leg === undefined) return r;
+            const notes = [
+              ...(leg.note === undefined ? [] : [leg.note]),
+              ...(leg.isWorkerLeg
+                ? []
+                : [
+                    `ran on ${leg.model}${leg.orchestrator === true ? " (the orchestrator's model)" : leg.role === undefined ? "" : ` (role ${leg.role})`}`,
+                  ]),
+            ];
             return {
               ...r,
-              notes: [
-                ...(r.notes ?? []),
-                `judge: ${redItems(before).length} of ${before.items.length} acceptance items were not met before the retry; the retry ended ${r.status} and was not judged`,
-              ],
+              model: leg.model,
+              ...(leg.role === undefined ? {} : { modelRole: leg.role }),
+              ...(notes.length === 0 ? {} : { notes: [...(r.notes ?? []), ...notes] }),
             };
-          }
-          const verdict = first.get(r.id);
-          return verdict === undefined ? r : applyJudgeVerdict(r, verdict, false);
-        });
-      }
-      // Workspaces kept for a retry are done with, retried or not.
-      await releaseKept();
-      // Automatic replanning (ATO-941): what did not close, from the
-      // facts above, with the attempts it has left. The planner's next
-      // step is held to `fusion.delegate` by the loop while any task is
-      // pending (`fusion-replan.ts`); exhausted tasks are to be reported.
-      // A task waiting for the person's yes after a restart is theirs to
-      // decide: held to `fusion.delegate`, the planner could only repeat
-      // the commands the question exists to guard.
-      const awaitingYes = new Set(
-        resume?.needsConfirmation.map((r) => r.id) ?? [],
-      );
-      const replan =
-        autoReplan > 0 &&
-        stoppedBy === undefined &&
-        trips.length === 0 &&
-        !ctx.signal.aborted
-          ? describeReplan(
-              results.filter((r) => !awaitingYes.has(r.id)),
-              (id) => turnBudget.attempts(ctx.sessionId, id),
-              autoReplan,
-              (id) => taskLegs.get(id)?.orchestrator === true,
-            )
-          : undefined;
-      const contractLine =
-        contract === undefined ? undefined : renderContractLine(contract);
-      // The run ended here. Stopped by the person or by a quit, its file
-      // stays for a resume, and so it does while a task waits for the
-      // person's yes: the confirm call resumes from it. Otherwise there
-      // is nothing left to resume.
-      run?.finish(
-        ctx.signal.aborted || (resume?.needsConfirmation.length ?? 0) > 0
-          ? "interrupted"
-          : "complete",
-      );
-      const resumeNote =
-        resume === undefined
-          ? ""
-          : `\n\nResumed run ${resume.runId}: ${resume.carried.length} task${resume.carried.length === 1 ? "" : "s"} reported from before the restart, ${resume.rerun.length} run again${
-              resume.needsConfirmation.length === 0
-                ? ""
-                : `, ${resume.needsConfirmation.length} not run again until the person agrees (${resume.needsConfirmation.map((r) => r.id).join(", ")})`
-            }.`;
-
-      // Where each task ran (ATO-943): the model and role on the row, and
-      // a note when it is not the worker leg or not where it asked to be.
-      // Without roles and without a task naming a model, rows are as before.
-      if (mode.roles !== undefined || roleLegs.size > 0) {
-        results = results.map((r) => {
-          const leg = taskLegs.get(r.id);
-          if (leg === undefined) return r;
-          const notes = [
-            ...(leg.note === undefined ? [] : [leg.note]),
-            ...(leg.isWorkerLeg
-              ? []
-              : [
-                  `ran on ${leg.model}${leg.orchestrator === true ? " (the orchestrator's model)" : leg.role === undefined ? "" : ` (role ${leg.role})`}`,
-                ]),
-          ];
-          return {
-            ...r,
-            model: leg.model,
-            ...(leg.role === undefined ? {} : { modelRole: leg.role }),
-            ...(notes.length === 0 ? {} : { notes: [...(r.notes ?? []), ...notes] }),
-          };
-        });
-      }
-      let roleSpendUsd = 0;
-      for (const [providerId, pricing] of rolePricing) {
-        if (pricing === undefined) continue;
-        roleSpendUsd += fanoutSpend(
-          results.filter(
-            (r) =>
-              taskLegs.get(r.id)?.providerId === providerId &&
-              taskLegs.get(r.id)?.isWorkerLeg === false,
-          ),
-          pricing,
-          providerId,
-        ).usd;
-      }
-
-      // …and takes the turn back. One line, so the operator can see the
-      // spend return to the cloud leg instead of guessing which of the
-      // lines above was the last worker.
-      const okCount = results.filter((r) => r.status === "ok").length;
-      deps.emitEvent(ctx.sessionId, {
-        type: "fusion_worker",
-        taskId: FUSION_DELEGATE_TOOL,
-        title: `${results.length} task${results.length === 1 ? "" : "s"}`,
-        phase: "finished",
-        role: "orchestrator",
-        model: orchestratorModel,
-        summary: `${okCount}/${results.length} ok — merging`,
-      });
-
-      // When the pool is what held the fan-out down, the orchestrator is
-      // the party that can adapt — by splitting differently next time,
-      // or by telling the operator which knob to turn. So the note names
-      // all three things it needs: what was wanted, what actually ran
-      // concurrently, and the config key that changes the second number.
-      const hint = poolIsBinding
-        ? `\n\nNote: ${Math.max(wanted, legTaskCount)} workers' worth of work was sent but the local server has ${poolSize} request slot${poolSize === 1 ? "" : "s"}, so only ${maxWorkers} ran at a time and the rest queued. That number comes from the machine — every slot draws on one shared llama-server context pool (\`localModels.managed.parallel\`, \`"auto"\` by default). Split into fewer, larger tasks if the queueing is costing more than the parallelism buys.`
-        : cloudCapIsBinding
-          ? `\n\nNote: maxWorkers ${wanted} was clamped to ${maxWorkers}, the cloud worker cap (\`llm.runMode.fusion.cloudWorkers\`); the rest queued behind them.`
-          : "";
-      // The call's own status is the tasks' summary: a fan-out where
-      // every worker failed used to come back `ok`, and an orchestrator
-      // reading only the status merged nothing as if it were something.
-      // Workers that were never served or timed out before a single step
-      // count as nothing delivered too (ATO-234).
-      const outcome = delegateOutcome(results);
-      // What the fan-out cost on the worker leg, when its model is priced
-      // (a cloud leg with a catalogue entry); a local leg resolves to no
-      // pricing and the header says nothing.
-      const spend =
-        workerPricing === undefined
-          ? null
-          : fanoutSpend(
-              roleLegs.size === 0
-                ? results
-                : results.filter(
-                    (r) => taskLegs.get(r.id)?.isWorkerLeg !== false,
-                  ),
-              workerPricing,
-              workerModel,
-            );
-      // The task tree, when any worker proposed a split (ATO-940); the
-      // children themselves are summarised in their parent's block.
-      const treeReport = tree?.report();
-      const treeNote =
-        treeReport === undefined ||
-        treeReport.splits + treeReport.rejected === 0
-          ? ""
-          : `\n\nTask tree: ${treeReport.splits} task${treeReport.splits === 1 ? "" : "s"} split by their workers, ${treeReport.rejected} proposal${treeReport.rejected === 1 ? "" : "s"} refused, ${treeReport.nodes} of ${treeReport.maxNodes} nodes used (depth limit ${treeReport.maxDepth}).`;
-      const budgetNote =
-        budgetStopped === undefined
-          ? ""
-          : `\n\nStopped: ${budgetStopped.message}. ${TURN_BUDGET_INSTRUCTION}`;
-      const breakerNote =
-        trips.length === 0
-          ? ""
-          : `\n\nStopped: ${trips.map(describeTrip).join("; ")}. ${FAILURE_BREAKER_INSTRUCTION}`;
-      return compressToolResult(
-        {
-          tool: FUSION_DELEGATE_TOOL,
-          status: outcome === "all_failed" ? "error" : "ok",
-          output: `${formatDelegateOutput(results, deps.outputCharCap, {
-            ...(contractLine === undefined ? {} : { contractLine }),
-            spend,
-            ...(ordered ? { waves: plan.waves } : {}),
-            // A green row of these shows its reply's first line only.
-            declaredFiles: new Set(
-              parsed.tasks
-                .filter((t) => (t.files?.length ?? 0) > 0)
-                .map((t) => t.id),
+          });
+        }
+        let roleSpendUsd = 0;
+        for (const [providerId, pricing] of rolePricing) {
+          if (pricing === undefined) continue;
+          roleSpendUsd += fanoutSpend(
+            results.filter(
+              (r) =>
+                taskLegs.get(r.id)?.providerId === providerId &&
+                taskLegs.get(r.id)?.isWorkerLeg === false,
             ),
-          })}${hint}${
-            escalationSpendUsd > 0
-              ? `\n\nEscalations to ${escalationTarget?.model ?? escalationTarget?.providerId ?? "the escalation model"} cost ${formatUsd(escalationSpendUsd)} this fan-out (each worker's row says what for).`
-              : ""
-          }${
-            judgeSpendUsd > 0
-              ? `\n\nThe judge (${judgeTarget?.model ?? judgeTarget?.providerId}) cost ${formatUsd(judgeSpendUsd)} this fan-out.`
-              : ""
-          }${
-            roleSpendUsd > 0
-              ? `\n\nRole models cost ${formatUsd(roleSpendUsd)} this fan-out.`
-              : ""
-          }${treeNote}${replan === undefined ? "" : renderReplanBlock(replan)}${renderMergeBlock(merges)}${resumeNote}${budgetNote}${breakerNote}${
-            sizeWarnings.length === 0
-              ? ""
-              : `\n\nWarning: ${sizeWarnings.join("; ")}.`
-          }`,
-          details: {
-            tasks: results,
-            outcome,
-            maxWorkers,
-            requestedWorkers: requested,
-            ...(Number.isFinite(poolSize) ? { slotPoolSize: poolSize } : {}),
-            // The wave plan, for the orchestrator and the trace's tool
-            // row alike — only when the contract ordered anything.
-            ...(ordered ? { waves: plan.waves } : {}),
-            ...(contract === undefined ? {} : { contract }),
-            ...(spend === null ? {} : { workerSpendUsd: spend.usd }),
-            ...(escalationSpendUsd > 0 ? { escalationSpendUsd } : {}),
-            ...(judgeSpendUsd > 0 ? { judgeSpendUsd } : {}),
-            ...(roleSpendUsd > 0 ? { roleSpendUsd } : {}),
-            ...(merges.length === 0 ? {} : { merges }),
-            ...(replan === undefined ||
-            (replan.pending.length === 0 && replan.exhausted.length === 0)
-              ? {}
-              : { replan }),
-            ...(treeReport === undefined ? {} : { taskTree: treeReport }),
-            ...(sizeWarnings.length === 0 ? {} : { sizeWarnings }),
-            ...(run === undefined ? {} : { runId: run.runId }),
-            ...(resume === undefined
-              ? {}
-              : {
-                  resume: {
-                    runId: resume.runId,
-                    carried: resume.carried.map((r) => r.id),
-                    rerun: resume.rerun,
-                    needsConfirmation: resume.needsConfirmation.map(
-                      (r) => r.id,
+            pricing,
+            providerId,
+          ).usd;
+        }
+
+        // …and takes the turn back. One line, so the operator can see the
+        // spend return to the cloud leg instead of guessing which of the
+        // lines above was the last worker.
+        const okCount = results.filter((r) => r.status === "ok").length;
+        deps.emitEvent(ctx.sessionId, {
+          type: "fusion_worker",
+          taskId: FUSION_DELEGATE_TOOL,
+          title: `${results.length} task${results.length === 1 ? "" : "s"}`,
+          phase: "finished",
+          role: "orchestrator",
+          model: orchestratorModel,
+          summary: `${okCount}/${results.length} ok — merging`,
+        });
+
+        // When the pool is what held the fan-out down, the orchestrator is
+        // the party that can adapt — by splitting differently next time,
+        // or by telling the operator which knob to turn. So the note names
+        // all three things it needs: what was wanted, what actually ran
+        // concurrently, and the config key that changes the second number.
+        const hint = poolIsBinding
+          ? `\n\nNote: ${Math.max(wanted, legTaskCount)} workers' worth of work was sent but the local server has ${poolSize} request slot${poolSize === 1 ? "" : "s"}, so only ${maxWorkers} ran at a time and the rest queued. That number comes from the machine — every slot draws on one shared llama-server context pool (\`localModels.managed.parallel\`, \`"auto"\` by default). Split into fewer, larger tasks if the queueing is costing more than the parallelism buys.`
+          : cloudCapIsBinding
+            ? `\n\nNote: maxWorkers ${wanted} was clamped to ${maxWorkers}, the cloud worker cap (\`llm.runMode.fusion.cloudWorkers\`); the rest queued behind them.`
+            : "";
+        // The call's own status is the tasks' summary: a fan-out where
+        // every worker failed used to come back `ok`, and an orchestrator
+        // reading only the status merged nothing as if it were something.
+        // Workers that were never served or timed out before a single step
+        // count as nothing delivered too (ATO-234).
+        const outcome = delegateOutcome(results);
+        // What the fan-out cost on the worker leg, when its model is priced
+        // (a cloud leg with a catalogue entry); a local leg resolves to no
+        // pricing and the header says nothing.
+        const spend =
+          workerPricing === undefined
+            ? null
+            : fanoutSpend(
+                roleLegs.size === 0
+                  ? results
+                  : results.filter(
+                      (r) => taskLegs.get(r.id)?.isWorkerLeg !== false,
                     ),
-                    carriedSpendUsd: resume.carriedSpendUsd,
-                  },
-                }),
-            ...(budgetStopped === undefined
-              ? {}
-              : {
-                  turnBudget: {
-                    kind: budgetStopped.kind,
-                    spentUsd: budgetStopped.spentUsd,
-                    elapsedMs: budgetStopped.elapsedMs,
-                  },
-                }),
+                workerPricing,
+                workerModel,
+              );
+        // The task tree, when any worker proposed a split (ATO-940); the
+        // children themselves are summarised in their parent's block.
+        const treeReport = tree?.report();
+        const treeNote =
+          treeReport === undefined ||
+          treeReport.splits + treeReport.rejected === 0
+            ? ""
+            : `\n\nTask tree: ${treeReport.splits} task${treeReport.splits === 1 ? "" : "s"} split by their workers, ${treeReport.rejected} proposal${treeReport.rejected === 1 ? "" : "s"} refused, ${treeReport.nodes} of ${treeReport.maxNodes} nodes used (depth limit ${treeReport.maxDepth}).`;
+        const budgetNote =
+          budgetStopped === undefined
+            ? ""
+            : `\n\nStopped: ${budgetStopped.message}. ${TURN_BUDGET_INSTRUCTION}`;
+        const breakerNote =
+          trips.length === 0
+            ? ""
+            : `\n\nStopped: ${trips.map(describeTrip).join("; ")}. ${FAILURE_BREAKER_INSTRUCTION}`;
+        return compressToolResult(
+          {
+            tool: FUSION_DELEGATE_TOOL,
+            status: outcome === "all_failed" ? "error" : "ok",
+            output: `${formatDelegateOutput(results, deps.outputCharCap, {
+              ...(contractLine === undefined ? {} : { contractLine }),
+              spend,
+              ...(ordered ? { waves: plan.waves } : {}),
+              // A green row of these shows its reply's first line only.
+              declaredFiles: new Set(
+                parsed.tasks
+                  .filter((t) => (t.files?.length ?? 0) > 0)
+                  .map((t) => t.id),
+              ),
+            })}${hint}${
+              escalationSpendUsd > 0
+                ? `\n\nEscalations to ${escalationTarget?.model ?? escalationTarget?.providerId ?? "the escalation model"} cost ${formatUsd(escalationSpendUsd)} this fan-out (each worker's row says what for).`
+                : ""
+            }${
+              judgeSpendUsd > 0
+                ? `\n\nThe judge (${judgeTarget?.model ?? judgeTarget?.providerId}) cost ${formatUsd(judgeSpendUsd)} this fan-out.`
+                : ""
+            }${
+              roleSpendUsd > 0
+                ? `\n\nRole models cost ${formatUsd(roleSpendUsd)} this fan-out.`
+                : ""
+            }${treeNote}${replan === undefined ? "" : renderReplanBlock(replan)}${renderMergeBlock(merges)}${resumeNote}${budgetNote}${breakerNote}${
+              sizeWarnings.length === 0
+                ? ""
+                : `\n\nWarning: ${sizeWarnings.join("; ")}.`
+            }`,
+            details: {
+              tasks: results,
+              outcome,
+              maxWorkers,
+              requestedWorkers: requested,
+              ...(Number.isFinite(poolSize) ? { slotPoolSize: poolSize } : {}),
+              // The wave plan, for the orchestrator and the trace's tool
+              // row alike — only when the contract ordered anything.
+              ...(ordered ? { waves: plan.waves } : {}),
+              ...(contract === undefined ? {} : { contract }),
+              ...(spend === null ? {} : { workerSpendUsd: spend.usd }),
+              ...(escalationSpendUsd > 0 ? { escalationSpendUsd } : {}),
+              ...(judgeSpendUsd > 0 ? { judgeSpendUsd } : {}),
+              ...(roleSpendUsd > 0 ? { roleSpendUsd } : {}),
+              ...(merges.length === 0 ? {} : { merges }),
+              ...(replan === undefined ||
+              (replan.pending.length === 0 && replan.exhausted.length === 0)
+                ? {}
+                : { replan }),
+              ...(treeReport === undefined ? {} : { taskTree: treeReport }),
+              ...(sizeWarnings.length === 0 ? {} : { sizeWarnings }),
+              ...(run === undefined ? {} : { runId: run.runId }),
+              ...(resume === undefined
+                ? {}
+                : {
+                    resume: {
+                      runId: resume.runId,
+                      carried: resume.carried.map((r) => r.id),
+                      rerun: resume.rerun,
+                      needsConfirmation: resume.needsConfirmation.map(
+                        (r) => r.id,
+                      ),
+                      carriedSpendUsd: resume.carriedSpendUsd,
+                    },
+                  }),
+              ...(budgetStopped === undefined
+                ? {}
+                : {
+                    turnBudget: {
+                      kind: budgetStopped.kind,
+                      spentUsd: budgetStopped.spentUsd,
+                      elapsedMs: budgetStopped.elapsedMs,
+                    },
+                  }),
+            },
           },
-        },
-        { maxSummaryLength: deps.outputCharCap + 400, maxTailLines: 2000 },
-      );
+          { maxSummaryLength: deps.outputCharCap + 400, maxTailLines: 2000 },
+        );
+      } finally {
+        // Kept workspaces (a judged-red task's, for its retry) are removed
+        // whatever happens after the waves: a throw in the retry, the
+        // contract pass, the syntax pass or the judge included.
+        await releaseKept();
+      }
     },
   };
 }

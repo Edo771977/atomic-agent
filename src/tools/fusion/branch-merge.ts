@@ -40,6 +40,7 @@ import { buildCommandEnv } from "../../sandbox/command-env.js";
 import {
   BRANCH_MERGE_DIR,
   createBranchSet,
+  ensureMergeDir,
   readEntry,
   sameEntry,
   touchedPaths,
@@ -49,6 +50,7 @@ import {
   type CreateBranchSetOptions,
 } from "./branch-workspace.js";
 import {
+  removeTaskPatch,
   workspaceChanges,
   writeTaskPatch,
   type PatchGit,
@@ -191,6 +193,7 @@ export async function mergeBranch(
   const savedRoot = join(BRANCH_MERGE_DIR, workspace.name);
   const save = async (rel: string, base: PathEntry | null, task: PathEntry | null): Promise<void> => {
     const at = join(set.realDir, savedRoot, rel);
+    await ensureMergeDir(set.realDir);
     await mkdir(dirname(at), { recursive: true });
     if (task !== null) await writeBuffer(`${at}.task`, task.data);
     else await writeBuffer(`${at}.task-removed`, Buffer.alloc(0));
@@ -665,6 +668,8 @@ export async function runIsolatedWave(
         input.options?.mergeFile,
       );
       outcomes.push(outcome);
+      // Green now: an earlier attempt's held-back patch is stale.
+      if (input.gate !== undefined) await removeTaskPatch(realDir, row.id);
       out.push(applyMergeOutcome(row, outcome));
       const task = input.tasks.find((t) => t.id === row.id);
       const suggestion =

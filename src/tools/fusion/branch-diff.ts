@@ -18,6 +18,7 @@
  * it, and the note says so.
  */
 import { chmod, copyFile, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, join, sep } from "node:path";
 import { createTwoFilesPatch, FILE_HEADERS_ONLY } from "diff";
@@ -25,6 +26,8 @@ import { runCommand, type CommandResult } from "../../sandbox/command-runner.js"
 import { buildCommandEnv } from "../../sandbox/command-env.js";
 import {
   BRANCH_MERGE_DIR,
+  ensureMergeDir,
+  FUSION_TMP_PREFIX,
   readEntry,
   sameEntry,
   touchedPaths,
@@ -150,10 +153,33 @@ export function renderPatch(changes: readonly WorkspaceChange[]): string {
     .join("");
 }
 
-/** `.atomic-agent/fusion-merge/<task>.patch`, relative to the working directory. */
+/**
+ * `.atomic-agent/fusion-merge/<task>-<hash>.patch`, relative to the
+ * working directory: the id made path-safe, plus a short hash of the
+ * id itself, so two ids that sanitise alike (`a/b`, `a_b`) never share
+ * a patch.
+ */
 export function taskPatchPath(taskId: string): string {
   const safe = taskId.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 60);
-  return join(BRANCH_MERGE_DIR, `${safe}.patch`);
+  const hash = createHash("sha256").update(taskId).digest("hex").slice(0, 6);
+  return join(BRANCH_MERGE_DIR, `${safe}-${hash}.patch`);
+}
+
+/** The folder of whole files saved beside a text-only patch. */
+function taskFilesPath(patchRel: string): string {
+  return `${patchRel.slice(0, -".patch".length)}.files`;
+}
+
+/**
+ * A task that merged green after an earlier attempt was held back: its
+ * old patch (and saved files) no longer describe anything. Never throws.
+ */
+export async function removeTaskPatch(realDir: string, taskId: string): Promise<void> {
+  const rel = taskPatchPath(taskId);
+  await rm(join(realDir, rel), { force: true }).catch(() => undefined);
+  await rm(join(realDir, taskFilesPath(rel)), { recursive: true, force: true }).catch(
+    () => undefined,
+  );
 }
 
 /** Runs git for the patch; resolves `null` when git is not there to run. */
@@ -207,7 +233,7 @@ export async function gitBinaryPatch(
   git: PatchGit = defaultPatchGit,
   tmpRoot: string = tmpdir(),
 ): Promise<string | null> {
-  const store = await mkdtemp(join(tmpRoot, "atag-fusion-patch-"));
+  const store = await mkdtemp(join(tmpRoot, `${FUSION_TMP_PREFIX}patch-`));
   try {
     const gitDir = join(store, "objects.git");
     if (!ran(await git(["init", "-q", "--bare", gitDir], { cwd: store, env: {} }))) return null;
@@ -308,9 +334,9 @@ export async function writeTaskPatch(input: {
 }): Promise<SavedTaskPatch> {
   const rel = taskPatchPath(input.taskId);
   const at = join(input.realDir, rel);
-  const filesRel = `${rel.slice(0, -".patch".length)}.files`;
+  const filesRel = taskFilesPath(rel);
   const filesAt = join(input.realDir, filesRel);
-  await mkdir(dirname(at), { recursive: true });
+  await ensureMergeDir(input.realDir);
   // An earlier attempt's copies are not this attempt's.
   await rm(filesAt, { recursive: true, force: true });
   const paths = await touchedPaths(input.workspace);

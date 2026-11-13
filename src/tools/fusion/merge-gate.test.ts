@@ -150,7 +150,7 @@ describe("merge only green tasks (isolation)", () => {
     expect(patch).toContain("+++ b/two.txt");
     expect(patch).toContain("+bad");
     expect(rows[1]!.notes?.join(" ")).toContain(
-      "not merged (its own checks failed: two.txt is bad): its changes to 1 file are kept as a patch at .atomic-agent/fusion-merge/two.patch",
+      `not merged (its own checks failed: two.txt is bad): its changes to 1 file are kept as a patch at ${taskPatchPath("two")} (\`git apply\` in the folder); the folder is unchanged`,
     );
     // The gate ran the checks in each task's workspace; nothing ran them again on the folder.
     const gateRuns = seen.filter((s) => s.dir !== repo);
@@ -418,6 +418,71 @@ describe("merge only green tasks (isolation)", () => {
     expect((result.details.tasks as WorkerTaskResult[])[0]!.status).toBe("failed");
     expect(await readFile(join(repo, "one.txt"), "utf8")).toBe("bad\n");
     await expect(readFile(join(repo, taskPatchPath("one")), "utf8")).rejects.toThrow();
+  });
+});
+
+describe("held-back patches and kept workspaces (isolation)", () => {
+  it("names patches apart, ignores the patch folder, and drops a stale patch once the task merges green", async () => {
+    expect(taskPatchPath("a/b")).not.toBe(taskPatchPath("a_b"));
+    expect(taskPatchPath("a/b")).toMatch(/fusion-merge[\\/]a_b-[0-9a-f]{6}\.patch$/);
+    const repo = await gitRepo({ "a.txt": "a\n" });
+    const seen: Array<{ file: string; dir: string; ok: boolean }> = [];
+    let round = 0;
+    const d = deps(
+      repo,
+      (_id, _n, dir) => writeFile(join(dir, "one.txt"), round === 1 ? "bad\n" : "good\n"),
+      { runChecks: fileChecks(seen) },
+    );
+    const args = {
+      tasks: [TASKS[0]!],
+      contract: { checks: [{ task: "one", kind: "command", file: "one.txt" }] },
+    };
+    round = 1;
+    await buildFusionDelegateTool(d).run(args, ctx(repo));
+    const patch = join(repo, taskPatchPath("one"));
+    expect(await readFile(patch, "utf8")).toContain("+bad");
+    expect(await readFile(join(repo, ".atomic-agent", "fusion-merge", ".gitignore"), "utf8")).toBe("*\n");
+    // Nothing under the patch folder shows up as a change to commit.
+    expect((await runGitRaw(repo, ["status", "--porcelain"])).stdout).toBe("");
+    round = 2;
+    const second = await buildFusionDelegateTool(d).run(args, ctx(repo));
+    expect((second.details.tasks as WorkerTaskResult[])[0]!.status).toBe("ok");
+    expect(await readFile(join(repo, "one.txt"), "utf8")).toBe("good\n");
+    await expect(readFile(patch, "utf8")).rejects.toThrow();
+  });
+
+  it("removes a kept workspace when something after the waves throws", async () => {
+    const repo = await gitRepo({ "a.txt": "a\n" });
+    let retrying = false;
+    const complete: EscalationComplete = async () => ({
+      content: JSON.stringify({ items: [{ id: "a2", pass: false, why: "unfinished" }] }),
+    });
+    const d = deps(
+      repo,
+      (_id, _n, dir) => writeFile(join(dir, "one.txt"), "draft\n"),
+      {
+        escalationComplete: complete,
+        knownSecrets: () => {
+          if (retrying) throw new Error("secret store went away");
+          return [];
+        },
+      },
+      { judge: { providerId: "cloud", model: "judge" } },
+    );
+    const runTurn = d.runTurn;
+    d.runTurn = async (session, message, options) => {
+      if (message.includes("A judge found these acceptance items NOT met")) retrying = true;
+      return runTurn(session, message, options);
+    };
+    await expect(
+      buildFusionDelegateTool(d).run(
+        { tasks: [{ id: "one", title: "One", instructions: "write one.txt", files: ["one.txt"] }] },
+        ctx(repo),
+      ),
+    ).rejects.toThrow("secret store went away");
+    expect(retrying).toBe(true);
+    const list = (await runGitRaw(repo, ["worktree", "list"])).stdout.trim().split("\n");
+    expect(list).toHaveLength(1);
   });
 });
 

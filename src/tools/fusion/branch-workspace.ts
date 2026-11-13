@@ -38,7 +38,9 @@ import {
   readlink,
   realpath,
   rm,
+  stat,
   symlink,
+  writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, sep } from "node:path";
@@ -53,6 +55,84 @@ import {
 
 /** Where conflicting sides are saved for the merge task, relative to the working directory. */
 export const BRANCH_MERGE_DIR = join(".atomic-agent", "fusion-merge");
+
+/**
+ * The merge folder inside `realDir`, made with a `.gitignore` of `*`
+ * so nothing saved there (patches, conflict sides) is committed by
+ * accident. Returns its absolute path.
+ */
+export async function ensureMergeDir(realDir: string): Promise<string> {
+  const dir = join(realDir, BRANCH_MERGE_DIR);
+  await mkdir(dir, { recursive: true });
+  await writeFile(join(dir, ".gitignore"), "*\n", { flag: "wx" }).catch(() => undefined);
+  return dir;
+}
+
+/** Every temporary folder fusion makes starts with this (run roots, patch stores). */
+export const FUSION_TMP_PREFIX = "atag-fusion-";
+/** The run root's owner record: the process that may still use it. */
+const OWNER_FILE = "owner.json";
+/** A fusion folder with no owner record is left alone this long (it may be being made). */
+const UNOWNED_GRACE_MS = 60 * 60 * 1000;
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+async function staleRoot(root: string): Promise<boolean> {
+  try {
+    const owner = JSON.parse(await readFile(join(root, OWNER_FILE), "utf8")) as { pid?: unknown };
+    return typeof owner.pid !== "number" || !processAlive(owner.pid);
+  } catch {
+    const info = await stat(root).catch(() => null);
+    return info !== null && Date.now() - info.mtimeMs > UNOWNED_GRACE_MS;
+  }
+}
+
+/**
+ * Remove what a fusion run that died (a crash, a kill, a throw nobody
+ * cleaned up after) left behind: its run roots under `tmpRoot` whose
+ * owner process is gone, and the git worktrees `repoTop` still records
+ * inside them. A root another live process owns is never touched.
+ * Never throws.
+ */
+export async function sweepStaleBranchSets(
+  tmpRoot: string,
+  repoTop: string | undefined,
+  git: GitExec,
+): Promise<void> {
+  try {
+    const stale: string[] = [];
+    for (const entry of await readdir(tmpRoot, { withFileTypes: true })) {
+      if (!entry.isDirectory() || !entry.name.startsWith(FUSION_TMP_PREFIX)) continue;
+      const root = join(tmpRoot, entry.name);
+      if (await staleRoot(root)) stale.push(await realpath(root).catch(() => root));
+    }
+    if (repoTop !== undefined) {
+      const listed = await git(["worktree", "list", "--porcelain", "-z"], repoTop);
+      if (ok(listed)) {
+        for (const line of zList(listed.stdout)) {
+          if (!line.startsWith("worktree ")) continue;
+          const path = line.slice("worktree ".length);
+          if (stale.some((root) => path === root || path.startsWith(`${root}${sep}`))) {
+            await git(["worktree", "remove", "--force", path], repoTop).catch(() => null);
+          }
+        }
+      }
+    }
+    for (const root of stale) await rm(root, { recursive: true, force: true }).catch(() => undefined);
+    if (repoTop !== undefined && stale.length > 0) {
+      await git(["worktree", "prune"], repoTop).catch(() => null);
+    }
+  } catch {
+    // Housekeeping; never a reason to fail a fan-out.
+  }
+}
 
 export type BranchMethod = "worktree" | "clonefile" | "copy";
 
@@ -342,11 +422,18 @@ export async function createBranchSet(
     await mkdtemp(
       join(
         options.tmpRoot ?? tmpdir(),
-        `atag-fusion-${randomBytes(3).toString("hex")}-`,
+        `${FUSION_TMP_PREFIX}${randomBytes(3).toString("hex")}-`,
       ),
     ),
   );
+  // Whose it is, so a later run's sweep can tell a dead run's leftovers
+  // from a live one's.
+  await writeFile(
+    join(runRoot, OWNER_FILE),
+    JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }),
+  ).catch(() => undefined);
   const snapshot = await gitSnapshot(real, git);
+  await sweepStaleBranchSets(dirname(runRoot), snapshot?.top, git);
   const roots: string[] = [];
   const removeRoot = async (root: string): Promise<void> => {
     if (snapshot !== null) {
