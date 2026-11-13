@@ -8,7 +8,10 @@ import {
 import { resolveUserPath } from "../os/expand-home.js";
 import { isOutsideReadRoots } from "../read-scope/read-scope.js";
 import type { SyntaxFileResult } from "../verify/syntax-check-types.js";
-import { VERIFY_SYNTAX_MAX_FILES } from "../verify/verify-syntax.js";
+import {
+  VERIFY_SYNTAX_MAX_FILES,
+  type VerifySyntaxOptions,
+} from "../verify/verify-syntax.js";
 import type { DelegateTask } from "./delegate-args.js";
 import { presentChangedPaths } from "./worker-changes.js";
 import type { WorkerTaskResult } from "./worker-result.js";
@@ -24,10 +27,17 @@ import type { WorkerTaskResult } from "./worker-result.js";
  * (`verifySyntax`, injected as `SyntaxCheckRunner`), and the row says
  * the verdict. A file that fails demotes its row the way a failed
  * contract check does: the table counts it `failed`, not `ok`.
+ *
+ * Only syntax demotes. TypeScript is checked with `typescript:
+ * "parse"`: a type error, a missing module or missing `@types` in a
+ * file the worker touched may well predate it, so it is a
+ * `types: N errors` note on the row, never a failure that would send
+ * the orchestrator into a rework loop over code that was already there.
  */
 export type SyntaxCheckRunner = (
   files: readonly string[],
   workingDir: string,
+  options: VerifySyntaxOptions,
 ) => Promise<{ results: readonly SyntaxFileResult[] }>;
 
 /** One row's syntax verdict, for the status table and the row's block. */
@@ -44,10 +54,17 @@ export interface TaskSyntaxSummary {
   output?: string;
   /** Why the pass gave no verdict at all (the checker threw). */
   error?: string;
+  /** Type (non-parse) diagnostics in the checked files; they demote nothing. */
+  typeErrors?: number;
+  /** Those diagnostics, masked, at most `TYPE_OUTPUT_CHARS`. */
+  typeOutput?: string;
 }
 
 /** How much of the failing files' errors one row carries. */
 export const SYNTAX_OUTPUT_CHARS = 600;
+
+/** How much of the checked files' type errors one row carries. */
+export const TYPE_OUTPUT_CHARS = 300;
 
 /**
  * The files a row is checked on: what its worker's file tools changed
@@ -127,7 +144,7 @@ export async function runSyntaxPass(
     const { results } =
       queued.length === 0
         ? { results: [] }
-        : await options.runner(queued, options.workingDir);
+        : await options.runner(queued, options.workingDir, { typescript: "parse" });
     verdicts = new Map(queued.map((file, i) => [file, results[i]!]));
   } catch (error) {
     verdicts = new Map();
@@ -148,7 +165,9 @@ export async function runSyntaxPass(
     }
     let checked = 0;
     let unchecked = 0;
+    let typeErrors = 0;
     const failed: { file: string; error: string }[] = [];
+    const typed: string[] = [];
     for (const file of plan.files) {
       const verdict = verdicts.get(absoluteOf.get(file)!);
       if (verdict === undefined || verdict.ok === null) {
@@ -159,15 +178,24 @@ export async function runSyntaxPass(
       if (verdict.ok === false) {
         failed.push({ file, error: maskSecrets(verdict.error ?? "failed", known) });
       }
+      if (verdict.typeErrors !== undefined && verdict.typeErrors.count > 0) {
+        typeErrors += verdict.typeErrors.count;
+        typed.push(`${file}: ${maskSecrets(verdict.typeErrors.detail, known)}`);
+      }
     }
     const output =
-      failed.length === 0 ? undefined : clip(failed.map((f) => `${f.file}: ${f.error}`).join("\n"));
+      failed.length === 0
+        ? undefined
+        : clip(failed.map((f) => `${f.file}: ${f.error}`).join("\n"), SYNTAX_OUTPUT_CHARS);
     const syntax: TaskSyntaxSummary = {
       checked,
       failedFiles: failed.map((f) => f.file),
       unchecked,
       ...outOfScope,
       ...(output === undefined ? {} : { output }),
+      ...(typeErrors === 0
+        ? {}
+        : { typeErrors, typeOutput: clip(typed.join("\n"), TYPE_OUTPUT_CHARS) }),
     };
     if (failed.length === 0) return { ...row, syntax };
     const error = describeSyntaxFailure(syntax);
@@ -189,11 +217,23 @@ function describeSyntaxFailure(syntax: TaskSyntaxSummary): string {
 /**
  * The status-table clause: `syntax ok (3 files)`, with what it did not
  * cover; the failure itself when the row's error does not already lead
- * with it; `null` when there is nothing to say.
+ * with it; then `types: N errors (not demoted)` when the checked files
+ * had any; `null` when there is nothing to say.
  */
 export function describeSyntax(
   syntax: TaskSyntaxSummary,
   error?: string,
+): string | null {
+  const verdict = describeSyntaxVerdict(syntax, error);
+  const n = syntax.typeErrors ?? 0;
+  if (n === 0) return verdict;
+  const types = `types: ${n} error${n === 1 ? "" : "s"} (not demoted)`;
+  return verdict === null ? types : `${verdict}; ${types}`;
+}
+
+function describeSyntaxVerdict(
+  syntax: TaskSyntaxSummary,
+  error: string | undefined,
 ): string | null {
   if (syntax.error !== undefined) return syntax.error;
   const notCovered = [
@@ -211,8 +251,6 @@ export function describeSyntax(
   return `syntax ok (${[files, ...notCovered].join(", ")})`;
 }
 
-function clip(text: string): string {
-  return text.length > SYNTAX_OUTPUT_CHARS
-    ? `${text.slice(0, SYNTAX_OUTPUT_CHARS - 1)}…`
-    : text;
+function clip(text: string, cap: number): string {
+  return text.length > cap ? `${text.slice(0, cap - 1)}…` : text;
 }

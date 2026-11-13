@@ -1178,6 +1178,9 @@ function renderBlock(
     ...(result.syntax?.output === undefined
       ? []
       : [`syntax output:\n${result.syntax.output}`]),
+    ...(result.syntax?.typeOutput === undefined
+      ? []
+      : [`type errors:\n${result.syntax.typeOutput}`]),
     ...(result.notes ?? []).map((note) => `note: ${note}`),
   ];
   const used = [head, ...diagnosis].join("\n").length;

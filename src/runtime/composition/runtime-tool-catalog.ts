@@ -846,7 +846,7 @@ export function registerRuntimeFusionAndReadScope(input: {
       // `verify.syntax`'s own checker: the delegate syntax-checks every
       // green row's changed files itself, so the orchestrator does not
       // spend a step (and its context) on it after each fan-out.
-      syntaxCheck: (files, dir) => verifySyntax(files, dir),
+      syntaxCheck: (files, dir, options) => verifySyntax(files, dir, options),
       // Check output reaches workers outside the registry: masked with
       // the same keys the registry masks tool results with (ATO-1077).
       knownSecrets: () => runtimeKnownSecrets(getConfig()),

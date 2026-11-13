@@ -93,10 +93,20 @@ async function checkOne(
   };
 }
 
+export interface VerifySyntaxOptions {
+  /**
+   * `"all"` (the tool's own): any tsc diagnostic in a file fails it.
+   * `"parse"` (the fusion delegate's pass): only a parse diagnostic
+   * does; the rest come back as the result's `typeErrors`.
+   */
+  readonly typescript?: "all" | "parse";
+}
+
 /** Check every file and render the report. Never throws for a bad file. */
 export async function verifySyntax(
   files: readonly string[],
   workingDir: string,
+  options: VerifySyntaxOptions = {},
 ): Promise<VerifySyntaxReport> {
   const results: SyntaxFileResult[] = new Array<SyntaxFileResult>(files.length);
   const typescript: { index: number; file: string; absolute: string }[] = [];
@@ -119,7 +129,9 @@ export async function verifySyntax(
     results[index] = await checkOne(file, absolute);
   }
   if (typescript.length > 0) {
-    const verdicts = await checkTypeScriptFiles(typescript);
+    const verdicts = await checkTypeScriptFiles(typescript, {
+      parseOnly: options.typescript === "parse",
+    });
     for (const [i, entry] of typescript.entries()) {
       results[entry.index] = { ...verdicts[i]!, file: entry.file };
     }

@@ -8,6 +8,7 @@ import {
   checkTypeScriptFiles,
   findTsconfig,
   findTscBinary,
+  isParseDiagnostic,
   TS_CHECKER,
 } from "./check-typescript-syntax.js";
 
@@ -91,4 +92,30 @@ describe("checkTypeScriptFiles", () => {
       ["node_modules", "outside.ts", "src", "tsconfig.json"].sort(),
     );
   }, 60_000);
+
+  it("parseOnly fails a file only on a parse error; type errors are reported beside the pass", async () => {
+    await project();
+    const typed = join(dir, "src", "typed.ts");
+    await writeFile(typed, "export const b: number = 'no';\n");
+    const entry = [{ file: "src/typed.ts", absolute: typed }];
+    // `verify.syntax` itself: any diagnostic fails the file.
+    const [all] = await checkTypeScriptFiles(entry);
+    expect(all).toMatchObject({ ok: false, checker: TS_CHECKER });
+    const [parse] = await checkTypeScriptFiles(entry, { parseOnly: true });
+    expect(parse).toMatchObject({ ok: true, checker: TS_CHECKER, typeErrors: { count: 1 } });
+    expect(parse?.typeErrors?.detail).toMatch(/^line 1: error TS2322/);
+    expect(parse?.warning).toBeUndefined();
+  }, 60_000);
+});
+
+describe("isParseDiagnostic", () => {
+  it("is the TS1xxx range less the module- and config-dependent codes", () => {
+    expect(isParseDiagnostic(1005)).toBe(true);
+    expect(isParseDiagnostic(1109)).toBe(true);
+    expect(isParseDiagnostic(2322)).toBe(false);
+    expect(isParseDiagnostic(2307)).toBe(false);
+    expect(isParseDiagnostic(7016)).toBe(false);
+    expect(isParseDiagnostic(1192)).toBe(false);
+    expect(isParseDiagnostic(1484)).toBe(false);
+  });
 });
