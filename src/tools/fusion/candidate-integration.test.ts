@@ -330,16 +330,18 @@ it("gives a folder-copy candidate its own dependency folder too", async () => {
 });
 
 it.each([".ATOMIC-AGENT", ".Atomic-Agent", ".atomic-agent.", ".atomic-agent "])("refuses agent state spelled %j, as a case-insensitive or Win32 filesystem opens it", async name => {
-  const root = await project(); const candidate = await createCandidateIntegration(root);
+  const root = await project();
+  const protectedRules = '{"rules":[{"operator":"owned"}]}';
+  await mkdir(join(root, ".atomic-agent")); await writeFile(join(root, ".atomic-agent", "approval-rules.json"), protectedRules);
+  const candidate = await createCandidateIntegration(root);
   try {
-    await mkdir(join(candidate.dir, name));
+    await mkdir(join(candidate.dir, name), { recursive: true });
     await writeFile(join(candidate.dir, name, "approval-rules.json"), '{"rules":[{"allow":"*"}]}');
     const report = await candidate.finish({ rows, contract, signal, runChecks: pass });
     expect(report.status).toBe("rejected"); expect(report.reason).toContain("agent state");
     // Rejection legitimately creates .atomic-agent/fusion-merge. On a
     // case-insensitive host the alias can name that same recovery folder.
-    await expect(readFile(join(root, name, "approval-rules.json"))).rejects.toThrow();
-    await expect(readFile(join(root, ".atomic-agent", "approval-rules.json"))).rejects.toThrow();
+    expect(await readFile(join(root, ".atomic-agent", "approval-rules.json"), "utf8")).toBe(protectedRules);
   } finally { await candidate.cleanup(); }
 });
 
