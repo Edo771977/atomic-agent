@@ -20,6 +20,15 @@ describe("fusion worker sessions", () => {
     expect(readFusionWorkerMeta(session.metadata)).toEqual(meta);
   });
 
+  it("carries the operator's whole request for the worker's input guard", () => {
+    const withRequest = { ...meta, operatorRequest: "Clean sales.csv" };
+    const session = createFusionWorkerSession({ workingDir: "/work", meta: withRequest });
+    expect(readFusionWorkerMeta(session.metadata)).toEqual(withRequest);
+    expect(
+      readFusionWorkerMeta({ [FUSION_WORKER_METADATA_KEY]: { ...meta, operatorRequest: 7 } }),
+    ).toEqual(meta);
+  });
+
   it("two workers never share an id", () => {
     const a = createFusionWorkerSession({ workingDir: "/work", meta });
     const b = createFusionWorkerSession({ workingDir: "/work", meta });

@@ -13,6 +13,9 @@ import { resolveLlmConfig } from "../../llm/provider/index.js";
 import type { ResolvedRunMode } from "../../llm/run-mode/index.js";
 import { visionCapableAlternatives } from "../../llm/provider/model-vision.js";
 import { resolveModelPricingFor } from "../resolve-model-pricing.js";
+import type { ModelProfile } from "../../llm/model-profile.js";
+import type { SlotManager } from "../../llm/slot-manager.js";
+import { createFusionFormatProbeFor } from "./fusion-format-check.js";
 import type { SessionUsageLedger } from "../../session/usage-meter.js";
 import { isLocalServerUrl } from "../../llm/provider/openai/local-server-url.js";
 import { ToolRegistry } from "../../tools/tool-registry.js";
@@ -24,7 +27,7 @@ import { replyTool } from "../../tools/conversation/index.js";
 import { buildBrowserTools, UserSiteApprovals } from "../../tools/browser/index.js";
 import type { BrowserBackend } from "../../tools/browser/browser-backend.js";
 import { registerOsScreenTools, registerOsTools, type DeclaredInputsRegistry, type ShellJobRegistry, type WebSearchKeyHelp } from "../../tools/os/index.js";
-import { registerVerifyTools, runChecks } from "../../tools/verify/index.js";
+import { registerVerifyTools, runChecks, verifySyntax } from "../../tools/verify/index.js";
 import { registerGithubTools } from "../../tools/github/index.js";
 import { resolveGithubToken } from "../../github/index.js";
 import { registerSkillTools } from "../../tools/skill/index.js";
@@ -693,7 +696,8 @@ export function registerRuntimeFusionAndReadScope(input: {
   >;
   approvals: ApprovalGate;
   dangerous: DangerousToolOptions;
-  slotManager: FusionDelegateDeps["slotManager"];
+  slotManager: FusionDelegateDeps["slotManager"] &
+    Partial<Pick<SlotManager, "getSlotCount" | "reservedSideCallSlotId">>;
   workingDir: string;
   logger: StructuredLogger;
   turnBudget?: FusionDelegateDeps["turnBudget"];
@@ -703,11 +707,25 @@ export function registerRuntimeFusionAndReadScope(input: {
   steerWorker?: FusionDelegateDeps["steerWorker"];
   orchestratorTurnSpendUsd?: FusionDelegateDeps["orchestratorTurnSpendUsd"];
   runCheckpoints?: FusionDelegateDeps["runCheckpoints"];
+  outcomeLog?: FusionDelegateDeps["outcomeLog"];
+  turnLedger?: FusionDelegateDeps["turnLedger"];
+  /**
+   * What the local legs' format check sends with (`fusion-format-check.ts`):
+   * the step's live base grammar and tool names, and the main local
+   * server's live profile and model id. Absent, no leg is checked.
+   */
+  localFormatCheck?: {
+    getGrammar: () => string;
+    getToolNames: () => readonly string[];
+    getProfile: () => ModelProfile;
+    getModelId: () => string | null;
+  };
 }): void {
   const { config, toolRegistry, runTurn, createEphemeralSession, resolveOriginalRequest, declaredInputs,
     prepareLocalLink, emitAgentLoopEventFor, resolveCurrentRunMode, providerRegistry,
     llama, approvals, dangerous, slotManager, workingDir, logger, turnBudget,
-    orchestratorTurnSpendUsd, liveWorkers, steerWorker, runCheckpoints, sessionUsage } = input;
+    orchestratorTurnSpendUsd, liveWorkers, steerWorker, runCheckpoints, sessionUsage,
+    outcomeLog, turnLedger, localFormatCheck } = input;
 
 
   // The orchestrator's fan-out. Registered UNCONDITIONALLY: the tool
@@ -727,6 +745,12 @@ export function registerRuntimeFusionAndReadScope(input: {
       createEphemeralSession,
       resolveOriginalRequest: resolveOriginalRequest,
       declaredInputs,
+      // The Codex CLI confines its own shell (`-s read-only`) rather than
+      // turning it off, so it is no `model: "orchestrator"` target.
+      cliToolsStayOn: (providerId) => {
+        const entry = resolveLlmConfig(getConfig()).providers.find((p) => p.id === providerId);
+        return entry?.kind === "subscription-cli" && entry.subscriptionCli?.cli === "codex";
+      },
       // The worker leg's pricing, when the catalogue or a hand-priced
       // entry knows it — the status table's spend line.
       resolveWorkerPricing: (providerId, modelId) =>
@@ -766,6 +790,34 @@ export function registerRuntimeFusionAndReadScope(input: {
           ? () => llama.probeHealth()
           : undefined;
       },
+      // One short completion under the workers' grammar before the first
+      // fan-out on the main local server's leg; never a cloud leg.
+      ...(localFormatCheck === undefined
+        ? {}
+        : {
+            localGrammarProbeFor: createFusionFormatProbeFor({
+              getConfig,
+              providers: () => resolveLlmConfig(getConfig()).providers,
+              complete: async (providerId, request) => {
+                const provider = providerRegistry.getProvider(providerId);
+                if (provider === undefined) {
+                  throw new Error(`format check: provider ${providerId} is not configured`);
+                }
+                return provider.complete(request);
+              },
+              slotOccupancy: async () => {
+                try {
+                  return readSlotOccupancy(await llama.fetchSlots());
+                } catch {
+                  return null;
+                }
+              },
+              // The reflection/compaction slot when reserved; never reserves one.
+              sideCallSlotId: () => slotManager.reservedSideCallSlotId?.() ?? null,
+              slotCount: () => slotManager.getSlotCount?.() ?? slotManager.poolSize(),
+              ...localFormatCheck,
+            }),
+          }),
       // The turn's $ / time caps (ATO-947), reset at each fusion turn's
       // start by the loop; read only when a cap is configured.
       ...(turnBudget === undefined ? {} : { turnBudget }),
@@ -818,6 +870,9 @@ export function registerRuntimeFusionAndReadScope(input: {
       // Run checkpoints (ATO-617): a fan-out cut off by a restart can be
       // resumed from its unfinished wave.
       ...(runCheckpoints === undefined ? {} : { runCheckpoints }),
+      // The outcome log and the turn receipt's tally (counts only).
+      ...(outcomeLog === undefined ? {} : { outcomeLog }),
+      ...(turnLedger === undefined ? {} : { turnLedger }),
       approvals,
       approvalRequired: dangerous.approvalRequired,
       slotManager,
@@ -843,6 +898,13 @@ export function registerRuntimeFusionAndReadScope(input: {
           signal: ctx.signal,
           config,
         }),
+      // `verify.syntax`'s own checker: the delegate syntax-checks every
+      // green row's changed files itself, so the orchestrator does not
+      // spend a step (and its context) on it after each fan-out.
+      syntaxCheck: (files, dir, options) => verifySyntax(files, dir, options),
+      // Check output reaches workers outside the registry: masked with
+      // the same keys the registry masks tool results with (ATO-1077).
+      knownSecrets: () => runtimeKnownSecrets(getConfig()),
       logger,
     }),
   );

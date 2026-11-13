@@ -75,6 +75,11 @@ import {
 } from "./theme/detect-terminal-background.js";
 import { resolveThemeName, setActiveTheme, THEMES } from "./theme/theme.js";
 import { formatStartupFusionNotice } from "./fusion-resume-notice.js";
+import {
+  outcomeLogPath,
+  parseReportArgs,
+  renderOutcomeReport,
+} from "../tools/fusion/index.js";
 import type { InitialTuiLayoutOptions, TuiSessionInfo } from "./tui-state.js";
 import {
   loadUninstallPreview,
@@ -696,6 +701,21 @@ export async function tuiCommand(args: string[]): Promise<number> {
         },
         prepareFusionResume: (sessionId, runId) =>
           runtime.fusionRuns?.resumeMessage(sessionId, runId) ?? null,
+        // `/fusion report`: the same text as `atomic-agent fusion report`.
+        renderFusionReport: (args) => {
+          const parsed = parseReportArgs(args);
+          if (typeof parsed === "string") {
+            return `usage: /fusion report [--days N] [--model X] (${parsed})`;
+          }
+          try {
+            return renderOutcomeReport(outcomeLogPath(runtime.config.paths.stateDir), {
+              ...parsed,
+              json: false,
+            }).trimEnd();
+          } catch (err) {
+            return `fusion report failed: ${err instanceof Error ? err.message : String(err)}`;
+          }
+        },
         onProvidersSelectChatModel: (providerId, modelId) =>
           void orchestrator.providers.selectChatModel(providerId, modelId),
         onProvidersChatModelPickerRequested: (providerId) =>

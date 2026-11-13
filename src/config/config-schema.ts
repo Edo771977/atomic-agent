@@ -1089,6 +1089,11 @@ export interface UserConfigFile {
 // Unversioned, additive: `llm.runMode.fusion.maxRoundsPerTurn` (0..100,
 // default 6) and `maxTasksPerTurn` (0..1000, default 48), ATO-1406. `0`
 // turns a cap off. An older file has neither and takes the defaults.
+// Unversioned, additive: `llm.runMode.fusion.maxOrchestratorTasksPerTurn`
+// (0..100, default 4): how many `model: "orchestrator"` tasks one fusion
+// turn may start; `0` turns that target off. An older file has no field
+// and takes the default; an older build drops the key on parse and the
+// whole-file write keeps it (`config-shape.ts`).
 // Unversioned, additive: `llm.runMode.fusion.escalation` (`off|advisor`,
 // default `off`), `escalationReplace` (default false),
 // `escalationProvider` (default the orchestrator leg) and
@@ -1101,6 +1106,10 @@ export interface UserConfigFile {
 // Unversioned, additive: `llm.runMode.fusion.roles` (`plan|build|review|
 // explore|utility` → provider id) and `mixLocalModels` (default false),
 // ATO-943. An older file has neither and runs every task on the worker leg.
+// Unversioned, additive: `llm.runMode.fusion.localFormatCheck` (boolean,
+// default true): one short completion under the workers' grammar before
+// the first fan-out on a local worker leg. An older file has no field and
+// gets the check; `false` turns it off.
 // Unversioned, additive: `llm.runMode.fusion.isolation` (`off|worktree`,
 // default `off`), ATO-946. An older file has none and workers write in
 // place, as before.

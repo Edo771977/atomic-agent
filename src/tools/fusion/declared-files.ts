@@ -295,7 +295,7 @@ export function applyNoChangesRule(
     status: "no_changes",
     notes: [
       ...(result.notes ?? []),
-      "no write, edit or patch call succeeded and no declared file changed",
+      "no write, edit or patch call succeeded and no declared file changed; fix: name the file and the exact edit in the brief",
     ],
   };
 }

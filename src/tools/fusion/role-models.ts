@@ -16,6 +16,16 @@ import type { DelegateTask } from "./delegate-args.js";
  * call (`unknownModels`), with the list, so the planner fixes it in one
  * regeneration.
  *
+ * `model: "orchestrator"` (`ORCHESTRATOR_TASK_MODEL`) is always on the
+ * list in fusion: the task runs on the orchestrator leg's provider and
+ * model, as an ordinary worker turn (worker brief, tool filter, approval
+ * refusals, fan-out write scope, read scope, pinned provider). The
+ * orchestrator's own turn still changes nothing itself; this is how it
+ * hands a hard part to the stronger model without doing it in its own
+ * turn. Counted against `maxOrchestratorTasksPerTurn`; priced toward
+ * `turnBudgetUsd` only where the leg has a price (a subscription CLI
+ * leg has none).
+ *
  * One guard: a second LOCAL model. A llama-server provider other than
  * the ones the session's legs already hold needs its own server and its
  * own memory, which this process cannot measure; without
@@ -33,6 +43,8 @@ export interface TaskLeg {
   isWorkerLeg: boolean;
   /** The role whose model this is, when a role picked it. */
   role?: FusionRole;
+  /** The task named `model: "orchestrator"` and runs on that leg. */
+  orchestrator?: true;
   /** Why the task did not run where it asked to, for its row. */
   note?: string;
 }
@@ -40,6 +52,22 @@ export interface TaskLeg {
 export interface WorkerLegRef {
   providerId: string;
   model: string;
+}
+
+/** The `model` a task names to run on the orchestrator leg. */
+export const ORCHESTRATOR_TASK_MODEL = "orchestrator";
+
+/** The orchestrator leg as a task target, or `undefined` when it cannot be one. */
+function orchestratorTarget(
+  workerLeg: WorkerLegRef,
+  orchestratorLeg: WorkerLegRef | undefined,
+): WorkerLegRef | undefined {
+  // The resolver never makes the two legs one provider; were they, the
+  // name would simply mean the worker leg.
+  return orchestratorLeg === undefined ||
+    orchestratorLeg.providerId === workerLeg.providerId
+    ? undefined
+    : orchestratorLeg;
 }
 
 /** Every model a task may name, worker leg first, each once. */
@@ -64,15 +92,23 @@ export function unknownModels(
   tasks: readonly DelegateTask[],
   workerLeg: WorkerLegRef,
   roles: FusionRoleModels | undefined,
+  orchestratorLeg?: WorkerLegRef,
 ): string | undefined {
   const allowed = allowedModels(workerLeg, roles);
+  const orchestrator = orchestratorTarget(workerLeg, orchestratorLeg);
   const bad = tasks.filter(
     (t) =>
       t.model !== undefined &&
+      !(t.model === ORCHESTRATOR_TASK_MODEL && orchestrator !== undefined) &&
       !allowed.some((a) => a.model === t.model || a.providerId === t.model),
   );
   if (bad.length === 0) return undefined;
-  const names = allowed.map((a) => `\`${a.model}\``).join(", ");
+  const names = [
+    ...allowed.map((a) => a.model),
+    ...(orchestrator === undefined ? [] : [ORCHESTRATOR_TASK_MODEL]),
+  ]
+    .map((name) => `\`${name}\``)
+    .join(", ");
   return `validation: ${bad
     .map((t) => `task "${t.id}" names model "${t.model}"`)
     .join("; ")}, which is not available here. Allowed models: ${names}. Use a task \`role\` or one of these names, or leave \`model\` out.`;
@@ -86,7 +122,9 @@ export function resolveTaskLegs(
   tasks: readonly DelegateTask[],
   workerLeg: WorkerLegRef,
   roles: FusionRoleModels | undefined,
+  orchestratorLeg?: WorkerLegRef,
 ): Map<string, TaskLeg> {
+  const orchestrator = orchestratorTarget(workerLeg, orchestratorLeg);
   const legs = new Map<string, TaskLeg>();
   const workerDefault = (note?: string): TaskLeg => ({
     providerId: workerLeg.providerId,
@@ -102,6 +140,17 @@ export function resolveTaskLegs(
     let picked:
       | { providerId: string; model: string; local: boolean; role?: FusionRole }
       | undefined;
+    if (task.model === ORCHESTRATOR_TASK_MODEL && orchestrator !== undefined) {
+      // The orchestrator leg is one the session already holds, so the
+      // second-local-model guard has nothing to say about it.
+      legs.set(task.id, {
+        providerId: orchestrator.providerId,
+        model: orchestrator.model,
+        isWorkerLeg: false,
+        orchestrator: true,
+      });
+      continue;
+    }
     if (task.model !== undefined) {
       if (
         task.model === workerLeg.model ||

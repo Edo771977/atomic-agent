@@ -606,6 +606,8 @@ export interface TuiAppCallbacks {
    * turn; `null` when there is no such run.
    */
   prepareFusionResume?(sessionId: string, runId: string | undefined): string | null;
+  /** `/fusion report [flags]`: the outcome report's text (or a usage line). */
+  renderFusionReport?(args: readonly string[]): string;
   /** Providers tab / LLM panel: select an exact chat model for a provider. */
   onProvidersSelectChatModel?(providerId: string, modelId: string): void;
   /**

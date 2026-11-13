@@ -12,6 +12,12 @@
  * under a `node_modules/.bin` above the project — a global `tsc` is
  * not consulted, since its version is not the project's.
  *
+ * `parseOnly` (the fusion delegate's own pass) fails a file only on its
+ * parse diagnostics (`isParseDiagnostic`): a type error, a missing
+ * module or missing `@types` is reported on the result as `typeErrors`
+ * and leaves it `ok`. `verify.syntax` itself keeps every diagnostic a
+ * failure.
+ *
  * Writes nothing into the project: `--noEmit`, and the build info an
  * incremental project would drop beside its tsconfig is redirected to
  * the OS temp dir and removed.
@@ -53,10 +59,35 @@ export function findTscBinary(dir: string): string | null {
   }
 }
 
+/** One `file(line,col): error TSnnnn: …` line, as the result shows it. */
+interface Diagnostic {
+  readonly code: number;
+  readonly text: string;
+}
+
+/**
+ * TS1xxx codes that are not about the file's syntax: they depend on the
+ * project's module settings or on another module (no default export,
+ * `esModuleInterop`, `isolatedModules`, type-only imports, CommonJS
+ * importing ESM), so a correct file can carry them.
+ */
+const NON_PARSE_TS1_CODES: ReadonlySet<number> = new Set([
+  1192, 1205, 1208, 1259, 1371, 1479, 1484, 1485,
+]);
+
+/**
+ * Whether a tsc diagnostic is about the file's syntax: the TS1xxx
+ * range (scanner, parser and grammar errors), less the module- and
+ * config-dependent codes above. TS2xxx and up are type checking.
+ */
+export function isParseDiagnostic(code: number): boolean {
+  return code >= 1000 && code < 2000 && !NON_PARSE_TS1_CODES.has(code);
+}
+
 interface ProjectCheck {
   readonly ok: boolean;
   /** Absolute path → diagnostics naming it. */
-  readonly diagnostics: ReadonlyMap<string, readonly string[]>;
+  readonly diagnostics: ReadonlyMap<string, readonly Diagnostic[]>;
   /** Absolute paths the project compiled (from `--listFiles`). */
   readonly included: ReadonlySet<string>;
   readonly errorCount: number;
@@ -64,11 +95,12 @@ interface ProjectCheck {
   readonly failure: string | null;
 }
 
-const DIAGNOSTIC = /^(.+?)\((\d+),(\d+)\): (error TS\d+: .*)$/;
+const DIAGNOSTIC = /^(.+?)\((\d+),(\d+)\): (error TS(\d+): .*)$/;
 
 async function checkProject(
   tsconfig: string,
   tsc: string,
+  signal: AbortSignal | undefined,
 ): Promise<ProjectCheck> {
   const projectDir = dirname(tsconfig);
   // An `incremental` (or `composite`) project writes `tsconfig.tsbuildinfo`
@@ -79,16 +111,17 @@ async function checkProject(
   const run = await runChecker(
     tsc,
     ["--noEmit", "-p", tsconfig, "--pretty", "false", "--listFiles", "--incremental", "--tsBuildInfoFile", buildInfo],
-    { cwd: projectDir, timeoutMs: TSC_TIMEOUT_MS },
+    { cwd: projectDir, timeoutMs: TSC_TIMEOUT_MS, ...(signal === undefined ? {} : { signal }) },
   );
   await rm(buildInfo, { force: true });
   if (run.missing) {
     return { ok: false, diagnostics: new Map(), included: new Set(), errorCount: 0, failure: "tsc could not be started" };
   }
   if (run.timedOut) {
-    return { ok: false, diagnostics: new Map(), included: new Set(), errorCount: 0, failure: "tsc timed out" };
+    const failure = run.aborted === true ? "not checked: cancelled" : "tsc timed out";
+    return { ok: false, diagnostics: new Map(), included: new Set(), errorCount: 0, failure };
   }
-  const diagnostics = new Map<string, string[]>();
+  const diagnostics = new Map<string, Diagnostic[]>();
   const included = new Set<string>();
   let errorCount = 0;
   for (const raw of run.stdout.replace(/\r\n/g, "\n").split("\n")) {
@@ -98,7 +131,7 @@ async function checkProject(
       const path = resolve(projectDir, match[1]!);
       errorCount += 1;
       const list = diagnostics.get(path) ?? [];
-      list.push(`line ${match[2]}: ${match[4]}`);
+      list.push({ code: Number(match[5]), text: `line ${match[2]}: ${match[4]}` });
       diagnostics.set(path, list);
       continue;
     }
@@ -122,12 +155,20 @@ function withoutVerdict(file: string, error: string): SyntaxFileResult {
   return { file, ok: null, checker: "none", error };
 }
 
+export interface TypeScriptCheckOptions {
+  /** Fail a file only on its parse diagnostics (`isParseDiagnostic`). */
+  readonly parseOnly?: boolean;
+  /** Kills `tsc` when it aborts; the files get no verdict. */
+  readonly signal?: AbortSignal;
+}
+
 /**
  * Check `.ts` / `.tsx` files (given as `{file, absolute}` pairs). Files
  * that share a tsconfig share one `tsc` run.
  */
 export async function checkTypeScriptFiles(
   files: readonly { file: string; absolute: string }[],
+  options: TypeScriptCheckOptions = {},
 ): Promise<SyntaxFileResult[]> {
   const byProject = new Map<string, { file: string; absolute: string }[]>();
   const results = new Map<string, SyntaxFileResult>();
@@ -150,9 +191,9 @@ export async function checkTypeScriptFiles(
       }
       continue;
     }
-    const project = await checkProject(tsconfig, tsc);
+    const project = await checkProject(tsconfig, tsc, options.signal);
     for (const entry of group) {
-      results.set(entry.absolute, attribute(entry, project, tsconfig));
+      results.set(entry.absolute, attribute(entry, project, tsconfig, options.parseOnly === true));
     }
   }
   return files.map((entry) => results.get(entry.absolute)!);
@@ -162,27 +203,37 @@ function attribute(
   entry: { file: string; absolute: string },
   project: ProjectCheck,
   tsconfig: string,
+  parseOnly: boolean,
 ): SyntaxFileResult {
   const { file, absolute } = entry;
   if (project.failure !== null) {
     return { file, ok: null, checker: TS_CHECKER, error: project.failure };
   }
-  const own = project.diagnostics.get(absolute);
-  if (own !== undefined) {
-    const shown = own.slice(0, 3).join("; ");
-    const more = own.length > 3 ? ` (+${own.length - 3} more)` : "";
-    return { file, ok: false, checker: TS_CHECKER, error: `${shown}${more}` };
+  const own = project.diagnostics.get(absolute) ?? [];
+  const failing = parseOnly ? own.filter((d) => isParseDiagnostic(d.code)) : own;
+  if (failing.length > 0) {
+    return { file, ok: false, checker: TS_CHECKER, error: listDiagnostics(failing) };
   }
-  if (!project.included.has(absolute)) {
+  if (own.length === 0 && !project.included.has(absolute)) {
     return withoutVerdict(file, `not included by ${tsconfig}`);
   }
-  if (project.errorCount > 0) {
+  const typeErrors =
+    own.length === 0 ? {} : { typeErrors: { count: own.length, detail: listDiagnostics(own) } };
+  const elsewhere = project.errorCount - own.length;
+  if (elsewhere > 0) {
     return {
       file,
       ok: true,
       checker: TS_CHECKER,
-      warning: `tsc reported ${project.errorCount} error(s) in other files of ${dirname(tsconfig)}`,
+      ...typeErrors,
+      warning: `tsc reported ${elsewhere} error(s) in other files of ${dirname(tsconfig)}`,
     };
   }
-  return { file, ok: true, checker: TS_CHECKER };
+  return { file, ok: true, checker: TS_CHECKER, ...typeErrors };
+}
+
+/** The first three diagnostics, `; `-joined, then `(+N more)`. */
+function listDiagnostics(list: readonly Diagnostic[]): string {
+  const shown = list.slice(0, 3).map((d) => d.text).join("; ");
+  return list.length > 3 ? `${shown} (+${list.length - 3} more)` : shown;
 }

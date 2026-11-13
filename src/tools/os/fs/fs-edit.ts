@@ -11,6 +11,7 @@ import { resolveUserPath } from "../expand-home.js";
 import { checkChangedFile } from "./fs-content-check.js";
 import {
   clampDiffPreview,
+  countLineDelta,
   DIFF_SUMMARY_MAX_CHARS,
   DIFF_SUMMARY_MAX_LINES,
   renderUnifiedDiff,
@@ -174,6 +175,8 @@ async function editFile(
               replaceAll: args.replaceAll,
               sizeBefore: Buffer.byteLength(original, "utf8"),
               sizeAfter: Buffer.byteLength(updated, "utf8"),
+              // For a fan-out's `changed:` line (`WorkerRunCollector`).
+              ...countLineDelta(original, updated),
             },
           },
           {

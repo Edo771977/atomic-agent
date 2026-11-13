@@ -105,6 +105,7 @@ describe("advisor escalation of a stuck worker (ATO-942)", () => {
     });
     expect(h.calls).toEqual(["cloud"]);
     expect(h.steers[0]).toMatch(/Advice from a stronger model \(big\)/);
+    expect(row!.escalations).toBe(1);
     // 1000 in at $1/M + 200 out at $4/M.
     expect(row!.notes?.join("\n")).toMatch(
       /escalated to big as advisor \(stalled: same result 3×\): \$0\.0018/,

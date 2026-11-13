@@ -248,6 +248,17 @@ describe("SlotManager", () => {
       expect(resolveSlotId(1)).toBe(1);
     });
   });
+
+  describe("reservedSideCallSlotId", () => {
+    it("reads the reservation without taking a slot from the pool", () => {
+      const mgr = new SlotManager(3);
+      expect(mgr.reservedSideCallSlotId()).toBeNull();
+      expect(mgr.poolSize()).toBe(3);
+      expect(mgr.sideCallSlotId()).toBe(2);
+      expect(mgr.reservedSideCallSlotId()).toBe(2);
+      expect(mgr.poolSize()).toBe(2);
+    });
+  });
 });
 
 describe("hashPrefix", () => {

@@ -158,3 +158,28 @@ export {
   planResume,
   renderResumeRequest,
 } from "./run-resume.js";
+export {
+  FusionOutcomeLog,
+  FUSION_OUTCOMES_DIR_NAME,
+  FUSION_OUTCOMES_FILE_NAME,
+  OUTCOME_LOG_KEEP,
+  OUTCOME_LOG_MAX_BYTES,
+  outcomeLogPath,
+  sessionTag,
+} from "./outcome-log.js";
+export type {
+  FusionOutcomeSink,
+  OutcomeRecord,
+  TaskOutcomeRecord,
+  TurnOutcomeRecord,
+} from "./outcome-log.js";
+export {
+  aggregateOutcomes,
+  formatFusionReport,
+  parseReportArgs,
+  readOutcomeRecords,
+  renderOutcomeReport,
+} from "./outcome-report.js";
+export type { FusionReport, ReportOptions } from "./outcome-report.js";
+export { FUSION_TURN_RECEIPT_TASK_ID, FusionTurnLedger, formatTurnReceipt } from "./turn-receipt.js";
+export type { FusionTurnReceipt } from "./turn-receipt.js";

@@ -26,6 +26,13 @@ export interface FusionWorkerMeta {
   parentSessionId: string;
   /** The orchestrator's task id for this subtask (its own bookkeeping). */
   taskId: string;
+  /**
+   * The operator's request the fan-out quotes, unclipped. A local
+   * worker's brief quotes only its first 6,000 chars, but the input
+   * guard must protect every file the whole request names, so
+   * `executeTurn` records this in place of the brief's clipped quote.
+   */
+  operatorRequest?: string;
 }
 
 /**
@@ -57,15 +64,18 @@ export function readFusionWorkerMeta(
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
     return null;
   }
-  const { parentSessionId, taskId } = raw as {
+  const { parentSessionId, taskId, operatorRequest } = raw as {
     parentSessionId?: unknown;
     taskId?: unknown;
+    operatorRequest?: unknown;
   };
   if (typeof parentSessionId !== "string" || parentSessionId.length === 0) {
     return null;
   }
   if (typeof taskId !== "string" || taskId.length === 0) return null;
-  return { parentSessionId, taskId };
+  return typeof operatorRequest === "string"
+    ? { parentSessionId, taskId, operatorRequest }
+    : { parentSessionId, taskId };
 }
 
 /** Whether `id` was minted by `createFusionWorkerSession`. */

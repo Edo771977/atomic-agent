@@ -34,6 +34,7 @@ This area owns configuration and compatibility. Read [AGENTS.md](AGENTS.md) befo
 - [llm-config.ts](llm-config.ts)
 - [llm-set-aside-providers.ts](llm-set-aside-providers.ts)
 - [llm-provider-commands.ts](llm-provider-commands.ts)
+- [fusion-setup-commands.ts](fusion-setup-commands.ts): the one validated write behind `setup fusion`
 - [mcp-server-commands.ts](mcp-server-commands.ts)
 - [mcp-server-config.ts](mcp-server-config.ts)
 

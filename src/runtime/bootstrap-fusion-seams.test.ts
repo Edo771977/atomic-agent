@@ -18,6 +18,9 @@ import { isFusionWorkerSessionId } from "../session/fusion-worker-session.js";
 import type { BrowserBackend } from "../tools/browser/browser-backend.js";
 import type { TraceEvent } from "../tracing/trace/trace-event.js";
 
+// The first behavioural line; the task-sizing line depends on the leg.
+const FUSION_GUIDANCE_HEAD = FUSION_GUIDANCE.split("\n")[0]!;
+
 const captureMessageSent = vi.fn();
 vi.mock("../analytics/index.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../analytics/index.js")>();
@@ -279,7 +282,7 @@ describe("createAgentRuntime fusion gate is live", () => {
 
       const before = await turnPrompt("before");
       expect(before).not.toContain("fusion.delegate");
-      expect(before).not.toContain(FUSION_GUIDANCE);
+      expect(before).not.toContain(FUSION_GUIDANCE_HEAD);
 
       // The operator moves into fusion: config write + active provider,
       // exactly the pair every TUI mode write performs.
@@ -291,7 +294,7 @@ describe("createAgentRuntime fusion gate is live", () => {
       ).toBe(true);
       const after = await turnPrompt("after");
       expect(after).toContain("fusion.delegate");
-      expect(after).toContain(FUSION_GUIDANCE);
+      expect(after).toContain(FUSION_GUIDANCE_HEAD);
 
       // …and back out again: the descriptor and the guidance leave with
       // the mode, so a cloud-only session is never told it can delegate.
@@ -299,7 +302,7 @@ describe("createAgentRuntime fusion gate is live", () => {
       await runtime.providerRegistry.setActive(LOCAL);
       const back = await turnPrompt("and back");
       expect(back).not.toContain("fusion.delegate");
-      expect(back).not.toContain(FUSION_GUIDANCE);
+      expect(back).not.toContain(FUSION_GUIDANCE_HEAD);
     } finally {
       await runtime.shutdown();
     }

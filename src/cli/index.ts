@@ -16,6 +16,7 @@ import { serveCommand } from "./serve-command.js";
 import { traceCommand } from "./trace-command.js";
 import { taskCommand } from "./task-command.js";
 import { overnightCommand } from "./overnight-command.js";
+import { fusionCommand } from "./fusion-command.js";
 import { memoryCommand } from "./memory-command.js";
 import { modelsCommand } from "./models-command.js";
 import { importCommand } from "./import-command.js";
@@ -25,6 +26,7 @@ import { updateCommand } from "./update-command.js";
 import { doctorCommand } from "./doctor-command.js";
 import { dataCommand } from "./data-command.js";
 import { providersCommand } from "./providers-command.js";
+import { setupCommand } from "./setup-command.js";
 import { tuiCommand } from "../tui/index.js";
 import { installTransportDeadlines } from "../llm/transport-deadlines.js";
 import { getAppVersion } from "../version.js";
@@ -122,6 +124,11 @@ const COMMANDS: CommandDescriptor[] = [
     run: overnightCommand,
   },
   {
+    name: "fusion",
+    summary: "Report how fusion workers did and what the strong side cost (report [--days N] [--model X] [--json])",
+    run: (args) => fusionCommand(args),
+  },
+  {
     name: "memory",
     summary: "Inspect, export + reindex the cross-session memory store (export|reindex)",
     run: memoryCommand,
@@ -158,6 +165,11 @@ const COMMANDS: CommandDescriptor[] = [
     name: "providers",
     summary: "Check the Claude Code / Codex subscription CLIs: installed, signed in, version (status)",
     run: providersCommand,
+  },
+  {
+    name: "setup",
+    summary: "Set up a preset in one step: fusion (a strong model plans, the local model executes)",
+    run: setupCommand,
   },
   {
     name: "update",

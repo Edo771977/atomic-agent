@@ -29,7 +29,7 @@ export const LOCAL_LEG_HEALTH_RETRY_MS = 2_000;
 export const LOCAL_LEG_UNRESPONSIVE_ERROR =
   "not dispatched: the local model server stopped answering after an earlier worker on it was cut off";
 export const LOCAL_LEG_UNRESPONSIVE_HINT =
-  "the local server is not answering /health since a worker on it was cancelled or timed out mid-generation; restart the local server (Manage → Local models, or restart the app) before delegating again, or do this part yourself";
+  "the local server is not answering /health since a worker on it was cancelled or timed out mid-generation; restart the local server (Manage → Local models, or restart the app), then delegate this part again, or tell the person";
 
 /** The key a mark is filed under when the caller names no server. */
 export const DEFAULT_LOCAL_LEG = "local";

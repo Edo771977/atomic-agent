@@ -284,7 +284,7 @@ export function renderContractBlock(contract: DelegateContract): string {
   const checks = contract.checks ?? [];
   if (checks.length > 0) {
     lines.push(
-      `CHECKS (run after the fan-out; a failing check fails its task):`,
+      `CHECKS (all run after the fan-out; a failing check fails its task. Run only YOUR checks, listed for your task below, before you reply):`,
       ...checks.map(renderCheck),
     );
   }
@@ -319,9 +319,20 @@ export function renderContractForTask(
             `${r.name} (${source.kind} from ${source.task}${source.in === undefined ? "" : ` in ${source.in}`})${source.shape === undefined ? "" : ` — ${source.shape}`}`,
           ];
     });
+  // A task's own checks are its worker's to run before it replies: a
+  // weak worker fixing its own failure costs local steps, the
+  // orchestrator fixing it costs a whole round. The runner checks them
+  // too when the worker replies (`worker-self-check.ts`).
+  const checks = (contract.checks ?? []).filter((c) => c.task === taskId);
   return [
     `You own: ${owned.length > 0 ? owned.join(", ") : "no path in this contract — write only the files your TASK names"}`,
     `You provide: ${provides.length > 0 ? provides.map(describeProvide).join("; ") : "nothing listed"}`,
     `You may rely on: ${relies.length > 0 ? relies.join("; ") : "nothing from the other parts"}`,
+    ...(checks.length === 0
+      ? []
+      : [
+          `Your checks — run each with verify.run, exactly as written, before you reply; every one must pass:`,
+          ...checks.map(renderCheck),
+        ]),
   ].join("\n");
 }

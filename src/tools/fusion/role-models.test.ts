@@ -2,7 +2,12 @@ import { describe, expect, it } from "vitest";
 
 import type { FusionRoleModels } from "../../llm/run-mode/index.js";
 import type { DelegateTask } from "./delegate-args.js";
-import { allowedModels, resolveTaskLegs, unknownModels } from "./role-models.js";
+import {
+  allowedModels,
+  ORCHESTRATOR_TASK_MODEL,
+  resolveTaskLegs,
+  unknownModels,
+} from "./role-models.js";
 
 const worker = { providerId: "local-llama", model: "qwen-14b" };
 const roles: FusionRoleModels = {
@@ -115,5 +120,49 @@ describe("models by role (ATO-943)", () => {
       isWorkerLeg: true,
       role: "utility",
     });
+  });
+});
+
+describe("model: \"orchestrator\"", () => {
+  const orchestrator = { providerId: "cloud-big", model: "big-model" };
+
+  it("is allowed whenever the orchestrator leg is known, roles or not", () => {
+    const tasks = [task("h", { model: ORCHESTRATOR_TASK_MODEL })];
+    expect(unknownModels(tasks, worker, undefined, orchestrator)).toBeUndefined();
+    expect(unknownModels(tasks, worker, roles, orchestrator)).toBeUndefined();
+    // No orchestrator leg to run it on: refused, and the list says so.
+    const refusal = unknownModels(tasks, worker, undefined);
+    expect(refusal).toContain('names model "orchestrator"');
+    expect(unknownModels([task("x", { model: "gpt-9" })], worker, undefined, orchestrator)).toContain(
+      "`qwen-14b`, `orchestrator`",
+    );
+  });
+
+  it("resolves to the orchestrator leg's provider and model, off the worker leg", () => {
+    const legs = resolveTaskLegs(
+      [task("h", { model: ORCHESTRATOR_TASK_MODEL, role: "build" }), task("d")],
+      worker,
+      roles,
+      orchestrator,
+    );
+    expect(legs.get("h")).toEqual({
+      providerId: "cloud-big",
+      model: "big-model",
+      isWorkerLeg: false,
+      orchestrator: true,
+    });
+    expect(legs.get("d")).toMatchObject({ providerId: "local-llama", isWorkerLeg: true });
+  });
+
+  it("is not subject to the second-local-model guard: the session already holds that leg", () => {
+    const localOrchestrator = { providerId: "big-llama", model: "big-local" };
+    const legs = resolveTaskLegs(
+      [task("h", { model: ORCHESTRATOR_TASK_MODEL })],
+      worker,
+      { ...roles, localLegProviderIds: ["big-llama", "local-llama"] },
+      localOrchestrator,
+    );
+    expect(legs.get("h")).toMatchObject({ providerId: "big-llama", isWorkerLeg: false });
+    expect(legs.get("h")?.note).toBeUndefined();
   });
 });

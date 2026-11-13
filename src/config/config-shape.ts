@@ -150,6 +150,7 @@ const LLM_FUSION_KEYS: Record<keyof UserLlmFusionConfig, true> = {
   turnTimeBudgetMs: true,
   maxRoundsPerTurn: true,
   maxTasksPerTurn: true,
+  maxOrchestratorTasksPerTurn: true,
   escalation: true,
   escalationReplace: true,
   escalationProvider: true,
@@ -159,6 +160,8 @@ const LLM_FUSION_KEYS: Record<keyof UserLlmFusionConfig, true> = {
   autoReplan: true,
   roles: true,
   mixLocalModels: true,
+  outcomeLog: true,
+  localFormatCheck: true,
   isolation: true,
   taskTree: true,
 };

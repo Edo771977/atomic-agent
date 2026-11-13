@@ -576,12 +576,32 @@ describe("runWorkerTasks", () => {
     expect(calls).toHaveLength(2);
     for (const call of calls) {
       expect(call.userMessage).toContain(
-        "ORIGINAL REQUEST — context only; your task is below.",
+        "ORIGINAL REQUEST — context only; your TASK is above.",
       );
       expect(call.userMessage).toContain("Build a snake game with a dark theme");
     }
     expect(calls[0]!.userMessage).toContain("Do part 0");
     expect(calls[1]!.userMessage).toContain("Do part 1");
+  });
+
+  it("quotes less of the request to a worker on a local leg", async () => {
+    const request = "s".repeat(10_000);
+    const run = async (localLeg: boolean): Promise<string> => {
+      const { deps, calls } = harness(async () => turnResult());
+      await runWorkerTasks(deps, {
+        ...BASE,
+        tasks: tasks(1),
+        maxWorkers: 1,
+        originalRequest: request,
+        localLeg,
+        signal: new AbortController().signal,
+      });
+      return calls[0]!.userMessage;
+    };
+    expect(await run(true)).toContain("only the first 6,000 are quoted above.");
+    const cloud = await run(false);
+    expect(cloud).toContain(request);
+    expect(cloud).not.toContain("(truncated:");
   });
 
   it("renders the fan-out's contract into every worker's brief", async () => {
@@ -701,7 +721,10 @@ describe("runWorkerTasks", () => {
       expect(results[0]).toMatchObject({
         status: "failed",
         error: "declared file js/scene.js does not exist after the task",
-        notes: ["spec.md unchanged by this task"],
+        notes: [
+          "self-check: its first reply left declared file js/scene.js missing; it was told once and given 2 more steps",
+          "spec.md unchanged by this task",
+        ],
       });
       expect(events.at(-1)!.event).toMatchObject({
         type: "fusion_worker",
@@ -752,7 +775,7 @@ describe("runWorkerTasks", () => {
         tools: { writes: 0 },
         notes: [
           "js/main.js unchanged by this task",
-          "no write, edit or patch call succeeded and no declared file changed",
+          "no write, edit or patch call succeeded and no declared file changed; fix: name the file and the exact edit in the brief",
         ],
       });
       expect(results[0]).not.toHaveProperty("error");
@@ -830,6 +853,8 @@ describe("runWorkerTasks", () => {
         maxWorkers: 1,
         signal,
       });
+      // No self-check grace after a replaced input: a second turn would
+      // only repeat the damage, and it is the orchestrator's to handle.
       expect(failed).toMatchObject({
         status: "failed",
         error: "declared file chart.png does not exist after the task",

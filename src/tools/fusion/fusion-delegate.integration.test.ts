@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -266,11 +266,16 @@ describe("fusion.delegate end to end", () => {
         (e) => e.event.role === "orchestrator",
       );
       expect(
-        orchestratorLines.map((e) => [e.event.phase, e.event.model]),
+        orchestratorLines.map((e) => [e.event.phase, e.event.model, e.event.taskId]),
       ).toEqual([
-        ["tool", "orchestrator-model"],
-        ["finished", "orchestrator-model"],
+        ["tool", "orchestrator-model", "fusion.delegate"],
+        ["finished", "orchestrator-model", "fusion.delegate"],
+        // The turn's receipt, just before its `turn_finished`.
+        ["finished", "orchestrator-model", "fusion.turn"],
       ]);
+      expect(orchestratorLines.at(-1)!.event.summary).toMatch(
+        /^fusion receipt · strong .*· workers .* tokens, .* · tasks 3 ok$/,
+      );
 
       // No worker row in the session store: ephemeral means ephemeral.
       const stored = runtime.sessionStore.listRecent(50).map((s) => s.id);
@@ -363,11 +368,125 @@ describe("fusion.delegate end to end", () => {
       // only the orchestrator's summary of it. This is the runtime seam:
       // the turn records its request, the tool reads it by session id.
       expect(workerPrompt!.prompt).toContain(
-        "ORIGINAL REQUEST — context only; your task is below.",
+        "ORIGINAL REQUEST — context only; your TASK is above.",
       );
       expect(workerPrompt!.prompt).toContain("delegate one thing");
     } finally {
       await runtime.shutdown();
+    }
+  }, 30_000);
+
+  it("runs a model: \"orchestrator\" task as a worker turn on the orchestrator leg, under worker policy", async () => {
+    const events: AgentLoopEvent[] = [];
+    const approvals: ApprovalRequest[] = [];
+    const workerCalls: Array<{ providerId?: string; prompt: string }> = [];
+    const steps = new Map<string, number>();
+    // Beside the working directory, so outside the fan-out's scope.
+    const outsideDir = mkdtempSync(join(tmpdir(), "atomic-fusion-outside-"));
+    const outside = join(outsideDir, "escape.txt");
+    let runtimeRef: Awaited<ReturnType<typeof createAgentRuntime>> | null = null;
+    const runtime = await createAgentRuntime({
+      workingDir,
+      // Level 1: every write outside an approved scope would need a person.
+      approvalLevel: 1,
+      handlers: {
+        onAgentEvent: (event) => events.push(event),
+        onApprovalRequest: (request) => {
+          approvals.push(request);
+          if (request.category === "fusion_fanout") {
+            queueMicrotask(() =>
+              runtimeRef?.approvals.resolve({
+                approvalId: request.approvalId,
+                approved: true,
+              }),
+            );
+          }
+        },
+      },
+      overrides: {
+        browserBackend: backend,
+        skipLlamaHealthCheck: true,
+        llamaComplete: async (params: LlmStreamParams) => {
+          const step = (steps.get(params.sessionId) ?? 0) + 1;
+          steps.set(params.sessionId, step);
+          if (params.sessionId.startsWith(FUSION_WORKER_ID_PREFIX)) {
+            workerCalls.push({
+              ...(params.providerId ? { providerId: params.providerId } : {}),
+              prompt: params.prompt,
+            });
+            if (step === 1) {
+              // Outside the fan-out's scope: approval-gated, and a
+              // worker cannot ask, so it is refused.
+              return completion(
+                JSON.stringify([
+                  { tool: "os.fs.write", args: { path: outside, content: "no" } },
+                ]),
+              );
+            }
+            if (step === 2) {
+              return completion(
+                JSON.stringify([
+                  { tool: "os.fs.write", args: { path: "sub/out.txt", content: "yes" } },
+                ]),
+              );
+            }
+            return completion(replyCall("wrote sub/out.txt"));
+          }
+          return completion(
+            step === 1
+              ? delegateCall([
+                  {
+                    id: "hard",
+                    title: "Hard part",
+                    instructions: "Write sub/out.txt",
+                    files: ["sub/out.txt"],
+                    model: "orchestrator",
+                  },
+                ])
+              : replyCall("merged"),
+          );
+        },
+      },
+    });
+    runtimeRef = runtime;
+    try {
+      const parent = runtime.createSession();
+      await runtime.runTurn(parent, "do the hard part", { maxSteps: 4 });
+      // The worker turn ran pinned to the orchestrator's provider…
+      expect(workerCalls.length).toBeGreaterThan(0);
+      for (const call of workerCalls) expect(call.providerId).toBe(CLOUD);
+      // …as a worker: the worker's catalog and brief, no fan-out of its own.
+      expect(workerCalls[0]!.prompt).not.toContain("fusion.delegate");
+      expect(workerCalls[0]!.prompt).toContain(
+        "worker agent executing one delegated task",
+      );
+      // One question, the fan-out's; the out-of-scope write asked nobody.
+      expect(approvals.map((a) => a.category)).toEqual(["fusion_fanout"]);
+      expect(existsSync(outside)).toBe(false);
+      expect(existsSync(join(workingDir, "sub", "out.txt"))).toBe(true);
+      const delegateResults = events.flatMap((event) =>
+        event.type === "llm_event" &&
+        event.event.type === "tool_call_executed" &&
+        event.event.result.tool === "fusion.delegate"
+          ? [event.event.result]
+          : [],
+      );
+      expect(delegateResults).toHaveLength(1);
+      const rows = delegateResults[0]!.details.tasks as WorkerTaskResult[];
+      expect(rows[0]).toMatchObject({ id: "hard", model: "orchestrator-model" });
+      expect(rows[0]!.tools.byTool["os.fs.write"]).toBe(2);
+      expect(rows[0]!.tools.errors).toBe(1);
+      // A refused approval is the worker policy's verdict on the row.
+      expect(rows[0]!.status).toBe("needs_orchestrator");
+      // The receipt counts the task on the strong side, as the report does.
+      const receipt = events.find(
+        (event) => event.type === "fusion_worker" && event.taskId === "fusion.turn",
+      );
+      expect(receipt).toMatchObject({ summary: expect.stringContaining("orchestrator task") });
+      expect(receipt).toMatchObject({ summary: expect.stringContaining("workers 0 tokens") });
+    } finally {
+      await runtime.shutdown();
+      rmSync(outsideDir, { recursive: true, force: true });
     }
   }, 30_000);
 

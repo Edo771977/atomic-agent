@@ -10,6 +10,11 @@ import {
 } from "./contract.js";
 import type { DelegateTask } from "./delegate-args.js";
 import type { WorkerTaskResult } from "./worker-result.js";
+import {
+  knownSecretsFromEnv,
+  maskSecrets,
+  type KnownSecret,
+} from "../../error-reporting/secret-detector.js";
 
 /**
  * What the disk says about the contract once the workers are done.
@@ -40,6 +45,13 @@ export interface ContractCheckResult {
   ok: boolean;
   summary?: string;
   error?: string;
+  /**
+   * The command's output tails, as `verify.run` keeps them. Where the
+   * assertion and the stack trace are; the summary's head is
+   * boilerplate ("verify.run command: FAILED", "exit 1 after N ms").
+   */
+  stderrTail?: string;
+  stdoutTail?: string;
 }
 
 /**
@@ -56,8 +68,14 @@ export interface ContractCheckOutcome {
   /** The task the check was attributed to; absent for a call-level check. */
   task?: string;
   ok: boolean;
-  /** The runner's summary or error, head only. */
+  /** The runner's summary or error, head only, on one line. */
   detail: string;
+  /**
+   * A failing check's output tail (stderr, then stdout), whitespace
+   * kept, at most `CHECK_OUTPUT_CHARS` — what a worker fixes from.
+   * Absent on a pass and when the head already said everything.
+   */
+  output?: string;
 }
 
 /**
@@ -91,6 +109,14 @@ export interface ContractReport {
 const MAX_SEARCHED_FILE_BYTES = 8 * 1024 * 1024;
 /** How much of a check's verdict a row carries. */
 const CHECK_DETAIL_CHARS = 400;
+/**
+ * How much of a failing check's output travels with it, and with each
+ * task's row: enough for an assertion and the top of a stack trace.
+ * Tail-biased — the end of a test run is where the failure is.
+ */
+export const CHECK_OUTPUT_CHARS = 1_500;
+/** Where `verify.run`'s summary starts its output tails. */
+const TAIL_MARKER = /\n(?:stderr|stdout) \(tail\):\n/;
 /** Bound on the `contract:` line of the status table. */
 const CONTRACT_LINE_CHARS = 1200;
 
@@ -285,15 +311,86 @@ function head(text: string, cap: number): string {
   return flat.length > cap ? `${flat.slice(0, cap)}…` : flat;
 }
 
+/** The last `cap` chars of `text`, marked when cut; whitespace kept. */
+export function tailClip(text: string, cap: number): string {
+  if (text.length <= cap) return text;
+  if (cap <= 1) return "…";
+  return `…${text.slice(-(cap - 1))}`;
+}
+
+function labelled(label: string, text: string, cap: number): string {
+  const prefix = `${label} (tail):\n`;
+  return `${prefix}${tailClip(text, Math.max(1, cap - prefix.length))}`;
+}
+
+/**
+ * A failing check's output, bounded: the runner's stderr and stdout
+ * tails when it kept them (stderr gets the larger share — it is where a
+ * runtime puts the failure), else whatever of its summary the one-line
+ * head could not hold.
+ */
+function checkOutput(result: ContractCheckResult, headText: string): string | undefined {
+  const stderr = result.stderrTail?.trim() ? result.stderrTail.trimEnd() : undefined;
+  const stdout = result.stdoutTail?.trim() ? result.stdoutTail.trimEnd() : undefined;
+  if (stderr !== undefined || stdout !== undefined) {
+    if (stderr === undefined) return labelled("stdout", stdout!, CHECK_OUTPUT_CHARS);
+    if (stdout === undefined) return labelled("stderr", stderr, CHECK_OUTPUT_CHARS);
+    const outCap = Math.min(stdout.length + 20, Math.floor(CHECK_OUTPUT_CHARS / 3));
+    const errBlock = labelled("stderr", stderr, CHECK_OUTPUT_CHARS - outCap - 1);
+    const outBlock = labelled("stdout", stdout, CHECK_OUTPUT_CHARS - errBlock.length - 1);
+    return `${errBlock}\n${outBlock}`;
+  }
+  const text = result.error ?? result.summary;
+  if (text === undefined) return undefined;
+  const at = text.search(TAIL_MARKER);
+  if (at >= 0) return tailClip(text.slice(at + 1).trimEnd(), CHECK_OUTPUT_CHARS);
+  // No tails: only what the head had to cut is worth repeating.
+  if (headText.replace(/\s+/g, " ").trim().length <= CHECK_DETAIL_CHARS) return undefined;
+  return tailClip(text.trim(), CHECK_OUTPUT_CHARS);
+}
+
+/** `result`'s texts with their secrets masked (`maskSecrets`). */
+function maskResult(
+  result: ContractCheckResult,
+  known: readonly KnownSecret[],
+): ContractCheckResult {
+  const mask = (text: string | undefined): { value?: string } =>
+    text === undefined ? {} : { value: maskSecrets(text, known) };
+  const summary = mask(result.summary).value;
+  const error = mask(result.error).value;
+  const stderrTail = mask(result.stderrTail).value;
+  const stdoutTail = mask(result.stdoutTail).value;
+  return {
+    ok: result.ok,
+    ...(summary === undefined ? {} : { summary }),
+    ...(error === undefined ? {} : { error }),
+    ...(stderrTail === undefined ? {} : { stderrTail }),
+    ...(stdoutTail === undefined ? {} : { stdoutTail }),
+  };
+}
+
 /**
  * Run the contract's checks through the wired runner. Never throws and
  * never invents a pass: no runner, an aborted turn or a runner that
  * threw all come back as `checksSkipped` with the reason.
+ *
+ * The runner is called directly, not through the tool registry, so
+ * nothing has masked its output (ATO-1077). Every text it returns is
+ * masked here, whole, before any of it is cut to a head or a tail: a
+ * key the clip cut in half matches no shape and no exact value, and its
+ * other half would reach the orchestrator, a worker's notice and a
+ * judge's retry brief (the same order `compressToolResult` keeps,
+ * ATO-1176). `knownSecrets` are the agent's own keys; absent, the
+ * environment's.
  */
 export async function runContractChecks(
   checks: readonly ContractCheck[],
   runner: ContractCheckRunner | undefined,
-  ctx: { workingDir: string; signal: AbortSignal },
+  ctx: {
+    workingDir: string;
+    signal: AbortSignal;
+    knownSecrets?: readonly KnownSecret[];
+  },
 ): Promise<{ outcomes: ContractCheckOutcome[]; checksSkipped?: string }> {
   if (checks.length === 0) return { outcomes: [] };
   const plural = `${checks.length} check${checks.length === 1 ? "" : "s"}`;
@@ -307,28 +404,53 @@ export async function runContractChecks(
     return { outcomes: [], checksSkipped: `${plural} not run — the turn was cancelled` };
   }
   const specs = checks.map(({ task: _task, ...spec }) => spec);
+  const known = ctx.knownSecrets ?? knownSecretsFromEnv();
   let results: readonly ContractCheckResult[];
   try {
-    results = (await runner(specs, ctx)).results;
+    results = (
+      await runner(specs, { workingDir: ctx.workingDir, signal: ctx.signal })
+    ).results;
   } catch (error) {
     return {
       outcomes: [],
-      checksSkipped: `${plural} not run — the check runner failed: ${error instanceof Error ? error.message : String(error)}`,
+      checksSkipped: maskSecrets(
+        `${plural} not run — the check runner failed: ${error instanceof Error ? error.message : String(error)}`,
+        known,
+      ),
     };
   }
   const outcomes = checks.map((check, i): ContractCheckOutcome => {
-    const result = results[i];
+    const raw = results[i];
     const task = check.task === undefined ? {} : { task: check.task };
-    if (result === undefined) {
+    if (raw === undefined) {
       return { ...task, ok: false, detail: "the runner returned no result" };
     }
-    const detail = head(
-      result.error ?? result.summary ?? (result.ok ? "passed" : "failed"),
-      CHECK_DETAIL_CHARS,
-    );
-    return { ...task, ok: result.ok, detail };
+    const result = maskResult(raw, known);
+    // The head is the summary before its output tails, on one line;
+    // the tails ride separately, whitespace kept, so the assertion is
+    // not lost behind "verify.run command: FAILED … exit 1 after N ms".
+    const text = result.error ?? result.summary ?? (result.ok ? "passed" : "failed");
+    const at = text.search(TAIL_MARKER);
+    const headText = at >= 0 ? text.slice(0, at) : text;
+    const detail = head(headText, CHECK_DETAIL_CHARS);
+    const output = result.ok ? undefined : checkOutput(result, headText);
+    return { ...task, ok: result.ok, detail, ...(output === undefined ? {} : { output }) };
   });
   return { outcomes };
+}
+
+/**
+ * The failing checks' output for one task, inside `CHECK_OUTPUT_CHARS`
+ * however many failed: each gets an equal share, its own tail kept.
+ */
+export function taskCheckOutput(
+  failed: readonly ContractCheckOutcome[],
+): string | undefined {
+  const outputs = failed.flatMap((o) => (o.output === undefined ? [] : [o.output]));
+  if (outputs.length === 0) return undefined;
+  if (outputs.length === 1) return tailClip(outputs[0]!, CHECK_OUTPUT_CHARS);
+  const share = Math.floor(CHECK_OUTPUT_CHARS / outputs.length) - 1;
+  return outputs.map((o) => tailClip(o, share)).join("\n");
 }
 
 /**
@@ -348,10 +470,12 @@ export function applyCheckOutcomes(
     const failed = own.filter((o) => !o.ok);
     const detail =
       failed.length > 0 ? failed.map((o) => o.detail).join("; ") : undefined;
+    const output = taskCheckOutput(failed);
     const checks = {
       total: own.length,
       failed: failed.length,
       ...(detail === undefined ? {} : { detail }),
+      ...(output === undefined ? {} : { output }),
     };
     if (failed.length === 0 || result.status === "cancelled") {
       return { ...result, checks };
