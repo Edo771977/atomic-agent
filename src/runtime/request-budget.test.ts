@@ -174,7 +174,7 @@ describe("request budget scope", () => {
       return { budget, scope: () => createRequestBudgetScope(budget, req, provider, entry, priced)! };
     }
 
-    it.each(["priority", "flex", "scale", 7])("refuses service_tier %s without a configured multiplier", tier => {
+    it.each(["priority", "Priority", "scale", 7])("refuses service_tier %s without a configured multiplier", tier => {
       const { budget, scope } = scoped(10, model);
       expect(() => scope().beforeSend({ model: "m", messages: [], service_tier: tier })).toThrow(/service_tier/);
       expect(spent(budget)).toBe(0);
@@ -183,6 +183,25 @@ describe("request budget scope", () => {
     it.each([undefined, null, "default", "auto"])("prices service_tier %s at the configured rates", tier => {
       const { scope } = scoped(10, model);
       expect(() => scope().beforeSend({ model: "m", messages: [], service_tier: tier })).not.toThrow();
+    });
+
+    // Base rates are an upper bound for these tiers: `flex` is cheaper,
+    // Anthropic's `standard_only` is the standard tier. Matching ignores case.
+    it.each(["Default", "AUTO", "standard", "standard_only", "Standard_Only", "flex", "FLEX"])("accepts service_tier %s at the base rates", tier => {
+      const { budget, scope } = scoped(10, model);
+      const s = scope();
+      expect(() => s.beforeSend({ model: "m", messages: [], service_tier: tier })).not.toThrow();
+      s.finish({ usage: { promptTokens: 1_000, completionTokens: 1_000, totalTokens: 2_000 } } as never);
+      expect(spent(budget)).toBeCloseTo((1_000 * 3 + 1_000 * 15) / 1_000_000, 9);
+    });
+
+    it("matches a configured multiplier whatever the case of the tier", () => {
+      const priced = { ...model, pricing: { ...model.pricing!, serviceTierMultipliers: { Priority: 2 } } } as ResolvedModel;
+      const { budget, scope } = scoped(10, priced);
+      const s = scope();
+      s.beforeSend({ model: "m", messages: [], service_tier: "PRIORITY" });
+      s.finish({ usage: { promptTokens: 1_000, completionTokens: 1_000, totalTokens: 2_000 } } as never);
+      expect(spent(budget)).toBeCloseTo(2 * (1_000 * 3 + 1_000 * 15) / 1_000_000, 9);
     });
 
     it("reserves and settles a configured service-tier multiplier", () => {

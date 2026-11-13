@@ -35,8 +35,24 @@ function addsProviderSideInput(body: Record<string, unknown>): boolean {
 
 type ModelPricing = NonNullable<ResolvedModel["pricing"]>;
 
-/** Tiers billed at the configured base rates. */
-const BASE_SERVICE_TIERS = new Set(["default", "auto"]);
+/**
+ * Tiers the configured base rates bound from above, lower-cased: the
+ * standard tier under its OpenAI (`default`) and Anthropic (`standard`,
+ * `standard_only`) names, the request-side `auto`, and the cheaper
+ * OpenAI `flex`.
+ */
+const BASE_SERVICE_TIERS = new Set(["default", "auto", "standard", "standard_only", "flex"]);
+
+/** The configured multiplier for `tier`, matched without regard to case. */
+function configuredTierMultiplier(tier: string, pricing: ModelPricing): number | undefined {
+  const tiers = pricing.serviceTierMultipliers;
+  if (tiers === undefined) return undefined;
+  const wanted = tier.toLowerCase();
+  for (const [name, multiplier] of Object.entries(tiers)) {
+    if (name.toLowerCase() === wanted) return multiplier;
+  }
+  return undefined;
+}
 
 function validRate(rate: unknown): boolean {
   return typeof rate === "number" && Number.isFinite(rate) && rate >= 0;
@@ -53,17 +69,20 @@ function verifiablePricing(pricing: ModelPricing | undefined): pricing is ModelP
 }
 
 /**
- * Price multiplier of the body's `service_tier`. Absent, `null`,
- * `default` and `auto` are the base rates; any other tier (OpenAI
+ * Price multiplier of the body's `service_tier`, matched without regard
+ * to case. A configured multiplier wins; otherwise absent, `null` and
+ * the `BASE_SERVICE_TIERS` are the base rates; any other tier (OpenAI
  * `priority` bills about 2x) needs a configured multiplier, so an
  * unknown modifier refuses instead of being under-reserved.
  */
 function serviceTierMultiplier(body: Record<string, unknown>, pricing: ModelPricing): number {
   const tier = body.service_tier;
   if (tier === undefined || tier === null) return 1;
-  if (typeof tier === "string" && BASE_SERVICE_TIERS.has(tier)) return 1;
-  const tiers = pricing.serviceTierMultipliers;
-  if (typeof tier === "string" && tiers !== undefined && Object.hasOwn(tiers, tier)) return tiers[tier]!;
+  if (typeof tier === "string") {
+    const configured = configuredTierMultiplier(tier, pricing);
+    if (configured !== undefined) return configured;
+    if (BASE_SERVICE_TIERS.has(tier.toLowerCase())) return 1;
+  }
   throw new Error(`turn budget cannot price service_tier ${JSON.stringify(tier)}; declare it in the model's pricing.serviceTierMultipliers or remove it`);
 }
 

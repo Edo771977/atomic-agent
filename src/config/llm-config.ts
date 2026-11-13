@@ -200,8 +200,10 @@ export type UserModelEntry = {
     };
     /**
      * Price multiplier per request `service_tier` (e.g. `{ priority: 2 }`).
-     * A USD turn cap refuses a body with any other tier than
-     * `default`/`auto` unless its multiplier is declared here.
+     * Matched without regard to case. A USD turn cap refuses a body with
+     * any other tier than `default`/`auto`/`standard`/`standard_only`/
+     * `flex` (priced at most at the base rates) unless its multiplier is
+     * declared here.
      */
     serviceTierMultipliers?: Record<string, number>;
   };
