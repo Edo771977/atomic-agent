@@ -55,6 +55,8 @@ interface TurnState {
   /** Delegations started this turn, and the tasks they carried (ATO-1406). */
   rounds: number;
   tasks: number;
+  /** Of those, the tasks sent to `model: "orchestrator"`. */
+  orchestratorTasks: number;
   /** Every failure breaker that tripped this turn (ATO-1406). */
   trips: BreakerTrip[];
 }
@@ -67,10 +69,16 @@ interface TurnState {
 export interface TurnCountLimits {
   rounds?: number;
   tasks?: number;
+  /**
+   * `model: "orchestrator"` tasks (`maxOrchestratorTasksPerTurn`). The
+   * orchestrator leg is often a flat-rate subscription, unpriced, so
+   * `turnBudgetUsd` cannot hold it; this count does.
+   */
+  orchestratorTasks?: number;
 }
 
 export interface TurnCountStop {
-  kind: "rounds" | "tasks";
+  kind: "rounds" | "tasks" | "orchestrator-tasks";
   message: string;
 }
 
@@ -124,6 +132,7 @@ export class FusionTurnBudget {
       onOrchestrator: new Set(),
       rounds: 0,
       tasks: 0,
+      orchestratorTasks: 0,
       trips: [],
     });
   }
@@ -143,6 +152,7 @@ export class FusionTurnBudget {
         onOrchestrator: new Set(),
         rounds: 0,
         tasks: 0,
+        orchestratorTasks: 0,
         trips: [],
       };
       this.turns.set(sessionId, state);
@@ -244,6 +254,7 @@ export class FusionTurnBudget {
     sessionId: string,
     limits: TurnCountLimits,
     taskCount: number,
+    orchestratorTaskCount = 0,
   ): TurnCountStop | undefined {
     const { rounds, tasks } = this.counts(sessionId);
     if (limits.rounds !== undefined && rounds + 1 > limits.rounds) {
@@ -262,14 +273,35 @@ export class FusionTurnBudget {
           `over the ${limits.tasks} llm.runMode.fusion.maxTasksPerTurn allows (${tasks} already ran)`,
       };
     }
+    const already = this.orchestratorTasks(sessionId);
+    if (
+      limits.orchestratorTasks !== undefined &&
+      orchestratorTaskCount > 0 &&
+      already + orchestratorTaskCount > limits.orchestratorTasks
+    ) {
+      return {
+        kind: "orchestrator-tasks",
+        message: orchestratorCapMessage(
+          orchestratorTaskCount,
+          already,
+          limits.orchestratorTasks,
+        ),
+      };
+    }
     return undefined;
   }
 
+  /** `model: "orchestrator"` tasks this turn's delegations so far started. */
+  orchestratorTasks(sessionId: string): number {
+    return this.turns.get(sessionId)?.orchestratorTasks ?? 0;
+  }
+
   /** Count a delegation that is starting, with its tasks. */
-  noteRound(sessionId: string, taskCount: number): void {
+  noteRound(sessionId: string, taskCount: number, orchestratorTaskCount = 0): void {
     const state = this.turn(sessionId);
     state.rounds += 1;
     state.tasks += Math.max(0, taskCount);
+    state.orchestratorTasks += Math.max(0, orchestratorTaskCount);
   }
 
   /** Remember a failure breaker that tripped this turn. */
@@ -331,6 +363,25 @@ export class FusionTurnBudget {
     return undefined;
   }
 }
+
+/**
+ * Why a call's `model: "orchestrator"` tasks are refused: `asked` more
+ * would pass `cap`, `already` having run this turn.
+ */
+export function orchestratorCapMessage(
+  asked: number,
+  already: number,
+  cap: number,
+): string {
+  return (
+    `${asked} task${asked === 1 ? "" : "s"} on \`model: "orchestrator"\` would take this turn to ${already + asked}, ` +
+    `over the ${cap} llm.runMode.fusion.maxOrchestratorTasksPerTurn allows (${already} already ran)`
+  );
+}
+
+/** What the orchestrator is told when the orchestrator-task cap refuses a call. */
+export const ORCHESTRATOR_TASK_CAP_INSTRUCTION =
+  'Nothing ran. Send those tasks again without `model: "orchestrator"` (on a worker model), or, if they cannot be done there, reply to the person in plain words: say which parts are left and that they can raise the cap.';
 
 /** What the orchestrator is told when a count cap refuses a delegation. */
 export const TURN_COUNT_INSTRUCTION =

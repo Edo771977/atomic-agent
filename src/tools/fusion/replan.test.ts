@@ -277,6 +277,11 @@ describe("the fix each status calls for", () => {
     );
   });
 
+  it("names no orchestrator fix while the target is off or its cap is used", () => {
+    const report = describeReplan([row("twice", "failed")], () => 2, 3, () => false, false);
+    expect(report.pending[0]!.fix).toBeUndefined();
+  });
+
   it("remembers across rounds that a task ran on the orchestrator's model", async () => {
     const budget = new FusionTurnBudget();
     budget.begin("s-p");

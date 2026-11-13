@@ -80,8 +80,14 @@ export function replanFix(
   status: WorkerTaskStatus,
   attempts: number,
   ranOnOrchestrator: boolean,
+  orchestratorAvailable = true,
 ): string | undefined {
-  if (attempts >= 2 && status !== "cancelled" && !ranOnOrchestrator) {
+  if (
+    attempts >= 2 &&
+    status !== "cancelled" &&
+    !ranOnOrchestrator &&
+    orchestratorAvailable
+  ) {
     return 'it failed twice on a worker: send it with `model: "orchestrator"`';
   }
   if (status === "max_steps" || status === "timeout") {
@@ -101,12 +107,15 @@ export function replanFix(
  * orchestrator leg this turn, in any round: its fix is never "send it
  * there", and once it has run twice it is listed in
  * `failedOnOrchestrator`, for the planner to report to the person.
+ * `orchestratorAvailable` is false when the target is off or this
+ * turn's `maxOrchestratorTasksPerTurn` is used: then no fix names it.
  */
 export function describeReplan(
   results: readonly WorkerTaskResult[],
   attempts: (taskId: string) => number,
   max: number,
   ranOnOrchestrator: (taskId: string) => boolean = () => false,
+  orchestratorAvailable = true,
 ): ReplanReport {
   const pending: ReplanTask[] = [];
   const exhausted: ReplanTask[] = [];
@@ -120,7 +129,13 @@ export function describeReplan(
     const stop = left > 0 && runs >= 2 && onOrchestrator;
     const fix =
       left > 0 && !stop
-        ? replanFix(result.id, result.status, runs, onOrchestrator)
+        ? replanFix(
+            result.id,
+            result.status,
+            runs,
+            onOrchestrator,
+            orchestratorAvailable,
+          )
         : undefined;
     const task: ReplanTask = {
       id: result.id,

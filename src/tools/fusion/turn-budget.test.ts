@@ -473,3 +473,113 @@ describe("model: \"orchestrator\" tasks count like any priced worker", () => {
     expect(result.details).toMatchObject({ reason: "turn-count", kind: "tasks" });
   });
 });
+
+describe("the per-turn cap on model: \"orchestrator\" tasks", () => {
+  const hard = (i: number) => ({
+    id: `o${i}`,
+    instructions: `the hard part ${i}`,
+    model: "orchestrator",
+  });
+
+  it("refuses a call whose orchestrator tasks pass the cap, across rounds, naming it", async () => {
+    const budget = new FusionTurnBudget();
+    budget.begin("s-parent");
+    const d = deps({
+      resolveRunMode: () => mode({ maxOrchestratorTasksPerTurn: 2 }),
+      turnBudget: budget,
+    });
+    const tool = buildFusionDelegateTool(d);
+    const tooMany = await tool.run({ tasks: [hard(1), hard(2), hard(3)] }, ctx());
+    expect(d.turns).toBe(0);
+    expect(tooMany.status).toBe("error");
+    expect(tooMany.details).toMatchObject({
+      reason: "turn-count",
+      kind: "orchestrator-tasks",
+      cap: 2,
+    });
+    expect(tooMany.summary).toContain(
+      "over the 2 llm.runMode.fusion.maxOrchestratorTasksPerTurn allows (0 already ran)",
+    );
+    await tool.run({ tasks: [hard(1), hard(2)] }, ctx());
+    expect(d.turns).toBe(2);
+    expect(budget.orchestratorTasks("s-parent")).toBe(2);
+    // The cap is used: one more is refused, a worker task still runs.
+    const third = await tool.run({ tasks: [hard(3)] }, ctx());
+    expect(third.details).toMatchObject({ kind: "orchestrator-tasks" });
+    await tool.run({ tasks: [{ id: "w", instructions: "bulk" }] }, ctx());
+    expect(d.turns).toBe(3);
+    // A new turn starts the count over.
+    budget.begin("s-parent");
+    await tool.run({ tasks: [hard(4)] }, ctx());
+    expect(d.turns).toBe(4);
+  });
+
+  it("defaults to four, and holds per call without the runtime's turn state", async () => {
+    const d = deps({});
+    const result = await buildFusionDelegateTool(d).run(
+      { tasks: [1, 2, 3, 4, 5].map(hard) },
+      ctx(),
+    );
+    expect(d.turns).toBe(0);
+    expect(result.details).toMatchObject({ kind: "orchestrator-tasks", cap: 4 });
+  });
+
+  it("turns the target off at 0", async () => {
+    const d = deps({ resolveRunMode: () => mode({ maxOrchestratorTasksPerTurn: 0 }) });
+    const result = await buildFusionDelegateTool(d).run({ tasks: [hard(1)] }, ctx());
+    expect(d.turns).toBe(0);
+    expect(result.details).toMatchObject({ reason: "orchestrator-target-off" });
+    expect(result.summary).toContain("maxOrchestratorTasksPerTurn is 0");
+  });
+
+  it("runs orchestrator tasks at most two at a time, whatever cloudWorkers allows", async () => {
+    let running = 0;
+    let peak = 0;
+    const d = deps({ resolveRunMode: () => mode({ cloudWorkers: 8 }) });
+    const inner = d.runTurn;
+    d.runTurn = (async (session, message, options) => {
+      running += 1;
+      peak = Math.max(peak, running);
+      await new Promise((r) => setTimeout(r, 10));
+      running -= 1;
+      return inner(session, message, options);
+    }) as FusionDelegateDeps["runTurn"];
+    await buildFusionDelegateTool(d).run(
+      { tasks: [1, 2, 3, 4].map(hard), maxWorkers: 8 },
+      ctx(),
+    );
+    expect(d.turns).toBe(4);
+    expect(peak).toBe(2);
+  });
+
+  it("parses the cap, 0 included, and resolves the default", async () => {
+    const { parseLlmRunModeConfig } = await import("../../config/llm-run-mode-config.js");
+    const { resolveRunMode } = await import("../../llm/run-mode/resolve-run-mode.js");
+    expect(
+      parseLlmRunModeConfig({ fusion: { maxOrchestratorTasksPerTurn: 0 } }, [], "llm.runMode")
+        .fusion,
+    ).toEqual({ maxOrchestratorTasksPerTurn: 0 });
+    expect(() =>
+      parseLlmRunModeConfig({ fusion: { maxOrchestratorTasksPerTurn: 101 } }, [], "llm.runMode"),
+    ).toThrow(/maxOrchestratorTasksPerTurn/);
+    const resolved = (runMode: object) =>
+      resolveRunMode(
+        {
+          activeTextProvider: "openrouter",
+          activeEmbeddingProvider: "local-llama",
+          providers: [
+            { id: "local-llama", kind: "llama-server", url: "http://127.0.0.1:19091" },
+            { id: "openrouter", kind: "openrouter", defaultChatModel: "big" },
+          ],
+          toolTransport: "auto",
+          runMode,
+        } as never,
+        { managedModelId: "small" },
+      );
+    expect(resolved({ mode: "fusion" }).maxOrchestratorTasksPerTurn).toBe(4);
+    expect(
+      resolved({ mode: "fusion", fusion: { maxOrchestratorTasksPerTurn: 0 } })
+        .maxOrchestratorTasksPerTurn,
+    ).toBe(0);
+  });
+});

@@ -1089,6 +1089,11 @@ export interface UserConfigFile {
 // Unversioned, additive: `llm.runMode.fusion.maxRoundsPerTurn` (0..100,
 // default 6) and `maxTasksPerTurn` (0..1000, default 48), ATO-1406. `0`
 // turns a cap off. An older file has neither and takes the defaults.
+// Unversioned, additive: `llm.runMode.fusion.maxOrchestratorTasksPerTurn`
+// (0..100, default 4): how many `model: "orchestrator"` tasks one fusion
+// turn may start; `0` turns that target off. An older file has no field
+// and takes the default; an older build drops the key on parse and the
+// whole-file write keeps it (`config-shape.ts`).
 // Unversioned, additive: `llm.runMode.fusion.escalation` (`off|advisor`,
 // default `off`), `escalationReplace` (default false),
 // `escalationProvider` (default the orchestrator leg) and
