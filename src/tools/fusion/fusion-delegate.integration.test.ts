@@ -363,7 +363,7 @@ describe("fusion.delegate end to end", () => {
       // only the orchestrator's summary of it. This is the runtime seam:
       // the turn records its request, the tool reads it by session id.
       expect(workerPrompt!.prompt).toContain(
-        "ORIGINAL REQUEST — context only; your task is below.",
+        "ORIGINAL REQUEST — context only; your TASK is above.",
       );
       expect(workerPrompt!.prompt).toContain("delegate one thing");
     } finally {

@@ -5,11 +5,17 @@ import {
   stoppedTurnMarker,
   userTurn,
 } from "../../session/conversation-turn.js";
+import {
+  REQUEST_SECTION_CHAR_BUDGET,
+  renderRequestSection,
+} from "../../prompt/request-section.js";
 import { parseDelegateArgs } from "./delegate-args.js";
 import {
   BROWSER_CODE_RULE,
   FOLLOW_UP_MAX_CHARS,
+  LOCAL_ORIGINAL_REQUEST_CHAR_BUDGET,
   ORIGINAL_REQUEST_CHAR_BUDGET,
+  originalRequestCharBudget,
   pickOriginalRequest,
   renderWorkerBrief,
   siblingFilesRule,
@@ -133,27 +139,100 @@ describe("renderWorkerBrief — the original request", () => {
   const REQUEST =
     "Build a browser snake game: index.html, style.css, js/main.js; dark theme, arrow keys.";
 
-  it("quotes the operator's request, labelled as context, ABOVE the task", () => {
+  it("quotes the operator's request, labelled as context, AFTER the task and rules", () => {
     // A worker briefed only "write index.html and style.css" built a
     // landing page, not the game: the request is what its part must match.
-    const brief = renderWorkerBrief(TASK, {
-      workingDir: "/repo",
-      originalRequest: REQUEST,
-    });
+    // It follows the task so a clip of the brief reaches the quote, not
+    // the worker's own TASK and RULES.
+    const brief = renderWorkerBrief(
+      { ...TASK, files: ["src/auth.md"], deliverable: "one bullet per route" },
+      { workingDir: "/repo", originalRequest: REQUEST },
+    );
     expect(brief).toContain(
-      "ORIGINAL REQUEST — context only; your task is below.",
+      "ORIGINAL REQUEST — context only; your TASK is above.",
     );
     expect(brief).toContain(REQUEST);
+    const taskAt = brief.indexOf("TASK t1: Map the auth routes");
+    const filesAt = brief.indexOf("FILES:");
+    const deliverableAt = brief.indexOf("DELIVERABLE:");
+    const rulesAt = brief.indexOf("RULES:");
     const requestAt = brief.indexOf("----- BEGIN ORIGINAL REQUEST -----");
     const endAt = brief.indexOf("----- END ORIGINAL REQUEST -----");
-    const taskAt = brief.indexOf("TASK t1: Map the auth routes");
-    expect(requestAt).toBeGreaterThan(0);
+    expect(taskAt).toBeGreaterThan(0);
+    expect(filesAt).toBeGreaterThan(taskAt);
+    expect(deliverableAt).toBeGreaterThan(filesAt);
+    expect(rulesAt).toBeGreaterThan(deliverableAt);
+    expect(requestAt).toBeGreaterThan(rulesAt);
     expect(requestAt).toBeLessThan(brief.indexOf(REQUEST));
     expect(endAt).toBeGreaterThan(brief.indexOf(REQUEST));
-    expect(taskAt).toBeGreaterThan(endAt);
-    // The frame line and the task body are unchanged.
+    // One line at the very end names the task again.
+    expect(brief.split("\n").at(-1)).toBe(
+      "Your part is TASK t1 (Map the auth routes) above — do only that, then `reply`.",
+    );
     expect(brief.split("\n")[0]).toContain("You are a worker agent");
     expect(brief).toContain(TASK.instructions);
+  });
+
+  it("quotes up to 6,000 chars on a local leg and 16,000 on a cloud leg", () => {
+    expect(originalRequestCharBudget(true)).toBe(LOCAL_ORIGINAL_REQUEST_CHAR_BUDGET);
+    expect(originalRequestCharBudget(false)).toBe(ORIGINAL_REQUEST_CHAR_BUDGET);
+    expect(LOCAL_ORIGINAL_REQUEST_CHAR_BUDGET).toBe(6_000);
+    expect(ORIGINAL_REQUEST_CHAR_BUDGET).toBe(16_000);
+    const request = "r".repeat(10_000);
+    const quoted = (brief: string): string =>
+      brief.slice(
+        brief.indexOf("----- BEGIN ORIGINAL REQUEST -----") +
+          "----- BEGIN ORIGINAL REQUEST -----\n".length,
+        brief.indexOf("\n----- END ORIGINAL REQUEST -----"),
+      );
+    const local = renderWorkerBrief(TASK, {
+      workingDir: "/repo",
+      originalRequest: request,
+      localLeg: true,
+    });
+    expect(quoted(local)).toHaveLength(6_000);
+    expect(local).toContain(
+      "(truncated: the original request is 10,000 chars; only the first 6,000 are quoted above.)",
+    );
+    const cloud = renderWorkerBrief(TASK, {
+      workingDir: "/repo",
+      originalRequest: request,
+      localLeg: false,
+    });
+    expect(quoted(cloud)).toBe(request);
+    expect(cloud).not.toContain("(truncated:");
+    // Unset is the cloud budget, byte for byte.
+    expect(
+      renderWorkerBrief(TASK, { workingDir: "/repo", originalRequest: request }),
+    ).toBe(cloud);
+  });
+
+  it("keeps the task and rules whole when the worker's pinned request is clipped", () => {
+    // A worker's pinned request is its whole brief; `### request` keeps a
+    // bounded slice of it. With a long brief, the quoted request is cut
+    // and the TASK, RULES and closing reminder survive.
+    const huge = `${"spec ".repeat(5_000)}TAIL-OF-SPEC`;
+    const longTask = {
+      ...TASK,
+      instructions: `${"Do the thing carefully. ".repeat(250)}END-OF-INSTRUCTIONS`,
+    };
+    const brief = renderWorkerBrief(longTask, {
+      workingDir: "/repo",
+      originalRequest: huge,
+    });
+    expect(brief.length).toBeGreaterThan(REQUEST_SECTION_CHAR_BUDGET);
+    const section = renderRequestSection(brief);
+    expect(section).toContain("TASK t1: Map the auth routes");
+    expect(section).toContain("END-OF-INSTRUCTIONS");
+    expect(section).toContain("RULES:");
+    expect(section).toContain("- Finish with `reply`");
+    expect(section).toContain("----- END ORIGINAL REQUEST -----");
+    expect(section).toContain("Your part is TASK t1 (Map the auth routes) above");
+    expect(section).not.toContain("TAIL-OF-SPEC");
+    expect(section).toContain("the quoted ORIGINAL REQUEST was cut to fit 16,000, the task and rules are whole.");
+    // The body (frame line and note aside) fits the budget.
+    const body = section.split("\n").slice(1, -1).join("\n");
+    expect(body.length).toBeLessThanOrEqual(REQUEST_SECTION_CHAR_BUDGET);
   });
 
   it("omits the section entirely when there is no request (or only whitespace)", () => {
@@ -190,20 +269,22 @@ describe("renderWorkerBrief — the contract", () => {
     requires: [{ task: "t1", name: "btn-launch" }],
   };
 
-  it("prepends the shared block and this task's three lines, between the request and the TASK", () => {
+  it("carries the shared block and this task's three lines after the TASK, before the rules and the request", () => {
     const brief = renderWorkerBrief(TASK, {
       workingDir: "/repo",
       originalRequest: "Build the game",
       contract: CONTRACT,
     });
-    const requestEnd = brief.indexOf("----- END ORIGINAL REQUEST -----");
+    const taskAt = brief.indexOf("TASK t1: Map the auth routes");
     const contractAt = brief.indexOf("CONTRACT — the interface between the parts");
     const forTaskAt = brief.indexOf("For TASK t1:");
-    const taskAt = brief.indexOf("TASK t1: Map the auth routes");
-    expect(requestEnd).toBeGreaterThan(0);
-    expect(contractAt).toBeGreaterThan(requestEnd);
+    const rulesAt = brief.indexOf("RULES:");
+    const requestAt = brief.indexOf("----- BEGIN ORIGINAL REQUEST -----");
+    expect(taskAt).toBeGreaterThan(0);
+    expect(contractAt).toBeGreaterThan(taskAt);
     expect(forTaskAt).toBeGreaterThan(contractAt);
-    expect(taskAt).toBeGreaterThan(forTaskAt);
+    expect(rulesAt).toBeGreaterThan(forTaskAt);
+    expect(requestAt).toBeGreaterThan(rulesAt);
     // The whole contract, then what it means for this worker.
     expect(brief).toContain("- [html] id btn-launch in index.html");
     expect(brief).toContain("You own: js/ship.js");

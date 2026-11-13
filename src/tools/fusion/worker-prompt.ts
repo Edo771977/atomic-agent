@@ -50,13 +50,30 @@ export const WORKER_REPLY_CHAR_BUDGET = 4000;
  * game the operator asked for, and workers with thin briefs spent 30–40
  * steps reverse-engineering sibling modules off the disk. The request is
  * the one text every part of the job must agree with, so every worker
- * gets it — labelled as context, with its own task below.
+ * gets it — labelled as context, after its own task.
  *
  * Bounded because every worker pays for it in its slot's context:
  * 16,000 chars is roughly 4K tokens, a real spec with room to spare,
  * and a request longer than that is clipped with a note saying so.
  */
 export const ORIGINAL_REQUEST_CHAR_BUDGET = 16_000;
+
+/**
+ * The same bound for a worker on a local leg, ~1.5K tokens. A local
+ * worker shares one server context with its siblings and reads its brief
+ * at a few hundred tokens a second, so 4K tokens of a spec it needs only
+ * for names and formats is a real share of its slot and of its first
+ * minute. What a clip reaches is the quoted request, never the task
+ * (`renderWorkerBrief` puts the task first).
+ */
+export const LOCAL_ORIGINAL_REQUEST_CHAR_BUDGET = 6_000;
+
+/** The request budget for a worker's leg: local or cloud. */
+export function originalRequestCharBudget(localLeg: boolean): number {
+  return localLeg
+    ? LOCAL_ORIGINAL_REQUEST_CHAR_BUDGET
+    : ORIGINAL_REQUEST_CHAR_BUDGET;
+}
 
 /**
  * A turn-starting message shorter than this is read as a follow-up
@@ -120,30 +137,27 @@ function lastLiveRequest(
   return undefined;
 }
 
-function quoteOriginalRequest(request: string): string[] {
-  const clipped =
-    request.length > ORIGINAL_REQUEST_CHAR_BUDGET
-      ? request.slice(0, ORIGINAL_REQUEST_CHAR_BUDGET)
-      : request;
+function quoteOriginalRequest(request: string, budget: number): string[] {
+  const clipped = request.length > budget ? request.slice(0, budget) : request;
   const lines = [
-    `ORIGINAL REQUEST — context only; your task is below. This is the operator's whole job, which the orchestrator split across several workers. Use it for the names, formats, constraints and look your part must agree with, and do only your TASK.`,
+    `ORIGINAL REQUEST — context only; your TASK is above. This is the operator's whole job, which the orchestrator split across several workers. Use it for the names, formats, constraints and look your part must agree with, and do only your TASK.`,
     ORIGINAL_REQUEST_BEGIN_MARKER,
     clipped,
     ORIGINAL_REQUEST_END_MARKER,
   ];
   if (clipped.length < request.length) {
     lines.push(
-      `(truncated: the original request is ${formatCount(request.length)} chars; only the first ${formatCount(ORIGINAL_REQUEST_CHAR_BUDGET)} are quoted above.)`,
+      `(truncated: the original request is ${formatCount(request.length)} chars; only the first ${formatCount(budget)} are quoted above.)`,
     );
   }
   return lines;
 }
 
 /**
- * The contract, when the fan-out has one, sits between the request
- * (what the whole job is) and the task (what this worker does): the
- * shared block first, then the three lines that say what it means for
- * this task. Every worker of the fan-out reads the same shared block,
+ * The contract, when the fan-out has one, follows the task (what this
+ * worker does) and comes before the rules and the request (what the
+ * whole job is): the shared block first, then the three lines that say
+ * what it means for this task. Every worker of the fan-out reads the same shared block,
  * which is the point — the names they must agree on are written once,
  * not paraphrased eight times.
  */
@@ -177,29 +191,45 @@ export function siblingFilesRule(hasContract: boolean): string {
 export const BROWSER_CODE_RULE =
   "- Code meant for the browser (it uses `window`, `document`, the DOM or `<script>` loading) does not run under node: `node -e`, `require` or `import` of it fails with \"Cannot find module\" or \"document is not defined\", which says nothing about your code. Check its syntax with `verify.syntax` instead of running it.";
 
+/**
+ * The brief, in reading order: the frame, this worker's TASK with its
+ * FILES, DELIVERABLE and contract part, the RULES, then the quoted
+ * ORIGINAL REQUEST, then one line naming the task again.
+ *
+ * Task first because a brief is cut from the end. The request used to
+ * come first, up to 16K chars of it, and a worker's pinned request
+ * (`renderRequestSection`) keeps a bounded slice of the brief — so on a
+ * long spec what fell off was the worker's own TASK and RULES. Now the
+ * quoted block is what a clip reaches, and the closing line puts the
+ * task back next to where the model starts generating.
+ *
+ * `localLeg` lowers the request's budget (`originalRequestCharBudget`).
+ */
 export function renderWorkerBrief(
   task: DelegateTask,
   options: {
     workingDir: string;
     originalRequest?: string;
     contract?: DelegateContract;
+    localLeg?: boolean;
   },
 ): string {
   const request = options.originalRequest?.trim() ?? "";
   const lines: string[] = [
     `You are a worker agent executing one delegated task inside ${options.workingDir}; you have no memory of the parent conversation.`,
     ``,
-    ...(request.length > 0 ? [...quoteOriginalRequest(request), ``] : []),
-    ...(options.contract ? [...quoteContract(options.contract, task.id), ``] : []),
     `TASK ${task.id}: ${task.title}`,
     ``,
     task.instructions,
   ];
+  if (task.files && task.files.length > 0) {
+    lines.push(``, `FILES:`, ...task.files.map((f) => `- ${f}`));
+  }
   if (task.deliverable) {
     lines.push(``, `DELIVERABLE: ${task.deliverable}`);
   }
-  if (task.files && task.files.length > 0) {
-    lines.push(``, `FILES:`, ...task.files.map((f) => `- ${f}`));
+  if (options.contract) {
+    lines.push(``, ...quoteContract(options.contract, task.id));
   }
   lines.push(
     ``,
@@ -217,5 +247,16 @@ export function renderWorkerBrief(
         ]
       : []),
   );
+  if (request.length > 0) {
+    lines.push(
+      ``,
+      ...quoteOriginalRequest(
+        request,
+        originalRequestCharBudget(options.localLeg === true),
+      ),
+      ``,
+      `Your part is TASK ${task.id} (${task.title}) above — do only that, then \`reply\`.`,
+    );
+  }
   return lines.join("\n");
 }

@@ -565,12 +565,32 @@ describe("runWorkerTasks", () => {
     expect(calls).toHaveLength(2);
     for (const call of calls) {
       expect(call.userMessage).toContain(
-        "ORIGINAL REQUEST — context only; your task is below.",
+        "ORIGINAL REQUEST — context only; your TASK is above.",
       );
       expect(call.userMessage).toContain("Build a snake game with a dark theme");
     }
     expect(calls[0]!.userMessage).toContain("Do part 0");
     expect(calls[1]!.userMessage).toContain("Do part 1");
+  });
+
+  it("quotes less of the request to a worker on a local leg", async () => {
+    const request = "s".repeat(10_000);
+    const run = async (localLeg: boolean): Promise<string> => {
+      const { deps, calls } = harness(async () => turnResult());
+      await runWorkerTasks(deps, {
+        ...BASE,
+        tasks: tasks(1),
+        maxWorkers: 1,
+        originalRequest: request,
+        localLeg,
+        signal: new AbortController().signal,
+      });
+      return calls[0]!.userMessage;
+    };
+    expect(await run(true)).toContain("only the first 6,000 are quoted above.");
+    const cloud = await run(false);
+    expect(cloud).toContain(request);
+    expect(cloud).not.toContain("(truncated:");
   });
 
   it("renders the fan-out's contract into every worker's brief", async () => {

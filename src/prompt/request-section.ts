@@ -17,7 +17,7 @@ import {
  * that carried it. While the carrier is in view it costs nothing.
  */
 
-/** Same 16,000-char clip as the workers' quoted request. */
+/** Same 16,000-char clip as a cloud worker's quoted request (`worker-prompt.ts`). */
 export const REQUEST_SECTION_CHAR_BUDGET = 16_000;
 
 /**
@@ -135,18 +135,48 @@ function formatCount(n: number): string {
   return n.toLocaleString("en-US");
 }
 
+/**
+ * A worker brief over the budget, clipped inside its quoted ORIGINAL
+ * REQUEST block: the task, rules and closing reminder around the block
+ * are the worker's own instructions and are kept whole. `null` when the
+ * text has no complete block, or when what surrounds the block alone is
+ * over the budget (then the plain head clip applies: the brief puts the
+ * task first, so the head is the part to keep).
+ */
+function clipQuotedRequest(text: string, budget: number): string | null {
+  const begin = text.indexOf(ORIGINAL_REQUEST_BEGIN_MARKER);
+  if (begin === -1) return null;
+  const start = begin + ORIGINAL_REQUEST_BEGIN_MARKER.length;
+  const end = text.indexOf(ORIGINAL_REQUEST_END_MARKER, start);
+  if (end === -1) return null;
+  const head = text.slice(0, start);
+  const tail = text.slice(end);
+  const room = budget - head.length - tail.length;
+  if (room < 0) return null;
+  return `${head}${text.slice(start, end).slice(0, room)}${tail}`;
+}
+
 /** The `### request` body: the record, clipped, with a one-line frame. */
 export function renderRequestSection(request: string): string {
   const text = request.trim();
-  const clipped =
+  const quotedClip =
     text.length > REQUEST_SECTION_CHAR_BUDGET
+      ? clipQuotedRequest(text, REQUEST_SECTION_CHAR_BUDGET)
+      : null;
+  const clipped =
+    quotedClip ??
+    (text.length > REQUEST_SECTION_CHAR_BUDGET
       ? text.slice(0, REQUEST_SECTION_CHAR_BUDGET)
-      : text;
+      : text);
   const lines = [
     "The operator's request that started this task. The turn that carried it has been dropped from the conversation below; this is what the work must still satisfy.",
     clipped,
   ];
-  if (clipped.length < text.length) {
+  if (quotedClip !== null) {
+    lines.push(
+      `(truncated: the request is ${formatCount(text.length)} chars; the quoted ORIGINAL REQUEST was cut to fit ${formatCount(REQUEST_SECTION_CHAR_BUDGET)}, the task and rules are whole.)`,
+    );
+  } else if (clipped.length < text.length) {
     lines.push(
       `(truncated: the request is ${formatCount(text.length)} chars; only the first ${formatCount(REQUEST_SECTION_CHAR_BUDGET)} are shown.)`,
     );
