@@ -344,6 +344,8 @@ Full TUI guide: [TUI.md](docs/user/tui.md).
 <details>
 <summary><b>Run modes: Local · Cloud · Fusion</b></summary>
 
+**Fastest way to run Fusion:** `atomic-agent setup fusion`. It picks a strong orchestrator (a cloud provider you configured with a key, else your signed-in Claude Code subscription) and the local model as the workers, shows what it will change, asks, and writes the config in one step (`--dry-run` to preview, `--yes` to skip the question, `--judge`/`--isolation` to opt into those too). When a leg is missing it prints the command that fixes it, such as the model download; it never stores a key.
+
 `local` and `cloud` are the two routes the composer always offered. **Fusion** adds a third: one model orchestrates and a pool of workers executes the parts it delegates. The usual pairing is a cloud orchestrator with local llama-server workers, but neither leg is tied to a kind: a local model can plan for cloud workers, and `/runmode swap` trades the two legs. The only rule is that the legs are two different providers. The block is additive and `llm.activeTextProvider` stays authoritative:
 
 ```json
