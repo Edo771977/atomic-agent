@@ -20,7 +20,8 @@
  * copied in; ignored directories and ignored files are copied privately
  * so a test run still finds them, except the shared dependency
  * directories (`node_modules`, `target`, `.venv`), which are symlinked
- * to the original's and cost no copy budget.
+ * to the original's and cost no copy budget (with
+ * `privateDependencyDirectories`, tasks copy them privately instead).
  * Outside git, or when git cannot snapshot
  * (no commit yet, a merge in progress, no git binary), a workspace is
  * a private folder copy without the original's git metadata. Copying
@@ -204,6 +205,13 @@ export interface CreateBranchSetOptions {
   ignoreGit?: IgnoreGit;
   /** Maximum actual copied bytes across base and tasks; not Git's separate checkout materializations. */
   maxCopyBytes?: number;
+  /**
+   * Give each task workspace a private copy of the shared dependency
+   * directories (charged to the copy budget) instead of a link to the
+   * original's. Candidate integration sets this: nothing may reach the
+   * original before promotion. The base, which nobody writes to, still links.
+   */
+  privateDependencyDirectories?: boolean;
 }
 
 const GIT_TIMEOUT_MS = 120_000;
@@ -345,7 +353,15 @@ class PrivateCopyLimitError extends Error {
   constructor() { super("the private workspace copies exceed the copy byte limit"); }
 }
 
-interface PrivateCopyBudget { left: number; signal?: AbortSignal }
+interface PrivateCopyBudget {
+  left: number;
+  signal?: AbortSignal;
+  /**
+   * Set while making a workspace that must own its dependency directories:
+   * the original they are copied from (the base only holds links to it).
+   */
+  privateDependenciesFrom?: string;
+}
 
 /**
  * Dependency and build-cache directories shared with the original by a
@@ -353,25 +369,45 @@ interface PrivateCopyBudget { left: number; signal?: AbortSignal }
  * project itself (hundreds of MB, 100k+ files), and copying them into
  * the base and every task both blew the copy limit and refused isolation
  * for ordinary repos. Never stamped or merged (`VERIFY_COPY_EXCLUDED`).
- * Writes through the link reach the original, as for `verify.run`.
+ * Writes through the link reach the original, as for `verify.run`;
+ * `privateDependencyDirectories` copies them instead.
  */
 export const SHARED_DEPENDENCY_DIRECTORIES: ReadonlySet<string> = new Set(["node_modules", "target", ".venv"]);
+
+/** Whether any component of `rel` names a shared dependency directory. */
+function underSharedDependencyDirectory(rel: string): boolean {
+  return rel.split(sep).some((name) => SHARED_DEPENDENCY_DIRECTORIES.has(name));
+}
 
 /**
  * Copy entries without sharing the source's git metadata. Only links
  * created here point back at the source: a shared dependency directory
- * (`SHARED_DEPENDENCY_DIRECTORIES`), which costs no copy budget.
+ * (`SHARED_DEPENDENCY_DIRECTORIES`), or with `shared` an ignored
+ * directory inside one, which costs no copy budget. With
+ * `budget.privateDependenciesFrom` such an entry is instead copied
+ * privately from the original (the source's link would lead there).
  */
 async function copyPrivateEntry(
   from: string,
   to: string,
   budget: PrivateCopyBudget,
   rel = "",
+  shared = rel.length > 0 && SHARED_DEPENDENCY_DIRECTORIES.has(basename(rel)),
 ): Promise<void> {
   budget.signal?.throwIfAborted();
   if (isUnderMergeDir(rel)) return;
+  if (shared && budget.privateDependenciesFrom !== undefined) {
+    const origin = join(budget.privateDependenciesFrom, rel);
+    const own = await lstat(origin).catch(() => null);
+    // A user's own link (or a path only the source has) keeps its normal copy.
+    if (own !== null && !own.isSymbolicLink()) {
+      // Nested shared names redirect to the same original path: copied too.
+      await copyPrivateEntry(origin, to, budget, rel, false);
+      return;
+    }
+  }
   const info = await lstat(from);
-  if (info.isDirectory() && rel.length > 0 && SHARED_DEPENDENCY_DIRECTORIES.has(basename(rel))) {
+  if (shared && budget.privateDependenciesFrom === undefined && info.isDirectory()) {
     await mkdir(dirname(to), { recursive: true });
     await symlink(await realpath(from), to, "dir");
   } else if (info.isDirectory()) {
@@ -489,8 +525,10 @@ async function addWorktree(
   }
   for (const entry of snapshot.ignored) {
     const isDir = entry.endsWith("/");
-    const path = isDir ? entry.slice(0, -1) : entry;
-    await copyPrivateEntry(join(realDir, path), join(dir, path), budget, path);
+    const path = (isDir ? entry.slice(0, -1) : entry).split("/").join(sep);
+    // Git lists ignored children (`node_modules/big/`) when a tracked
+    // placeholder keeps the dependency directory itself unignored.
+    await copyPrivateEntry(join(realDir, path), join(dir, path), budget, path, isDir && underSharedDependencyDirectory(path));
   }
   return dir;
 }
@@ -576,6 +614,8 @@ export async function createBranchSet(
       return root;
     };
     const baseDir = await make("base", real);
+    // Tasks copy what the base only links; the base itself stays link-only.
+    if (options.privateDependencyDirectories === true) budget.privateDependenciesFrom = real;
     const directoryIgnorePolicy = await createDirectoryIgnorePolicy({
       originalDir: real, baseDir, probeDir: join(runRoot, "ignore-policy"),
       ...(options.signal === undefined ? {} : { signal: options.signal }),

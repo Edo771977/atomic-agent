@@ -1,7 +1,8 @@
-import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, realpath, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, expect, it } from "vitest";
+import { createBranchSet } from "./branch-workspace.js";
 import { createCandidateIntegration } from "./candidate-integration.js";
 import type { WorkerTaskResult } from "./worker-result.js";
 import { makeGitRepo, runGitRaw, writeRepoFile } from "../os/git/test-helpers.js";
@@ -211,6 +212,7 @@ it("never promotes deletion or modification of ignored standalone files", async 
     await writeFile(join(next.dir, ".env.local"), "created\n");
     const report = await next.finish({ rows, contract, signal, runChecks: pass });
     expect(report.status).toBe("promoted"); expect(report.changes).toEqual([".env.local"]);
+    expect(report.ignoredChanges).toEqual([".env"]);
     expect(await readFile(join(root, ".env"), "utf8")).toBe("SECRET=1\n");
   } finally { await next.cleanup(); }
 });
@@ -231,4 +233,97 @@ it("refuses to promote changes to the project's agent state directory", async ()
       expect(await readFile(join(root, "a.txt"), "utf8")).toBe("a\n");
     } finally { await candidate.cleanup(); }
   }
+});
+
+it("keeps worker writes under a shared dependency folder private to the candidate, even after rejection", async () => {
+  const root = await ignoreRepo(); const candidate = await createCandidateIntegration(root);
+  try {
+    // The candidate's dependency folder is its own copy, never a link to the original.
+    expect((await lstat(join(candidate.dir, "node_modules"))).isSymbolicLink()).toBe(false);
+    expect(await readFile(join(candidate.dir, "node_modules", "dep.js"), "utf8")).toBe("dep\n");
+    // Per-task workspaces made inside the candidate share the candidate's copy.
+    const inner = await createBranchSet(candidate.dir, ["worker"]);
+    expect(inner).not.toBeNull();
+    try {
+      const task = inner!.workspaces.get("worker")!;
+      expect(await realpath(join(task.dir, "node_modules"))).toBe(await realpath(join(candidate.dir, "node_modules")));
+      await writeFile(join(task.dir, "node_modules", "dep.js"), "worker write\n");
+      await writeFile(join(task.dir, "node_modules", "added.js"), "worker add\n");
+    } finally { await inner!.cleanup(); }
+    expect(await readFile(join(root, "node_modules", "dep.js"), "utf8")).toBe("dep\n");
+    await expect(lstat(join(root, "node_modules", "added.js"))).rejects.toThrow();
+    const report = await candidate.finish({ rows, contract, signal, runChecks: async () => ({ ok: false, results: [{ ok: false }] }) });
+    expect(report.status).toBe("rejected");
+    expect(await readFile(join(root, "node_modules", "dep.js"), "utf8")).toBe("dep\n");
+    await expect(lstat(join(root, "node_modules", "added.js"))).rejects.toThrow();
+  } finally { await candidate.cleanup(); }
+  expect(await readFile(join(root, "node_modules", "dep.js"), "utf8")).toBe("dep\n");
+});
+
+it("gives a folder-copy candidate its own dependency folder too", async () => {
+  const root = await project();
+  await mkdir(join(root, "node_modules")); await writeFile(join(root, "node_modules", "dep.js"), "dep\n");
+  const candidate = await createCandidateIntegration(root);
+  try {
+    expect((await lstat(join(candidate.dir, "node_modules"))).isSymbolicLink()).toBe(false);
+    await writeFile(join(candidate.dir, "node_modules", "dep.js"), "worker write\n");
+    expect((await candidate.reject("test")).status).toBe("rejected");
+  } finally { await candidate.cleanup(); }
+  expect(await readFile(join(root, "node_modules", "dep.js"), "utf8")).toBe("dep\n");
+});
+
+it.each([".ATOMIC-AGENT", ".Atomic-Agent", ".atomic-agent.", ".atomic-agent "])("refuses agent state spelled %j, as a case-insensitive or Win32 filesystem opens it", async name => {
+  const root = await project(); const candidate = await createCandidateIntegration(root);
+  try {
+    await mkdir(join(candidate.dir, name));
+    await writeFile(join(candidate.dir, name, "approval-rules.json"), '{"rules":[{"allow":"*"}]}');
+    const report = await candidate.finish({ rows, contract, signal, runChecks: pass });
+    expect(report.status).toBe("rejected"); expect(report.reason).toContain("agent state");
+    await expect(lstat(join(root, name))).rejects.toThrow();
+  } finally { await candidate.cleanup(); }
+});
+
+async function droppedRepo() {
+  const repo = await makeGitRepo("atag-candidate-dropped-"); roots.push(repo);
+  await writeRepoFile(repo, ".gitignore", "*.log\nout/\n");
+  await writeRepoFile(repo, "src/notes.md", "keep me\n");
+  await writeRepoFile(repo, "a.txt", "a\n");
+  await runGitRaw(repo, ["add", "-A"]); await runGitRaw(repo, ["commit", "-qm", "fixture"]);
+  return repo;
+}
+
+it("rejects a tracked file renamed onto an ignored name instead of silently deleting it", async () => {
+  const root = await droppedRepo(); const candidate = await createCandidateIntegration(root);
+  try {
+    await writeFile(join(candidate.dir, "src", "notes.log"), await readFile(join(candidate.dir, "src", "notes.md")));
+    await rm(join(candidate.dir, "src", "notes.md"));
+    const report = await candidate.finish({ rows, contract, signal, runChecks: pass });
+    expect(report.status).toBe("rejected");
+    expect(report.reason).toContain("src/notes.md"); expect(report.reason).toContain("src/notes.log");
+    expect(await readFile(join(root, "src", "notes.md"), "utf8")).toBe("keep me\n");
+  } finally { await candidate.cleanup(); }
+});
+
+it("rejects a declared provide that only exists under an ignored path", async () => {
+  const root = await droppedRepo(); const candidate = await createCandidateIntegration(root);
+  try {
+    await mkdir(join(candidate.dir, "out")); await writeFile(join(candidate.dir, "out", "bundle.js"), "export {}\n");
+    await writeFile(join(candidate.dir, "a.txt"), "a2\n");
+    const tasks = [{ id: "api", title: "api", instructions: "build" }] as never;
+    const report = await candidate.finish({ rows, tasks, contract: { ...contract, provides: [{ task: "api", kind: "file", name: "out/bundle.js" }] } as never, signal, runChecks: pass });
+    expect(report.status).toBe("rejected"); expect(report.reason).toContain("out/bundle.js");
+    expect(await readFile(join(root, "a.txt"), "utf8")).toBe("a\n");
+  } finally { await candidate.cleanup(); }
+});
+
+it("promotes but reports new ignored paths it kept private", async () => {
+  const root = await droppedRepo(); const candidate = await createCandidateIntegration(root);
+  try {
+    await writeFile(join(candidate.dir, "a.txt"), "a2\n");
+    await writeFile(join(candidate.dir, "run.log"), "log\n");
+    await mkdir(join(candidate.dir, "out")); await writeFile(join(candidate.dir, "out", "x.js"), "x\n");
+    const report = await candidate.finish({ rows, contract, signal, runChecks: pass });
+    expect(report.status).toBe("promoted"); expect(report.changes).toEqual(["a.txt"]);
+    expect(report.ignoredChanges).toEqual(["out", "run.log"]);
+  } finally { await candidate.cleanup(); }
 });

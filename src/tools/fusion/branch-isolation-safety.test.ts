@@ -36,6 +36,29 @@ describe("shared dependency directories", () => {
     expect(await readFile(join(repo, "node_modules/dep/index.js"), "utf8")).toHaveLength(300_000);
   });
 
+  it("links ignored folders inside a dependency directory that keeps a tracked placeholder", async () => {
+    const repo = await makeGitRepo("atag-shared-gitkeep-");
+    cleanup.push(repo);
+    await writeRepoFile(repo, ".gitignore", "node_modules/*\n!node_modules/.gitkeep\n");
+    await writeRepoFile(repo, "node_modules/.gitkeep", "");
+    await runGitRaw(repo, ["add", "-A"]);
+    await runGitRaw(repo, ["commit", "-q", "-m", "init"]);
+    await writeRepoFile(repo, "node_modules/big/x.bin", "x".repeat(300_000));
+    await writeRepoFile(repo, "node_modules/big/node_modules/inner/y.bin", "y".repeat(300_000));
+    const { root } = await fixture();
+    const set = await createBranchSet(repo, ["t1", "t2"], { tmpRoot: root, maxCopyBytes: 100_000 });
+    expect(set).not.toBeNull();
+    try {
+      for (const id of ["t1", "t2"]) {
+        const dir = set!.workspaces.get(id)!.dir;
+        expect(await readFile(join(dir, "node_modules/.gitkeep"), "utf8")).toBe("");
+        expect((await lstat(join(dir, "node_modules"))).isSymbolicLink()).toBe(false);
+        expect(await realpath(join(dir, "node_modules/big"))).toBe(await realpath(join(repo, "node_modules/big")));
+        expect(await touchedPaths(set!.workspaces.get(id)!)).toEqual([]);
+      }
+    } finally { await set?.cleanup(); }
+  });
+
   it("does not copy node_modules, target or .venv wholesale in the folder-copy fallback", async () => {
     const { root, dir } = await fixture();
     for (const name of ["node_modules", "target", ".venv"]) {
