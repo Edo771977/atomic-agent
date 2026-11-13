@@ -13,6 +13,7 @@ export default defineConfig({
     ],
     exclude: ["**/fixtures/**", "**/node_modules/**"],
     environment: "node",
+    passWithNoTests: false,
     testTimeout: 20_000,
     fileParallelism: false,
     maxWorkers: 1,

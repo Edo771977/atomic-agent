@@ -75,6 +75,11 @@ smoke is a separate hermetic unit test and does not establish agent execution.
 Set `ATOMIC_AGENT_GAIA_REPORT_DIR` to place a campaign's reports in a chosen
 directory (the default remains a timestamped directory under `reports/`).
 
+Orchestrators launch the installed Vitest JavaScript entry with the current
+Node executable, including on Windows; forwarded arguments stay separate
+argv entries. Spawn errors fail the run, and cancellation waits for the
+test child to close before returning.
+
 ## Methodology
 
 - **Chat model**: shared `llama-server` URL for all agents.

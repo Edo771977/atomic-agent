@@ -9,6 +9,7 @@ const HERE = fileURLToPath(new URL(".", import.meta.url));
 export const REPO_ROOT = resolve(HERE, "..", "..");
 export const CLI_BIN = resolve(REPO_ROOT, "dist", "cli", "index.js");
 export const VITEST_CONFIG = resolve(REPO_ROOT, "eval-agents", "vitest.config.ts");
+export const VITEST_ENTRY = fileURLToPath(import.meta.resolve("vitest/vitest.mjs"));
 export const ENV_FILE = resolve(REPO_ROOT, "eval-agents", ".env");
 
 export function makeLog(tag) {
@@ -134,18 +135,42 @@ export function teardownDaemons(log, startedByUs) {
   }
 }
 
-export function runVitest({ extraEnv = {}, forwarded = [] }) {
+export function runVitest({ extraEnv = {}, forwarded = [], signal,
+  entryPath = VITEST_ENTRY, cwd = REPO_ROOT } = {}) {
   return new Promise((resolveExit) => {
     const child = spawn(
-      "npx",
-      ["vitest", "run", "--config", VITEST_CONFIG, ...forwarded],
+      process.execPath,
+      [entryPath, "run", "--config", VITEST_CONFIG, ...forwarded],
       {
-        cwd: REPO_ROOT,
+        cwd,
         env: { ...process.env, ...extraEnv },
         stdio: "inherit",
+        windowsHide: true,
+        signal,
       },
     );
-    child.on("exit", (code) => resolveExit(code ?? 1));
+    let launchFailed = false;
+    let interrupted = false;
+    const forward = (name) => {
+      interrupted = true;
+      child.kill(name);
+    };
+    const onInt = () => forward("SIGINT");
+    const onTerm = () => forward("SIGTERM");
+    // Run before the orchestrator's daemon teardown/exit handler.
+    process.prependListener("SIGINT", onInt);
+    process.prependListener("SIGTERM", onTerm);
+    child.once("error", (error) => {
+      launchFailed = true;
+      if (!signal?.aborted) console.error(`[eval-agents] could not launch vitest: ${error.message}`);
+    });
+    // close follows both failed spawns and cancellation; wait until the child
+    // and its inherited streams have closed before the caller tears down.
+    child.once("close", (code) => {
+      process.removeListener("SIGINT", onInt);
+      process.removeListener("SIGTERM", onTerm);
+      resolveExit(signal?.aborted || interrupted ? 130 : launchFailed ? 1 : code ?? 1);
+    });
   });
 }
 
