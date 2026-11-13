@@ -1,4 +1,4 @@
-import { lstat, mkdir, mkdtemp, readFile, realpath, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
@@ -108,6 +108,11 @@ it("rolls back partial delivery on failure without overwriting a concurrent user
     expect(report.status).toBe("rejected"); expect(report.reason).toMatch(/delivery/);
     expect(await readFile(join(root, "api.json"), "utf8")).toBe("user edit during delivery");
     expect(await readFile(join(root, "dirty.txt"), "utf8")).toBe("user's uncommitted bytes\r\n");
+    // An incomplete rollback keeps the promotion journal for manual recovery.
+    expect(report.rollbackConflicts).toEqual(["api.json"]);
+    const journal = JSON.parse(await readFile(join(root, report.promotionJournal!), "utf8"));
+    expect(journal.state).toBe("rolled-back-with-conflicts");
+    expect(journal.steps.map((step: { path: string; status: string }) => [step.path, step.status])).toEqual([["api.json", "rollback-conflict"]]);
   } finally { await candidate.cleanup(); }
 });
 
@@ -372,4 +377,45 @@ it("treats a user edit between the step's verification and the rename as a concu
     // The already-delivered sibling is rolled back.
     expect(await readFile(join(root, "api.json"), "utf8")).toBe('{"name":"before"}');
   } finally { await candidate.cleanup(); }
+});
+
+const mergeDir = (root: string) => join(root, ".atomic-agent", "fusion-merge");
+const promotionFiles = async (root: string) => (await readdir(mergeDir(root)).catch(() => [] as string[])).filter(name => name.includes(".promotion"));
+
+it("journals each promotion step durably with pre-image backups so a crash mid-delivery is recoverable", async () => {
+  const root = await project();
+  let journalAtCrash: { state: string; steps: { path: string; status: string; original: { kind: string; sha256?: string } | null; backup?: string }[] } | undefined;
+  let backupBytes: Record<string, string> = {};
+  const candidate = await createCandidateIntegration(root, { beforeApply: async (_path, index) => {
+    if (index !== 2) return;
+    // The process "dies" here: inspect exactly what a human would find on disk.
+    const names = await promotionFiles(root);
+    const journal = names.find(name => name.endsWith(".promotion.json"));
+    expect(journal).toBeTruthy();
+    journalAtCrash = JSON.parse(await readFile(join(mergeDir(root), journal!), "utf8"));
+    for (const step of journalAtCrash!.steps) if (step.backup !== undefined) backupBytes[step.path] = await readFile(join(mergeDir(root), step.backup), "utf8");
+    throw new Error("simulated crash");
+  } });
+  try {
+    await writeFile(join(candidate.dir, "api.json"), "candidate api");
+    await rm(join(candidate.dir, "dirty.txt"));
+    await writeFile(join(candidate.dir, "new.txt"), "new");
+    const report = await candidate.finish({ rows, contract, signal, runChecks: async () => ({ ok: true, results: [{ ok: true }] }) });
+    expect(report.status).toBe("rejected");
+  } finally { await candidate.cleanup(); }
+  expect(journalAtCrash?.state).toBe("promoting");
+  expect(journalAtCrash?.steps.map(step => [step.path, step.status])).toEqual([["api.json", "applied"], ["dirty.txt", "applied"]]);
+  expect(journalAtCrash?.steps.map(step => step.original?.kind)).toEqual(["file", "file"]);
+  expect(backupBytes).toEqual({ "api.json": '{"name":"before"}', "dirty.txt": "user's uncommitted bytes\r\n" });
+  // A full rollback restored the original, so the journal and backups are gone.
+  expect(await readFile(join(root, "api.json"), "utf8")).toBe('{"name":"before"}');
+  expect(await readFile(join(root, "dirty.txt"), "utf8")).toBe("user's uncommitted bytes\r\n");
+  expect(await promotionFiles(root)).toEqual([]);
+  backupBytes = {};
+  const next = await createCandidateIntegration(root);
+  try {
+    await writeFile(join(next.dir, "api.json"), "promoted api");
+    expect((await next.finish({ rows, contract, signal, runChecks: async () => ({ ok: true, results: [{ ok: true }] }) })).status).toBe("promoted");
+  } finally { await next.cleanup(); }
+  expect(await promotionFiles(root)).toEqual([]);
 });

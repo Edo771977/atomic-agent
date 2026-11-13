@@ -1,8 +1,9 @@
 import { createHash, randomBytes } from "node:crypto";
 import { createReadStream, type Stats } from "node:fs";
-import { chmod, copyFile, lstat, mkdir, opendir, readlink, rename, rm, rmdir, symlink } from "node:fs/promises";
+import { chmod, copyFile, lstat, mkdir, open, opendir, readlink, rename, rm, rmdir, symlink } from "node:fs/promises";
 import { dirname, join, relative, sep } from "node:path";
 import { isInside } from "../../approval/fanout-scope.js";
+import { renameWithRetrySync, syncDirectoryBestEffort, writeFileSyncedSync } from "../../config/durable-write.js";
 import { resolveUserPath } from "../os/expand-home.js";
 import { inputPathIdentity, windowsComponentIdentity } from "../os/fs/fs-input-path-identity.js";
 import { VERIFY_COPY_EXCLUDED, VERIFY_COPY_MAX_BYTES } from "../verify/verify-workspace-copy.js";
@@ -206,6 +207,26 @@ function differences(a: Inventory, b: Inventory): string[] {
   return [...new Set([...a.keys(), ...b.keys()])].filter(path => !equal(a.get(path), b.get(path))).sort();
 }
 
+/** What a promotion journal records about one entry (see the fusion README for recovery). */
+interface JournalEntry { kind: Entry["kind"]; mode: number; sha256?: string; linkTarget?: string }
+interface PromotionJournalStep {
+  path: string;
+  action: "write" | "delete" | "mkdir" | "rmdir";
+  /** `intent` is written before the change, `applied` after it. */
+  status: "intent" | "applied" | "not-applied" | "rolled-back" | "rollback-conflict";
+  original: JournalEntry | null;
+  promoted: JournalEntry | null;
+  /** Pre-image bytes of a modified or deleted file, relative to the merge folder. */
+  backup?: string;
+}
+interface PromotionJournal {
+  version: 1; candidate: string; project: string; startedAt: string;
+  state: "promoting" | "rolling-back" | "rolled-back-with-conflicts";
+  recovery: string;
+  steps: PromotionJournalStep[];
+}
+const JOURNAL_RECOVERY = "Steps run in order. 'applied' paths hold the promoted entry; an 'intent' path may hold either. To undo, restore each such path from 'original': a file from 'backup' with its mode, a symlink from 'linkTarget', a directory with its mode; remove the path if 'original' is null. Verify sha256 before trusting a backup, then delete this journal and its backup folder.";
+
 export interface CandidateIntegrationReport {
   status: "promoted" | "rejected";
   nonResumable: true;
@@ -222,6 +243,8 @@ export interface CandidateIntegrationReport {
   ignoredChanges?: string[];
   /** Concurrent edits prevent rollback of these paths; their current bytes were preserved. */
   rollbackConflicts?: string[];
+  /** Promotion journal kept after an incomplete rollback, relative to the project (with its pre-image backup folder). */
+  promotionJournal?: string;
   /** Recovery fallback if a bounded patch cannot be made; cleanup leaves this private workspace intact. */
   retainedWorkspace?: string;
   heldArtifactsDir?: string;
@@ -352,6 +375,47 @@ export async function createCandidateIntegration(
     } finally { await rm(tmp, { force: true }); }
   };
 
+  /**
+   * A durable record of promotion under the original's merge folder: every
+   * step is journaled with its original entry (and pre-image bytes of a
+   * modified or deleted file) before it is applied, and marked after, so
+   * a hard stop mid-delivery leaves enough to restore by hand.
+   */
+  const openJournal = async (): Promise<{ journal: PromotionJournal; file: string; backups: string; write(): void; step(path: string, original: Entry | undefined, promoted: Entry | undefined): Promise<PromotionJournalStep>; remove(): Promise<void> }> => {
+    const merge = await ensureMergeDir(set.realDir);
+    const file = join(merge, `${id}.promotion.json`), backups = join(merge, `${id}.promotion-backup`);
+    const journal: PromotionJournal = { version: 1, candidate: id, project: set.realDir, startedAt: new Date().toISOString(), state: "promoting", recovery: JOURNAL_RECOVERY, steps: [] };
+    const write = (): void => {
+      const tmp = `${file}.tmp`;
+      writeFileSyncedSync(tmp, `${JSON.stringify(journal, null, 2)}\n`, { mode: 0o600 });
+      renameWithRetrySync(tmp, file); syncDirectoryBestEffort(merge);
+    };
+    const describe = (entry: Entry | undefined, link?: string): JournalEntry | null => entry === undefined ? null
+      : { kind: entry.kind, mode: entry.mode, ...(entry.kind === "file" && entry.hash !== undefined ? { sha256: entry.hash } : {}), ...(link === undefined ? {} : { linkTarget: link }) };
+    await mkdir(backups); write();
+    return {
+      journal, file, backups, write,
+      async step(path, original, promoted) {
+        const index = journal.steps.length;
+        const action = original?.kind === "directory" && promoted === undefined ? "rmdir" : promoted === undefined ? "delete" : promoted.kind === "directory" ? "mkdir" : "write";
+        let backup: string | undefined;
+        if (original?.kind === "file") {
+          backup = join(`${id}.promotion-backup`, String(index));
+          const destination = join(merge, backup);
+          await copyFile(join(set.baseDir, path), destination);
+          const handle = await open(destination, "r+");
+          try { await handle.sync().catch((err: NodeJS.ErrnoException) => { if (!["EINVAL", "ENOTSUP", "EOPNOTSUPP"].includes(err.code ?? "")) throw err; }); } finally { await handle.close(); }
+          syncDirectoryBestEffort(backups);
+        }
+        const link = original?.kind === "symlink" ? await readlink(join(set.baseDir, path)) : undefined;
+        const step: PromotionJournalStep = { path: posixPath(path), action, status: "intent", original: describe(original, link), promoted: describe(promoted), ...(backup === undefined ? {} : { backup: posixPath(backup) }) };
+        journal.steps.push(step); write();
+        return step;
+      },
+      remove: async () => { await rm(file, { force: true }); await rm(backups, { recursive: true, force: true }); },
+    };
+  };
+
   return {
     dir: workspace.dir, cleanup: () => retain ? Promise.resolve() : set.cleanup(), reject,
     async finish(input) {
@@ -360,6 +424,8 @@ export async function createCandidateIntegration(
       let final: Inventory | undefined;
       let artifactManifest: ArtifactManifest | undefined;
       let ignoredChanges: string[] = [];
+      let journal: Awaited<ReturnType<typeof openJournal>> | undefined;
+      const steps = new Map<string, PromotionJournalStep>();
       try {
         input.signal.throwIfAborted();
         if (input.rows.length === 0 || input.rows.some(row => row.status !== "ok") || input.tasks?.some(task => !input.rows.some(row => row.id === task.id))) return await reject("candidate not promoted: every task must close with status ok");
@@ -447,29 +513,51 @@ export async function createCandidateIntegration(
           }
           return first;
         };
+        // Created before the first write; removed once delivery or a full rollback completes.
+        if (changed.length > 0) journal = await openJournal();
         for (const [index, path] of [...additions, ...files, ...removals].entries()) {
           promotionSignal.throwIfAborted(); await options.beforeApply?.(path, index); promotionSignal.throwIfAborted();
           const verified = await verifyPaths(withAncestors(path), expectedAt, "original project changed during candidate delivery");
+          const step = await journal!.step(path, base.get(path), final.get(path)); steps.set(path, step);
           if (base.get(path)?.kind === "directory" && !final.has(path)) { await commitGuard(path, verified); await rmdir(join(set.realDir, path)); }
           else await writeEntry(workspace.dir, path, final.get(path), verified);
           applied.push(path); appliedSet.add(path);
+          step.status = "applied"; journal!.write();
         }
         promotionSignal.throwIfAborted();
         // Final check of the touched paths only: each must now hold its candidate entry.
         await verifyPaths([...new Set(changed.flatMap(withAncestors))], path => final!.get(path), "original project changed while completing candidate delivery");
+        await journal?.remove().catch(() => undefined);
         return { status: "promoted", nonResumable: true, changes: changed.map(posixPath), contract: evidence, artifactManifest, ...(ignoredChanges.length === 0 ? {} : { ignoredChanges: ignoredChanges.map(posixPath) }) };
       } catch (err) {
         // Roll back only bytes we still own. If a user edited a delivered
         // path, retain that edit and report it instead of overwriting it.
+        // The journal is best effort from here on: rollback must not stop for it.
+        const record = (): boolean => { try { journal?.write(); return true; } catch { return false; } };
+        let journalOk = true;
+        if (journal !== undefined) {
+          journal.journal.state = "rolling-back";
+          for (const [path, step] of steps) if (step.status === "intent" && !applied.includes(path)) step.status = "not-applied";
+          journalOk = record();
+        }
         for (const path of applied.reverse()) {
+          const step = steps.get(path);
           try {
             const current = await observeEntry(set.realDir, path, liveBounds(AbortSignal.timeout(options.maxInventoryMs ?? 30_000)));
-            if (!equal(current.entry, final?.get(path))) { rollbackConflicts.push(path); continue; }
+            if (!equal(current.entry, final?.get(path))) { rollbackConflicts.push(path); if (step !== undefined) step.status = "rollback-conflict"; journalOk = record() && journalOk; continue; }
             if (final?.get(path)?.kind === "directory" && !base.has(path)) { await commitGuard(path, current.stat); await rmdir(join(set.realDir, path)); }
             else await writeEntry(set.baseDir, path, base.get(path), current.stat);
-          } catch { rollbackConflicts.push(path); }
+            if (step !== undefined) step.status = "rolled-back";
+          } catch { rollbackConflicts.push(path); if (step !== undefined) step.status = "rollback-conflict"; }
+          journalOk = record() && journalOk;
         }
-        return await reject(`candidate not promoted: ${err instanceof Error ? err.message : String(err)}`, { ...(evidence === undefined ? {} : { contract: evidence }), ...(artifactManifest === undefined ? {} : { artifactManifest }), ...(rollbackConflicts.length === 0 ? {} : { rollbackConflicts }) });
+        let promotionJournal: string | undefined;
+        if (journal !== undefined) {
+          // Fully restored: nothing left to recover. Otherwise keep the record.
+          if (rollbackConflicts.length === 0 && journalOk) await journal.remove().catch(() => undefined);
+          else { journal.journal.state = "rolled-back-with-conflicts"; record(); promotionJournal = posixPath(relative(set.realDir, journal.file)); }
+        }
+        return await reject(`candidate not promoted: ${err instanceof Error ? err.message : String(err)}`, { ...(evidence === undefined ? {} : { contract: evidence }), ...(artifactManifest === undefined ? {} : { artifactManifest }), ...(rollbackConflicts.length === 0 ? {} : { rollbackConflicts }), ...(promotionJournal === undefined ? {} : { promotionJournal }) });
       }
     },
   };
