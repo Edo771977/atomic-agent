@@ -35,13 +35,15 @@ describe("request budget scope", () => {
     expect(outcomes).toEqual(["ok", "ok", "ok"]);
   });
 
-  it("still overestimates input tokens with the UTF-8 byte count plus framing", () => {
-    const body = () => ({ model: "m", messages: [{ role: "user", content: "é".repeat(1200) }] });
-    const sent = { ...body(), max_tokens: 4096 };
-    const bound = ((Buffer.byteLength(JSON.stringify(sent), "utf8") + 1024) * 3.75 + 4096 * 15) / 1_000_000;
-    expect(() => setup(bound * 0.999).scope().beforeSend(body())).toThrow(/budget|cap/i);
-    expect(() => setup(bound * 1.001).scope().beforeSend(body())).not.toThrow();
-});
+  it("reserves at least one input token per character of a multi-byte prompt", () => {
+    // Independent bound: even a tokenizer emitting one token per character
+    // of N characters needs N input tokens at the highest ($3.75) rate.
+    const n = 20_000;
+    const body = () => ({ model: "m", messages: [{ role: "user", content: "é".repeat(n) }] });
+    const perCharacterUsd = (n * 3.75 + 4096 * 15) / 1_000_000;
+    expect(() => setup(perCharacterUsd).scope().beforeSend(body())).toThrow(/budget|cap/i);
+    expect(() => setup(perCharacterUsd * 4).scope().beforeSend(body())).not.toThrow();
+  });
 
   // A 200k window at the $3.75 cache-write rate alone holds $0.75.
   it.each<[string, Record<string, unknown>]>([
