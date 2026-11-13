@@ -3,12 +3,15 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
-  renameSync,
   unlinkSync,
-  writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
 
+import {
+  renameWithRetrySync,
+  syncDirectoryBestEffort,
+  writeFileSyncedSync,
+} from "./durable-write.js";
 import { restrictWindowsAcl } from "./windows-acl.js";
 
 /**
@@ -95,9 +98,11 @@ export function setDotenvKey(
 
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.tmp-${process.pid}`;
-  writeFileSync(tmp, updated, { encoding: "utf8", mode: SECRET_FILE_MODE });
+  // Flushed before the rename, the directory after it: a power loss
+  // leaves the old `.env` or the new one, never an empty file.
+  writeFileSyncedSync(tmp, updated, { mode: SECRET_FILE_MODE });
   try {
-    renameSync(tmp, path);
+    renameWithRetrySync(tmp, path);
   } catch (err) {
     try {
       unlinkSync(tmp);
@@ -106,6 +111,7 @@ export function setDotenvKey(
     }
     throw err;
   }
+  syncDirectoryBestEffort(dirname(path));
   // `rename` preserves the source-mode on most platforms but a few do
   // not; chmod again to be defensive. Cheap and idempotent.
   try {
@@ -171,24 +177,23 @@ function matchesKey(line: string, key: string): boolean {
 }
 
 /**
- * Quote the value when it contains whitespace, `#`, or quote
+ * Quote the value when it contains whitespace, `#`, backslashes or quote
  * characters so the loader (which uses simple line-splitting) reads
  * the same string back. Plain alphanumeric/punctuation values pass
  * through unquoted to match conventional `.env` files.
+ *
+ * Never writes escapes: the loader strips one outer quote pair and keeps
+ * everything inside verbatim, including backslashes and inner quotes.
+ * Values with `"` or `\` go in `'...'` (literal in npm dotenv too);
+ * other values needing quotes go in `"..."`. A value with `'` as well as
+ * `"`/`\` still goes in `'...'`: the loader reads it exactly, though npm
+ * dotenv would not. Values containing a newline cannot be represented
+ * (the loader is line-based) and are not supported.
  */
 function formatValue(value: string): string {
   if (value.length === 0) return "";
-  if (/[\s"'#\\]/.test(value)) {
-    // Escape backslashes and double quotes; the reader strips a
-    // single matching outer quote pair without honouring escapes, so
-    // keep this conservative — values with embedded `"` round-trip
-    // by being wrapped in `'...'` instead.
-    if (value.includes('"') && !value.includes("'")) {
-      return `'${value}'`;
-    }
-    const escaped = value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-    return `"${escaped}"`;
-  }
+  if (/["\\]/.test(value)) return `'${value}'`;
+  if (/[\s'#]/.test(value)) return `"${value}"`;
   return value;
 }
 

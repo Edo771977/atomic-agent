@@ -1,10 +1,10 @@
-import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { setDotenvKey } from "../../config/dotenv-writer.js";
 import type { SessionStore } from "../../session/index.js";
 import type { SessionState } from "../../session/session-state.js";
 import { TaskStore } from "../../tasks/index.js";
+import { readDotenvValue } from "../dotenv-read.js";
 import {
   buildReport,
   type ImportItemResult,
@@ -240,34 +240,4 @@ export class HermesImporter {
       items.push({ ...base, reason: "overwritten" });
     }
   }
-}
-
-/**
- * Read a single key's value from a dotenv file without mutating it.
- * Mirrors the `loadDotenvFromStateDir` parse (trim, strip one surrounding
- * quote pair, ignore comments). Returns `undefined` when absent.
- */
-function readDotenvValue(path: string, key: string): string | undefined {
-  if (!existsSync(path)) return undefined;
-  const text = readFileSync(path, "utf8");
-  for (const line of text.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (trimmed.length === 0 || trimmed.startsWith("#")) continue;
-    const eq = trimmed.indexOf("=");
-    if (eq === -1) continue;
-    if (trimmed.slice(0, eq).trim() !== key) continue;
-    return stripQuotes(trimmed.slice(eq + 1).trim());
-  }
-  return undefined;
-}
-
-function stripQuotes(value: string): string {
-  if (value.length >= 2) {
-    const first = value[0];
-    const last = value[value.length - 1];
-    if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
-      return value.slice(1, -1);
-    }
-  }
-  return value;
 }

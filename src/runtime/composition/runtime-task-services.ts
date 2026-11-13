@@ -27,7 +27,20 @@ export function createRuntimeTaskStores(args: {
   const taskStore = new TaskStore({ dbFile: config.paths.tasksDbFile });
   const webhookSessionStore = new WebhookSessionStore(
     resolve(config.paths.stateDir, WEBHOOK_SESSIONS_FILENAME),
+    {
+      onCorrupt: (info) => {
+        logger.warn("webhook session map was not valid JSON; persistent webhook bindings reset", {
+          path: info.path,
+          movedTo: info.movedTo ?? undefined,
+          moveError: info.moveError,
+        });
+      },
+    },
   );
+  // A corrupt map would otherwise make every boot skip session retention
+  // (it cannot tell which sessions the map pinned); moving it aside now
+  // lets the next boot prune again.
+  webhookSessionStore.recoverCorruptFile();
   if (taskStore.runOwnersUnavailable !== null) {
     logger.warn("task runs will not record their process; boot recovery falls back to age", {
       reason: taskStore.runOwnersUnavailable,

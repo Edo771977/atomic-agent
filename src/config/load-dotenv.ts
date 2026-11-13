@@ -71,11 +71,15 @@ function sleepSync(ms: number): void {
 
 /**
  * Strip a single matching pair of surrounding quotes (`"..."` or `'...'`).
- * Inner content is taken verbatim — no escape sequences, no `${VAR}`
- * interpolation. Mismatched quotes are left as-is so the user sees their
- * literal value (and can debug from it).
+ * Inner content is taken verbatim: no escape sequences (a backslash is
+ * always literal, so a hand-written `"\\server\share"` keeps both
+ * leading backslashes, as npm dotenv does), no `${VAR}` interpolation.
+ * Only the first and last characters are inspected, so inner quotes of
+ * either kind are literal as well; `setDotenvKey` relies on that rather
+ * than writing escapes. Mismatched quotes are left as-is so the user
+ * sees their literal value (and can debug from it).
  */
-function stripQuotes(value: string): string {
+export function stripDotenvQuotes(value: string): string {
   if (value.length < 2) return value;
   const first = value[0];
   const last = value[value.length - 1];
@@ -93,10 +97,10 @@ function stripQuotes(value: string): string {
  * left behind by an external non-atomic writer, so only the 1-based line
  * number and length are reported.
  */
-function parseLine(
+export function parseDotenvLine(
   line: string,
   lineNo: number,
-  onError: (reason: string) => void,
+  onError: (reason: string) => void = () => {},
 ): [string, string] | null {
   const trimmed = line.trim();
   if (trimmed.length === 0) return null;
@@ -116,7 +120,26 @@ function parseLine(
     return null;
   }
 
-  return [key, stripQuotes(rawValue)];
+  return [key, stripDotenvQuotes(rawValue)];
+}
+
+/**
+ * The value `loadDotenvFromStateDir` would apply for `key` from this file
+ * text when the key is not already set in the environment, or `undefined`
+ * when the file does not define it. Same line parser; among duplicate
+ * lines the first non-empty value wins (an empty value is overridden by a
+ * later one, exactly as the loader's `process.env` check does). Read-only
+ * callers (importers) use this instead of re-implementing the parse.
+ */
+export function dotenvTextValue(raw: string, key: string): string | undefined {
+  let found: string | undefined;
+  for (const line of raw.split(/\r?\n/)) {
+    const parsed = parseDotenvLine(line, 0);
+    if (parsed === null || parsed[0] !== key) continue;
+    if (parsed[1].length > 0) return parsed[1];
+    found = parsed[1];
+  }
+  return found;
 }
 
 /**
@@ -194,7 +217,8 @@ export function formatDotenvReadWarning(
  *
  * The loader has no external dependency and supports a deliberately tiny
  * subset of dotenv syntax: `KEY=VALUE` per line, optional surrounding
- * quotes, `#` line comments, blank lines. No interpolation, no `export`
+ * quotes (contents verbatim, no escapes), `#` line comments, blank
+ * lines. No interpolation, no `export`
  * prefix, no multiline values. Add later if a real use case demands it.
  *
  * Returned `loaded` / `skipped` lists carry variable **names only** — values
@@ -231,7 +255,7 @@ export function loadDotenvFromStateDir(
 
   const lines = read.raw.split(/\r?\n/);
   for (let i = 0; i < lines.length; i += 1) {
-    const parsed = parseLine(lines[i] ?? "", i + 1, (reason) => {
+    const parsed = parseDotenvLine(lines[i] ?? "", i + 1, (reason) => {
       process.stderr.write(
         `atomic-agent: skipping ${path} entry — ${reason}\n`,
       );

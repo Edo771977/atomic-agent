@@ -167,6 +167,43 @@ describe("setDotenvKey", () => {
     expect(process.env.SOME_OTHER_KEY).toBe('has "quotes" inside');
   });
 
+  it.each([
+    ["a backslash", "pa\\ss"],
+    ["a backslash and whitespace", "C:\\Program Files\\app"],
+    ["a trailing backslash", "ends with \\"],
+    ["both quote kinds", `it's "quoted"`],
+    ["an escaped-looking sequence", 'x\\"y \\\\ z'],
+    ["a single quote only", "it's here"],
+    ["a UNC path", String.raw`\\server\share`],
+    ["a doubled backslash", String.raw`ab\\cd`],
+    ["a single quote and a backslash", String.raw`it's C:\x`],
+    ["outer single quotes", `'wrapped'`],
+    ["outer double quotes", `"wrapped"`],
+    ["a quote at each end", `'mixed"`],
+    ["a lone single quote", `'`],
+    ["a lone double quote", `"`],
+    ["a lone backslash", "\\"],
+    ["a hash", "a#b"],
+    ["leading and trailing spaces", "  padded  "],
+    ["a tab", "a\tb"],
+    ["equals signs", "a=b=c"],
+    ["a backtick", "a`b"],
+  ])("round-trips a value with %s through the loader", (_label, value) => {
+    setDotenvKey(stateDir, "SOME_OTHER_KEY", value);
+    const result = loadDotenvFromStateDir(stateDir);
+    expect(result.loaded).toContain("SOME_OTHER_KEY");
+    expect(process.env.SOME_OTHER_KEY).toBe(value);
+  });
+
+  it("never writes escapes: backslash values are single-quoted verbatim", () => {
+    setDotenvKey(stateDir, "SOME_OTHER_KEY", String.raw`\\server\share`);
+    expect(readFileSync(envPath, "utf8")).toBe(
+      String.raw`SOME_OTHER_KEY='\\server\share'` + "\n",
+    );
+    setDotenvKey(stateDir, "SOME_OTHER_KEY", "it's");
+    expect(readFileSync(envPath, "utf8")).toBe(`SOME_OTHER_KEY="it's"\n`);
+  });
+
   it("does not log or expose the value through the result object", () => {
     const result = setDotenvKey(stateDir, "TELEGRAM_BOT_TOKEN", "secret-value");
     // Result keys should be exactly { path, preexisting, changed }.

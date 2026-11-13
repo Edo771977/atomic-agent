@@ -14,6 +14,7 @@ import {
 } from "./profile-name-keys.js";
 import {
   assertProfileMaxEntries,
+  prepareProfileKeyForget,
   ProfileEvictor,
   type ProfileEviction,
 } from "./profile-eviction.js";
@@ -203,7 +204,7 @@ export class ProfileStore {
   private readonly selectActiveByIdStmt: Database.Statement;
   private readonly selectAllActiveStmt: Database.Statement;
   private readonly historyByKeyStmt: Database.Statement;
-  private readonly deleteActiveStmt: Database.Statement;
+  private readonly forgetKey: (key: string) => number;
   private readonly markNameGroundingStmt: Database.Statement;
   private readonly markUnconfirmedNameGroundingStmt: Database.Statement;
 
@@ -284,10 +285,7 @@ export class ProfileStore {
         WHERE key = ?
         ORDER BY valid_from ASC, id ASC`,
     );
-    this.deleteActiveStmt = this.db.prepare(
-      `DELETE FROM profile_facts
-        WHERE key = ? AND superseded_by IS NULL`,
-    );
+    this.forgetKey = prepareProfileKeyForget(this.db);
     // Metadata only: `updated_at` is left alone — it orders eviction,
     // and a check is not a write of the fact.
     this.markNameGroundingStmt = this.db.prepare(
@@ -451,16 +449,23 @@ export class ProfileStore {
   }
 
   /**
-   * Delete the **active** row for `key`. Historical (superseded)
-   * rows are kept on disk — direct chain walks via `history(key)`
-   * still work. Returns `true` when a row was deleted.
+   * Forget `key`: delete every row for it, the active one and all
+   * superseded versions, so `history(key)` is empty afterwards. A row of
+   * another key that cross-key superseded one of them stays, with its
+   * `supersedes` pointer cleared; an older row of another key that one
+   * of them superseded stays superseded. Returns `true` only when the key
+   * had an active row (one `get(key)` could see), so
+   * `memory.profile.remove` never reports success for a key that was not
+   * there; leftover history alone is still purged, but reads as `false`.
    */
   remove(key: string): boolean {
     const normalisedKey = validateKey(key);
-    const result = this.deleteActiveStmt.run(normalisedKey) as {
-      changes: number;
-    };
-    return result.changes > 0;
+    return this.db.transaction((): boolean => {
+      const hadActive =
+        this.selectActiveByKeyStmt.get(normalisedKey) !== undefined;
+      this.forgetKey(normalisedKey);
+      return hadActive;
+    })();
   }
 
   /**

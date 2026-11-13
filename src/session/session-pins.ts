@@ -13,11 +13,13 @@ import { Database as DatabaseCtor } from "../native/load-better-sqlite3.js";
  * a prune honest is reading them, and the cost of not reading them is a
  * scheduled job or a webhook binding that silently stops working.
  *
- * Every reader here is read-only and forgiving: a missing file, a missing
- * table, a corrupt payload or a handle that will not open all read as "no
- * pins" rather than failing. The surfaces they describe are optional
- * (`tasks.enabled`, a webhook the operator may never have configured) and
- * the runtime has to boot either way.
+ * Every reader here is read-only. A missing file or a missing `tasks`
+ * table reads as "no pins": the surfaces they describe are optional
+ * (`tasks.enabled`, a webhook the operator may never have configured).
+ * A file that exists but cannot be read or parsed throws
+ * `SessionPinsReadError` instead: it may still name live bindings, and an
+ * empty keep-list would let retention prune exactly those sessions. The
+ * caller skips the prune and boots anyway.
  *
  * What is deliberately *not* here: the Telegram and Discord per-chat
  * session pointers. Those two paths already treat a pointer to a missing
@@ -27,7 +29,54 @@ import { Database as DatabaseCtor } from "../native/load-better-sqlite3.js";
  * binding and mints a fresh session with the same chat metadata.
  */
 
-/** Everything that pins a session, from every source, deduped. */
+/**
+ * A pin source exists but could not be read. Carries the source, the
+ * path and a short reason (an errno code, `parse` or `sqlite`), never
+ * file content.
+ */
+export class SessionPinsReadError extends Error {
+  constructor(
+    public readonly source: "tasks" | "webhooks",
+    public readonly path: string,
+    public readonly reason: string,
+  ) {
+    super(`could not read ${source} session pins from ${path} (${reason})`);
+    this.name = "SessionPinsReadError";
+  }
+}
+
+/**
+ * What the operator should do about an unreadable pin file. Retention
+ * keeps skipping its pass until the file reads again (pruning blind
+ * could take a pinned session), so this is shown wherever the skip is
+ * reported: the boot warning and `atomic-agent doctor`.
+ */
+export function describeSessionPinsFix(err: SessionPinsReadError): string {
+  const { path, reason } = err;
+  if (reason === "EACCES" || reason === "EPERM") {
+    return `make ${path} readable by the user that runs atomic-agent (check ls -l "${path}", then chmod 600 "${path}")`;
+  }
+  if (err.source === "webhooks" && reason === "parse") {
+    return `${path} is not valid JSON; repair it by hand, or move it aside (its persistent webhook bindings are lost either way; the webhook store moves it to ${path}.corrupt-<time> the next time it starts)`;
+  }
+  if (err.source === "tasks" && (reason === "SQLITE_BUSY" || reason === "SQLITE_LOCKED")) {
+    return `another process held a lock on ${path}; this usually clears by the next start`;
+  }
+  if (err.source === "tasks") {
+    return `check ${path} with sqlite3 "${path}" "PRAGMA integrity_check"; restore it from a backup or move it aside (the scheduled tasks in it are lost if moved)`;
+  }
+  return `check that ${path} is readable, or move it aside`;
+}
+
+function failureReason(err: unknown, fallback: string): string {
+  const code = (err as { code?: unknown } | null)?.code;
+  return typeof code === "string" && code.length > 0 ? code : fallback;
+}
+
+/**
+ * Everything that pins a session, from every source, deduped. Throws
+ * `SessionPinsReadError` when a source exists but cannot be read.
+ */
 export function readSessionPins(sources: {
   tasksDbFile?: string | null;
   webhookSessionsFile?: string | null;
@@ -63,8 +112,17 @@ export function readTaskPinnedSessionIds(
       )
       .all() as { id: unknown }[];
     return onlyIds(rows.map((row) => row.id));
-  } catch {
-    return [];
+  } catch (err) {
+    // A database with no `tasks` table yet pins nothing; anything else
+    // (a corrupt file, a lock, a permission error) is unknown pins.
+    if (err instanceof Error && /no such table: tasks\b/.test(err.message)) {
+      return [];
+    }
+    throw new SessionPinsReadError(
+      "tasks",
+      tasksDbFile,
+      failureReason(err, "sqlite"),
+    );
   } finally {
     try {
       db?.close();
@@ -88,20 +146,30 @@ export function readTaskPinnedSessionIds(
 export function readWebhookPinnedSessionIds(
   webhookSessionsFile: string | null | undefined,
 ): string[] {
-  if (!webhookSessionsFile || !existsSync(webhookSessionsFile)) return [];
+  if (!webhookSessionsFile) return [];
+  let raw: string;
   try {
-    const parsed = JSON.parse(
-      readFileSync(webhookSessionsFile, "utf8"),
-    ) as unknown;
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      return [];
-    }
-    return onlyIds(Object.values(parsed as Record<string, unknown>));
+    raw = readFileSync(webhookSessionsFile, "utf8");
+  } catch (err) {
+    if (failureReason(err, "") === "ENOENT") return [];
+    throw new SessionPinsReadError(
+      "webhooks",
+      webhookSessionsFile,
+      failureReason(err, "read"),
+    );
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw) as unknown;
   } catch {
-    // The same reading `WebhookSessionStore` gives a corrupt file: an
-    // empty map. It pins nothing, and the store will overwrite it.
+    // A half-written or hand-broken file may still have named live
+    // bindings: unknown pins, not none.
+    throw new SessionPinsReadError("webhooks", webhookSessionsFile, "parse");
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     return [];
   }
+  return onlyIds(Object.values(parsed as Record<string, unknown>));
 }
 
 /** Non-empty strings only — the file is hand-editable. */

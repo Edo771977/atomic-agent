@@ -429,10 +429,10 @@ function importProfileFacts(
   const ordered = [...facts].sort((a, b) => a.validFrom - b.validFrom);
   for (const fact of ordered) {
     try {
-      // Any row for the key: an active value, or the history of one
-      // changed and then removed here. Either way the target's word on
-      // the key stands. (A single-version fact removed here leaves no
-      // row, so the desktop's value is imported.)
+      // Any row for the key: an active value, or its superseded history.
+      // Either way the target's word on the key stands. (A fact removed
+      // here leaves no row, history included, so the desktop's value is
+      // imported.)
       if (store.history(fact.key).length > 0) {
         counts.skipped += 1;
         continue;

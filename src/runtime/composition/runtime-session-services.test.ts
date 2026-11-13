@@ -61,6 +61,30 @@ describe("runtime session phases", () => {
     expect(store.load(state.id)?.id).toBe(state.id);
   });
 
+  it("skips the prune and says so when a pin file cannot be read", () => {
+    config.sessions.retention.enabled = true;
+    vi.spyOn(sessions, "readSessionPins").mockImplementation(() => {
+      throw new sessions.SessionPinsReadError("webhooks", "/state/webhook-sessions.json", "parse");
+    });
+    const prune = vi.spyOn(sessions, "pruneSessions");
+    open();
+    expect(prune).not.toHaveBeenCalled();
+    const warn = records.find(record => record.message === "session retention skipped: could not read session pins");
+    expect(warn?.level).toBe("warn");
+    expect(warn?.context).toMatchObject({ source: "webhooks", reason: "parse" });
+    expect(String(warn?.context?.fix)).toContain("/state/webhook-sessions.json.corrupt-");
+  });
+
+  it("an unreadable pin file on disk keeps every pinned session", async () => {
+    config.sessions.retention.enabled = true;
+    config.sessions.retention.maxAgeDays = 1;
+    const { writeFile } = await import("node:fs/promises");
+    await writeFile(join(dir, "webhook-sessions.json"), '{"deploy": "s1', "utf8");
+    const prune = vi.spyOn(sessions, "pruneSessions");
+    open();
+    expect(prune).not.toHaveBeenCalled();
+  });
+
   it("disabled retention does not read external pins or perform a prune", () => {
     const pins = vi.spyOn(sessions, "readSessionPins");
     const prune = vi.spyOn(sessions, "pruneSessions");

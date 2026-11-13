@@ -1,13 +1,7 @@
-import {
-  chmodSync,
-  mkdirSync,
-  readFileSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { mkdirSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
-import { restrictWindowsAcl } from "../config/windows-acl.js";
+import { writeOwnerOnlyFileAtomicSync } from "../config/owner-only-file.js";
 import {
   ensureUserConfigFileSync,
   getConfig,
@@ -82,16 +76,9 @@ export function writeCachedSession(
     return;
   }
   mkdirSync(join(stateDir, "atomic-mail"), { recursive: true, mode: 0o700 });
-  writeFileSync(path, JSON.stringify(session), {
-    encoding: "utf-8",
-    mode: 0o600,
-  });
-  try {
-    chmodSync(path, 0o600);
-  } catch {
-    /* Windows: mode bits mean nothing there */
-  }
-  if (process.platform === "win32") restrictWindowsAcl(path);
+  // tmp + rename, 0600 and the Windows ACL narrowed before the rename:
+  // a crash mid-write never leaves a truncated token file behind.
+  writeOwnerOnlyFileAtomicSync(path, JSON.stringify(session));
 }
 
 /** Merge a patch into `config.json`'s `atomicMail` block. */

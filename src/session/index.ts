@@ -23,9 +23,11 @@ export type {
   PruneSessionsResult,
 } from "./session-retention.js";
 export {
+  describeSessionPinsFix,
   readSessionPins,
   readTaskPinnedSessionIds,
   readWebhookPinnedSessionIds,
+  SessionPinsReadError,
 } from "./session-pins.js";
 export { summarizeSessionState } from "./session-summary.js";
 export type { SessionSummary } from "./session-summary.js";
