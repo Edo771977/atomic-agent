@@ -3,9 +3,12 @@ import {
   type ConversationTurn,
 } from "../../session/conversation-turn.js";
 import {
+  LOCAL_WORKER_REQUEST_CHAR_BUDGET,
   ORIGINAL_REQUEST_BEGIN_MARKER,
   ORIGINAL_REQUEST_END_MARKER,
   REQUEST_FOLLOW_UP_MARKER,
+  neutraliseRequestMarkers,
+  quotedRequestTruncationNote,
 } from "../../prompt/request-section.js";
 import type { DelegateTask } from "./delegate-args.js";
 import {
@@ -50,7 +53,7 @@ export const WORKER_REPLY_CHAR_BUDGET = 4000;
  * game the operator asked for, and workers with thin briefs spent 30–40
  * steps reverse-engineering sibling modules off the disk. The request is
  * the one text every part of the job must agree with, so every worker
- * gets it — labelled as context, with its own task below.
+ * gets it — labelled as context, after its own task.
  *
  * Bounded because every worker pays for it in its slot's context:
  * 16,000 chars is roughly 4K tokens, a real spec with room to spare,
@@ -59,15 +62,30 @@ export const WORKER_REPLY_CHAR_BUDGET = 4000;
 export const ORIGINAL_REQUEST_CHAR_BUDGET = 16_000;
 
 /**
+ * The same bound for a worker on a local leg, ~1.5K tokens. A local
+ * worker shares one server context with its siblings and reads its brief
+ * at a few hundred tokens a second, so 4K tokens of a spec it needs only
+ * for names and formats is a real share of its slot and of its first
+ * minute. What a clip reaches is the quoted request, never the task
+ * (`renderWorkerBrief` puts the task first). The orchestrator is told
+ * the cap (`### fusion`, the `fusion.delegate` summary), so what a task
+ * needs from past it rides in `instructions`.
+ */
+export const LOCAL_ORIGINAL_REQUEST_CHAR_BUDGET = LOCAL_WORKER_REQUEST_CHAR_BUDGET;
+
+/** The request budget for a worker's leg: local or cloud. */
+export function originalRequestCharBudget(localLeg: boolean): number {
+  return localLeg
+    ? LOCAL_ORIGINAL_REQUEST_CHAR_BUDGET
+    : ORIGINAL_REQUEST_CHAR_BUDGET;
+}
+
+/**
  * A turn-starting message shorter than this is read as a follow-up
  * ("continue", "fix the failing test") rather than as the request
  * itself, so the brief quotes the message before it as well.
  */
 export const FOLLOW_UP_MAX_CHARS = 280;
-
-function formatCount(n: number): string {
-  return n.toLocaleString("en-US");
-}
 
 /**
  * The request to quote in the briefs of a turn's fan-outs.
@@ -120,30 +138,28 @@ function lastLiveRequest(
   return undefined;
 }
 
-function quoteOriginalRequest(request: string): string[] {
-  const clipped =
-    request.length > ORIGINAL_REQUEST_CHAR_BUDGET
-      ? request.slice(0, ORIGINAL_REQUEST_CHAR_BUDGET)
-      : request;
+function quoteOriginalRequest(request: string, budget: number): string[] {
+  const safe = neutraliseRequestMarkers(request);
+  const clipped = safe.length > budget ? safe.slice(0, budget) : safe;
   const lines = [
-    `ORIGINAL REQUEST — context only; your task is below. This is the operator's whole job, which the orchestrator split across several workers. Use it for the names, formats, constraints and look your part must agree with, and do only your TASK.`,
+    `ORIGINAL REQUEST — context only; your TASK is above. This is the operator's whole job, which the orchestrator split across several workers. Use it for the names, formats, constraints and look your part must agree with, and do only your TASK.`,
     ORIGINAL_REQUEST_BEGIN_MARKER,
     clipped,
     ORIGINAL_REQUEST_END_MARKER,
   ];
-  if (clipped.length < request.length) {
+  if (clipped.length < safe.length) {
     lines.push(
-      `(truncated: the original request is ${formatCount(request.length)} chars; only the first ${formatCount(ORIGINAL_REQUEST_CHAR_BUDGET)} are quoted above.)`,
+      quotedRequestTruncationNote(safe.length, budget),
     );
   }
   return lines;
 }
 
 /**
- * The contract, when the fan-out has one, sits between the request
- * (what the whole job is) and the task (what this worker does): the
- * shared block first, then the three lines that say what it means for
- * this task. Every worker of the fan-out reads the same shared block,
+ * The contract, when the fan-out has one, follows the task (what this
+ * worker does) and comes before the rules and the request (what the
+ * whole job is): the shared block first, then the three lines that say
+ * what it means for this task. Every worker of the fan-out reads the same shared block,
  * which is the point — the names they must agree on are written once,
  * not paraphrased eight times.
  */
@@ -177,29 +193,64 @@ export function siblingFilesRule(hasContract: boolean): string {
 export const BROWSER_CODE_RULE =
   "- Code meant for the browser (it uses `window`, `document`, the DOM or `<script>` loading) does not run under node: `node -e`, `require` or `import` of it fails with \"Cannot find module\" or \"document is not defined\", which says nothing about your code. Check its syntax with `verify.syntax` instead of running it.";
 
+/**
+ * The reply's layout. The orchestrator is the expensive model: it reads
+ * the runtime's own `changed:` line (`worker-changes.ts`) and, for a
+ * green task with files, only what `compactGreenReply` keeps (the
+ * status line, the assumptions, contract deviations), so those carry
+ * what the disk cannot say. The runtime line never depends on a worker
+ * following this.
+ */
+export const WORKER_REPLY_RULE = [
+  `- Finish with \`reply\` (about ${WORKER_REPLY_CHAR_BUDGET} characters at most), laid out as:`,
+  "  STATUS: done | partial | blocked, and why in a few words",
+  "  CHANGED: each file you wrote and what changed in it",
+  "  CHECKS RUN: each command or check you ran → its result",
+  "  ASSUMPTIONS: what you assumed, or none",
+  "  The orchestrator also gets the runtime's own list of the files you changed. For a finished task with files it reads only your STATUS line, your ASSUMPTIONS and any line naming something you provided differently from the contract or could not provide, so put there anything it needs to merge your part that is not in a file.",
+].join("\n");
+
+/**
+ * The brief, in reading order: the frame, this worker's TASK with its
+ * FILES, DELIVERABLE and contract part, the RULES, then the quoted
+ * ORIGINAL REQUEST, then one line naming the task again.
+ *
+ * Task first because a brief is cut from the end. The request used to
+ * come first, up to 16K chars of it, and a worker's pinned request
+ * (`renderRequestSection`) keeps a bounded slice of the brief — so on a
+ * long spec what fell off was the worker's own TASK and RULES. Now the
+ * quoted block is what a clip reaches, and the closing line puts the
+ * task back next to where the model starts generating.
+ *
+ * `localLeg` lowers the request's budget (`originalRequestCharBudget`).
+ * Every line but the quote's own markers goes through
+ * `neutraliseRequestMarkers`, so those are the only markers in it.
+ */
 export function renderWorkerBrief(
   task: DelegateTask,
   options: {
     workingDir: string;
     originalRequest?: string;
     contract?: DelegateContract;
+    localLeg?: boolean;
   },
 ): string {
   const request = options.originalRequest?.trim() ?? "";
   const lines: string[] = [
     `You are a worker agent executing one delegated task inside ${options.workingDir}; you have no memory of the parent conversation.`,
     ``,
-    ...(request.length > 0 ? [...quoteOriginalRequest(request), ``] : []),
-    ...(options.contract ? [...quoteContract(options.contract, task.id), ``] : []),
     `TASK ${task.id}: ${task.title}`,
     ``,
     task.instructions,
   ];
+  if (task.files && task.files.length > 0) {
+    lines.push(``, `FILES:`, ...task.files.map((f) => `- ${f}`));
+  }
   if (task.deliverable) {
     lines.push(``, `DELIVERABLE: ${task.deliverable}`);
   }
-  if (task.files && task.files.length > 0) {
-    lines.push(``, `FILES:`, ...task.files.map((f) => `- ${f}`));
+  if (options.contract) {
+    lines.push(``, ...quoteContract(options.contract, task.id));
   }
   lines.push(
     ``,
@@ -210,12 +261,27 @@ export function renderWorkerBrief(
     `- Read files only inside ${options.workingDir} and the directories this task writes in; a read anywhere else is refused. Do not search other projects for context — ${request.length > 0 ? "your task, its FILES and the original request are" : "your task and its FILES are"} the context you have.`,
     siblingFilesRule(options.contract !== undefined),
     BROWSER_CODE_RULE,
-    `- Finish with \`reply\` carrying the concise result of this task (about ${WORKER_REPLY_CHAR_BUDGET} characters at most). That reply is the ONLY thing the orchestrator receives — findings, file paths, decisions and anything it needs to merge your part must be inside it.`,
+    WORKER_REPLY_RULE,
     ...(options.contract
       ? [
           `- End the reply with a \`PROVIDED:\` list of what you produced, one line per item, using the CONTRACT's exact names (kind, name, path). Name anything you provide differently from the contract, or could not provide, on its own line.`,
         ]
       : []),
   );
+  // The orchestrator's text, defused before the quote's markers are added.
+  lines.splice(0, lines.length, ...lines.map(neutraliseRequestMarkers));
+  if (request.length > 0) {
+    lines.push(
+      ``,
+      ...quoteOriginalRequest(
+        request,
+        originalRequestCharBudget(options.localLeg === true),
+      ),
+      ``,
+      neutraliseRequestMarkers(
+        `Your part is TASK ${task.id} (${task.title}) above — do only that, then \`reply\`.`,
+      ),
+    );
+  }
   return lines.join("\n");
 }

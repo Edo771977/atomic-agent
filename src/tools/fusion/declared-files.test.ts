@@ -185,7 +185,7 @@ describe("applyNoChangesRule", () => {
     expect(result).not.toHaveProperty("error");
     expect(result.notes).toEqual([
       "js/main.js unchanged by this task",
-      "no write, edit or patch call succeeded and no declared file changed",
+      "no write, edit or patch call succeeded and no declared file changed; fix: name the file and the exact edit in the brief",
     ]);
   });
 

@@ -14,7 +14,7 @@ import { resetConfigCache } from "../../config/index.js";
 import type { ResolvedRunMode } from "../../llm/run-mode/index.js";
 import { createEmptySessionState, type SessionState } from "../../session/session-state.js";
 import { createRuntimeSessionFactories } from "../../runtime/composition/runtime-session-services.js";
-import { FUSION_WORKER_ID_PREFIX } from "../../session/fusion-worker-session.js";
+import { FUSION_WORKER_ID_PREFIX, type FusionWorkerMeta } from "../../session/fusion-worker-session.js";
 import { StructuredLogger } from "../../tracing/structured-logger.js";
 import type { ToolContext } from "../tool-registry.js";
 import {
@@ -140,6 +140,18 @@ describe("fusion.delegate", () => {
     expect(create.mock.calls[0]?.[2]).toBe(false);
     expect(runTurn).toHaveBeenCalledOnce();
   });
+  it("hands each worker session the operator's whole request, which its brief may clip", async () => {
+    const full = `${"spec ".repeat(2_000)}Read sales.csv.`;
+    const create = vi.fn((meta: FusionWorkerMeta, workingDir?: string) => createEmptySessionState({ id: `${FUSION_WORKER_ID_PREFIX}${meta.taskId}`, workingDir: workingDir ?? "/repo", metadata: { fusionWorker: { ...meta } } }));
+    const result = await buildFusionDelegateTool(deps({ createEphemeralSession: create, resolveOriginalRequest: () => full })).run(
+      { tasks: [...TASKS] }, ctx());
+    expect(result.status).toBe("ok");
+    expect(create.mock.calls.map((call) => call[0])).toEqual([
+      { parentSessionId: "s-parent", taskId: "t1", operatorRequest: full },
+      { parentSessionId: "s-parent", taskId: "t2", operatorRequest: full },
+    ]);
+  });
+
   it("is not readonly and carries its own name", () => {
     const tool = buildFusionDelegateTool(deps());
     expect(tool.name).toBe("fusion.delegate");
@@ -603,8 +615,12 @@ describe("fusion.delegate", () => {
     const capture = (over: Partial<FusionDelegateDeps>) =>
       buildFusionDelegateTool(
         deps({
-          runTurn: async (_s, _m, options) => {
-            limits.push(options.taskMaxDurationMs);
+          runTurn: async (_s, message, options) => {
+            // The first turn only: a missing declared file earns a
+            // self-check grace turn, sized from what is left.
+            if (!message.startsWith("Your reply did not close the task")) {
+              limits.push(options.taskMaxDurationMs);
+            }
             return turnResult();
           },
           resolveRunMode: () => fusionMode({ workerTimeoutMs: 2_700_000 }),
@@ -1147,7 +1163,13 @@ describe("fusion.delegate", () => {
           { tasks: TASKS, contract: CONTRACT },
           ctx({ workingDir: dir }),
         );
-        expect(briefs).toHaveLength(2);
+        // t2's own check failed when it replied: it got one self-check
+        // notice with the verdict, then the turn ended as before.
+        expect(briefs).toHaveLength(3);
+        expect(briefs[2]).toContain("Your reply did not close the task");
+        expect(briefs[2]).toContain(
+          '- your check {"kind":"page","path":"index.html","checks":["no errors"]} failed: no errors: 1 pageerror — ReferenceError: p is not defined',
+        );
         expect(briefs[0]).toContain(
           "CONTRACT — the interface between the parts",
         );
@@ -1158,14 +1180,22 @@ describe("fusion.delegate", () => {
           "You may rely on: HD.Ship (symbol from t1 in js/ship.js)",
         );
 
+        // Each worker ran its own check once before its reply closed
+        // (t1's passed, t2's failed); then the fan-out's run of them all.
         // The runner sees the specs without their `task` key, and the call's cwd.
-        expect(runChecks).toHaveBeenCalledTimes(1);
+        expect(runChecks).toHaveBeenCalledTimes(3);
         expect(runChecks.mock.calls[0]![0]).toEqual([
+          { kind: "command", cmd: "node", args: ["--check", "js/ship.js"] },
+        ]);
+        expect(runChecks.mock.calls[1]![0]).toEqual([
+          { kind: "page", path: "index.html", checks: ["no errors"] },
+        ]);
+        expect(runChecks.mock.calls[2]![0]).toEqual([
           { kind: "command", cmd: "node", args: ["--check", "js/ship.js"] },
           { kind: "page", path: "index.html", checks: ["no errors"] },
           { kind: "command", cmd: "npm", args: ["test"] },
         ]);
-        expect(runChecks.mock.calls[0]![1].workingDir).toBe(dir);
+        expect(runChecks.mock.calls[2]![1].workingDir).toBe(dir);
 
         // Presence: `HD.Ship.reset` was never written; the id is spelled the other way.
         const lines = result.summary.split("\n");
@@ -1179,7 +1209,7 @@ describe("fusion.delegate", () => {
         );
         // The task whose declared check failed is `failed`, with the verdict as its error.
         expect(lines[3]).toBe(
-          "- [t2] failed — Two — error: checks: no errors: 1 pageerror — ReferenceError: p is not defined — checks: 1 of 1 failed — contract: id btn-launch not in index.html",
+          "- [t2] failed — Two — error: checks: no errors: 1 pageerror — ReferenceError: p is not defined — checks: 1 of 1 failed — self-check: its first reply left its own check failing; it was told once and given 4 more steps — contract: id btn-launch not in index.html",
         );
         const rows = result.details.tasks as WorkerTaskResult[];
         expect(rows.map((r) => r.status)).toEqual(["ok", "failed"]);
@@ -1972,5 +2002,152 @@ describe("scopeInsideStateDir (ATO-1267)", () => {
 
   it("checks nothing when no state directory is known", () => {
     expect(scopeInsideStateDir(["/home/u/.atomic-agent"], undefined)).toEqual([]);
+  });
+});
+
+describe("fusion.delegate — task size on a local leg", () => {
+  const BIG = {
+    id: "big",
+    instructions: "Write the four modules.",
+    files: ["src/a.ts", "src/b.ts", "src/c.ts", "src/d.ts"],
+  };
+
+  it("warns, never refuses, when a local task declares more than three files", async () => {
+    const result = await buildFusionDelegateTool(deps()).run(
+      { tasks: [BIG, { id: "small", instructions: "x", files: ["src/e.ts"] }] },
+      ctx(),
+    );
+    expect(result.details.tasks).toHaveLength(2);
+    expect(result.details.sizeWarnings).toEqual([
+      'task "big" declares 4 files to write for a local worker (tests, fixtures and snapshots aside); a small local model does best with one file or one function per task — split it next time if it stalls or comes back half done',
+    ]);
+    expect(result.summary).toContain('Warning: task "big" declares 4 files to write for a local worker');
+  });
+
+  it("names an oversized local task on the fan-out's approval, before any worker starts", async () => {
+    const prompts: ApprovalRequest[] = [];
+    let started = 0;
+    const gate: ApprovalGate = new ApprovalGate({
+      level: 1,
+      emit: (req) => {
+        prompts.push(req);
+        expect(started).toBe(0);
+        queueMicrotask(() => gate.resolve({ approvalId: req.approvalId, approved: true }));
+      },
+    });
+    const result = await buildFusionDelegateTool(
+      deps({
+        approvalRequired: true,
+        approvals: gate,
+        runTurn: async () => {
+          started += 1;
+          return turnResult();
+        },
+      }),
+    ).run({ tasks: [BIG] }, ctx());
+    expect(result.details.sizeWarnings).toHaveLength(1);
+    // Asked once, then the worker ran: the note was in front of the person first.
+    expect(started).toBeGreaterThan(0);
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]?.reason).toContain('task "big" has 4 files to write, a lot for a local worker');
+  });
+
+  it("says nothing on a cloud leg", async () => {
+    const result = await buildFusionDelegateTool(
+      deps({ workerSupportsSlotAffinity: () => false }),
+    ).run({ tasks: [BIG] }, ctx());
+    expect(result.details.sizeWarnings).toBeUndefined();
+    expect(result.summary).not.toContain("for a local worker");
+  });
+});
+
+describe("fusion.delegate — the delegate's own syntax pass", () => {
+  function writeEvent(path: string) {
+    return {
+      type: "llm_event" as const,
+      event: {
+        type: "tool_call_executed" as const,
+        result: {
+          tool: "os.fs.write",
+          status: "ok" as const,
+          summary: `wrote ${path}`,
+          details: { path, existed: false, addedLines: 1, removedLines: 0 },
+          truncated: false,
+        },
+        batchIndex: 0,
+        batchSize: 1,
+      },
+    };
+  }
+
+  it("checks each green row's changed files, renders the verdict and demotes a failure", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "fusion-delegate-syntax-"));
+    try {
+      const syntaxCheck = vi.fn<NonNullable<FusionDelegateDeps["syntaxCheck"]>>(
+        async (files) => ({
+          results: files.map((file) =>
+            file.endsWith("bad.js")
+              ? { file, ok: false, checker: "node --check", error: "SyntaxError: Unexpected token '='" }
+              : { file, ok: true, checker: "node --check" },
+          ),
+        }),
+      );
+      const tool = buildFusionDelegateTool(
+        deps({
+          workingDir: dir,
+          syntaxCheck,
+          runTurn: async (session, _message, options) => {
+            const name = session.id.endsWith("1") ? "good.js" : "bad.js";
+            const path = join(dir, name);
+            writeFileSync(path, "x\n");
+            options.eventHook?.(writeEvent(path));
+            options.eventHook?.({
+              type: "llm_event",
+              event: {
+                type: "assistant_reply",
+                text: `STATUS: done\nwrote ${name}\n${"detail ".repeat(50)}`,
+              },
+            });
+            return turnResult();
+          },
+        }),
+      );
+      const result = await tool.run(
+        {
+          tasks: [
+            { id: "t1", title: "Good", instructions: "write good.js", files: ["good.js"] },
+            { id: "t2", title: "Bad", instructions: "write bad.js", files: ["bad.js"] },
+          ],
+        },
+        ctx({ workingDir: dir }),
+      );
+      // One run for the fan-out, on the files the workers wrote.
+      expect(syntaxCheck).toHaveBeenCalledTimes(1);
+      expect(syntaxCheck.mock.calls[0]![0]).toEqual([
+        join(dir, "good.js"),
+        join(dir, "bad.js"),
+      ]);
+      const rows = result.details.tasks as WorkerTaskResult[];
+      expect(rows.map((r) => r.status)).toEqual(["ok", "failed"]);
+      const lines = result.summary.split("\n");
+      expect(lines[0]).toBe("2 tasks: 1 ok, 1 failed");
+      expect(lines[1]).toBe("- [t1] ok — Good — syntax ok (1 file)");
+      expect(lines[2]).toBe(
+        "- [t2] failed — Bad — error: syntax: 1 file failed (bad.js)",
+      );
+      expect(result.summary).toContain(
+        "syntax output:\nbad.js: SyntaxError: Unexpected token '='",
+      );
+      // The runtime's changed line on both; the green row's prose is
+      // cut to its first line, the red row's kept whole.
+      expect(result.summary).toContain("changed: good.js (new, +1)");
+      expect(result.summary).toContain("changed: bad.js (new, +1)");
+      expect(result.summary).toContain("reply: STATUS: done …");
+      expect(result.summary.match(/wrote (good|bad)\.js\n/g)).toEqual([
+        "wrote bad.js\n",
+      ]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

@@ -13,7 +13,7 @@ export {
   verifySyntax,
   verifySyntaxTool,
 } from "./verify-syntax.js";
-export type { VerifySyntaxReport } from "./verify-syntax.js";
+export type { VerifySyntaxOptions, VerifySyntaxReport } from "./verify-syntax.js";
 export type { SyntaxFileResult } from "./syntax-check-types.js";
 export {
   checkJavaScriptFile,

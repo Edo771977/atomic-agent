@@ -17,7 +17,14 @@ import {
  * that carried it. While the carrier is in view it costs nothing.
  */
 
-/** Same 16,000-char clip as the workers' quoted request. */
+/**
+ * How much of the operator's request a local worker's brief quotes
+ * (`worker-prompt.ts`, ~1.5K tokens). Here so the orchestrator's
+ * `### fusion` block can name it.
+ */
+export const LOCAL_WORKER_REQUEST_CHAR_BUDGET = 6_000;
+
+/** Same 16,000-char clip as a cloud worker's quoted request (`worker-prompt.ts`). */
 export const REQUEST_SECTION_CHAR_BUDGET = 16_000;
 
 /**
@@ -36,6 +43,23 @@ export const REQUEST_FOLLOW_UP_MARKER =
  */
 export const ORIGINAL_REQUEST_BEGIN_MARKER = "----- BEGIN ORIGINAL REQUEST -----";
 export const ORIGINAL_REQUEST_END_MARKER = "----- END ORIGINAL REQUEST -----";
+
+/**
+ * `text` with every copy of the two markers defused, for anything a
+ * brief carries other than the markers themselves: the orchestrator's
+ * task, instructions, contract (a `shape`), and the quoted request. The
+ * brief's own markers are then the only ones in it, so the first BEGIN
+ * and the first END after it (`quotedRequestText`, the `### request`
+ * clip) are the real quote's. Otherwise a marker in the instructions,
+ * which come before the quote, would move the block's start: the
+ * orchestrator's words read as the operator's (consent to replace an
+ * input), and a clip cutting the rules instead of the quote.
+ */
+export function neutraliseRequestMarkers(text: string): string {
+  return text
+    .replaceAll(ORIGINAL_REQUEST_BEGIN_MARKER, "[begin original request]")
+    .replaceAll(ORIGINAL_REQUEST_END_MARKER, "[end original request]");
+}
 
 /**
  * The operator's words in a pinned request: the quoted block when the
@@ -62,11 +86,28 @@ export function quotedRequestText(request: string): string {
 export const NO_OPERATOR_WORDS_MARKER =
   "[a worker brief without an ORIGINAL REQUEST block: no operator words]";
 
-/** The record `executeTurn` keeps for a worker turn, from its brief. */
-export function workerRequestRecord(brief: string): string {
-  return brief.includes(ORIGINAL_REQUEST_BEGIN_MARKER)
-    ? brief
-    : `${NO_OPERATOR_WORDS_MARKER}\n${brief}`;
+/**
+ * The record `executeTurn` keeps for a worker turn, from its brief.
+ *
+ * `operatorRequest` is the request the brief quotes, unclipped
+ * (`FusionWorkerMeta.operatorRequest`): a local brief quotes only its
+ * head, so a file named past the cap would be missing from the quote
+ * and lose the input guard's refusal. With it, the record's ORIGINAL
+ * REQUEST block holds the whole request; the rest of the brief is kept.
+ */
+export function workerRequestRecord(
+  brief: string,
+  operatorRequest?: string,
+): string {
+  const begin = brief.indexOf(ORIGINAL_REQUEST_BEGIN_MARKER);
+  if (begin === -1) return `${NO_OPERATOR_WORDS_MARKER}\n${brief}`;
+  const full = neutraliseRequestMarkers(operatorRequest?.trim() ?? "");
+  if (full.length === 0) return brief;
+  const start = begin + ORIGINAL_REQUEST_BEGIN_MARKER.length;
+  const end = brief.indexOf(ORIGINAL_REQUEST_END_MARKER, start);
+  return end === -1
+    ? `${brief.slice(0, start)}\n${full}\n${ORIGINAL_REQUEST_END_MARKER}`
+    : `${brief.slice(0, start)}\n${full}\n${brief.slice(end)}`;
 }
 
 /**
@@ -135,18 +176,82 @@ function formatCount(n: number): string {
   return n.toLocaleString("en-US");
 }
 
+/**
+ * The note a worker brief puts right after a clipped quote
+ * (`worker-prompt.ts`). Here so `### request` can find it and replace
+ * it when it cuts the quote further.
+ */
+export function quotedRequestTruncationNote(total: number, quoted: number): string {
+  return `(truncated: the original request is ${formatCount(total)} chars; only the first ${formatCount(quoted)} are quoted above.)`;
+}
+
+/** {@link quotedRequestTruncationNote} on the line after the END marker. */
+const BRIEF_TRUNCATION_NOTE =
+  /\n\(truncated: the original request is ([\d,]+) chars; only the first [\d,]+ are quoted above\.\)/y;
+
+/**
+ * A worker brief over the budget, clipped inside its quoted ORIGINAL
+ * REQUEST block: the task, rules and closing reminder around the block
+ * are the worker's own instructions and are kept whole. `null` when the
+ * text has no complete block, or when what surrounds the block alone is
+ * over the budget (then the plain head clip applies: the brief puts the
+ * task first, so the head is the part to keep).
+ *
+ * A brief that already clipped its quote says so after the END marker
+ * ("only the first 16,000 are quoted"); that note is taken out, since
+ * it no longer holds, and its count of the whole request kept, so the
+ * section's one note says how long the request is and how much of it
+ * is still quoted.
+ */
+function clipQuotedRequest(
+  text: string,
+  budget: number,
+): { text: string; total: number; quoted: number } | null {
+  const begin = text.indexOf(ORIGINAL_REQUEST_BEGIN_MARKER);
+  if (begin === -1) return null;
+  const start = begin + ORIGINAL_REQUEST_BEGIN_MARKER.length;
+  const end = text.indexOf(ORIGINAL_REQUEST_END_MARKER, start);
+  if (end === -1) return null;
+  const head = text.slice(0, start);
+  const afterEnd = end + ORIGINAL_REQUEST_END_MARKER.length;
+  BRIEF_TRUNCATION_NOTE.lastIndex = afterEnd;
+  const briefNote = BRIEF_TRUNCATION_NOTE.exec(text);
+  const tail =
+    briefNote === null
+      ? text.slice(end)
+      : `${ORIGINAL_REQUEST_END_MARKER}${text.slice(afterEnd + briefNote[0].length)}`;
+  const room = budget - head.length - tail.length;
+  if (room < 0) return null;
+  const quote = text.slice(start, end);
+  const kept = quote.slice(0, room);
+  const total =
+    briefNote === null
+      ? quote.trim().length
+      : Number(briefNote[1]!.replaceAll(",", ""));
+  return { text: `${head}${kept}${tail}`, total, quoted: kept.trim().length };
+}
+
 /** The `### request` body: the record, clipped, with a one-line frame. */
 export function renderRequestSection(request: string): string {
   const text = request.trim();
-  const clipped =
+  const quotedClip =
     text.length > REQUEST_SECTION_CHAR_BUDGET
+      ? clipQuotedRequest(text, REQUEST_SECTION_CHAR_BUDGET)
+      : null;
+  const clipped =
+    quotedClip?.text ??
+    (text.length > REQUEST_SECTION_CHAR_BUDGET
       ? text.slice(0, REQUEST_SECTION_CHAR_BUDGET)
-      : text;
+      : text);
   const lines = [
     "The operator's request that started this task. The turn that carried it has been dropped from the conversation below; this is what the work must still satisfy.",
     clipped,
   ];
-  if (clipped.length < text.length) {
+  if (quotedClip !== null) {
+    lines.push(
+      `(truncated: the original request is ${formatCount(quotedClip.total)} chars; only the first ${formatCount(quotedClip.quoted)} are quoted above; the task and rules are whole.)`,
+    );
+  } else if (clipped.length < text.length) {
     lines.push(
       `(truncated: the request is ${formatCount(text.length)} chars; only the first ${formatCount(REQUEST_SECTION_CHAR_BUDGET)} are shown.)`,
     );

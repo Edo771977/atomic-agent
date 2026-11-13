@@ -34,9 +34,13 @@ import {
   mkdir,
   mkdtemp,
   readdir,
+  readFile,
+  readlink,
   realpath,
   rm,
+  stat,
   symlink,
+  writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, sep } from "node:path";
@@ -52,12 +56,97 @@ import {
 /** Where conflicting sides are saved for the merge task, relative to the working directory. */
 export const BRANCH_MERGE_DIR = join(".atomic-agent", "fusion-merge");
 
+/**
+ * The merge folder inside `realDir`, made with a `.gitignore` of `*`
+ * so nothing saved there (patches, conflict sides) is committed by
+ * accident. Returns its absolute path.
+ */
+export async function ensureMergeDir(realDir: string): Promise<string> {
+  const dir = join(realDir, BRANCH_MERGE_DIR);
+  await mkdir(dir, { recursive: true });
+  await writeFile(join(dir, ".gitignore"), "*\n", { flag: "wx" }).catch(() => undefined);
+  return dir;
+}
+
+/** Every temporary folder fusion makes starts with this (run roots, patch stores). */
+export const FUSION_TMP_PREFIX = "atag-fusion-";
+/** The run root's owner record: the process that may still use it. */
+const OWNER_FILE = "owner.json";
+/** A fusion folder with no owner record is left alone this long (it may be being made). */
+const UNOWNED_GRACE_MS = 60 * 60 * 1000;
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+async function staleRoot(root: string): Promise<boolean> {
+  try {
+    const owner = JSON.parse(await readFile(join(root, OWNER_FILE), "utf8")) as { pid?: unknown };
+    return typeof owner.pid !== "number" || !processAlive(owner.pid);
+  } catch {
+    const info = await stat(root).catch(() => null);
+    return info !== null && Date.now() - info.mtimeMs > UNOWNED_GRACE_MS;
+  }
+}
+
+/**
+ * Remove what a fusion run that died (a crash, a kill, a throw nobody
+ * cleaned up after) left behind: its run roots under `tmpRoot` whose
+ * owner process is gone, and the git worktrees `repoTop` still records
+ * inside them. A root another live process owns is never touched.
+ * Never throws.
+ */
+export async function sweepStaleBranchSets(
+  tmpRoot: string,
+  repoTop: string | undefined,
+  git: GitExec,
+): Promise<void> {
+  try {
+    const stale: string[] = [];
+    for (const entry of await readdir(tmpRoot, { withFileTypes: true })) {
+      if (!entry.isDirectory() || !entry.name.startsWith(FUSION_TMP_PREFIX)) continue;
+      const root = join(tmpRoot, entry.name);
+      if (await staleRoot(root)) stale.push(await realpath(root).catch(() => root));
+    }
+    if (repoTop !== undefined) {
+      const listed = await git(["worktree", "list", "--porcelain", "-z"], repoTop);
+      if (ok(listed)) {
+        for (const line of zList(listed.stdout)) {
+          if (!line.startsWith("worktree ")) continue;
+          const path = line.slice("worktree ".length);
+          if (stale.some((root) => path === root || path.startsWith(`${root}${sep}`))) {
+            await git(["worktree", "remove", "--force", path], repoTop).catch(() => null);
+          }
+        }
+      }
+    }
+    for (const root of stale) await rm(root, { recursive: true, force: true }).catch(() => undefined);
+    if (repoTop !== undefined && stale.length > 0) {
+      await git(["worktree", "prune"], repoTop).catch(() => null);
+    }
+  } catch {
+    // Housekeeping; never a reason to fail a fan-out.
+  }
+}
+
 export type BranchMethod = "worktree" | "clonefile" | "copy";
 
-/** Size and mtime of one file at workspace creation: what "changed" is measured against. */
+/**
+ * Size, mtime and mode of one file or symlink at workspace creation:
+ * what "changed" is measured against. A chmod moves only the mode.
+ */
 export interface FileStamp {
   size: number;
   mtimeMs: number;
+  /** Permission bits; a symlink's are not compared. */
+  mode?: number;
+  /** A symlink, stamped itself (never followed). */
+  link?: boolean;
 }
 
 export interface BranchWorkspace {
@@ -77,8 +166,14 @@ export interface BranchSet {
   /** The untouched snapshot every workspace started from. */
   readonly baseDir: string;
   readonly workspaces: ReadonlyMap<string, BranchWorkspace>;
-  /** Removes every workspace (worktrees included) and prunes git's records. Never throws. */
-  cleanup(): Promise<void>;
+  /**
+   * Removes every workspace (worktrees included) and prunes git's
+   * records. Never throws. With `keep`, the workspaces of those task ids
+   * and the base stay for a later call (a judge's retry works on in the
+   * workspace it was judged red in); a call without `keep` removes the
+   * rest.
+   */
+  cleanup(keep?: readonly string[]): Promise<void>;
 }
 
 /** Runs git; resolves `null` when git is not there to run. */
@@ -150,9 +245,10 @@ function isUnderMergeDir(rel: string): boolean {
 }
 
 /**
- * Every regular file under `root` with its size and mtime. Symlinks are
- * not followed, the copy exclusions (`.git`, `node_modules`, …) and the
- * merge folder are skipped: none of it is merged back.
+ * Every regular file and symlink under `root` with its size, mtime and
+ * mode. Symlinks are stamped, not followed; the copy exclusions (`.git`,
+ * `node_modules`, …) and the merge folder are skipped: none of it is
+ * merged back.
  */
 export async function stampTree(root: string): Promise<Map<string, FileStamp>> {
   const out = new Map<string, FileStamp>();
@@ -172,10 +268,15 @@ export async function stampTree(root: string): Promise<Map<string, FileStamp>> {
       if (isUnderMergeDir(rel)) continue;
       if (entry.isDirectory()) {
         stack.push(full);
-      } else if (entry.isFile()) {
+      } else if (entry.isFile() || entry.isSymbolicLink()) {
         try {
           const info = await lstat(full);
-          out.set(rel, { size: info.size, mtimeMs: info.mtimeMs });
+          out.set(
+            rel,
+            info.isSymbolicLink()
+              ? { size: info.size, mtimeMs: info.mtimeMs, link: true }
+              : { size: info.size, mtimeMs: info.mtimeMs, mode: info.mode & 0o777 },
+          );
         } catch {
           // Vanished mid-walk.
         }
@@ -321,20 +422,50 @@ export async function createBranchSet(
     await mkdtemp(
       join(
         options.tmpRoot ?? tmpdir(),
-        `atag-fusion-${randomBytes(3).toString("hex")}-`,
+        `${FUSION_TMP_PREFIX}${randomBytes(3).toString("hex")}-`,
       ),
     ),
   );
+  // Whose it is, so a later run's sweep can tell a dead run's leftovers
+  // from a live one's.
+  await writeFile(
+    join(runRoot, OWNER_FILE),
+    JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }),
+  ).catch(() => undefined);
   const snapshot = await gitSnapshot(real, git);
+  await sweepStaleBranchSets(dirname(runRoot), snapshot?.top, git);
   const roots: string[] = [];
-  const cleanup = async (): Promise<void> => {
+  const removeRoot = async (root: string): Promise<void> => {
     if (snapshot !== null) {
-      for (const root of roots) {
-        await git(["worktree", "remove", "--force", root], snapshot.top).catch(
-          () => null,
-        );
-      }
+      await git(["worktree", "remove", "--force", root], snapshot.top).catch(
+        () => null,
+      );
     }
+  };
+  const workspaceRoots = new Map<string, string>();
+  const cleanup = async (keep: readonly string[] = []): Promise<void> => {
+    if (keep.length > 0) {
+      const kept = new Set(
+        keep.flatMap((id) => {
+          const root = workspaceRoots.get(id);
+          return root === undefined ? [] : [root];
+        }),
+      );
+      const base = roots[0];
+      for (const root of roots.splice(0)) {
+        if (kept.has(root) || root === base) {
+          roots.push(root);
+          continue;
+        }
+        await removeRoot(root);
+        await rm(root, { recursive: true, force: true }).catch(() => undefined);
+      }
+      if (snapshot !== null) {
+        await git(["worktree", "prune"], snapshot.top).catch(() => null);
+      }
+      return;
+    }
+    for (const root of roots) await removeRoot(root);
     await rm(runRoot, { recursive: true, force: true }).catch(() => undefined);
     if (snapshot !== null) {
       await git(["worktree", "prune"], snapshot.top).catch(() => null);
@@ -360,6 +491,7 @@ export async function createBranchSet(
     const workspaces = new Map<string, BranchWorkspace>();
     for (const [index, taskId] of taskIds.entries()) {
       const name = workspaceName(index, taskId);
+      workspaceRoots.set(taskId, join(runRoot, name));
       const dir = await make(name);
       workspaces.set(taskId, {
         taskId,
@@ -390,7 +522,9 @@ export async function touchedPaths(
     if (
       before === undefined ||
       before.size !== stamp.size ||
-      before.mtimeMs !== stamp.mtimeMs
+      before.mtimeMs !== stamp.mtimeMs ||
+      before.link !== stamp.link ||
+      before.mode !== stamp.mode
     ) {
       out.push(rel);
     }
@@ -399,4 +533,40 @@ export async function touchedPaths(
     if (!now.has(rel)) out.push(rel);
   }
   return out.sort();
+}
+
+/**
+ * One path as a merge or a patch sees it: a regular file's bytes and
+ * exec bit, or a symlink's target (never followed). `null` for nothing
+ * there, a directory, or what cannot be read.
+ */
+export interface PathEntry {
+  data: Buffer;
+  executable: boolean;
+  /** Set for a symlink: its target, as written. */
+  link?: string;
+}
+
+export async function readEntry(path: string): Promise<PathEntry | null> {
+  try {
+    const info = await lstat(path);
+    if (info.isSymbolicLink()) {
+      const link = await readlink(path);
+      return { data: Buffer.from(link, "utf8"), executable: false, link };
+    }
+    if (!info.isFile()) return null;
+    return { data: await readFile(path), executable: (info.mode & 0o111) !== 0 };
+  } catch {
+    return null;
+  }
+}
+
+/** The same bytes, kind and exec bit (what git records). */
+export function sameEntry(a: PathEntry | null, b: PathEntry | null): boolean {
+  if (a === null || b === null) return a === b;
+  return (
+    a.data.equals(b.data) &&
+    (a.link === undefined) === (b.link === undefined) &&
+    a.executable === b.executable
+  );
 }

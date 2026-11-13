@@ -58,7 +58,9 @@ export type UserLlmFusionConfig = {
    */
   workerModel?: string;
   /**
-   * Default fan-out width, 1..8. Default 2.
+   * Default fan-out width, 1..8. Default 2 on a cloud worker leg; on a
+   * local (slot-affine) leg an unset value means one worker at a time,
+   * and only a value written here raises that (`workersPinned`).
    *
    * **Not a ceiling.** The orchestrator sizes each `fusion.delegate`
    * call itself — it is the party that knows how divisible the job is,
@@ -94,9 +96,12 @@ export type UserLlmFusionConfig = {
    * write a worker makes (~10K tokens) or it re-creates the 8192 wall.
    */
   workerMaxOutputTokens?: number;
-  /** Step ceiling per worker turn. Default 40. */
+  /** Step ceiling per worker turn. Default 60 (`DEFAULT_FUSION_WORKER_MAX_STEPS`). */
   workerMaxSteps?: number;
-  /** Wall-clock ceiling per worker turn, in ms. Default 600 000. */
+  /**
+   * Wall-clock ceiling per worker turn, in ms. Default 2 700 000, 45 min
+   * (`DEFAULT_FUSION_WORKER_TIMEOUT_MS`).
+   */
   workerTimeoutMs?: number;
   /**
    * How many consecutive read-only orchestrator steps without a
@@ -133,6 +138,15 @@ export type UserLlmFusionConfig = {
    * (ATO-1406). Unset: `DEFAULT_FUSION_MAX_TASKS_PER_TURN`; `0`: no cap.
    */
   maxTasksPerTurn?: number;
+  /**
+   * Most tasks one fusion turn may send to `model: "orchestrator"` (a
+   * worker turn on the orchestrator leg). Counted rather than priced,
+   * because that leg is often a subscription whose turns have no price
+   * to cap. Unset: `DEFAULT_FUSION_MAX_ORCHESTRATOR_TASKS_PER_TURN`;
+   * `0` turns the target off (unlike the caps above, where `0` lifts
+   * the cap).
+   */
+  maxOrchestratorTasksPerTurn?: number;
   /**
    * Automatic escalation of a stuck worker (ATO-942). `"advisor"`: when a
    * worker stalls (same result 3x, read-only for 6 steps) or its first
@@ -198,6 +212,20 @@ export type UserLlmFusionConfig = {
    * Default `false`. Cloud role models never need it.
    */
   mixLocalModels?: boolean;
+  /**
+   * The outcome log (`<stateDir>/fusion/outcomes.ndjson`): one line of
+   * counts and categories per worker task and per fusion turn, read by
+   * `atomic-agent fusion report`. No prompt, reply or path is written.
+   * Default `true`; `false` writes nothing.
+   */
+  outcomeLog?: boolean;
+  /**
+   * The one-call format check before the first fan-out on a local worker
+   * leg: a few dozen tokens under the workers' own grammar, and a reply
+   * that does not parse refuses the fan-out before a worker spends its
+   * time. Default `true`; `false` sends workers unchecked, as before.
+   */
+  localFormatCheck?: boolean;
   /**
    * Branch isolation (ATO-946). `"worktree"`: every task of a fan-out
    * works in a workspace of its own (a detached git worktree inside a
@@ -329,6 +357,13 @@ export const DEFAULT_FUSION_MAX_ROUNDS_PER_TURN = 6;
 export const DEFAULT_FUSION_MAX_TASKS_PER_TURN = 48;
 export const FUSION_MAX_ROUNDS_PER_TURN_MAX = 100;
 export const FUSION_MAX_TASKS_PER_TURN_MAX = 1000;
+/**
+ * Default cap on `model: "orchestrator"` tasks per fusion turn. Small on
+ * purpose: each is a full worker turn on the strong (and often flat-rate
+ * subscription) leg, meant for the few hard parts, not the bulk.
+ */
+export const DEFAULT_FUSION_MAX_ORCHESTRATOR_TASKS_PER_TURN = 4;
+export const FUSION_MAX_ORCHESTRATOR_TASKS_PER_TURN_MAX = 100;
 /** Upper bound on `turnBudgetUsd`; anything larger is a typo. */
 export const FUSION_TURN_BUDGET_USD_MAX = 10_000;
 
@@ -603,6 +638,14 @@ function parseFusion(
       FUSION_MAX_TASKS_PER_TURN_MAX,
     );
   }
+  if (obj.maxOrchestratorTasksPerTurn !== undefined) {
+    out.maxOrchestratorTasksPerTurn = parseBoundedInt(
+      obj.maxOrchestratorTasksPerTurn,
+      `${field}.maxOrchestratorTasksPerTurn`,
+      0,
+      FUSION_MAX_ORCHESTRATOR_TASKS_PER_TURN_MAX,
+    );
+  }
   if (obj.turnTimeBudgetMs !== undefined) {
     out.turnTimeBudgetMs = parseBoundedInt(
       obj.turnTimeBudgetMs,
@@ -622,6 +665,21 @@ function parseFusion(
       );
     }
     out.mixLocalModels = obj.mixLocalModels;
+  }
+  if (obj.outcomeLog !== undefined) {
+    if (typeof obj.outcomeLog !== "boolean") {
+      throw new ConfigValidationError(`${field}.outcomeLog`, "expected boolean");
+    }
+    out.outcomeLog = obj.outcomeLog;
+  }
+  if (obj.localFormatCheck !== undefined) {
+    if (typeof obj.localFormatCheck !== "boolean") {
+      throw new ConfigValidationError(
+        `${field}.localFormatCheck`,
+        "expected boolean",
+      );
+    }
+    out.localFormatCheck = obj.localFormatCheck;
   }
   if (obj.taskTree !== undefined) {
     out.taskTree = parseTaskTree(obj.taskTree, `${field}.taskTree`);

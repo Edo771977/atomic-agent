@@ -45,14 +45,18 @@ export const LANGUAGE_SYNTAX_EXTENSIONS: ReadonlySet<string> = new Set(
 export async function checkLanguageFile(
   file: string,
   ext: string,
-  options: { cmd?: string } = {},
+  options: { cmd?: string; signal?: AbortSignal } = {},
 ): Promise<SyntaxFileResult> {
   const spec = CHECKERS[ext];
   if (spec === undefined) {
     return { file, ok: null, checker: "none", error: `no checker for ${ext}` };
   }
   const cmd = options.cmd ?? spec.cmd;
-  const run = await runChecker(cmd, [...spec.args, file]);
+  const run = await runChecker(
+    cmd,
+    [...spec.args, file],
+    options.signal === undefined ? {} : { signal: options.signal },
+  );
   const checker = `${spec.cmd} ${spec.args.join(" ")}`;
   if (run.missing) {
     return { file, ok: null, checker: "none", error: `${spec.tool} not found` };

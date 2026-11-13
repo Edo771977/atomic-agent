@@ -23,6 +23,7 @@ import {
   type WorkerTaskResult,
   type WorkerTaskStatus,
 } from "./worker-result.js";
+import { mergeFileChanges } from "./worker-changes.js";
 
 /**
  * The fusion task tree (ATO-940).
@@ -542,7 +543,7 @@ async function expandOne(
       error: row.error === undefined ? validated.error : `${validated.error}; ${row.error}`,
       notes: [
         ...(row.notes ?? []),
-        "re-brief the task yourself or split it in your next fusion.delegate",
+        "re-brief or split the task in your next fusion.delegate",
       ],
     };
   }
@@ -667,6 +668,7 @@ async function closeParent(
       `[${c.id}] ${c.status} — ${c.title}: ${oneLine(c.error ?? c.reply, replyCap)}`,
   );
   const tools = sumTools(row, children);
+  const changes = mergeFileChanges([row.changes, ...children.map((c) => c.changes)]);
   const usage = sumUsage([row, ...children]);
   const billing = sumWorkerBilling([row, ...children]);
   const { error: _parentError, billing: _parentBilling, ...parentRow } = row;
@@ -680,6 +682,8 @@ async function closeParent(
     stepCount: row.stepCount + children.reduce((n, c) => n + c.stepCount, 0),
     durationMs: Math.max(row.durationMs, Date.now() - startedAt),
     tools,
+    ...(changes.length === 0 ? {} : { changes }),
+    ...([row, ...children].some((r) => r.shellRan === true) ? { shellRan: true as const } : {}),
     ...(usage === undefined ? {} : { usage }),
     ...(billing === undefined ? {} : { billing }),
     notes: [

@@ -17,6 +17,9 @@ import {
   FUSION_WORKER_OPERATOR_ONLY_MARKER,
 } from "./worker-tool-policy.js";
 import type { JudgeSummary } from "./judge.js";
+import { CHECK_OUTPUT_CHARS, tailClip } from "./contract-checks.js";
+import { describeChanges, FileChangeLog, type FileChange } from "./worker-changes.js";
+import { describeSyntax, type TaskSyntaxSummary } from "./syntax-pass.js";
 
 /**
  * The note on a task a worker could not finish because a step needs the
@@ -212,6 +215,31 @@ export interface WorkerTaskResult {
   model?: string;
   /** The role that picked `model`, when one did (ATO-943). */
   modelRole?: FusionRole;
+  /**
+   * What the worker's file tools changed, path by path, from the
+   * runtime's record of the calls (`worker-changes.ts`). Rendered as the
+   * block's `changed:` line; absent when the file tools changed nothing.
+   */
+  changes?: FileChange[];
+  /**
+   * A tool that can write outside the file tools ran (a shell command,
+   * `worker-changes.ts`' `UNTRACKED_WRITE_TOOLS`): `changes` may be
+   * incomplete, and the `changed:` line says so.
+   */
+  shellRan?: true;
+  /**
+   * The delegate's own syntax pass over this row's changed and
+   * declared files (`syntax-pass.ts`), when it ran. A failure is also
+   * the row's `error` and made it `failed`.
+   */
+  syntax?: TaskSyntaxSummary;
+  /**
+   * The worker's self-check found something and it got its one notice
+   * (`worker-self-check.ts`). For the outcome log; nothing renders it.
+   */
+  selfCheckNotice?: true;
+  /** Escalations that reached the worker (advisor hints, a re-run), for the outcome log. */
+  escalations?: number;
 }
 
 export interface TaskCheckSummary {
@@ -219,6 +247,12 @@ export interface TaskCheckSummary {
   failed: number;
   /** The failing checks' verdicts, joined; absent when all passed. */
   detail?: string;
+  /**
+   * The failing checks' output tails (`taskCheckOutput`), whitespace
+   * kept, at most `CHECK_OUTPUT_CHARS`; absent when all passed or the
+   * runner kept none. Rendered in the row's block, never the table.
+   */
+  output?: string;
 }
 
 /**
@@ -270,6 +304,15 @@ export class WorkerRunCollector {
   /** The last few tool results, one line each — what a hand-back reports. */
   private readonly recent: string[] = [];
   private readonly replaced: ReplacedInput[] = [];
+  private readonly changes: FileChangeLog;
+
+  /**
+   * `workingDir` is the worker's own (its workspace under isolation):
+   * changed paths inside it are recorded relative to it.
+   */
+  constructor(options: { workingDir?: string } = {}) {
+    this.changes = new FileChangeLog(options.workingDir);
+  }
 
   /** Feed one `AgentLoopEvent` from the worker turn's hook. */
   observe(event: AgentLoopEvent): void {
@@ -314,6 +357,7 @@ export class WorkerRunCollector {
       this.byTool[result.tool] = (this.byTool[result.tool] ?? 0) + 1;
       if (result.status === "error") this.errors += 1;
       else if (FILE_WRITING_TOOLS.has(result.tool)) this.writes += 1;
+      this.changes.observe(result);
       if (resultCarriesApprovalRefusal(result.summary, result.details)) {
         this.approvalRefused = true;
         if (resultCarriesOperatorOnlyRefusal(result.summary, result.details)) {
@@ -414,6 +458,7 @@ export class WorkerRunCollector {
     if (this.operatorOnlyRefused && status === "needs_orchestrator") {
       notes.push(WORKER_OPERATOR_ONLY_NOTE);
     }
+    const changes = this.changes.list();
     return {
       id: input.id,
       title: input.title,
@@ -437,6 +482,8 @@ export class WorkerRunCollector {
       ...(this.replaced.length === 0
         ? {}
         : { replacedInputs: [...this.replaced] }),
+      ...(changes.length === 0 ? {} : { changes }),
+      ...(this.changes.shellRan() ? { shellRan: true as const } : {}),
     };
   }
 }
@@ -446,7 +493,7 @@ function stopCauseNote(cause: WorkerStopCause, stepCount: number): string {
     return "stopped because the provider is out of credit";
   }
   if (cause === "time_ceiling") {
-    return "stopped at its time limit; any reply was written on the forced final step and may describe work that was not done";
+    return "stopped at its time limit; any reply was written on the forced final step and may describe work that was not done; fix: split it into smaller tasks";
   }
   if (cause === "no_progress") {
     return "stopped after a whole leg of steps made no progress";
@@ -454,7 +501,7 @@ function stopCauseNote(cause: WorkerStopCause, stepCount: number): string {
   if (cause === "cost_ceiling") {
     return "stopped at its spend limit; any reply was written on the forced final step and may describe work that was not done";
   }
-  return `stopped at its step limit (${stepCount} steps); the reply was written on the forced final step and may describe work that was not done`;
+  return `stopped at its step limit (${stepCount} steps); the reply was written on the forced final step and may describe work that was not done; fix: split it into smaller tasks`;
 }
 
 /** Whether a tool result is the worker approval refusal. */
@@ -746,6 +793,8 @@ const FINDING_CHARS = 160;
 
 /** How much of an error the head line carries; the rest is noise. */
 const ERROR_HEAD_CHARS = 400;
+/** All rows' failing-check output together, in one delegate result. */
+export const FANOUT_CHECK_OUTPUT_CHARS = 6_000;
 
 /**
  * Render the results as the tool's `summary`.
@@ -773,7 +822,21 @@ export function formatDelegateOutput(
   const table = renderStatusTable(results, extra);
   const room = Math.max(0, charCap - table.length - 4);
   const perTask = Math.max(200, Math.floor(room / results.length));
-  const blocks = results.map((r) => renderBlock(r, perTask));
+  // The failing checks' output is the most useful text a failed row
+  // carries, and the largest: a share of each block, and a budget for
+  // the fan-out, spent in task order, so eight red rows cannot crowd
+  // out the replies.
+  let outputLeft = FANOUT_CHECK_OUTPUT_CHARS;
+  const blocks = results.map((r) => {
+    const allowance = Math.min(
+      CHECK_OUTPUT_CHARS,
+      outputLeft,
+      Math.floor(perTask / 2),
+    );
+    const block = renderBlock(r, perTask, allowance, compactReply(r, extra));
+    outputLeft -= Math.min(allowance, r.checks?.output?.length ?? 0);
+    return block;
+  });
   const joined = [table, ...blocks].join("\n\n");
   if (joined.length <= charCap) return joined;
   return `${joined.slice(0, Math.max(0, charCap - 15))}\n… [truncated]`;
@@ -966,6 +1029,92 @@ export interface DelegateOutputExtras {
    * the head line then reads exactly as before.
    */
   waves?: readonly (readonly string[])[];
+  /**
+   * The ids of the tasks that declared `files`. A green row among them
+   * shows only its reply's status line, assumptions and contract
+   * deviations (`compactGreenReply`): its result is on disk and in its
+   * `changed:` line, and the rest of the prose is the worker's own
+   * account of it. Absent, every reply is shown whole.
+   */
+  declaredFiles?: ReadonlySet<string>;
+}
+
+/** How much of a green row's first (STATUS) line its block keeps (`compactReply`). */
+export const GREEN_REPLY_CHARS = 200;
+
+/** How much of a green row's reply its block keeps in all (`compactGreenReply`). */
+export const GREEN_REPLY_KEPT_CHARS = 400;
+
+/** A reply-skeleton header: `STATUS:`, `CHECKS RUN:`, `**ASSUMPTIONS:**`. */
+const REPLY_HEADER = /^[\s*_#>-]*([A-Z][A-Z ]{2,}?)[*_]*:[*_]*\s*(.*)$/;
+
+/** A line saying the worker provided something other than the contract asked. */
+const CONTRACT_DEVIATION =
+  /\b(?:differently|instead of|deviat\w*|not provided|could ?n[o']t provide|cannot provide|can't provide)\b/i;
+
+/** An ASSUMPTIONS section that says nothing. */
+const NO_ASSUMPTIONS = /^[\s*_.-]*(?:none|n\/a|nothing)?[\s*_.]*$/i;
+
+/**
+ * Whether a row's block shows only `compactGreenReply` of its reply: the
+ * row is green (`ok`) and its task declared files. A row that is not
+ * green keeps the whole reply (it is the evidence of what went wrong),
+ * and so does a task that declared no files (its reply IS the result:
+ * findings, an answer, a plan).
+ */
+function compactReply(
+  result: WorkerTaskResult,
+  extra: DelegateOutputExtras,
+): boolean {
+  return result.status === "ok" && extra.declaredFiles?.has(result.id) === true;
+}
+
+/**
+ * What a green row with files keeps of its reply: the first non-blank
+ * (STATUS) line, at most `GREEN_REPLY_CHARS`, marked ` …` when anything
+ * was left out; then its ASSUMPTIONS section unless it says none, and
+ * every other line naming a deviation from the contract ("provided
+ * differently", "could not provide"). The disk and the `changed:` line
+ * say what was written; these are what they cannot say. At most
+ * `GREEN_REPLY_KEPT_CHARS` in all.
+ */
+export function compactGreenReply(reply: string): string {
+  const lines = reply.trim().split(/\r?\n/).map((line) => line.trimEnd());
+  const nonBlank = lines.filter((line) => line.trim().length > 0).length;
+  const firstIndex = lines.findIndex((line) => line.trim().length > 0);
+  if (firstIndex < 0) return "";
+  const first = lines[firstIndex]!.trim();
+  const cut = first.length > GREEN_REPLY_CHARS;
+  const head = cut ? first.slice(0, GREEN_REPLY_CHARS) : first;
+  const kept: string[] = [];
+  let assumptions: string[] | undefined;
+  const closeAssumptions = (): void => {
+    if (assumptions === undefined) return;
+    const said = assumptions.join(" ").replace(REPLY_HEADER, "$2");
+    if (!NO_ASSUMPTIONS.test(said)) kept.push(...assumptions);
+    assumptions = undefined;
+  };
+  for (const raw of lines.slice(firstIndex + 1)) {
+    const line = raw.trim();
+    const header = line.match(REPLY_HEADER);
+    if (line.length === 0 || header !== null) closeAssumptions();
+    if (line.length === 0) continue;
+    if (header?.[1]?.trim().toUpperCase() === "ASSUMPTIONS") {
+      assumptions = [line];
+      continue;
+    }
+    if (assumptions !== undefined) {
+      assumptions.push(line);
+      continue;
+    }
+    if (CONTRACT_DEVIATION.test(line)) kept.push(line);
+  }
+  closeAssumptions();
+  const omitted = cut || kept.length + 1 < nonBlank;
+  const text = [omitted ? `${head} …` : head, ...kept].join("\n");
+  return text.length > GREEN_REPLY_KEPT_CHARS
+    ? `${text.slice(0, GREEN_REPLY_KEPT_CHARS - 1)}…`
+    : text;
 }
 
 /** `analyze → organize, index` — waves in order, each wave's tasks together. */
@@ -1040,6 +1189,7 @@ function renderStatusTable(
       ...(r.checks
         ? [describeChecks(r.checks, TABLE_DETAIL_CHARS, r.error)]
         : []),
+      ...syntaxClause(r),
       ...(r.notes ?? []).map((note) => oneLine(note, TABLE_DETAIL_CHARS)),
     ].join(" — "),
   );
@@ -1049,6 +1199,12 @@ function renderStatusTable(
     ...lines,
     ...(clock === null ? [] : [clock]),
   ].join("\n");
+}
+
+function syntaxClause(r: WorkerTaskResult): string[] {
+  if (r.syntax === undefined) return [];
+  const clause = describeSyntax(r.syntax, r.error);
+  return clause === null ? [] : [oneLine(clause, TABLE_DETAIL_CHARS)];
 }
 
 function oneLine(text: string, cap: number): string {
@@ -1062,7 +1218,12 @@ function oneLine(text: string, cap: number): string {
  * provider has no reply worth the space, and one that claimed work it
  * did not do has a reply that must not be read first.
  */
-function renderBlock(result: WorkerTaskResult, perTaskCap: number): string {
+function renderBlock(
+  result: WorkerTaskResult,
+  perTaskCap: number,
+  outputCap: number,
+  compact: boolean,
+): string {
   const head =
     `[${result.id}] ${result.status} — ${result.title} ` +
     `(${result.stepCount} steps, ${Math.round(result.durationMs / 1000)}s, ` +
@@ -1070,17 +1231,35 @@ function renderBlock(result: WorkerTaskResult, perTaskCap: number): string {
     (result.error
       ? ` — error: ${oneLine(result.error, ERROR_HEAD_CHARS)}`
       : "");
+  const changed = describeChanges(result.changes, {
+    ...(result.shellRan === true ? { shellRan: true } : {}),
+  });
   const diagnosis = [
+    ...(changed === null ? [] : [changed]),
     ...(result.replacedInputs ?? []).map(describeReplacedInput),
     ...(result.hint ? [`hint: ${result.hint}`] : []),
     ...(result.checks
       ? [describeChecks(result.checks, ERROR_HEAD_CHARS, result.error)]
       : []),
+    ...(result.checks?.output !== undefined && outputCap > 40
+      ? [`check output:\n${tailClip(result.checks.output, outputCap)}`]
+      : []),
+    ...(result.syntax?.output === undefined
+      ? []
+      : [`syntax output:\n${result.syntax.output}`]),
+    ...(result.syntax?.typeOutput === undefined
+      ? []
+      : [`type errors:\n${result.syntax.typeOutput}`]),
     ...(result.notes ?? []).map((note) => `note: ${note}`),
   ];
   const used = [head, ...diagnosis].join("\n").length;
   const bodyCap = Math.max(100, perTaskCap - used);
-  const body = result.reply.length > 0 ? result.reply : NO_REPLY;
+  const body =
+    result.reply.length === 0
+      ? NO_REPLY
+      : compact
+        ? `reply: ${compactGreenReply(result.reply)}`
+        : result.reply;
   const clipped =
     body.length > bodyCap
       ? `${body.slice(0, Math.max(0, bodyCap - 15))}\n… [truncated]`

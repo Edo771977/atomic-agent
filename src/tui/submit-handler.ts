@@ -329,6 +329,14 @@ export function runSlashCommand(
   if (result.fusionRunAction !== undefined) {
     runFusionRunAction(result.fusionRunAction, state, dispatch, callbacks);
   }
+  if (result.fusionReport !== undefined) {
+    dispatch({
+      type: "system_message",
+      text:
+        callbacks.renderFusionReport?.(result.fusionReport.args) ??
+        "the fusion report is not available here: run `atomic-agent fusion report`",
+    });
+  }
   if (result.runModeWorkers !== undefined) {
     callbacks.onFusionWorkersChangeRequested?.(result.runModeWorkers);
   }

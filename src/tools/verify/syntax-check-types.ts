@@ -18,6 +18,12 @@ export interface SyntaxFileResult {
   readonly error?: string;
   /** Advisory — never changes `ok` (content after `</html>`, say). */
   readonly warning?: string;
+  /**
+   * A parse-only TypeScript check (`typescript: "parse"`): the file's
+   * diagnostics that are not about its syntax (type errors, missing
+   * modules), which leave `ok` as it is. Absent when there were none.
+   */
+  readonly typeErrors?: { readonly count: number; readonly detail: string };
 }
 
 /** Longest error text kept per file; checkers are chatty, prompts are not. */

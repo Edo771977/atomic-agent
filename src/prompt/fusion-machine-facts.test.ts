@@ -9,8 +9,10 @@ import { workerSlotFootprint } from "../local-llm/server/worker-slots.js";
 import { createEmptySessionState } from "../session/session-state.js";
 import { buildPrompt } from "./build-prompt.js";
 import {
+  MIN_WORKER_NEW_LINES,
   resolveFusionMachineFacts,
   roundTokensPerSecond,
+  workerMaxNewLines,
 } from "./fusion-machine-facts.js";
 import type { CapabilitiesSummary, ToolDescriptor } from "./stable-prefix.js";
 
@@ -26,6 +28,7 @@ function config(over: {
   workerModel?: string;
   workerProvider?: string;
   orchestratorProvider?: string;
+  workerMaxOutputTokens?: number;
   providers?: Providers;
 }): AtomicAgentConfig {
   return {
@@ -55,6 +58,9 @@ function config(over: {
           ...(over.orchestratorProvider === undefined
             ? {}
             : { orchestratorProvider: over.orchestratorProvider }),
+          ...(over.workerMaxOutputTokens === undefined
+            ? {}
+            : { workerMaxOutputTokens: over.workerMaxOutputTokens }),
         },
       },
     },
@@ -71,7 +77,43 @@ describe("resolveFusionMachineFacts", () => {
       workerTokenBudget: workerSlotFootprint(),
       workerModel: "qwen3-4b",
       tokensPerSecond: null,
+      workerMaxNewLines: 650,
     });
+  });
+
+  it("sizes a local task from the worker's completion cap", () => {
+    // 25 tokens a new line, rounded down to 50: the number the block
+    // states, read from config only so the prefix bytes stay put.
+    expect(workerMaxNewLines(16_384)).toBe(650);
+    expect(workerMaxNewLines(8_192)).toBe(300);
+    expect(workerMaxNewLines(4_096)).toBe(150);
+    expect(workerMaxNewLines(100)).toBe(MIN_WORKER_NEW_LINES);
+    // The cap local workers are sent: the reply allowance (a raised
+    // completionMaxTokens is held to it), or the operator's own cap.
+    expect(
+      resolveFusionMachineFacts(config({ completionMaxTokens: 8_192 }))
+        .workerMaxNewLines,
+    ).toBe(300);
+    expect(
+      resolveFusionMachineFacts(config({ completionMaxTokens: 96_000 }))
+        .workerMaxNewLines,
+    ).toBe(650);
+    expect(
+      resolveFusionMachineFacts(
+        config({ completionMaxTokens: 96_000, workerMaxOutputTokens: 4_096 }),
+      ).workerMaxNewLines,
+    ).toBe(150);
+    // A cloud leg is not sized this way.
+    const cloud = resolveFusionMachineFacts(
+      config({
+        workerProvider: "cloud-w",
+        providers: [
+          { id: "cloud-w", kind: "openai-compatible", defaultChatModel: "m" },
+        ] as unknown as Providers,
+      }),
+    );
+    expect(cloud.workerLeg).toBe("cloud");
+    expect(cloud).not.toHaveProperty("workerMaxNewLines");
   });
 
   it("states no slot count for an external server", () => {

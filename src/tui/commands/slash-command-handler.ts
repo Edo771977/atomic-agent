@@ -191,6 +191,8 @@ export interface SlashDispatchResult {
     action: "list" | "resume" | "discard";
     runId?: string;
   };
+  /** `/fusion report [flags]`: the outcome report; the caller reads the log. */
+  readonly fusionReport?: { args: readonly string[] };
 }
 
 export type FusionWorkerAction =
@@ -311,12 +313,19 @@ export function dispatchSlashCommand(buffer: string, skills: readonly SlashComma
     }
     case "fusion": {
       const [verb = "", runId, ...rest] = parsed.args.trim().split(/\s+/).filter((part) => part.length > 0);
+      // `/fusion report [--days N] [--model X]`: the same text as
+      // `atomic-agent fusion report`, printed in the chat.
+      if (verb === "report") {
+        return pureActions([], {
+          fusionReport: { args: [runId, ...rest].filter((p): p is string => p !== undefined) },
+        });
+      }
       const action =
         verb === "" ? "list" : verb === "resume" || verb === "discard" ? verb : null;
       if (action === null || rest.length > 0 || (action === "list" && runId !== undefined)) {
         return pureActions([], {
           systemMessage:
-            "usage: /fusion (list unfinished runs) | /fusion resume [run id] | /fusion discard [run id]",
+            "usage: /fusion (list unfinished runs) | /fusion resume [run id] | /fusion discard [run id] | /fusion report [--days N] [--model X]",
         });
       }
       return pureActions([], {

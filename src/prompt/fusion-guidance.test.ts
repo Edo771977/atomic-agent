@@ -5,11 +5,14 @@ import {
   FUSION_DELEGATE_TOOL,
   FUSION_GUIDANCE,
   isFusionActive,
+  localTaskSizing,
 } from "./fusion-guidance.js";
 import {
   NO_FUSION_MACHINE_FACTS,
+  resolveFusionMachineFacts,
   type FusionMachineFacts,
 } from "./fusion-machine-facts.js";
+import type { AtomicAgentConfig } from "../config/config-schema.js";
 import { COMPOSIO_SEARCH_TOOL } from "./composio-guidance.js";
 import { buildStablePrefix, type ToolDescriptor } from "./stable-prefix.js";
 import type { CapabilitiesSummary } from "./capabilities.js";
@@ -29,6 +32,16 @@ const FACTS: FusionMachineFacts = {
   workerModel: "qwen3-4b",
   tokensPerSecond: null,
 };
+
+const LOCAL_CONFIG = (completionMaxTokens: number): AtomicAgentConfig =>
+  ({
+    localModels: {
+      mode: "managed",
+      completionMaxTokens,
+      managed: { parallel: 2, contextSize: 0, modelId: "qwen3-4b" },
+    },
+    llm: { providers: [], runMode: { mode: "fusion", fusion: {} } },
+  }) as unknown as AtomicAgentConfig;
 
 function facts(over: Partial<FusionMachineFacts>): FusionMachineFacts {
   return { ...NO_FUSION_MACHINE_FACTS, ...over };
@@ -139,10 +152,19 @@ describe("the ### fusion prefix section", () => {
     // F43's restore line was paid for by shortening the others — the
     // budget is the budget.
     expect(FUSION_GUIDANCE.length).toBeLessThan(1400);
-    expect(buildFusionGuidance(FACTS).length).toBeLessThan(1900);
+    // A local leg also says its workers see only the request's head
+    // (~65 more chars): without it the orchestrator left in the request
+    // what a local worker never read.
+    expect(buildFusionGuidance(FACTS).length).toBeLessThan(1975);
     expect(
       buildFusionGuidance({ ...FACTS, tokensPerSecond: 6.4 }).length,
-    ).toBeLessThan(1900);
+    ).toBeLessThan(1975);
+    // A local leg's task-sizing clause is the other line that grows: one
+    // file or function and ~N new lines instead of "a big one".
+    expect(
+      buildFusionGuidance({ ...FACTS, tokensPerSecond: 6.4, workerMaxNewLines: 650 })
+        .length,
+    ).toBeLessThan(2075);
   });
 });
 
@@ -237,13 +259,85 @@ describe("the machine facts in the ### fusion block", () => {
     // "It should always try to involve them more often" — but never at
     // the price of sending work that cannot succeed without the
     // conversation the worker will not have.
-    expect(FUSION_GUIDANCE).toMatch(/prefer sending more/i);
+    expect(FUSION_GUIDANCE).toContain(
+      "every part that changes something is a worker's",
+    );
+    // Never "do it yourself": the orchestrator's mutations are refused.
+    expect(FUSION_GUIDANCE).not.toMatch(/yourself/);
     expect(FUSION_GUIDANCE).toContain("independent parts");
-    // And to check a fan-out before accepting it, with the tools that can.
-    expect(FUSION_GUIDANCE).toContain("`verify.syntax` on the declared files");
+    // And to check a fan-out before accepting it, but only what the
+    // delegate's own contract checks and syntax pass left uncovered:
+    // a re-run of `verify.syntax` is a strong step for nothing.
+    expect(FUSION_GUIDANCE).toContain("Checks and syntax run for you");
+    expect(FUSION_GUIDANCE).not.toContain("`verify.syntax` on the declared files");
     expect(FUSION_GUIDANCE).toContain("`verify.run` on what the request must do");
     expect(FUSION_GUIDANCE).toMatch(/only makes sense with this conversation/i);
     // And the width is stated as the model's own call.
     expect(FUSION_GUIDANCE).toMatch(/You choose `maxWorkers`/);
+  });
+});
+
+describe("task sizing per worker leg", () => {
+  it("cuts local tasks to one file or function and ~N new lines", () => {
+    // A small local model with a small context: "a big one per worker"
+    // is what it runs out of cap, context or steps on.
+    const block = buildFusionGuidance({ ...FACTS, workerMaxNewLines: 300 });
+    expect(block).toContain(
+      "list the independent parts, one file or one function per task, at most ~300 new lines (fewer on a slow machine); edit large files, never rewrite them.",
+    );
+    expect(block).not.toContain("a big one per worker");
+    expect(localTaskSizing(650)).toContain("at most ~650 new lines");
+  });
+
+  it("tells the orchestrator a local worker sees only the head of the request", () => {
+    // A local brief quotes the first 6,000 chars (`worker-prompt.ts`):
+    // what the task needs past them has to ride in `instructions`.
+    const note =
+      "workers see only the first ~6,000 chars of the request, not this chat, and cannot ask; put what a task needs past that in `instructions`.";
+    expect(buildFusionGuidance({ ...FACTS, workerMaxNewLines: 300 })).toContain(note);
+    expect(buildFusionGuidance(FACTS)).toContain(note);
+    // A cloud leg and an unknown one keep the line byte for byte.
+    const cloud = buildFusionGuidance(facts({ workerLeg: "cloud", workerModel: "gpt-x" }));
+    expect(cloud).not.toContain("6,000");
+    expect(cloud).toContain(
+      "workers see the operator's request, not this chat, and cannot ask.",
+    );
+    expect(FUSION_GUIDANCE).not.toContain("6,000");
+  });
+
+  it("keeps the big-part line for a cloud leg and an unknown one", () => {
+    expect(FUSION_GUIDANCE).toContain("a big one per worker, small ones shared.");
+    const cloud = buildFusionGuidance(
+      facts({ workerLeg: "cloud", workerModel: "gpt-x" }),
+    );
+    expect(cloud).toContain("a big one per worker");
+    expect(cloud).not.toContain("new lines");
+    // A local leg with no cap known keeps the default line.
+    expect(buildFusionGuidance(FACTS)).toContain("a big one per worker");
+  });
+
+  it("derives N from the configured cap, the same bytes every step", () => {
+    // The facts come from config only, so two builds in one session (two
+    // steps) render the same prefix; a different cap is a config write.
+    const small = resolveFusionMachineFacts(LOCAL_CONFIG(4_096));
+    const big = resolveFusionMachineFacts(LOCAL_CONFIG(16_384));
+    expect(buildFusionGuidance(small)).toContain("at most ~150 new lines");
+    expect(buildFusionGuidance(big)).toContain("at most ~650 new lines");
+    const descriptors = [descriptor(FUSION_DELEGATE_TOOL)];
+    const first = prefixWith(descriptors, resolveFusionMachineFacts(LOCAL_CONFIG(8_192)));
+    const second = prefixWith(descriptors, resolveFusionMachineFacts(LOCAL_CONFIG(8_192)));
+    expect(first).toContain("at most ~300 new lines");
+    expect(second).toBe(first);
+  });
+});
+
+
+describe("the orchestrator as a task target", () => {
+  it("sends hard parts and twice-failed ones to model \"orchestrator\", the bulk to workers", () => {
+    for (const block of [FUSION_GUIDANCE, buildFusionGuidance(FACTS)]) {
+      expect(block).toContain(
+        'Hard parts, or one that failed twice, go to `model: "orchestrator"` (a worker turn on your model); keep the bulk on workers.',
+      );
+    }
   });
 });

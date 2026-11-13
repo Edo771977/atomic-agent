@@ -7,6 +7,8 @@ import {
 } from "./contract.js";
 import {
   humaniseTaskId,
+  LOCAL_TASK_FILES_WARN_ABOVE,
+  localTaskSizeWarnings,
   MAX_DELEGATE_TASKS,
   MAX_INSTRUCTIONS_CHARS,
   MAX_REPORTED_PROBLEMS,
@@ -617,5 +619,60 @@ describe("parseDelegateArgs role and model (ATO-943)", () => {
     if (parsed.ok) return;
     expect(parsed.error).toContain("tasks[0].role must be one of plan|build|review|explore|utility");
     expect(parsed.error).toContain("tasks[1].model must be a non-empty string");
+  });
+});
+
+describe("localTaskSizeWarnings", () => {
+  const files = (n: number): string[] =>
+    Array.from({ length: n }, (_, i) => `f${i}.ts`);
+
+  it("names a local task over the file threshold, and only that", () => {
+    const parsed = parseDelegateArgs({
+      tasks: [
+        { id: "three", instructions: "x", files: files(LOCAL_TASK_FILES_WARN_ABOVE) },
+        { id: "four", instructions: "x", files: files(LOCAL_TASK_FILES_WARN_ABOVE + 1) },
+        { id: "none", instructions: "x" },
+      ],
+    });
+    if (!parsed.ok) throw new Error(parsed.error);
+    expect(LOCAL_TASK_FILES_WARN_ABOVE).toBe(3);
+    const warnings = localTaskSizeWarnings(parsed.tasks, () => true);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(/^task "four" declares 4 files to write for a local worker /);
+    // A task on a cloud leg is not warned about.
+    expect(localTaskSizeWarnings(parsed.tasks, () => false)).toEqual([]);
+    expect(localTaskSizeWarnings(parsed.tasks, (t) => t.id !== "four")).toEqual([]);
+  });
+
+  it("does not count tests, fixtures, snapshots or declared inputs", () => {
+    // A source file with its test, fixture and snapshot is one unit of
+    // work, not four; an input the task reads is not one it writes.
+    const parsed = parseDelegateArgs({
+      tasks: [
+        {
+          id: "unit",
+          instructions: "x",
+          files: [
+            "src/a.ts",
+            "src/a.test.ts",
+            "src/b.spec.tsx",
+            "src/__tests__/c.ts",
+            "test/fixtures/d.json",
+            "src/fixture/e.csv",
+            "src/__snapshots__/a.test.ts.snap",
+            "data/sales.csv",
+            "src\\win\\__tests__\\f.ts",
+          ],
+        },
+      ],
+      contract: { inputs: ["./data/sales.csv"] },
+    });
+    if (!parsed.ok) throw new Error(parsed.error);
+    expect(localTaskSizeWarnings(parsed.tasks, () => true, parsed.contract?.inputs)).toEqual([]);
+    const big = parseDelegateArgs({
+      tasks: [{ id: "big", instructions: "x", files: ["a.ts", "b.ts", "c.ts", "d.ts", "a.test.ts"] }],
+    });
+    if (!big.ok) throw new Error(big.error);
+    expect(localTaskSizeWarnings(big.tasks, () => true)[0]).toMatch(/^task "big" declares 4 files to write /);
   });
 });

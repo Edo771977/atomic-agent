@@ -410,3 +410,248 @@ describe("auto-replan after a breaker trip (ATO-1406)", () => {
     expect(result.details.replan).toBeUndefined();
   });
 });
+
+describe("model: \"orchestrator\" tasks count like any priced worker", () => {
+  const hard = (i: number) => ({
+    id: `h${i}`,
+    instructions: `the hard part ${i}`,
+    model: "orchestrator",
+  });
+
+  it("pins each to the orchestrator leg, prices it there and counts it toward the spend cap", async () => {
+    const budget = new FusionTurnBudget();
+    budget.begin("s-parent");
+    const pins: Array<string | undefined> = [];
+    const priced: Array<[string, string]> = [];
+    const d = deps({
+      resolveRunMode: () => mode({ turnBudgetUsd: 1.5 }),
+      turnBudget: budget,
+      resolveWorkerPricing: (providerId, model) => {
+        priced.push([providerId, model]);
+        return { input: 1, output: 4, cacheRead: 0.1 };
+      },
+    });
+    const inner = d.runTurn;
+    d.runTurn = (async (session, message, options) => {
+      pins.push(options.providerId);
+      return inner(session, message, options);
+    }) as FusionDelegateDeps["runTurn"];
+    const result = await buildFusionDelegateTool(d).run(
+      { tasks: [hard(1), hard(2), hard(3)] },
+      ctx(),
+    );
+    // $1 each on the orchestrator leg: the second crosses $1.50.
+    expect(d.turns).toBe(2);
+    expect(pins).toEqual(["openrouter", "openrouter"]);
+    expect(priced).toContainEqual(["openrouter", "big"]);
+    const rows = result.details.tasks as Array<{
+      id: string;
+      status: string;
+      model?: string;
+      notes?: string[];
+      error?: string;
+    }>;
+    expect(rows[0]).toMatchObject({ model: "big" });
+    expect(rows[0]!.notes).toContain("ran on big (the orchestrator's model)");
+    expect(rows[2]).toMatchObject({ id: "h3", status: "cancelled" });
+    expect(rows[2]!.error).toMatch(/^not started: the spend cap/);
+    expect(result.details.turnBudget).toMatchObject({ kind: "usd" });
+  });
+
+  it("counts against maxTasksPerTurn like worker tasks", async () => {
+    const budget = new FusionTurnBudget();
+    budget.begin("s-parent");
+    const d = deps({
+      resolveRunMode: () => mode({ maxTasksPerTurn: 2 }),
+      turnBudget: budget,
+    });
+    const result = await buildFusionDelegateTool(d).run(
+      { tasks: [hard(1), { id: "w", instructions: "bulk" }, hard(2)] },
+      ctx(),
+    );
+    expect(d.turns).toBe(0);
+    expect(result.details).toMatchObject({ reason: "turn-count", kind: "tasks" });
+  });
+});
+
+describe("the per-turn cap on model: \"orchestrator\" tasks", () => {
+  const hard = (i: number) => ({
+    id: `o${i}`,
+    instructions: `the hard part ${i}`,
+    model: "orchestrator",
+  });
+
+  it("refuses a call whose orchestrator tasks pass the cap, across rounds, naming it", async () => {
+    const budget = new FusionTurnBudget();
+    budget.begin("s-parent");
+    const d = deps({
+      resolveRunMode: () => mode({ maxOrchestratorTasksPerTurn: 2 }),
+      turnBudget: budget,
+    });
+    const tool = buildFusionDelegateTool(d);
+    const tooMany = await tool.run({ tasks: [hard(1), hard(2), hard(3)] }, ctx());
+    expect(d.turns).toBe(0);
+    expect(tooMany.status).toBe("error");
+    expect(tooMany.details).toMatchObject({
+      reason: "turn-count",
+      kind: "orchestrator-tasks",
+      cap: 2,
+    });
+    expect(tooMany.summary).toContain(
+      "over the 2 llm.runMode.fusion.maxOrchestratorTasksPerTurn allows (0 already ran)",
+    );
+    await tool.run({ tasks: [hard(1), hard(2)] }, ctx());
+    expect(d.turns).toBe(2);
+    expect(budget.orchestratorTasks("s-parent")).toBe(2);
+    // The cap is used: one more is refused, a worker task still runs.
+    const third = await tool.run({ tasks: [hard(3)] }, ctx());
+    expect(third.details).toMatchObject({ kind: "orchestrator-tasks" });
+    await tool.run({ tasks: [{ id: "w", instructions: "bulk" }] }, ctx());
+    expect(d.turns).toBe(3);
+    // A new turn starts the count over.
+    budget.begin("s-parent");
+    await tool.run({ tasks: [hard(4)] }, ctx());
+    expect(d.turns).toBe(4);
+  });
+
+  it("defaults to four, and holds per call without the runtime's turn state", async () => {
+    const d = deps({});
+    const result = await buildFusionDelegateTool(d).run(
+      { tasks: [1, 2, 3, 4, 5].map(hard) },
+      ctx(),
+    );
+    expect(d.turns).toBe(0);
+    expect(result.details).toMatchObject({ kind: "orchestrator-tasks", cap: 4 });
+  });
+
+  it("turns the target off at 0", async () => {
+    const d = deps({ resolveRunMode: () => mode({ maxOrchestratorTasksPerTurn: 0 }) });
+    const result = await buildFusionDelegateTool(d).run({ tasks: [hard(1)] }, ctx());
+    expect(d.turns).toBe(0);
+    expect(result.details).toMatchObject({ reason: "orchestrator-target-off" });
+    expect(result.summary).toContain("maxOrchestratorTasksPerTurn is 0");
+  });
+
+  it("runs orchestrator tasks at most two at a time, whatever cloudWorkers allows", async () => {
+    let running = 0;
+    let peak = 0;
+    const d = deps({ resolveRunMode: () => mode({ cloudWorkers: 8 }) });
+    const inner = d.runTurn;
+    d.runTurn = (async (session, message, options) => {
+      running += 1;
+      peak = Math.max(peak, running);
+      await new Promise((r) => setTimeout(r, 10));
+      running -= 1;
+      return inner(session, message, options);
+    }) as FusionDelegateDeps["runTurn"];
+    await buildFusionDelegateTool(d).run(
+      { tasks: [1, 2, 3, 4].map(hard), maxWorkers: 8 },
+      ctx(),
+    );
+    expect(d.turns).toBe(4);
+    expect(peak).toBe(2);
+  });
+
+  it("never escalates an orchestrator task, even to another provider", async () => {
+    const asked: string[] = [];
+    const d = deps({
+      resolveRunMode: () =>
+        mode({
+          escalation: {
+            providerId: "third",
+            model: "other",
+            auto: true,
+            replace: false,
+            maxUsd: 1,
+          },
+        }),
+      escalationComplete: async ({ providerId }) => {
+        asked.push(providerId);
+        return {
+          content: "write the file",
+          usage: { promptTokens: 10, completionTokens: 10, totalTokens: 20 },
+        };
+      },
+      steerWorker: () => true,
+    });
+    d.runTurn = (async (_session, _message, options) => {
+      d.turns += 1;
+      // Six identical failing reads: a stall the advisor would answer.
+      for (let i = 0; i < 6; i += 1) {
+        options.eventHook?.({
+          type: "llm_event",
+          event: {
+            type: "tool_call_executed",
+            result: { tool: "os.fs.read", status: "error", summary: "not found: a.txt", details: {} },
+          },
+        } as never);
+        options.eventHook?.({ type: "step_finished", stepIndex: i, summary: "", durationMs: 1 } as never);
+      }
+      await new Promise((r) => setTimeout(r, 0));
+      return {
+        session: createEmptySessionState({ id: "s-w", workingDir: "/repo" }),
+        reason: "reply",
+        stepCount: 6,
+      } as RunTurnResult;
+    }) as FusionDelegateDeps["runTurn"];
+    await buildFusionDelegateTool(d).run(
+      { tasks: [hard(1), { id: "w", instructions: "bulk" }] },
+      ctx(),
+    );
+    expect(d.turns).toBe(2);
+    // Only the worker-leg task asked the advisor.
+    expect(asked).toEqual(["third"]);
+  });
+
+  it("says on an unpriced row that only the count cap holds it", async () => {
+    const d = deps({ resolveWorkerPricing: () => undefined });
+    const result = await buildFusionDelegateTool(d).run({ tasks: [hard(1)] }, ctx());
+    const rows = result.details.tasks as Array<{ notes?: string[] }>;
+    expect(rows[0]!.notes).toContain(
+      "unpriced: counted against llm.runMode.fusion.maxOrchestratorTasksPerTurn, not turnBudgetUsd",
+    );
+  });
+
+  it("refuses the target when the orchestrator leg's CLI keeps its own shell on", async () => {
+    const d = deps({ cliToolsStayOn: (id) => id === "openrouter" });
+    const tool = buildFusionDelegateTool(d);
+    const refused = await tool.run({ tasks: [hard(1)] }, ctx());
+    expect(d.turns).toBe(0);
+    expect(refused.details).toMatchObject({ reason: "orchestrator-target-cli-tools" });
+    expect(refused.summary).toContain("not limited to the worker's read scope");
+    // Worker tasks are unaffected.
+    await tool.run({ tasks: [{ id: "w", instructions: "bulk" }] }, ctx());
+    expect(d.turns).toBe(1);
+  });
+
+  it("parses the cap, 0 included, and resolves the default", async () => {
+    const { parseLlmRunModeConfig } = await import("../../config/llm-run-mode-config.js");
+    const { resolveRunMode } = await import("../../llm/run-mode/resolve-run-mode.js");
+    expect(
+      parseLlmRunModeConfig({ fusion: { maxOrchestratorTasksPerTurn: 0 } }, [], "llm.runMode")
+        .fusion,
+    ).toEqual({ maxOrchestratorTasksPerTurn: 0 });
+    expect(() =>
+      parseLlmRunModeConfig({ fusion: { maxOrchestratorTasksPerTurn: 101 } }, [], "llm.runMode"),
+    ).toThrow(/maxOrchestratorTasksPerTurn/);
+    const resolved = (runMode: object) =>
+      resolveRunMode(
+        {
+          activeTextProvider: "openrouter",
+          activeEmbeddingProvider: "local-llama",
+          providers: [
+            { id: "local-llama", kind: "llama-server", url: "http://127.0.0.1:19091" },
+            { id: "openrouter", kind: "openrouter", defaultChatModel: "big" },
+          ],
+          toolTransport: "auto",
+          runMode,
+        } as never,
+        { managedModelId: "small" },
+      );
+    expect(resolved({ mode: "fusion" }).maxOrchestratorTasksPerTurn).toBe(4);
+    expect(
+      resolved({ mode: "fusion", fusion: { maxOrchestratorTasksPerTurn: 0 } })
+        .maxOrchestratorTasksPerTurn,
+    ).toBe(0);
+  });
+});

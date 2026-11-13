@@ -164,7 +164,8 @@ describe("buildPrompt", () => {
       skillCatalog: SKILLS,
     });
     expect(withFusion.text).toContain("### fusion");
-    expect(withFusion.text).toContain(FUSION_GUIDANCE);
+    // The behavioural lines; the task-sizing clause depends on the leg.
+    expect(withFusion.text).toContain(FUSION_GUIDANCE.split("\n")[0]!);
     expect(withFusion.text.indexOf("### fusion")).toBeLessThan(
       withFusion.text.indexOf("### instructions"),
     );

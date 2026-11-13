@@ -14,6 +14,7 @@ import {
   DEFAULT_FUSION_TASK_TREE_MAX_NODES,
   DEFAULT_FUSION_MAX_ROUNDS_PER_TURN,
   DEFAULT_FUSION_MAX_TASKS_PER_TURN,
+  DEFAULT_FUSION_MAX_ORCHESTRATOR_TASKS_PER_TURN,
   FUSION_TASK_TREE_MAX_DEPTH,
   LOCAL_PROVIDER_KIND,
 } from "../../config/llm-run-mode-config.js";
@@ -95,6 +96,12 @@ export type ResolvedRunMode = {
    */
   isolation?: "worktree";
   /**
+   * `llm.runMode.fusion.localFormatCheck`, present only when turned off
+   * (`false`): no one-call format check before a fan-out on a local
+   * worker leg (`tools/fusion/local-grammar-smoke.ts`).
+   */
+  localFormatCheck?: false;
+  /**
    * `llm.runMode.fusion.taskTree` (ATO-940), present only when enabled
    * with a depth above 1 — a tree of depth 1 is the flat fan-out.
    * `maxDepth` is already clamped to `FUSION_TASK_TREE_MAX_DEPTH`.
@@ -110,6 +117,12 @@ export type ResolvedRunMode = {
    */
   maxRoundsPerTurn?: number;
   maxTasksPerTurn?: number;
+  /**
+   * `model: "orchestrator"` tasks one turn may start: the configured
+   * value, else the default; `0` means the target is off. Always set
+   * when resolved; optional for fixtures, where absent is the default.
+   */
+  maxOrchestratorTasksPerTurn?: number;
   /**
    * The provider that must be `llm.activeTextProvider` for `effective`
    * to hold. Never empty — falls back to the configured active provider
@@ -363,6 +376,7 @@ export function resolveRunMode(
       ? { autoReplan: fusion.autoReplan }
       : {}),
     ...(fusion?.isolation === "worktree" ? { isolation: "worktree" as const } : {}),
+    ...(fusion?.localFormatCheck === false ? { localFormatCheck: false as const } : {}),
     ...resolveTaskTree(fusion?.taskTree),
     ...(fusion?.turnBudgetUsd !== undefined && fusion.turnBudgetUsd > 0
       ? { turnBudgetUsd: fusion.turnBudgetUsd }
@@ -372,6 +386,9 @@ export function resolveRunMode(
       : {}),
     ...countCap("maxRoundsPerTurn", fusion?.maxRoundsPerTurn, DEFAULT_FUSION_MAX_ROUNDS_PER_TURN),
     ...countCap("maxTasksPerTurn", fusion?.maxTasksPerTurn, DEFAULT_FUSION_MAX_TASKS_PER_TURN),
+    maxOrchestratorTasksPerTurn:
+      fusion?.maxOrchestratorTasksPerTurn ??
+      DEFAULT_FUSION_MAX_ORCHESTRATOR_TASKS_PER_TURN,
     primaryProviderId,
     degraded,
   };

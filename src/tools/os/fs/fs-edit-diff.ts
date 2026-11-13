@@ -125,3 +125,44 @@ export function clampDiffPreview(text: string): string {
   if (text.length <= PREVIEW_MAX_LEN) return text;
   return text.slice(0, PREVIEW_MAX_LEN - 15) + "\n… [truncated]";
 }
+
+/** Lines a change added and removed, named as `os.fs.patch` reports them. */
+export interface LineDelta {
+  addedLines: number;
+  removedLines: number;
+}
+
+/**
+ * How many lines `after` added to and removed from `before`, counted
+ * around the changed region: the common head and tail are trimmed and
+ * what is left on each side counts. Exact for one edited region (an
+ * `os.fs.edit`), an upper bound for a rewrite that changed several
+ * regions far apart; linear, so a whole-file write costs one pass. A
+ * trailing newline is not a line.
+ */
+export function countLineDelta(before: string, after: string): LineDelta {
+  if (before === after) return { addedLines: 0, removedLines: 0 };
+  const a = splitLines(before);
+  const b = splitLines(after);
+  let head = 0;
+  while (head < a.length && head < b.length && a[head] === b[head]) head += 1;
+  let tail = 0;
+  while (
+    tail < a.length - head &&
+    tail < b.length - head &&
+    a[a.length - 1 - tail] === b[b.length - 1 - tail]
+  ) {
+    tail += 1;
+  }
+  return {
+    addedLines: b.length - head - tail,
+    removedLines: a.length - head - tail,
+  };
+}
+
+function splitLines(text: string): string[] {
+  if (text.length === 0) return [];
+  const lines = text.split(/\r?\n/);
+  if (lines[lines.length - 1] === "") lines.pop();
+  return lines;
+}

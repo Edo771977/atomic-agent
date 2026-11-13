@@ -10,8 +10,13 @@ import { FUSION_WORKER_ID_PREFIX } from "../../session/fusion-worker-session.js"
 import { StructuredLogger } from "../../tracing/structured-logger.js";
 import {
   buildAcceptanceChecklist,
+  gatherEvidence,
+  JUDGE_DIFF_FILE_CHARS,
+  JUDGE_FILE_CHARS,
   judgeTask,
   parseJudgeAnswer,
+  renderRetryFindings,
+  RETRY_OUTPUT_CHARS,
   type AcceptanceItem,
 } from "./judge.js";
 import {
@@ -347,6 +352,163 @@ describe("a node closes only on a green list (ATO-944)", () => {
     expect(d.briefs).toHaveLength(1);
     expect(d.briefs[0]).not.toContain("ACCEPTANCE CHECKLIST");
     expect((result.details.tasks as Array<{ status: string }>)[0]!.status).toBe("ok");
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe("the retry brief carries a failing check's output", () => {
+  it("quotes the output tail under the red check item, bounded", () => {
+    const items: AcceptanceItem[] = [
+      { id: "a1", kind: "check", text: "the check passes: {\"cmd\":\"npm test\"}", checkIndex: 0, judged: false },
+    ];
+    const text = renderRetryFindings(items, {
+      green: false,
+      costUsd: null,
+      items: [
+        {
+          id: "a1",
+          pass: false,
+          why: "verify.run command: FAILED exit 1 after 9 ms",
+          by: "fact",
+          output: `${"z".repeat(5000)}\nAssertionError: expected 3 to equal 4`,
+        },
+      ],
+    });
+    expect(text).toContain("[a1] the check passes");
+    expect(text).toContain("  output:\n");
+    expect(text).toContain("    AssertionError: expected 3 to equal 4");
+    expect((text.match(/z/g) ?? []).length).toBeLessThanOrEqual(RETRY_OUTPUT_CHARS);
+  });
+
+  it("reaches the retried worker's brief from a real failing check", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "judge-out-"));
+    const d = deps(dir, answer([{ id: "a3", pass: true }]), {
+      runChecks: async () => ({
+        ok: false,
+        results: [
+          {
+            ok: false,
+            summary: "verify.run command: FAILED\nexit 1 after 5 ms\nstderr (tail):\nError: score is NaN\n    at hud.js:3:9",
+            stderrTail: "Error: score is NaN\n    at hud.js:3:9",
+          },
+        ],
+      }),
+    });
+    await buildFusionDelegateTool(d).run(
+      {
+        tasks: TASK,
+        contract: { checks: [{ task: "t", kind: "command", cmd: "node hud.js" }] },
+      },
+      { workingDir: dir, sessionId: "s-p", stepIndex: 0, signal: new AbortController().signal },
+    );
+    const retry = d.briefs.find((b) => b.includes("A judge found these acceptance items NOT met"));
+    expect(retry).toBeDefined();
+    expect(retry).toContain("    Error: score is NaN\n        at hud.js:3:9");
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("masks a secret in the check output before the retry brief quotes it", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "judge-mask-"));
+    const d = deps(dir, answer([{ id: "a3", pass: true }]), {
+      runChecks: async () => ({
+        ok: false,
+        results: [
+          {
+            ok: false,
+            summary: "verify.run command: FAILED\nexit 1 after 5 ms",
+            stderrTail: "Error: auth failed for sk_live_abcdefghijklmnop1234 at db.js:3:9",
+          },
+        ],
+      }),
+    });
+    await buildFusionDelegateTool(d).run(
+      {
+        tasks: TASK,
+        contract: { checks: [{ task: "t", kind: "command", cmd: "node db.js" }] },
+      },
+      { workingDir: dir, sessionId: "s-p", stepIndex: 0, signal: new AbortController().signal },
+    );
+    const retry = d.briefs.find((b) => b.includes("A judge found these acceptance items NOT met"));
+    expect(retry).toBeDefined();
+    expect(retry).toContain("Error: auth failed for [redacted:stripe-key] at db.js:3:9");
+    expect(retry).not.toContain("sk_live_abcdefghijklmnop1234");
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe("judge evidence", () => {
+  const task: DelegateTask = { id: "t", title: "T", instructions: "edit a.txt", files: ["a.txt"] };
+
+  it("without a diff (no isolation) reads each declared file's head, as before", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "judge-ev-"));
+    writeFileSync(join(dir, "a.txt"), "x".repeat(JUDGE_FILE_CHARS + 50));
+    const evidence = await gatherEvidence(task, undefined, "", dir);
+    expect(evidence.startsWith("### a.txt\n")).toBe(true);
+    expect(evidence).toContain("[… 50 more chars clipped]");
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("reads the diff when the changes are known, shows an unchanged declared file's head, and masks", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "judge-ev-"));
+    writeFileSync(join(dir, "a.txt"), "kept\n");
+    const secret = "sk-test-" + "Z".repeat(32);
+    const evidence = await gatherEvidence(
+      { ...task, files: ["a.txt", "b.txt"] },
+      undefined,
+      "",
+      dir,
+      [
+        {
+          path: "b.txt",
+          kind: "modified",
+          patch: `--- a/b.txt\n+++ b/b.txt\n@@ -1 +1 @@\n-old\n+key=${secret}\n`,
+        },
+      ],
+      [{ label: "TEST_KEY", value: secret }],
+    );
+    expect(evidence).toContain("Touched files: b.txt (modified)");
+    expect(evidence).toContain("Declared but not changed: a.txt");
+    expect(evidence).toContain("### a.txt (unchanged)\nkept");
+    expect(evidence).toContain("-old");
+    expect(evidence).not.toContain(secret);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("masks a secret the clip would cut in half: masked first, then clipped", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "judge-ev-"));
+    const secret = "Kx9qWmTr4vLp8nZs2bYc7hJd3fGa";
+    const known = [{ label: "TEST_KEY", value: secret }];
+    // The secret starts just before the per-file diff cap and the file-head cap.
+    const header = "--- a/b.txt\n+++ b/b.txt\n@@ -1 +1 @@\n+";
+    const pad = "p".repeat(JUDGE_DIFF_FILE_CHARS - header.length - 10);
+    const diff = await gatherEvidence(
+      { ...task, files: ["b.txt"] },
+      undefined,
+      "",
+      dir,
+      [{ path: "b.txt", kind: "modified", patch: `${header}${pad}${secret}\n` }],
+      known,
+    );
+    expect(diff).not.toContain(secret.slice(0, 8));
+    const added = await gatherEvidence(
+      { ...task, files: ["c.txt"] },
+      undefined,
+      "",
+      dir,
+      [
+        {
+          path: "c.txt",
+          kind: "added",
+          patch: "--- /dev/null\n+++ b/c.txt\n",
+          content: `${"c".repeat(JUDGE_FILE_CHARS - 10)}${secret}\n`,
+        },
+      ],
+      known,
+    );
+    expect(added).not.toContain(secret.slice(0, 8));
+    writeFileSync(join(dir, "a.txt"), `${"a".repeat(JUDGE_FILE_CHARS - 10)}${secret}\n`);
+    const heads = await gatherEvidence(task, undefined, "", dir, undefined, known);
+    expect(heads).not.toContain(secret.slice(0, 8));
     rmSync(dir, { recursive: true, force: true });
   });
 });

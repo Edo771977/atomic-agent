@@ -60,6 +60,23 @@ import {
   type LocalLegHealth,
 } from "./local-leg-health.js";
 import { hasSplitProposal, splitSteer } from "./task-tree.js";
+import type { ContractCheckRunner } from "./contract-checks.js";
+import {
+  knownSecretsFromEnv,
+  type KnownSecret,
+} from "../../error-reporting/secret-detector.js";
+import {
+  SELF_CHECK_GRACE_STEPS,
+  SELF_CHECK_MAX_MS,
+  SELF_CHECK_MIN_GRACE_STEPS,
+  SELF_CHECK_MIN_REMAINING_MS,
+  WorkerCheckRuns,
+  concurrentPaths,
+  describeSelfCheck,
+  hasFindings,
+  renderSelfCheckNotice,
+  runSelfCheck,
+} from "./worker-self-check.js";
 
 /**
  * How many `phase: "tool"` lines one worker may put in the parent's
@@ -523,6 +540,22 @@ export interface WorkerRunnerDeps {
    * (tests, embedders), nothing is renewed.
    */
   renewLocalTransport?: () => boolean;
+  /**
+   * Runs a contract's `checks` (`verify.run` specs) — the verify tool
+   * family's `runChecks`, wired by the runtime. Used after the fan-out
+   * (`fusion-delegate.ts`) and by a worker's self-check before its reply
+   * closes the task (`worker-self-check.ts`). Absent, declared checks
+   * are reported as not run and never assumed to have passed.
+   */
+  runChecks?: ContractCheckRunner;
+  /**
+   * The agent's own secrets (exact values: `.env`, the config's keys),
+   * for masking check output that reaches a worker outside the tool
+   * registry — the same list the registry masks tool results with
+   * (ATO-1077). Absent: the environment's (`knownSecretsFromEnv`); the
+   * detector's shape rules apply either way.
+   */
+  knownSecrets?: () => readonly KnownSecret[];
 }
 
 /** Escalations one worker may get, automatic and manual together. */
@@ -531,6 +564,12 @@ export const MAX_ESCALATIONS_PER_WORKER = 2;
 export interface RunWorkerTasksOptions {
   parentSessionId: string;
   tasks: readonly DelegateTask[];
+  /**
+   * Every task id running at the same time as these (a wave, a judge's
+   * retry), across all legs. A worker's self-check does not ask a
+   * sibling's files of it (`concurrentPaths`). Absent: `tasks`.
+   */
+  concurrentTaskIds?: readonly string[];
   /** Concurrency ceiling, already reconciled against the slot pool. */
   maxWorkers: number;
   /** The local leg every worker turn is pinned to. */
@@ -735,11 +774,13 @@ async function runOneTask(
   task: DelegateTask,
 ): Promise<WorkerTaskResult> {
   const startedAt = Date.now();
-  const collector = new WorkerRunCollector();
   // Branch isolation (ATO-946): the task's own workspace stands in for
   // the working directory everywhere below. Without it, nothing changes.
   const isolated = options.taskWorkspace?.(task.id);
   const workingDir = isolated?.workingDir ?? deps.workingDir;
+  // Changed paths are kept relative to it, so they name the same files
+  // in the folder once a workspace is merged back.
+  const collector = new WorkerRunCollector({ workingDir });
   // The worker always runs in this folder (the parent's, in every model
   // mode, #1121); only an isolated or cloud worker inherits a workspace.
   const inheritWorkspace = isolated !== undefined || deps.inheritWorkspace === true;
@@ -983,6 +1024,7 @@ async function runOneTask(
       ? {}
       : { originalRequest: options.originalRequest }),
     ...(options.contract === undefined ? {} : { contract: options.contract }),
+    localLeg: options.localLeg === true,
   })}${suffix === undefined ? "" : `\n\n${suffix}`}`;
   const declaredFiles = task.files?.length ?? 0;
   // Per-task budgets the orchestrator sized itself, clamped into what
@@ -1167,9 +1209,16 @@ async function runOneTask(
     if (steered) splitAskedAt = stepsFinished;
     return steered;
   };
+  // Set while the worker fixes what its self-check found: those steps
+  // were granted on top of the hand-back rule, not measured against it.
+  let inSelfCheckGrace = false;
+  // The worker's own `verify.run` passes, so the self-check does not
+  // run a check a third time that the worker already saw pass.
+  const checkRuns = new WorkerCheckRuns(READ_ONLY_TOOLS);
   const maybeHandBack = (): void => {
     if (declaredFiles === 0 || wroteSomething || handBack.signal.aborted)
       return;
+    if (inSelfCheckGrace) return;
     if (stepsFinished < HAND_BACK_MIN_COMPLETED_STEPS) return;
     const pastHalfTime = Date.now() - startedAt >= halfTimeMs;
     // The step half needs a stalled worker, not merely a busy one at
@@ -1242,6 +1291,9 @@ async function runOneTask(
   let escalations = 0;
   let escalating = false;
   let replaceRequested = false;
+  // Escalations that reached the worker: an advisor hint or the re-run.
+  // Counted for the outcome log (`outcome-log.ts`), never read back.
+  let escalationsUsed = 0;
   const escalationNotes: string[] = [];
   const target = options.escalation?.target;
   const targetLabel = target?.model ?? target?.providerId ?? "";
@@ -1304,6 +1356,7 @@ async function runOneTask(
       deps.steerWorker?.(session.id, formatAdvisorSteer(targetLabel, outcome.hint)) ??
       false;
     const line = `escalated to ${targetLabel} as advisor (${describeTrigger(trigger)}): ${formatCost(outcome.costUsd)}${steered ? "" : " — the worker's turn had ended, so the hint was not used"}`;
+    escalationsUsed += 1;
     escalationNotes.push(line);
     announceEscalation(line, outcome.costUsd ?? undefined);
     return line;
@@ -1390,13 +1443,141 @@ async function runOneTask(
     },
   );
 
+  const selfCheckNotes: string[] = [];
+  // The worker got its one self-check notice (the outcome log's flag).
+  let selfCheckNoticed = false;
+  /**
+   * The worker replied: before that reply closes the task, ask what the
+   * fan-out will ask afterwards — declared files present, this task's
+   * own checks passing in its workspace (`worker-self-check.ts`). On a
+   * "no", the worker gets one notice as the next message of its own
+   * conversation and `SELF_CHECK_GRACE_STEPS` more steps, under the same
+   * session policy, signals and clocks as its first turn. Once per task;
+   * whatever the grace turn ends with is the turn's outcome.
+   */
+  const selfCheck = async (
+    first: RunTurnResult,
+    runTurnOptions: (maxSteps: number, taskMaxDurationMs: number) => Parameters<WorkerRunnerDeps["runTurn"]>[2],
+  ): Promise<RunTurnResult> => {
+    if (first.reason !== "reply" || first.stopCause !== undefined) return first;
+    const hasFiles = (task.files?.length ?? 0) > 0;
+    const hasChecks =
+      deps.runChecks !== undefined &&
+      (options.contract?.checks ?? []).some((check) => check.task === task.id);
+    if (!hasFiles && !hasChecks) return first;
+    const stopped = (): boolean =>
+      options.signal.aborted ||
+      timeLimit.aborted ||
+      stopByPerson.signal.aborted ||
+      replaceAbort.signal.aborted ||
+      handBack.signal.aborted;
+    if (stopped()) return first;
+    // A reply the worker was not allowed to close on (a refusal handed
+    // back) or a split proposal (its files are its children's) is not
+    // the worker's own claim of done.
+    const provisional = collector.finish({
+      id: task.id,
+      title: task.title,
+      reason: first.reason,
+      stepCount: first.stepCount,
+      durationMs: 0,
+    });
+    if (provisional.status !== "ok") return first;
+    // A worker that already replaced one of the operator's inputs is the
+    // orchestrator's to handle (`replacedInputs` on the row): a second
+    // turn of the same worker on the same files only repeats the damage.
+    if ((provisional.replacedInputs?.length ?? 0) > 0) return first;
+    if (mayPropose && hasSplitProposal(provisional.reply)) return first;
+    const stepsLeft = stepBudget.value - first.stepCount;
+    const graceSteps = Math.min(SELF_CHECK_GRACE_STEPS, stepsLeft);
+    if (graceSteps < SELF_CHECK_MIN_GRACE_STEPS) return first;
+    const remainingMs =
+      servedAt === null ? timeoutMs : timeoutMs - (Date.now() - servedAt);
+    if (remainingMs < SELF_CHECK_MIN_REMAINING_MS) return first;
+    const knownSecrets = deps.knownSecrets?.() ?? knownSecretsFromEnv();
+    const finding = await runSelfCheck({
+      task,
+      ...(options.contract === undefined ? {} : { contract: options.contract }),
+      workingDir,
+      startedAt,
+      ...(deps.runChecks === undefined ? {} : { runChecks: deps.runChecks }),
+      signal: AbortSignal.any([
+        options.signal,
+        timeLimit,
+        stopByPerson.signal,
+        replaceAbort.signal,
+      ]),
+      timeCapMs: Math.min(SELF_CHECK_MAX_MS, remainingMs),
+      knownSecrets,
+      concurrentPaths: concurrentPaths(
+        options.contract,
+        task.id,
+        options.concurrentTaskIds ?? options.tasks.map((t) => t.id),
+      ),
+      alreadyPassed: (check) => checkRuns.passedSinceLastChange(check),
+    });
+    if (finding.checksCapped === true) {
+      // Said on the row, not only in the log: a check that always runs
+      // past the cap makes the self-check a no-op for this task, and
+      // the orchestrator should know its worker saw nothing.
+      selfCheckNotes.push(
+        `self-check: its own checks did not finish within ${Math.round(Math.min(SELF_CHECK_MAX_MS, remainingMs) / 1000)}s, so it was told nothing; only the post-fan-out run judges them`,
+      );
+    }
+    if (finding.checksDeferred !== undefined) {
+      deps.logger?.info("fusion: a worker's self-check left checks to the fan-out", {
+        taskId: task.id,
+        reason: `they read ${finding.checksDeferred.join(", ")}, written by a task running alongside it`,
+      });
+    }
+    if (finding.checksNotRun !== undefined) {
+      deps.logger?.info("fusion: a worker's self-check ran no checks", {
+        taskId: task.id,
+        reason: finding.checksNotRun,
+      });
+    }
+    if (!hasFindings(finding) || stopped()) return first;
+    selfCheckNotes.push(describeSelfCheck(finding, graceSteps));
+    selfCheckNoticed = true;
+    const left =
+      servedAt === null ? timeoutMs + queueBudgetMs : timeoutMs - (Date.now() - servedAt);
+    inSelfCheckGrace = true;
+    let grace: RunTurnResult;
+    try {
+      grace = await deps.runTurn(
+        first.session,
+        renderSelfCheckNotice(finding, graceSteps, knownSecrets),
+        runTurnOptions(graceSteps, Math.max(1, left)),
+      );
+    } finally {
+      inSelfCheckGrace = false;
+    }
+    countUnreadNotes(session.id, grace.undelivered);
+    // A grace that ran out of its steps ended on a forced final step:
+    // its reply is what the worker was made to say, not its claim of
+    // done, so it keeps the `step_ceiling` cause and the row stays
+    // `max_steps`, as any forced reply does. Nothing after the waves
+    // turns a row `ok` (the checks and the declared files only ever
+    // demote one), so stripping the cause here would have been the only
+    // thing calling an unfinished fix done. The note says the ceiling was
+    // the grace's, not the task's whole budget.
+    if (grace.stopCause === "step_ceiling") {
+      selfCheckNotes.push(
+        `self-check: the grace ran out of its ${graceSteps} steps; the last reply was written on the forced final step`,
+      );
+    }
+    return { ...grace, stepCount: first.stepCount + grace.stepCount };
+  };
   let result: WorkerTaskResult;
   try {
-    const turn = await deps.runTurn(session, brief, {
+    const workerTurnOptions = (
+      maxSteps: number,
+      taskMaxDurationMs: number,
+    ): Parameters<WorkerRunnerDeps["runTurn"]>[2] => ({
       origin: "fusion",
       providerId: options.providerId,
-      maxSteps: stepBudget.value,
-      taskMaxDurationMs: timeoutMs + queueBudgetMs,
+      maxSteps,
+      taskMaxDurationMs,
       toolFilter: isWorkerVisibleTool,
       toolRole: WORKER_TOOL_ROLE,
       ...(options.workerReasoning === undefined || options.workerReasoning === "unbounded"
@@ -1447,6 +1628,11 @@ async function runOneTask(
           // a batched step, so the dedupe above earns its keep.
           announceStart();
           announceTool(event.event.call.tool);
+          checkRuns.parsedCall(
+            event.event.call.tool,
+            event.event.call.args,
+            event.event.batchIndex,
+          );
           try {
             options.onWorkerTool?.(task.id, event.event.call.tool);
           } catch {
@@ -1504,6 +1690,12 @@ async function runOneTask(
           if (result.status === "ok" && WRITE_TOOLS.has(result.tool)) {
             wroteSomething = true;
           }
+          checkRuns.executed(
+            result.tool,
+            result.status,
+            event.event.batchIndex,
+            stepsFinished,
+          );
           currentFingerprints.push(fingerprintToolOutcome(result.tool, result));
           if (result.status === "ok" && !READ_ONLY_TOOLS.has(result.tool)) {
             currentBusy = true;
@@ -1513,7 +1705,13 @@ async function runOneTask(
         collector.observe(event);
       },
     });
+    let turn = await deps.runTurn(
+      session,
+      brief,
+      workerTurnOptions(stepBudget.value, timeoutMs + queueBudgetMs),
+    );
     countUnreadNotes(session.id, turn.undelivered);
+    turn = await selfCheck(turn, workerTurnOptions);
     const timedOut = turn.reason === "cancelled" && hitTimeLimit();
     timedOutOutcome = timedOut;
     queuedOutcome = turn.reason === "cancelled" && hitQueueLimit();
@@ -1608,7 +1806,7 @@ async function runOneTask(
       inheritWorkspace,
     );
     armWorkerSession(replaceSession.id);
-    const replaceCollector = new WorkerRunCollector();
+    const replaceCollector = new WorkerRunCollector({ workingDir });
     const capAbort = new AbortController();
     const replaceTimer = setTimeout(
       () => capAbort.abort(new Error("time limit")),
@@ -1625,6 +1823,7 @@ async function runOneTask(
         steer: (text) => steerByPerson(replaceSession.id, text),
       },
     );
+    escalationsUsed += 1;
     announceEscalation(
       `re-running the task on ${targetLabel}: the advisor's hint did not unstick the local worker`,
     );
@@ -1781,6 +1980,12 @@ async function runOneTask(
       notes: [...(result.notes ?? []), ...escalationNotes],
     };
   }
+
+  if (selfCheckNotes.length > 0) {
+    result = { ...result, notes: [...(result.notes ?? []), ...selfCheckNotes] };
+  }
+  if (selfCheckNoticed) result = { ...result, selfCheckNotice: true };
+  if (escalationsUsed > 0) result = { ...result, escalations: escalationsUsed };
 
   // A budget the orchestrator asked for and did not get is something it
   // has to know: it planned the task against the bigger number.

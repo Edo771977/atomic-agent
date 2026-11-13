@@ -1,5 +1,5 @@
 import type { ApprovalCategory } from "../../approval/approval-level.js";
-import type { ToolRole } from "../tool-roles.js";
+import { roleAdmits, type ToolRole } from "../tool-roles.js";
 
 /**
  * What a fusion worker may and may not do.
@@ -64,6 +64,16 @@ export function isWorkerVisibleTool(name: string): boolean {
  * out-of-role one can.
  */
 export const WORKER_TOOL_ROLE: ToolRole = "builder";
+
+/**
+ * The tool names a fresh worker step's grammar admits, from the step's
+ * descriptor names: the role's own (`descriptorsForRole`, nothing loaded
+ * yet) less the hidden ones — what `stepGrammarToolNames` keeps for a
+ * worker turn.
+ */
+export function workerStepToolNames(names: Iterable<string>): string[] {
+  return [...names].filter((name) => roleAdmits(WORKER_TOOL_ROLE, name) && isWorkerVisibleTool(name));
+}
 
 /**
  * Reason a worker's approval-gated call is refused instead of prompting.

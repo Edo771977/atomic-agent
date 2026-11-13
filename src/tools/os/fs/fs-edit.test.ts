@@ -54,6 +54,8 @@ describe("os.fs.edit", () => {
     expect(result.status).toBe("ok");
     expect(await readFile(file, "utf8")).toBe("const x = 42;\nconst y = 2;\n");
     expect(result.details.replacedOccurrences).toBe(1);
+    // The line delta a fan-out's `changed:` line is built from.
+    expect(result.details).toMatchObject({ addedLines: 1, removedLines: 1 });
   });
 
   it("rejects non-unique oldString without replaceAll", async () => {

@@ -1,6 +1,6 @@
 /**
- * `models recommend [--json]` and `models upgrade [--json] [--dry-run]`
- * (ATO-1043, ATO-15).
+ * `models recommend [--json] [--role worker]` and
+ * `models upgrade [--json] [--dry-run]` (ATO-1043, ATO-15).
  *
  * `recommend` says what this machine has and names three models for it:
  * fast, balanced, quality. `upgrade` decides whether the quality one is
@@ -10,14 +10,27 @@
  * never switches the model: the switch is offered by whoever shows the
  * progress (the desktop bar, the TUI), once the weights are on disk.
  *
+ * `recommend --role worker` also names the model for fusion's workers
+ * (a strong model directs, a local one executes): ranked by its recorded
+ * fusion-worker rating, then by room for the server's parallel worker
+ * slots, then by catalog rank, with the reasons (`recommendWorkerModel`).
+ *
  * The desktop reads `--json` of both. Their shape is a contract: fields
  * are only ever added.
  */
 
+import { getConfig } from "../config/index.js";
 import {
   modelDownloadGb,
+  modelsThisMachineCarries,
+  type MachineForModels,
   type ModelUpgradeDecision,
 } from "../local-llm/catalog/model-upgrade.js";
+import {
+  recommendWorkerModel,
+  type RecommendRole,
+  type WorkerModelPick,
+} from "../local-llm/catalog/recommended-model.js";
 import type { LocalModelDef } from "../local-llm/index.js";
 import {
   readRecommendSnapshot,
@@ -78,26 +91,111 @@ function round1(n: number | null): number | null {
   return n === null ? null : Math.round(n * 10) / 10;
 }
 
-/** `models recommend [--json]`. */
+/** `--role <default|worker>` (or `--role=<…>`); `null` when the value is not a role. */
+export function readRoleFlag(args: readonly string[]): RecommendRole | null {
+  let value: string | undefined;
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i]!;
+    if (arg === "--role") value = args[i + 1] ?? "";
+    else if (arg.startsWith("--role=")) value = arg.slice("--role=".length);
+  }
+  if (value === undefined) return "default";
+  return value === "default" || value === "worker" ? value : null;
+}
+
+/**
+ * The worker pick for this machine: among the models it carries (RAM,
+ * GPU share, disk, as for the tiers), with `parallel` worker slots
+ * (`localModels.managed.parallel`; `auto` sizes them as the managed
+ * daemon does). The slots must fit the GPU budget beside the weights as
+ * well as RAM. A GPU off macOS is taken to have memory of its own (the
+ * daemon's lower auto ceiling); this probe cannot tell an integrated
+ * one, which the daemon sizes against RAM.
+ */
+export function workerRecommendation(
+  machine: MachineForModels,
+  parallel: number | "auto",
+  platform: NodeJS.Platform = process.platform,
+): WorkerModelPick | null {
+  return recommendWorkerModel(machine.ramGb, {
+    catalog: modelsThisMachineCarries(machine),
+    parallel,
+    gpuBudgetGb: machine.gpuBudgetGb,
+    cpuOnly: machine.cpuOnly,
+    dedicatedGpu: !machine.cpuOnly && machine.gpuBudgetGb !== null && platform !== "darwin",
+  });
+}
+
+export function workerJson(pick: WorkerModelPick | null): Record<string, unknown> | null {
+  if (pick === null) return null;
+  return {
+    model: modelJson(pick.model),
+    rating: pick.fit?.rating ?? null,
+    ratingNote: pick.fit?.note ?? null,
+    slots: pick.slots,
+    slotsWanted: pick.slotsWanted,
+    needGb: round1(pick.needGb),
+    why: pick.why,
+  };
+}
+
+/** `models recommend [--json] [--role worker]`. */
 export async function runModelsRecommend(args: readonly string[]): Promise<number> {
+  const role = readRoleFlag(args);
+  if (role === null) {
+    process.stderr.write("models recommend: --role takes default or worker\n");
+    return 2;
+  }
   const snap = await readRecommendSnapshot();
+  const worker =
+    role === "worker"
+      ? workerRecommendation(snap.machine, getConfig().localModels.managed.parallel)
+      : undefined;
   if (args.includes("--json")) {
-    process.stdout.write(`${JSON.stringify(recommendJson(snap))}\n`);
+    const json = recommendJson(snap);
+    const out = worker === undefined ? json : { ...json, role, worker: workerJson(worker) };
+    process.stdout.write(`${JSON.stringify(out)}\n`);
     return 0;
   }
-  process.stdout.write(describeRecommendation(snap));
+  process.stdout.write(
+    worker === undefined ? describeRecommendation(snap) : describeWorkerRecommendation(snap, worker),
+  );
   return 0;
 }
 
-export function describeRecommendation(snap: RecommendSnapshot): string {
-  const m = snap.machine;
+/** The machine line and the worker pick with its reasons. */
+export function describeWorkerRecommendation(
+  snap: RecommendSnapshot,
+  pick: WorkerModelPick | null,
+): string {
+  const lines = [machineLine(snap.machine), ""];
+  if (pick === null) {
+    lines.push("worker model for fusion: none fits this machine");
+    return `${lines.join("\n")}\n`;
+  }
+  const def = pick.model;
+  lines.push(
+    `worker model for fusion (${pick.slotsWanted} worker slot${pick.slotsWanted === 1 ? "" : "s"}):`,
+    `  ${def.id.padEnd(20)} ${def.sizeLabel.padEnd(8)} ${def.description}`,
+    ...pick.why.map((reason, i) => `  ${i === 0 ? "why:" : "    "} ${reason}`),
+    "",
+    `fetch it: 'atomic-agent models pull ${def.id}'`,
+  );
+  return `${lines.join("\n")}\n`;
+}
+
+function machineLine(m: MachineForModels): string {
   const gpu = m.cpuOnly
     ? "no GPU (runs on the CPU)"
     : m.gpuBudgetGb === null
       ? "GPU memory unknown"
       : `${m.gpuBudgetGb.toFixed(1)} GB for the model on the GPU`;
   const disk = m.freeDiskGb === null ? "free disk unknown" : `${m.freeDiskGb.toFixed(0)} GB free on disk`;
-  const lines = [`this machine: ${m.ramGb} GB RAM, ${gpu}, ${disk}`, ""];
+  return `this machine: ${m.ramGb} GB RAM, ${gpu}, ${disk}`;
+}
+
+export function describeRecommendation(snap: RecommendSnapshot): string {
+  const lines = [machineLine(snap.machine), ""];
   const row = (label: string, def: LocalModelDef | null) =>
     `  ${label.padEnd(9)} ${def ? `${def.id.padEnd(20)} ${def.sizeLabel.padEnd(8)} ${def.description}` : "none fits this machine"}`;
   lines.push(

@@ -1,4 +1,5 @@
 import { mkdtemp, readFile, readdir, rm, writeFile, mkdir } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -126,6 +127,26 @@ describe("createBranchSet", () => {
     expect(await readFile(join(ws.dir, "notes.md"), "utf8")).toBe("hello\n");
     await set!.cleanup();
     expect(await readdir(root)).toEqual([]);
+  });
+
+  it("sweeps a dead run's leftovers and its git worktrees on the next start, never a live run's", async () => {
+    const repo = await gitRepo({ "a.txt": "a\n" });
+    const root = await tmpRoot();
+    const dead = spawnSync(process.execPath, ["-e", ""]).pid!;
+    const stale = join(root, "atag-fusion-dead00-x1");
+    await mkdir(stale);
+    await writeFile(join(stale, "owner.json"), JSON.stringify({ pid: dead }));
+    await runGitRaw(repo, ["worktree", "add", "--detach", "--quiet", join(stale, "base"), "HEAD"]);
+    const live = join(root, "atag-fusion-live00-x2");
+    await mkdir(live);
+    await writeFile(join(live, "owner.json"), JSON.stringify({ pid: process.pid }));
+    const other = join(root, "unrelated");
+    await mkdir(other);
+    expect((await runGitRaw(repo, ["worktree", "list"])).stdout.trim().split("\n")).toHaveLength(2);
+    const set = await createBranchSet(repo, ["one"], { tmpRoot: root });
+    await set!.cleanup();
+    expect((await readdir(root)).sort()).toEqual(["atag-fusion-live00-x2", "unrelated"]);
+    expect((await runGitRaw(repo, ["worktree", "list"])).stdout.trim().split("\n")).toHaveLength(1);
   });
 
   it("returns null for a tree too large to copy", async () => {
@@ -258,7 +279,7 @@ describe("runIsolatedWave", () => {
     expect(wave.results.map((r) => r.status)).toEqual(["ok", "needs_orchestrator"]);
     expect(wave.results[1]!.error).toContain("merge conflict in docs/a.md");
     expect(wave.merges.map((m) => m.id)).toEqual(["merge-two"]);
-    const saved = join(repo, BRANCH_MERGE_DIR, (await readdir(join(repo, BRANCH_MERGE_DIR)))[0]!);
+    const saved = join(repo, BRANCH_MERGE_DIR, (await readdir(join(repo, BRANCH_MERGE_DIR))).filter((n) => n !== ".gitignore")[0]!);
     expect(await readFile(join(saved, "docs", "a.md.task"), "utf8")).toBe("under docs\n");
   });
 

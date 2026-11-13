@@ -94,7 +94,7 @@ export function takeReplanNotice(state: ReplanState): {
   if (state.pending !== null) {
     return {
       state,
-      notice: `Replan required: ${state.pending.join(", ")} did not close. This step runs only \`fusion.delegate\`: rewrite those briefs from the facts in the last result and send them again with the same ids.`,
+      notice: `Replan required: ${state.pending.join(", ")} did not close. This step runs only \`fusion.delegate\`: rewrite those briefs from the facts in the last result and send them again with the same ids, or split one into continuation ids (\`<id>.a\`, \`<id>.b\`).`,
     };
   }
   if (state.releaseNoticeOwed) {
