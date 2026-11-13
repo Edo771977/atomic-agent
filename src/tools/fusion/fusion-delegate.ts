@@ -48,8 +48,15 @@ import { LocalLegHealth } from "./local-leg-health.js";
 import {
   renderMergeBlock,
   runIsolatedWave,
+  type KeptBranch,
   type MergeTaskSuggestion,
 } from "./branch-merge.js";
+import {
+  applyPostMergeChecks,
+  buildMergeGate,
+  MergeGateState,
+  type GateJudge,
+} from "./merge-gate.js";
 import {
   TaskTreeState,
   expandSplits,
@@ -925,6 +932,57 @@ export function buildFusionDelegateTool(
               ].filter((part): part is string => part !== undefined);
               return parts.length === 0 ? undefined : parts.join("\n\n");
             };
+      // The judge's spend counts toward the turn's cap, whether it ruled
+      // in a task's workspace before the merge or after the waves.
+      let judgeSpendUsd = 0;
+      const judgePricing =
+        judging && judgeTarget !== null
+          ? deps.resolveWorkerPricing?.(
+              judgeTarget.providerId,
+              judgeTarget.model ?? judgeTarget.providerId,
+            )
+          : undefined;
+      const judgeable = (r: WorkerTaskResult): boolean =>
+        (acceptance.get(r.id)?.length ?? 0) > 0 &&
+        (r.status === "ok" ||
+          (r.status === "failed" && (r.error ?? "").startsWith("checks:")));
+      const judgeOne: GateJudge = async (input) => {
+        const stop = budgetStop();
+        if (stop !== undefined || ctx.signal.aborted) {
+          return {
+            green: false,
+            items: [],
+            unverified:
+              stop === undefined ? "the turn was cancelled" : `not judged: ${stop.message}`,
+            costUsd: null,
+          };
+        }
+        const verdict = await judgeTask({
+          ...input,
+          target: judgeTarget!,
+          pricing: judgePricing,
+          complete: sideComplete!,
+          signal: ctx.signal,
+        });
+        if (verdict.costUsd !== null && verdict.costUsd > 0) {
+          judgeSpendUsd += verdict.costUsd;
+          run?.addSpend(verdict.costUsd);
+          turnBudget.addWorkerSpend(ctx.sessionId, verdict.costUsd);
+        }
+        return verdict;
+      };
+      // Merge only green tasks: under isolation a task's own checks and
+      // the judge rule inside its workspace before its merge, and a red
+      // one is kept as a patch (`merge-gate.ts`). A judged-red task's
+      // workspace is kept for its retry, and removed after the judge.
+      const gateState = new MergeGateState();
+      const keptBranches = new Map<string, KeptBranch>();
+      let retryRound = false;
+      const releaseKept = async (): Promise<void> => {
+        const sets = new Set([...keptBranches.values()].map((b) => b.set));
+        keptBranches.clear();
+        for (const set of sets) await set.cleanup();
+      };
       // Branch isolation (ATO-946): with `isolation: "worktree"` each run
       // of tasks (a wave, a judge's retry) gets a workspace per task and
       // is merged back before anything reads the folder. Off: unchanged.
@@ -940,6 +998,12 @@ export function buildFusionDelegateTool(
         if (mode.isolation !== "worktree") {
           return runAcrossLegs(tasks, contract, briefSuffix, undefined, allowSplit);
         }
+        const kept = new Map(
+          tasks.flatMap((t) => {
+            const branch = keptBranches.get(t.id);
+            return branch === undefined ? [] : [[t.id, branch] as const];
+          }),
+        );
         const wave = await runIsolatedWave({
           realDir: ctx.workingDir,
           tasks,
@@ -947,7 +1011,30 @@ export function buildFusionDelegateTool(
           inputs: contract?.inputs ?? [],
           run: (rebased, taskWorkspace) =>
             runAcrossLegs(rebased, contract, briefSuffix, taskWorkspace, allowSplit),
+          gate: buildMergeGate({
+            contract: parsed.contract,
+            tasks: parsed.tasks,
+            concurrent: tasks.map((t) => t.id),
+            runChecks: deps.runChecks,
+            ...(deps.knownSecrets === undefined
+              ? {}
+              : { knownSecrets: deps.knownSecrets() }),
+            signal: ctx.signal,
+            state: gateState,
+            ...(judging
+              ? {
+                  judge: {
+                    items: (id: string) => acceptance.get(id),
+                    judgeable,
+                    run: judgeOne,
+                    keepForRetry: !retryRound,
+                  },
+                }
+              : {}),
+          }),
+          ...(kept.size === 0 ? {} : { kept }),
         });
+        for (const [id, branch] of wave.kept ?? []) keptBranches.set(id, branch);
         merges.push(...wave.merges);
         run?.recordMerges(wave.merges);
         for (const row of wave.results) {
@@ -1277,6 +1364,7 @@ export function buildFusionDelegateTool(
         // orchestrator still gets a readable result rather than a dead turn.
         // The checkpoint stays: what finished can still be resumed.
         run?.finish("interrupted");
+        await releaseKept();
         return error(
           `the fan-out failed: ${err instanceof Error ? err.message : String(err)}`,
           { reason: "fan-out-failed" },
@@ -1357,8 +1445,14 @@ export function buildFusionDelegateTool(
           { results: allRows, signal: ctx.signal },
         );
         let out = applyContractFindings(rows, provides.findings);
+        // A check a gate already ran in its task's workspace (isolation)
+        // is not run again; the rest run here, on the merged folder.
+        const allChecks = parsed.contract.checks ?? [];
+        const pending = allChecks.flatMap((check, index) =>
+          gateState.checkOutcomes.has(index) ? [] : [{ check, index }],
+        );
         const checks = await runContractChecks(
-          parsed.contract.checks ?? [],
+          pending.map((p) => p.check),
           deps.runChecks,
           {
             workingDir: ctx.workingDir,
@@ -1368,11 +1462,17 @@ export function buildFusionDelegateTool(
               : { knownSecrets: deps.knownSecrets() }),
           },
         );
-        out = applyCheckOutcomes(out, checks.outcomes);
+        out = applyPostMergeChecks(out, checks.outcomes);
+        const byIndex = new Map(gateState.checkOutcomes);
+        if (checks.outcomes.length === pending.length) {
+          pending.forEach((p, i) => byIndex.set(p.index, checks.outcomes[i]!));
+        }
+        const allOutcomes = allChecks.flatMap((_, i) => {
+          const outcome = byIndex.get(i);
+          return outcome === undefined ? [] : [outcome];
+        });
         checkOutcomes =
-          checks.outcomes.length === (parsed.contract.checks ?? []).length
-            ? checks.outcomes
-            : [];
+          allOutcomes.length === allChecks.length ? allOutcomes : [];
         // What the call was run with despite the contract — a require
         // nobody provides, a provide nothing can check, a cycle in the
         // requires, a provider that had not delivered when its dependent
@@ -1384,7 +1484,7 @@ export function buildFusionDelegateTool(
           ...(provides.providesSkipped === undefined
             ? {}
             : { providesSkipped: provides.providesSkipped }),
-          checks: checks.outcomes,
+          checks: allOutcomes,
           ...(checks.checksSkipped === undefined
             ? {}
             : { checksSkipped: checks.checksSkipped }),
@@ -1419,57 +1519,35 @@ export function buildFusionDelegateTool(
       // red list is re-run once with the findings, and a list still red
       // after that is a failed task, item by item. Its spend counts
       // toward the turn's cap.
-      let judgeSpendUsd = 0;
       if (judging && judgeTarget !== null) {
-        const judgePricing = deps.resolveWorkerPricing?.(
-          judgeTarget.providerId,
-          judgeTarget.model ?? judgeTarget.providerId,
-        );
-        const judgeable = (r: WorkerTaskResult): boolean =>
-          (acceptance.get(r.id)?.length ?? 0) > 0 &&
-          (r.status === "ok" ||
-            (r.status === "failed" && (r.error ?? "").startsWith("checks:")));
         const judgeRows = async (
           rows: readonly WorkerTaskResult[],
         ): Promise<Map<string, JudgeVerdict>> => {
           const verdicts = new Map<string, JudgeVerdict>();
           for (const row of rows) {
-            if (!judgeable(row)) continue;
-            const task = parsed.tasks.find((t) => t.id === row.id)!;
-            const stop = budgetStop();
-            if (stop !== undefined || ctx.signal.aborted) {
-              verdicts.set(row.id, {
-                green: false,
-                items: [],
-                unverified:
-                  stop === undefined
-                    ? "the turn was cancelled"
-                    : `not judged: ${stop.message}`,
-                costUsd: null,
-              });
+            // Already ruled on in its workspace, before its merge.
+            const gated = gateState.verdicts.get(row.id);
+            if (gated !== undefined) {
+              verdicts.set(row.id, gated);
               continue;
             }
-            const verdict = await judgeTask({
-              task,
-              items: acceptance.get(row.id) ?? [],
-              facts: {
-                checkOutcomes,
-                findings: contract?.findings ?? [],
-              },
-              reply: row.reply,
-              contract: parsed.contract,
-              workingDir: ctx.workingDir,
-              target: judgeTarget,
-              pricing: judgePricing,
-              complete: sideComplete!,
-              signal: ctx.signal,
-            });
-            if (verdict.costUsd !== null && verdict.costUsd > 0) {
-              judgeSpendUsd += verdict.costUsd;
-              run?.addSpend(verdict.costUsd);
-              turnBudget.addWorkerSpend(ctx.sessionId, verdict.costUsd);
-            }
-            verdicts.set(row.id, verdict);
+            if (!judgeable(row)) continue;
+            const task = parsed.tasks.find((t) => t.id === row.id)!;
+            verdicts.set(
+              row.id,
+              await judgeOne({
+                task,
+                items: acceptance.get(row.id) ?? [],
+                facts: {
+                  checkOutcomes,
+                  findings: contract?.findings ?? [],
+                },
+                reply: row.reply,
+                contract: parsed.contract,
+                workingDir: ctx.workingDir,
+                changes: [],
+              }),
+            );
           }
           return verdicts;
         };
@@ -1493,6 +1571,11 @@ export function buildFusionDelegateTool(
           // The retry keeps the right to split: a task judged red for being
           // too big would only fail again in one piece.
           const retryTasks = parsed.tasks.filter((t) => retryIds.has(t.id));
+          // Under isolation the retry works on in the workspace it was
+          // judged red in, so its first attempt is there to fix; the
+          // retry's own gate rules on it before it merges.
+          for (const id of retryIds) gateState.verdicts.delete(id);
+          retryRound = true;
           const retried = await expandWave(
             retryTasks,
             await runTasks(
@@ -1539,6 +1622,8 @@ export function buildFusionDelegateTool(
           return verdict === undefined ? r : applyJudgeVerdict(r, verdict, false);
         });
       }
+      // Workspaces kept for a retry are done with, retried or not.
+      await releaseKept();
       // Automatic replanning (ATO-941): what did not close, from the
       // facts above, with the attempts it has left. The planner's next
       // step is held to `fusion.delegate` by the loop while any task is

@@ -19,6 +19,11 @@
  *
  * A task that failed, was cancelled, timed out or never got a slot is
  * not merged: its workspace, and what it wrote there, is thrown away.
+ * A task that finished but is red before its merge (a `gate`: its own
+ * contract checks, the judge) is not merged either: its changes are
+ * kept as a patch under `.atomic-agent/fusion-merge/<task>.patch`
+ * (`branch-diff.ts`), and its workspace is kept when a retry will work
+ * on in it.
  */
 import {
   chmod,
@@ -40,6 +45,12 @@ import {
   type BranchWorkspace,
   type CreateBranchSetOptions,
 } from "./branch-workspace.js";
+import {
+  renderPatch,
+  saveTaskPatch,
+  workspaceChanges,
+  type WorkspaceChange,
+} from "./branch-diff.js";
 import { resolveContractInputs } from "./contract-inputs.js";
 import type { DelegateTask } from "./delegate-args.js";
 import type { WorkerTaskResult, WorkerTaskStatus } from "./worker-result.js";
@@ -321,7 +332,7 @@ export function applyMergeOutcome(
  * Rewrite every mention of a root (the working directory, under any of
  * its spellings) to `to`, longest spelling first and each spot once.
  */
-function rebaseText(text: string, roots: readonly string[], to: string): string {
+export function rebaseText(text: string, roots: readonly string[], to: string): string {
   const mark = "\u0000workspace\u0000";
   let out = text;
   for (const root of [...roots].sort((a, b) => b.length - a.length)) {
@@ -376,6 +387,46 @@ export function rebaseScope(
   return out;
 }
 
+/** A task's verdict before its merge: its own checks and, when on, the judge. */
+export interface GateVerdict {
+  /** The row with the verdict folded in. */
+  row: WorkerTaskResult;
+  /** `false` holds the task's changes back: saved as a patch, the folder untouched. */
+  merge: boolean;
+  /** Why it is held back, for its row. */
+  reason?: string;
+  /** Keep its workspace past the wave, for a judge's retry to work on. */
+  keep?: boolean;
+}
+
+/** What a gate sees of a task's workspace. */
+export interface GateWorkspace {
+  /** The task's working directory inside its workspace. */
+  dir: string;
+  /** The working directory the workspace mirrors. */
+  realDir: string;
+  /** Every spelling of the working directory, for rebasing absolute paths. */
+  roots: readonly string[];
+  /** What the task changed against the snapshot its workspace started from. */
+  changes: () => Promise<WorkspaceChange[]>;
+}
+
+/**
+ * Decides, inside the workspace and before anything reaches the folder,
+ * whether a finished task is merged. Called for the statuses that would
+ * merge (`MERGED_STATUSES`), in task order.
+ */
+export type MergeGate = (
+  row: WorkerTaskResult,
+  workspace: GateWorkspace,
+) => Promise<GateVerdict>;
+
+/** A workspace kept past its wave (`GateVerdict.keep`), with the set it belongs to. */
+export interface KeptBranch {
+  set: BranchSet;
+  workspace: BranchWorkspace;
+}
+
 export interface IsolatedWaveInput {
   /** The working directory the wave would otherwise write into. */
   realDir: string;
@@ -389,6 +440,14 @@ export interface IsolatedWaveInput {
       | ((taskId: string) => { workingDir: string; writeScope: readonly string[] } | undefined)
       | undefined,
   ) => Promise<WorkerTaskResult[]>;
+  /** Merge only what this passes; absent, every mergeable status merges. */
+  gate?: MergeGate;
+  /**
+   * Workspaces kept from an earlier wave, by task id: those tasks work on
+   * in them (and merge against their own base) instead of a fresh one.
+   * Their owner removes them (`set.cleanup()`), not this wave.
+   */
+  kept?: ReadonlyMap<string, KeptBranch>;
   options?: CreateBranchSetOptions & { mergeFile?: MergeFile };
 }
 
@@ -397,13 +456,34 @@ export interface IsolatedWaveResult {
   merges: MergeTaskSuggestion[];
   /** Set when the wave ran in place: why it could not be isolated. */
   inPlace?: string;
+  /** Workspaces a gate asked to keep; the caller removes them. */
+  kept?: Map<string, KeptBranch>;
+}
+
+function heldNote(
+  reason: string | undefined,
+  changes: number,
+  patch: string | undefined,
+  kept: boolean,
+): string {
+  const why = reason === undefined ? "not merged" : `not merged (${reason})`;
+  if (changes === 0) return `${why}: it changed no files`;
+  const files = `${changes} file${changes === 1 ? "" : "s"}`;
+  const where =
+    patch === undefined
+      ? `its changes to ${files} could not be saved as a patch`
+      : `its changes to ${files} are kept as a patch at ${patch.split(sep).join("/")}; the folder is unchanged`;
+  return `${why}: ${where}${kept ? "; its workspace is kept for the retry" : ""}`;
 }
 
 /**
  * Run one wave with a workspace per task and merge each back, in task
- * order. The workspaces are removed whatever happens, an abort and a
- * throw included. When no workspace can be made the wave runs in place,
- * as without isolation, and every row says so.
+ * order. With a `gate`, a task is merged only when the gate passes it;
+ * one it holds back leaves the folder as it was and its changes in a
+ * patch file. The workspaces are removed whatever happens, an abort and
+ * a throw included, except those a gate kept. When no workspace can be
+ * made the wave runs in place, as without isolation, and every row says
+ * so.
  */
 export async function runIsolatedWave(
   input: IsolatedWaveInput,
@@ -411,20 +491,25 @@ export async function runIsolatedWave(
   if (input.tasks.length === 0) {
     return { results: await input.run(input.tasks, undefined), merges: [] };
   }
-  let set: BranchSet | null;
-  let reason: string;
-  try {
-    set = await createBranchSet(
-      input.realDir,
-      input.tasks.map((t) => t.id),
-      input.options,
-    );
-    reason = "the folder is too large to copy";
-  } catch (err) {
-    set = null;
-    reason = err instanceof Error ? err.message : String(err);
+  const kept = input.kept ?? new Map<string, KeptBranch>();
+  const fresh = input.tasks.filter((t) => !kept.has(t.id));
+  let set: BranchSet | null = null;
+  let reason = "";
+  if (fresh.length > 0) {
+    try {
+      set = await createBranchSet(
+        input.realDir,
+        fresh.map((t) => t.id),
+        input.options,
+      );
+      reason = "the folder is too large to copy";
+    } catch (err) {
+      set = null;
+      reason = err instanceof Error ? err.message : String(err);
+    }
   }
-  if (set === null) {
+  const inPlace = fresh.length > 0 && set === null;
+  if (inPlace && kept.size === 0) {
     const results = await input.run(input.tasks, undefined);
     const note = `ran in the folder itself, not in a workspace of its own: ${reason}`;
     return {
@@ -433,22 +518,34 @@ export async function runIsolatedWave(
       inPlace: reason,
     };
   }
-  const branches = set;
+  const freshSet = set;
+  const lookup = (taskId: string): KeptBranch | undefined => {
+    const own = kept.get(taskId);
+    if (own !== undefined) return own;
+    const ws = freshSet?.workspaces.get(taskId);
+    return ws === undefined || freshSet === null ? undefined : { set: freshSet, workspace: ws };
+  };
+  const newlyKept = new Map<string, KeptBranch>();
   try {
-    const roots = [...new Set([input.realDir, branches.realDir])];
+    const realDir =
+      freshSet?.realDir ?? [...kept.values()][0]?.set.realDir ?? input.realDir;
+    const roots = [...new Set([input.realDir, realDir])];
     const rebased = input.tasks.map((task) => {
-      const ws = branches.workspaces.get(task.id);
-      return ws === undefined ? task : rebaseTask(task, roots, ws.dir);
+      const branch = lookup(task.id);
+      return branch === undefined ? task : rebaseTask(task, roots, branch.workspace.dir);
     });
     const results = await input.run(rebased, (taskId) => {
-      const ws = branches.workspaces.get(taskId);
-      return ws === undefined
+      const branch = lookup(taskId);
+      return branch === undefined
         ? undefined
-        : { workingDir: ws.dir, writeScope: rebaseScope(input.writeScope, roots, ws.dir) };
+        : {
+            workingDir: branch.workspace.dir,
+            writeScope: rebaseScope(input.writeScope, roots, branch.workspace.dir),
+          };
     });
     const protectedPaths = new Set(
-      resolveContractInputs(input.inputs, branches.realDir)
-        .map((abs) => relative(branches.realDir, abs))
+      resolveContractInputs(input.inputs, realDir)
+        .map((abs) => relative(realDir, abs))
         .filter((rel) => rel.length > 0 && !rel.startsWith("..") && !isAbsolute(rel)),
     );
     // Inputs named through a symlinked path (`/var` vs `/private/var`).
@@ -456,17 +553,21 @@ export async function runIsolatedWave(
       const rel = relative(input.realDir, abs);
       if (rel.length > 0 && !rel.startsWith("..")) protectedPaths.add(rel);
     }
+    const inPlaceNote = `ran in the folder itself, not in a workspace of its own: ${reason}`;
     const merges: MergeTaskSuggestion[] = [];
     const out: WorkerTaskResult[] = [];
     for (const raw of results) {
-      const ws = branches.workspaces.get(raw.id);
-      if (ws === undefined) {
-        out.push(raw);
+      const branch = lookup(raw.id);
+      if (branch === undefined) {
+        out.push(
+          inPlace ? { ...raw, notes: [...(raw.notes ?? []), inPlaceNote] } : raw,
+        );
         continue;
       }
+      const ws = branch.workspace;
       // The planner reads the folder's paths, not a workspace that is
       // about to be removed.
-      const row: WorkerTaskResult = {
+      let row: WorkerTaskResult = {
         ...raw,
         reply: rebaseText(raw.reply, [ws.dir], input.realDir),
         ...(raw.error === undefined
@@ -488,8 +589,47 @@ export async function runIsolatedWave(
         );
         continue;
       }
+      if (input.gate !== undefined) {
+        let verdict: GateVerdict;
+        try {
+          verdict = await input.gate(row, {
+            dir: ws.dir,
+            realDir: input.realDir,
+            roots,
+            changes: () => workspaceChanges(branch.set, ws),
+          });
+        } catch (err) {
+          verdict = {
+            row,
+            merge: false,
+            reason: `its checks could not be run: ${err instanceof Error ? err.message : String(err)}`,
+          };
+        }
+        row = verdict.row;
+        if (!verdict.merge) {
+          const changes = await workspaceChanges(branch.set, ws).catch(
+            (): WorkspaceChange[] => [],
+          );
+          let patch: string | undefined;
+          if (changes.length > 0) {
+            patch = await saveTaskPatch(realDir, row.id, renderPatch(changes)).catch(
+              () => undefined,
+            );
+          }
+          const keep = verdict.keep === true && changes.length > 0;
+          if (keep) newlyKept.set(row.id, branch);
+          out.push({
+            ...row,
+            notes: [
+              ...(row.notes ?? []),
+              heldNote(verdict.reason, changes.length, patch, keep),
+            ],
+          });
+          continue;
+        }
+      }
       const outcome = await mergeBranch(
-        branches,
+        branch.set,
         ws,
         protectedPaths,
         input.options?.mergeFile,
@@ -500,9 +640,18 @@ export async function runIsolatedWave(
         task === undefined ? undefined : mergeTaskSuggestion(task, outcome);
       if (suggestion !== undefined) merges.push(suggestion);
     }
-    return { results: out, merges };
+    return {
+      results: out,
+      merges,
+      ...(inPlace ? { inPlace: reason } : {}),
+      ...(newlyKept.size === 0 ? {} : { kept: newlyKept }),
+    };
   } finally {
-    await branches.cleanup();
+    if (freshSet !== null) {
+      await freshSet.cleanup(
+        [...newlyKept].filter(([, b]) => b.set === freshSet).map(([id]) => id),
+      );
+    }
   }
 }
 

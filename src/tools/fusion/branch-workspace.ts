@@ -77,8 +77,14 @@ export interface BranchSet {
   /** The untouched snapshot every workspace started from. */
   readonly baseDir: string;
   readonly workspaces: ReadonlyMap<string, BranchWorkspace>;
-  /** Removes every workspace (worktrees included) and prunes git's records. Never throws. */
-  cleanup(): Promise<void>;
+  /**
+   * Removes every workspace (worktrees included) and prunes git's
+   * records. Never throws. With `keep`, the workspaces of those task ids
+   * and the base stay for a later call (a judge's retry works on in the
+   * workspace it was judged red in); a call without `keep` removes the
+   * rest.
+   */
+  cleanup(keep?: readonly string[]): Promise<void>;
 }
 
 /** Runs git; resolves `null` when git is not there to run. */
@@ -327,14 +333,37 @@ export async function createBranchSet(
   );
   const snapshot = await gitSnapshot(real, git);
   const roots: string[] = [];
-  const cleanup = async (): Promise<void> => {
+  const removeRoot = async (root: string): Promise<void> => {
     if (snapshot !== null) {
-      for (const root of roots) {
-        await git(["worktree", "remove", "--force", root], snapshot.top).catch(
-          () => null,
-        );
-      }
+      await git(["worktree", "remove", "--force", root], snapshot.top).catch(
+        () => null,
+      );
     }
+  };
+  const workspaceRoots = new Map<string, string>();
+  const cleanup = async (keep: readonly string[] = []): Promise<void> => {
+    if (keep.length > 0) {
+      const kept = new Set(
+        keep.flatMap((id) => {
+          const root = workspaceRoots.get(id);
+          return root === undefined ? [] : [root];
+        }),
+      );
+      const base = roots[0];
+      for (const root of roots.splice(0)) {
+        if (kept.has(root) || root === base) {
+          roots.push(root);
+          continue;
+        }
+        await removeRoot(root);
+        await rm(root, { recursive: true, force: true }).catch(() => undefined);
+      }
+      if (snapshot !== null) {
+        await git(["worktree", "prune"], snapshot.top).catch(() => null);
+      }
+      return;
+    }
+    for (const root of roots) await removeRoot(root);
     await rm(runRoot, { recursive: true, force: true }).catch(() => undefined);
     if (snapshot !== null) {
       await git(["worktree", "prune"], snapshot.top).catch(() => null);
@@ -360,6 +389,7 @@ export async function createBranchSet(
     const workspaces = new Map<string, BranchWorkspace>();
     for (const [index, taskId] of taskIds.entries()) {
       const name = workspaceName(index, taskId);
+      workspaceRoots.set(taskId, join(runRoot, name));
       const dir = await make(name);
       workspaces.set(taskId, {
         taskId,
