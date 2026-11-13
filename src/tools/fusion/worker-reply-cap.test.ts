@@ -248,6 +248,37 @@ describe("a local worker's reply cap follows its time limit (ATO-214)", () => {
     // The loop's own time-limit note is still there, after it.
     expect(result!.notes?.slice(1).join(" ")).toMatch(/time limit/);
     expect(result!.hint).toMatch(/longer timeoutMs/);
+    expect(result!.hint).toMatch(/lower the worker reasoning effort$/);
+  });
+
+  it("on a local leg the hint names the setting that bounds the worker's thinking, and its bound", async () => {
+    const { deps, calls } = harness(
+      (options) =>
+        new Promise<RunTurnResult>((resolve) => {
+          options.eventHook?.({ type: "turn_started", turnIndex: 0 });
+          options.eventHook?.(SERVED);
+          options.eventHook?.(completed(WORKER_REPLY_CAP_FLOOR_TOKENS));
+          options.signal!.addEventListener(
+            "abort",
+            () => resolve(turnResult({ reason: "cancelled", stepCount: 0 })),
+            { once: true },
+          );
+        }),
+    );
+    const [result] = await runWorkerTasks(deps, {
+      ...BASE,
+      workerTimeoutMs: 40,
+      localTokensPerSecond: 4,
+      localLeg: true,
+      workerReasoning: "high",
+      workerMaxOutputTokens: 16_384,
+      signal: new AbortController().signal,
+    });
+    expect(calls[0]!.options.reasoningBudgetTokens).toBe(4096);
+    expect(result).toMatchObject({ status: "timeout", stepCount: 0 });
+    expect(result!.hint).toMatch(
+      /or lower llm\.runMode\.fusion\.workerReasoning \(here it bounds each step's thinking, now 4096 tokens\)$/,
+    );
   });
 
   it("adds the same account beside the error when the cut answer fails the turn", async () => {

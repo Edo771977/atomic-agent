@@ -43,6 +43,7 @@ import {
 } from "./worker-result.js";
 import type { StructuredLogger } from "../../tracing/index.js";
 import { getConfig } from "../../config/index.js";
+import { localWorkerReasoningBudgetTokens } from "../../llm/reasoning-budget.js";
 import {
   FUSION_WORKER_APPROVAL_REFUSED,
   WORKER_TOOL_ROLE,
@@ -182,6 +183,8 @@ export function describeFirstAnswerCut(input: {
   capTokens: number;
   tokensPerSecond: number;
   timeoutMs: number;
+  /** The worker's think-block bound on a local leg; absent on a cloud leg. */
+  reasoningBudgetTokens?: number;
 }): { reply: string; note: string; hint: string } {
   const budget =
     input.timeoutMs < 60_000
@@ -191,7 +194,11 @@ export function describeFirstAnswerCut(input: {
   return {
     reply: `${cut}, before any step completed`,
     note: `${cut}: at the measured ${input.tokensPerSecond.toFixed(1)} tok/s a ${budget} limit leaves room for about ${input.capTokens} tokens per answer, and no step completed`,
-    hint: "the model's answers run longer than this machine can generate within the limit: give the task a longer timeoutMs, split it into smaller tasks, or lower the worker reasoning effort",
+    hint: `the model's answers run longer than this machine can generate within the limit: give the task a longer timeoutMs, split it into smaller tasks, or ${
+      input.reasoningBudgetTokens === undefined
+        ? "lower the worker reasoning effort"
+        : `lower llm.runMode.fusion.workerReasoning (here it bounds each step's thinking, now ${input.reasoningBudgetTokens} tokens)`
+    }`,
   };
 }
 
@@ -436,6 +443,7 @@ export interface WorkerRunnerDeps {
       toolRole?: ToolRole;
       reasoningEffort?: ReasoningEffort;
       maxOutputTokens?: number;
+      reasoningBudgetTokens?: number;
       signal?: AbortSignal;
       eventHook?: (event: AgentLoopEvent) => void;
     },
@@ -548,7 +556,13 @@ export interface RunWorkerTasksOptions {
    * a local one nothing has been measured on yet.
    */
   localLeg?: boolean;
-  /** `runMode.fusion.workerReasoning`, sent with every worker completion. */
+  /**
+   * `runMode.fusion.workerReasoning`, sent with every worker completion
+   * as the reasoning effort (a cloud leg's body builder reads it). On a
+   * local leg, which has no such parameter, it picks the think-block
+   * bound of every non-final worker step instead
+   * (`localWorkerReasoningBudgetTokens`), bounded by default when unset.
+   */
   workerReasoning?: ReasoningEffort;
   /**
    * `runMode.fusion.workerMaxOutputTokens`, the per-step output cap. A
@@ -1193,6 +1207,15 @@ async function runOneTask(
       getConfig().localModels.completionMaxTokens,
   });
   const replyCap = timeFittedCap ?? options.workerMaxOutputTokens;
+  // A local leg bounds each worker step's thinking per request: unbounded,
+  // it ran to thousands of tokens a step and the time limit cut the
+  // answer. A cloud leg keeps the provider's own (the effort above).
+  const reasoningBudgetTokens = options.localLeg === true
+    ? localWorkerReasoningBudgetTokens(
+        options.workerReasoning,
+        getConfig().localModels.reasoningBudgetTokens,
+      )
+    : undefined;
   // How long the first answer ran when it spent the time-fitted cap
   // before any step had completed; read once the turn is over.
   let firstCutTokens: number | undefined;
@@ -1366,6 +1389,7 @@ async function runOneTask(
         ? {}
         : { reasoningEffort: options.workerReasoning }),
       ...(replyCap === undefined ? {} : { maxOutputTokens: replyCap }),
+      ...(reasoningBudgetTokens === undefined ? {} : { reasoningBudgetTokens }),
       signal: AbortSignal.any([
         options.signal,
         timeLimit,
@@ -1855,6 +1879,7 @@ async function runOneTask(
       capTokens: timeFittedCap,
       tokensPerSecond: options.localTokensPerSecond ?? 0,
       timeoutMs,
+      ...(reasoningBudgetTokens === undefined ? {} : { reasoningBudgetTokens }),
     });
     result = {
       ...result,

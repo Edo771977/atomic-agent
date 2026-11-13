@@ -204,6 +204,30 @@ describe("runWorkerTasks", () => {
     expect(plain.calls[0]!.options).not.toHaveProperty("maxOutputTokens");
   });
 
+  it("bounds a local worker's thinking per turn: the workerReasoning level, or the default when unset", async () => {
+    const run = async (extra: { localLeg?: boolean; workerReasoning?: "low" | "medium" | "high" }) => {
+      const { deps, calls } = harness(async () => turnResult());
+      await runWorkerTasks(deps, {
+        ...BASE,
+        tasks: tasks(1),
+        maxWorkers: 1,
+        ...extra,
+        signal: new AbortController().signal,
+      });
+      return calls[0]!.options;
+    };
+    // Unset on a local leg: bounded at the worker default.
+    expect((await run({ localLeg: true })).reasoningBudgetTokens).toBe(1536);
+    expect(await run({ localLeg: true })).not.toHaveProperty("reasoningEffort");
+    expect((await run({ localLeg: true, workerReasoning: "low" })).reasoningBudgetTokens).toBe(512);
+    expect((await run({ localLeg: true, workerReasoning: "medium" })).reasoningBudgetTokens).toBe(1536);
+    const high = await run({ localLeg: true, workerReasoning: "high" });
+    expect(high).toMatchObject({ reasoningBudgetTokens: 4096, reasoningEffort: "high" });
+    // A cloud leg keeps the provider's own reasoning: no grammar bound.
+    expect(await run({ workerReasoning: "low" })).not.toHaveProperty("reasoningBudgetTokens");
+    expect(await run({})).not.toHaveProperty("reasoningBudgetTokens");
+  });
+
   it("runs on a fresh session id, never the parent's — that would deadlock", async () => {
     const { deps, calls } = harness(async () => turnResult());
     await runWorkerTasks(deps, {
