@@ -5,7 +5,7 @@ import type { CompletionRequest, CompletionResult } from "../../llm/provider/com
 import type { LlmProviderConfigEntry } from "../../llm/provider/index.js";
 import { readLaunchRecord, readRunningPid } from "../../local-llm/index.js";
 import { resolveServerTemplatePolicy } from "../../llm/server-template-policy.js";
-import type { LocalGrammarProbe } from "../../tools/fusion/local-grammar-smoke.js";
+import type { LocalGrammarProbeFor } from "../../tools/fusion/local-grammar-smoke.js";
 import type { SlotOccupancy } from "../../tools/fusion/worker-result.js";
 import { workerStepToolNames } from "../../tools/fusion/worker-tool-policy.js";
 
@@ -38,6 +38,10 @@ export interface FusionFormatCheckDeps {
    * server with every slot working skips the check rather than queue it.
    */
   slotOccupancy?: () => Promise<SlotOccupancy | null>;
+  /** `SlotManager.reservedSideCallSlotId`: the side-call slot if reserved, never reserving one. */
+  sideCallSlotId?: () => number | null;
+  /** `SlotManager.getSlotCount`: the server's request slots. */
+  slotCount?: () => number;
 }
 
 /**
@@ -64,15 +68,34 @@ export function managedServerGeneration(config: AtomicAgentConfig): string | nul
  * generation at the time of the check (`external` when nothing tells
  * one launch from the next: the kept failure's time limit covers that
  * case). An unknown model id gives no key, so nothing is kept.
+ *
+ * The check runs on the runtime's reserved side-call slot when one is
+ * reserved. Without one it goes out on slot `-1` and the server clears
+ * whichever idle slot it picks; with a single slot and the orchestrator
+ * on this same server, that is the orchestrator's prefix, so no probe is
+ * made then and the leg goes unchecked.
  */
 export function createFusionFormatProbeFor(
   deps: FusionFormatCheckDeps,
-): (providerId: string) => LocalGrammarProbe | undefined {
-  return (providerId) => {
+): LocalGrammarProbeFor {
+  const onMainServer = (providerId: string | undefined): boolean => {
+    if (providerId === undefined) return false;
     const entry = deps.providers().find((p) => p.id === providerId);
-    if (entry === undefined || entry.kind !== "llama-server") return undefined;
+    if (entry === undefined || entry.kind !== "llama-server") return false;
     const main = deps.getConfig().localModels.url;
-    if (entry.url !== undefined && normalise(entry.url) !== normalise(main)) return undefined;
+    return entry.url === undefined || normalise(entry.url) === normalise(main);
+  };
+  return (providerId, at = {}) => {
+    if (!onMainServer(providerId)) return undefined;
+    const main = deps.getConfig().localModels.url;
+    // The reserved side-call slot, where reflection and compaction run;
+    // never reserved here, which would take a slot from the workers.
+    const slotId = deps.sideCallSlotId?.() ?? null;
+    // Without one the server picks an idle slot and the check clears it.
+    // On a one-slot server that slot is a local orchestrator's.
+    if (slotId === null && (deps.slotCount?.() ?? 2) <= 1 && onMainServer(at.orchestratorProviderId)) {
+      return undefined;
+    }
     const profile = deps.getProfile();
     const modelId = deps.getModelId();
     const generation =
@@ -103,6 +126,7 @@ export function createFusionFormatProbeFor(
             : { toolNames: workerStepToolNames(deps.getToolNames()) }),
           complete: (request) => deps.complete(providerId, request),
           partition: providerId,
+          ...(slotId === null ? {} : { slotId }),
           ...(signal === undefined ? {} : { signal }),
         }),
     };

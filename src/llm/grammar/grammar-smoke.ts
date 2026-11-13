@@ -53,8 +53,12 @@
  * breaker) apply.
  *
  * The request lives on its own partition (`sessionId`) with
- * `cache_prompt: false`; which slot it lands on is the caller's
- * (`slotId`, see `fusion-format-check.ts`).
+ * `cache_prompt: false`. Which slot it lands on is the caller's
+ * (`slotId`): the reserved side-call slot where one exists; otherwise
+ * `-1`, where the server picks an idle slot and the check evicts that
+ * slot's cached prompt — so the caller does not ask on a one-slot server
+ * whose only slot holds a local orchestrator's prefix
+ * (`fusion-format-check.ts`).
  */
 
 import {
@@ -146,11 +150,19 @@ export interface GrammarSmokeInput {
   timeoutMs?: number;
   /** Suffix for the request's partition, e.g. the leg's provider id. */
   partition?: string;
+  /**
+   * The slot to run on: the runtime's reserved side-call slot when there
+   * is one. Defaults to `-1`, which lets the server pick a slot: an idle
+   * one, whose cached prompt the check then evicts (`cache_prompt:
+   * false` keeps the check's own prompt out of the cache, not the slot
+   * clear).
+   */
+  slotId?: number;
 }
 
 type RequestInput = Pick<
   GrammarSmokeInput,
-  "profile" | "baseGrammar" | "serverTemplate" | "thinking" | "toolNames" | "partition"
+  "profile" | "baseGrammar" | "serverTemplate" | "thinking" | "toolNames" | "partition" | "slotId"
 >;
 
 /** Thinking off on the built prompt: the step's own rule (F49). */
@@ -197,7 +209,7 @@ export function buildGrammarSmokeRequest(input: RequestInput): CompletionRequest
         }
       : {}),
     grammar: buildGrammarForTools(base, input.toolNames ?? [GRAMMAR_SMOKE_TOOL]),
-    slotId: -1,
+    slotId: input.slotId ?? -1,
     cachePrompt: false,
     temperature: 0,
     maxTokens: GRAMMAR_SMOKE_MAX_TOKENS,

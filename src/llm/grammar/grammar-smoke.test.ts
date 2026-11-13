@@ -295,6 +295,16 @@ describe("buildGrammarSmokeRequest", () => {
     expect(hasReasoningPrelude(off.grammar!)).toBe(true);
   });
 
+  it("goes to the slot it is given, else lets the server pick (-1)", async () => {
+    const input = {
+      profile: PLAIN_INSTRUCT_PROFILE,
+      baseGrammar: await buildGrammar(PLAIN_INSTRUCT_PROFILE),
+      serverTemplate: NO_SERVER_TEMPLATE,
+    };
+    expect(buildGrammarSmokeRequest(input).slotId).toBe(-1);
+    expect(buildGrammarSmokeRequest({ ...input, slotId: 2 })).toMatchObject({ slotId: 2, cachePrompt: false });
+  });
+
   it("admits the worker's tools, and reply even when it is not named", async () => {
     const baseGrammar = await buildGrammar(PLAIN_INSTRUCT_PROFILE);
     const request = buildGrammarSmokeRequest({

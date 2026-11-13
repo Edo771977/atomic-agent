@@ -96,6 +96,25 @@ describe("createFusionFormatProbeFor", () => {
     );
   });
 
+  it("runs on the reserved side-call slot when there is one", async () => {
+    const { make, complete } = await probeFor(undefined, { sideCallSlotId: () => 3, slotCount: () => 4 });
+    await make("local-llama", { orchestratorProviderId: "local-llama" })!.run();
+    expect(complete.mock.calls[0]![1].slotId).toBe(3);
+  });
+
+  it("without a reservation, never clears a one-slot server a local orchestrator is using", async () => {
+    const oneSlot = { sideCallSlotId: () => null, slotCount: () => 1 };
+    const { make, complete } = await probeFor(undefined, oneSlot);
+    expect(make("local-llama", { orchestratorProviderId: "same-llama" })).toBeUndefined();
+    // A cloud orchestrator holds no slot here: the check may take it.
+    const cloud = make("local-llama", { orchestratorProviderId: "openrouter" })!;
+    await cloud.run();
+    expect(complete.mock.calls[0]![1].slotId).toBe(-1);
+    // With more slots than one, an idle slot is picked: still asked.
+    const wider = await probeFor(undefined, { sideCallSlotId: () => null, slotCount: () => 2 });
+    expect(wider.make("local-llama", { orchestratorProviderId: "local-llama" })).toBeDefined();
+  });
+
   it("asks afresh after a daemon restart, and keeps nothing for an unknown model", async () => {
     let generation: string | null = "4242@1000";
     let modelId: string | null = "worker-model";

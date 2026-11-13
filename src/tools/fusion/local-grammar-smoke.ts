@@ -60,6 +60,16 @@ export interface LocalGrammarProbe {
   allSlotsBusy?: () => Promise<boolean>;
 }
 
+/**
+ * The probe for one leg, or `undefined` when nothing can ask it there.
+ * `orchestratorProviderId` lets the maker decline a server whose only
+ * slot the orchestrator itself is using.
+ */
+export type LocalGrammarProbeFor = (
+  providerId: string,
+  at?: { orchestratorProviderId?: string },
+) => LocalGrammarProbe | undefined;
+
 export type LocalGrammarCheck =
   | (GrammarSmokeVerdict & { cached: boolean })
   | { kind: "skipped"; why: "worker-succeeded" | "cancelled" | "server-busy" };

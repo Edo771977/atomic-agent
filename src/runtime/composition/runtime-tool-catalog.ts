@@ -14,6 +14,7 @@ import type { ResolvedRunMode } from "../../llm/run-mode/index.js";
 import { visionCapableAlternatives } from "../../llm/provider/model-vision.js";
 import { resolveModelPricingFor } from "../resolve-model-pricing.js";
 import type { ModelProfile } from "../../llm/model-profile.js";
+import type { SlotManager } from "../../llm/slot-manager.js";
 import { createFusionFormatProbeFor } from "./fusion-format-check.js";
 import type { SessionUsageLedger } from "../../session/usage-meter.js";
 import { isLocalServerUrl } from "../../llm/provider/openai/local-server-url.js";
@@ -695,7 +696,8 @@ export function registerRuntimeFusionAndReadScope(input: {
   >;
   approvals: ApprovalGate;
   dangerous: DangerousToolOptions;
-  slotManager: FusionDelegateDeps["slotManager"];
+  slotManager: FusionDelegateDeps["slotManager"] &
+    Partial<Pick<SlotManager, "getSlotCount" | "reservedSideCallSlotId">>;
   workingDir: string;
   logger: StructuredLogger;
   turnBudget?: FusionDelegateDeps["turnBudget"];
@@ -810,6 +812,9 @@ export function registerRuntimeFusionAndReadScope(input: {
                   return null;
                 }
               },
+              // The reflection/compaction slot when reserved; never reserves one.
+              sideCallSlotId: () => slotManager.reservedSideCallSlotId?.() ?? null,
+              slotCount: () => slotManager.getSlotCount?.() ?? slotManager.poolSize(),
               ...localFormatCheck,
             }),
           }),

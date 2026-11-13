@@ -284,6 +284,15 @@ export class SlotManager {
   sideCallSlotId(): number {
     return this.reserveReflectionSlot() ?? -1;
   }
+
+  /**
+   * The side-call slot when one is already reserved, else `null` —
+   * without reserving one. For a caller that may use the reservation
+   * but must not take a slot from the session pool for itself.
+   */
+  reservedSideCallSlotId(): number | null {
+    return this.reservedReflectionSlot;
+  }
 }
 
 export function hashPrefix(input: string): string {

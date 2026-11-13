@@ -346,6 +346,10 @@ describe("fusion.delegate with the local format check", () => {
     const tool = buildFusionDelegateTool(d);
     expect((await tool.run({ tasks: TASKS }, ctx())).status).toBe("ok");
     expect(d.runTurn).toHaveBeenCalledTimes(2);
+    // The maker is told where the orchestrator runs (a one-slot server it holds is not asked).
+    expect(d.localGrammarProbeFor).toHaveBeenCalledWith("local-llama", {
+      orchestratorProviderId: "openrouter",
+    });
     expect((await tool.run({ tasks: TASKS }, ctx())).status).toBe("ok");
     expect(passing.run).toHaveBeenCalledOnce();
   });

@@ -52,7 +52,7 @@ import {
   LocalGrammarSmoke,
   describeFormatCheckRefusal,
   formatCheckTrip,
-  type LocalGrammarProbe,
+  type LocalGrammarProbeFor,
 } from "./local-grammar-smoke.js";
 import {
   renderMergeBlock,
@@ -231,7 +231,7 @@ export interface FusionDelegateDeps extends WorkerRunnerDeps {
    * `undefined` when nothing can ask it (a cloud leg, a second local
    * server). Absent: no leg is checked.
    */
-  localGrammarProbeFor?: (providerId: string) => LocalGrammarProbe | undefined;
+  localGrammarProbeFor?: LocalGrammarProbeFor;
   /** Its verdicts across fan-outs; one per tool unless injected. */
   localGrammarSmoke?: LocalGrammarSmoke;
 }
@@ -690,7 +690,9 @@ export function buildFusionDelegateTool(
           if (deps.workerSupportsSlotAffinity(providerId)) localLegs.set(providerId, leg.model);
         }
         for (const [providerId, model] of localLegs) {
-          const probe = deps.localGrammarProbeFor(providerId);
+          const probe = deps.localGrammarProbeFor(providerId, {
+            orchestratorProviderId: mode.orchestratorProviderId ?? mode.primaryProviderId,
+          });
           if (probe === undefined) continue;
           checkedServers.add(probe.server);
           const checked = await formatCheck.check(probe, {
