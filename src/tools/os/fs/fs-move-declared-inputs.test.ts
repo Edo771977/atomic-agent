@@ -8,6 +8,8 @@ it("protects a declared input under Windows path identity, as os.fs.write does",
   expect(declaredInputTouched([move("c:\\PROJ\\Input.TXT", "C:\\proj\\out.txt")], [input], "win32")).toBe(input);
   expect(declaredInputTouched([move("C:\\proj\\other.txt", "c:/PROJ/INPUT.txt")], [input], "win32")).toBe(input);
   expect(declaredInputTouched([move("c:\\Proj", "D:\\moved", true)], [input], "win32")).toBe(input);
+  expect(declaredInputTouched([move("C:\\proj\\input.txt.", "C:\\proj\\out.txt")], [input], "win32")).toBe(input);
+  expect(declaredInputTouched([move("C:\\proj\\other.txt", "C:\\proj\\input.txt::$DATA")], [input], "win32")).toBe(input);
   expect(declaredInputTouched([move("C:\\proj\\other.txt", "C:\\proj\\out.txt")], [input], "win32")).toBeUndefined();
 });
 
