@@ -1292,6 +1292,11 @@ export function buildFusionDelegateTool(
         // One round per family: a split's continuations (`t3.a`, `t3.b`)
         // count once, on the task they continue.
         turnBudget.noteRoundAttempts(ctx.sessionId, [...ranNow]);
+        // Across rounds: a task that ran there once is not steered back.
+        turnBudget.noteOrchestratorRuns(
+          ctx.sessionId,
+          [...ranNow].filter((id) => taskLegs.get(id)?.orchestrator === true),
+        );
       }
       // What the failure breakers saw (ATO-1406): remembered for the
       // rest of the turn, so the next round on a broken leg is refused.
@@ -1526,7 +1531,7 @@ export function buildFusionDelegateTool(
               results.filter((r) => !awaitingYes.has(r.id)),
               (id) => turnBudget.attempts(ctx.sessionId, id),
               autoReplan,
-              (id) => taskLegs.get(id)?.orchestrator === true,
+              (id) => turnBudget.ranOnOrchestrator(ctx.sessionId, id),
             )
           : undefined;
       // How this round's families ended, judged rows included: a family
@@ -1698,7 +1703,9 @@ export function buildFusionDelegateTool(
             ...(roleSpendUsd > 0 ? { roleSpendUsd } : {}),
             ...(merges.length === 0 ? {} : { merges }),
             ...(replan === undefined ||
-            (replan.pending.length === 0 && replan.exhausted.length === 0)
+            (replan.pending.length === 0 &&
+              replan.exhausted.length === 0 &&
+              replan.failedOnOrchestrator.length === 0)
               ? {}
               : { replan }),
             ...(treeReport === undefined ? {} : { taskTree: treeReport }),

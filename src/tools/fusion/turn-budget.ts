@@ -50,6 +50,8 @@ interface TurnState {
    * `parse.dates` after a closed `parse` is new work.
    */
   closed: Set<string>;
+  /** Roots that ran on the orchestrator leg (`model: "orchestrator"`) this turn. */
+  onOrchestrator: Set<string>;
   /** Delegations started this turn, and the tasks they carried (ATO-1406). */
   rounds: number;
   tasks: number;
@@ -119,6 +121,7 @@ export class FusionTurnBudget {
       attempts: new Map(),
       family: new Map(),
       closed: new Set(),
+      onOrchestrator: new Set(),
       rounds: 0,
       tasks: 0,
       trips: [],
@@ -137,6 +140,7 @@ export class FusionTurnBudget {
         attempts: new Map(),
         family: new Map(),
         closed: new Set(),
+        onOrchestrator: new Set(),
         rounds: 0,
         tasks: 0,
         trips: [],
@@ -200,6 +204,23 @@ export class FusionTurnBudget {
       if (isOpen) state.closed.delete(root);
       else state.closed.add(root);
     }
+  }
+
+  /**
+   * Tasks this round ran on the orchestrator leg, by family, so a later
+   * round knows it already went there (`ranOnOrchestrator`). Call after
+   * `noteRoundAttempts`, which files the continuations.
+   */
+  noteOrchestratorRuns(sessionId: string, taskIds: readonly string[]): void {
+    const state = this.turn(sessionId);
+    for (const id of taskIds) state.onOrchestrator.add(continuationRoot(state, id));
+  }
+
+  /** Whether `taskId`'s family ran on the orchestrator leg this turn. */
+  ranOnOrchestrator(sessionId: string, taskId: string): boolean {
+    const state = this.turns.get(sessionId);
+    if (state === undefined) return false;
+    return state.onOrchestrator.has(continuationRoot(state, taskId));
   }
 
   /** How many rounds ran `taskId`'s family this turn. */
