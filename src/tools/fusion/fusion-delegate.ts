@@ -979,6 +979,12 @@ export function buildFusionDelegateTool(
       // one is kept as a patch (`merge-gate.ts`). A judged-red task's
       // workspace is kept for its retry, and removed after the judge.
       const gateState = new MergeGateState();
+      // The session's read scope, for the syntax pass (gate and after).
+      const syntaxRoots = [
+        ctx.workingDir,
+        ...(ctx.readRoots ?? []),
+        ...writeScope,
+      ];
       const keptBranches = new Map<string, KeptBranch>();
       let retryRound = false;
       const releaseKept = async (): Promise<void> => {
@@ -1024,6 +1030,7 @@ export function buildFusionDelegateTool(
               : { knownSecrets: deps.knownSecrets() }),
             signal: ctx.signal,
             state: gateState,
+            syntax: { runner: deps.syntaxCheck, roots: syntaxRoots },
             ...(judging
               ? {
                   judge: {
@@ -1499,15 +1506,15 @@ export function buildFusionDelegateTool(
       // rows' changed files through `verify.syntax`'s checker, inside the
       // session's read scope, before the judge and the head line see
       // them. A failure demotes the row as a failed check does.
-      const syntaxRoots = [
-        ctx.workingDir,
-        ...(ctx.readRoots ?? []),
-        ...writeScope,
-      ];
-      const syntaxPass = (
+      // Under isolation the gate already ran it in each merged task's
+      // workspace (`merge-gate.ts`); here it covers the rest (a wave
+      // that ran in place, isolation off).
+      const syntaxPass = async (
         rows: readonly WorkerTaskResult[],
-      ): Promise<WorkerTaskResult[]> =>
-        runSyntaxPass(rows, parsed.tasks, {
+      ): Promise<WorkerTaskResult[]> => {
+        const pending = rows.filter((r) => !gateState.syntaxGated.has(r.id));
+        if (pending.length === 0) return [...rows];
+        const checked = await runSyntaxPass(pending, parsed.tasks, {
           runner: deps.syntaxCheck,
           workingDir: ctx.workingDir,
           roots: syntaxRoots,
@@ -1516,6 +1523,8 @@ export function buildFusionDelegateTool(
             ? {}
             : { knownSecrets: deps.knownSecrets() }),
         });
+        return rows.map((r) => checked.find((c) => c.id === r.id) ?? r);
+      };
       results = await syntaxPass(await evaluateContract(results, results));
 
       // The judge (ATO-944): a task closes on a green acceptance list, a

@@ -290,6 +290,49 @@ describe("merge only green tasks (isolation)", () => {
     expect(rows[1]!.error).toMatch(/held for the replan: it depends on core/);
   });
 
+  it("holds back a task whose changed file fails the syntax pass in its workspace", async () => {
+    const repo = await gitRepo({ "a.txt": "a\n" });
+    const syntaxDirs: string[] = [];
+    const syntaxCheck: FusionDelegateDeps["syntaxCheck"] = async (files, workingDir) => {
+      syntaxDirs.push(workingDir);
+      const results = [];
+      for (const file of files) {
+        const body = await readFile(file, "utf8").catch(() => "");
+        results.push(
+          body.includes("SYNTAX")
+            ? { file, ok: false, checker: "fake", error: "Unexpected token" }
+            : { file, ok: true, checker: "fake" },
+        );
+      }
+      return { results };
+    };
+    const d = deps(
+      repo,
+      (id, _n, dir) => writeFile(join(dir, `${id}.js`), id === "two" ? "SYNTAX(\n" : "ok()\n"),
+      { syntaxCheck },
+    );
+    const result = await buildFusionDelegateTool(d).run(
+      {
+        tasks: [
+          { id: "one", title: "One", instructions: "write one.js", files: ["one.js"] },
+          { id: "two", title: "Two", instructions: "write two.js", files: ["two.js"] },
+        ],
+      },
+      ctx(repo),
+    );
+    const rows = result.details.tasks as WorkerTaskResult[];
+    expect(rows.map((r) => r.status)).toEqual(["ok", "failed"]);
+    expect(rows[1]!.error).toMatch(/^syntax: 1 file failed \(two\.js\)/);
+    expect(rows[1]!.notes?.join(" ")).toContain("not merged (syntax: 1 file failed (two.js))");
+    expect(rows[0]!.syntax).toMatchObject({ checked: 1, failedFiles: [] });
+    expect(await readFile(join(repo, "one.js"), "utf8")).toBe("ok()\n");
+    await expect(readFile(join(repo, "two.js"), "utf8")).rejects.toThrow();
+    expect(await readFile(join(repo, taskPatchPath("two")), "utf8")).toContain("+SYNTAX(");
+    // Ruled on in the workspaces; the merged green file is not checked again.
+    expect(syntaxDirs.length).toBeGreaterThan(0);
+    expect(syntaxDirs).not.toContain(repo);
+  });
+
   it("off: a task whose check fails still wrote into the folder, as before", async () => {
     const repo = await gitRepo({ "a.txt": "a\n" });
     const seen: Array<{ file: string; dir: string; ok: boolean }> = [];

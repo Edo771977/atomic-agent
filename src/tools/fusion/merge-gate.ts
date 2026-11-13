@@ -21,7 +21,12 @@
  * and the judge block reads the verdicts instead of judging again.
  */
 import type { KnownSecret } from "../../error-reporting/secret-detector.js";
-import { rebaseText, type GateVerdict, type MergeGate } from "./branch-merge.js";
+import {
+  rebaseScope,
+  rebaseText,
+  type GateVerdict,
+  type MergeGate,
+} from "./branch-merge.js";
 import type { WorkspaceChange } from "./branch-diff.js";
 import {
   applyCheckOutcomes,
@@ -34,6 +39,7 @@ import {
 import type { ContractCheck, DelegateContract } from "./contract.js";
 import type { DelegateTask } from "./delegate-args.js";
 import type { AcceptanceItem, JudgeFacts, JudgeVerdict } from "./judge.js";
+import { runSyntaxPass, type SyntaxCheckRunner } from "./syntax-pass.js";
 import { concurrentPaths, mentionsPath } from "./worker-self-check.js";
 import type { WorkerTaskResult } from "./worker-result.js";
 
@@ -43,6 +49,8 @@ export class MergeGateState {
   readonly checkOutcomes = new Map<number, ContractCheckOutcome>();
   /** The judge's verdict per task, from its latest gate. */
   readonly verdicts = new Map<string, JudgeVerdict>();
+  /** Tasks whose syntax pass ran in their workspace and gave a verdict. */
+  readonly syntaxGated = new Set<string>();
 }
 
 /** The judge as the gate calls it: spend accounting is the caller's. */
@@ -67,6 +75,12 @@ export interface MergeGateInput {
   knownSecrets?: readonly KnownSecret[];
   signal: AbortSignal;
   state: MergeGateState;
+  /**
+   * The delegate's syntax pass (`syntax-pass.ts`), run on the task's
+   * changed (else declared) files in its workspace; `roots` is the
+   * session's read scope as the folder spells it.
+   */
+  syntax?: { runner: SyntaxCheckRunner | undefined; roots: readonly string[] };
   judge?: {
     items: (taskId: string) => readonly AcceptanceItem[] | undefined;
     judgeable: (row: WorkerTaskResult) => boolean;
@@ -131,13 +145,37 @@ export function buildMergeGate(input: MergeGateInput): MergeGate {
       }
     }
     const checksRed = gated.status === "failed";
+    const ownTask = rebased(task, workspace.roots, workspace.dir);
+    // A syntax-only failure must not reach the folder either: the pass
+    // after the merge stays for waves that ran in place.
+    if (!checksRed && gated.status === "ok" && input.syntax?.runner !== undefined) {
+      const [checked] = await runSyntaxPass([gated], [ownTask], {
+        runner: input.syntax.runner,
+        workingDir: workspace.dir,
+        roots: rebaseScope(input.syntax.roots, workspace.roots, workspace.dir),
+        signal: input.signal,
+        ...(input.knownSecrets === undefined ? {} : { knownSecrets: input.knownSecrets }),
+      });
+      if (checked !== undefined) {
+        gated = checked;
+        if (checked.syntax !== undefined && checked.syntax.error === undefined) {
+          input.state.syntaxGated.add(row.id);
+        }
+        if (checked.status === "failed") {
+          return {
+            row: checked,
+            merge: false,
+            reason: (checked.error ?? "syntax failed").split("; ")[0]!,
+          };
+        }
+      }
+    }
     const items = input.judge?.items(row.id) ?? [];
     if (input.judge !== undefined && items.length > 0 && input.judge.judgeable(gated)) {
       // A check item the gate did not run is decided after the merge.
       const judgedItems = items.filter(
         (item) => item.kind !== "check" || ran.has(item.checkIndex ?? -1),
       );
-      const ownTask = rebased(task, workspace.roots, workspace.dir);
       let findings: ContractFinding[] = [];
       if (contract !== undefined) {
         findings = (
