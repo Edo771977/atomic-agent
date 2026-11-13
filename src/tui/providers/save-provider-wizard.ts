@@ -8,7 +8,10 @@ import {
   writeProviderApiKeyToDotenv,
 } from "../../config/llm-provider-commands.js";
 import { findProviderPreset } from "./provider-presets.js";
-import { wizardKeyIsOptional } from "./providers-wizard-target.js";
+import {
+  networkComputerKeyEnvVar,
+  wizardKeyIsOptional,
+} from "./providers-wizard-target.js";
 import {
   storedEntryAtBaseUrl,
   storedProviderFileEntry,
@@ -44,10 +47,7 @@ function defaultChatModelForKind(kind: ProvidersWizardKind): string {
   return OPENROUTER_DEFAULT_CHAT_MODEL;
 }
 
-/** `.env` variable for the key of a server on another computer: `custom-192-168-1-20-8080` -> `ATOMIC_AGENT_KEY_CUSTOM_192_168_1_20_8080`. */
-export function networkComputerKeyEnvVar(providerId: string): string {
-  return `ATOMIC_AGENT_KEY_${providerId.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}`;
-}
+export { networkComputerKeyEnvVar };
 
 export function saveProviderWizardToConfig(
   wizard: ProvidersWizardState,

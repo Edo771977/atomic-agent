@@ -5,7 +5,6 @@ import {
   refreshAimlapiChatCatalogFromApi,
 } from "../../llm/provider/aimlapi/fetch-aimlapi-chat-catalog.js";
 import { fetchOpenAiCompatModels } from "../../llm/provider/openai/fetch-openai-compat-models.js";
-import { describeOtherComputerUnreachable } from "../../llm/provider/openai/network-server-address.js";
 import { fetchGeminiModels } from "../../llm/provider/gemini/fetch-gemini-models.js";
 import {
   getCachedOpenRouterChatPicks,
@@ -17,7 +16,9 @@ import {
   baseUrlForWizard,
   emptyKeyMeaningForWizard,
   envHintForWizard,
+  sharedKeyNotSentNote,
 } from "./providers-wizard-target.js";
+import { describeModelListError } from "./describe-model-list-error.js";
 import { PasteFieldTarget } from "../context-menu/paste-field-target.js";
 import { pasteIntoProvidersWizard } from "./providers-wizard-paste.js";
 import { theme } from "../theme/theme.js";
@@ -51,29 +52,6 @@ import { pickListHints, renderPickList } from "./wizard-pick-list.js";
 function providerLabelForWizard(w: ProvidersWizardState): string {
   const preset = w.presetId ? findProviderPreset(w.presetId) : undefined;
   return preset?.label ?? w.kind ?? "provider";
-}
-
-/**
- * Turn a bare transport error into something actionable. `http 401` on
- * its own reads as a product failure, when it almost always means the
- * key belongs to a different service than the one selected.
- */
-function explainModelListError(error: string, w: ProvidersWizardState): string {
-  const service = providerLabelForWizard(w);
-  // `http <status>` leads; the provider's own sentence may follow it, and
-  // a number inside that sentence is not the status.
-  const status = /^http (\d{3})\b/.exec(error)?.[1];
-  // ATO-1066: a server on another computer that did not answer is about
-  // that computer (asleep, server stopped, bound to 127.0.0.1, firewall).
-  const unreachable = describeOtherComputerUnreachable(baseUrlForWizard(w), error);
-  if (unreachable) return unreachable;
-  if (status === "401" || status === "403") {
-    return `${service} rejected this key, check it belongs to ${service}`;
-  }
-  if (status === "404") {
-    return `${service} has no model list at this URL`;
-  }
-  return `could not list models from ${service} (${error})`;
 }
 
 function maskedKey(buffer: string): string {
@@ -297,7 +275,7 @@ function CompatChatModelStep(props: {
           ? "listing models from Gemini…"
           : `listing models from ${baseUrl}/v1/models…`
         : status.error
-          ? `${explainModelListError(status.error, w)} · type the id · Enter to save`
+          ? `${describeModelListError(status.error, w, providerLabelForWizard(w))} · type the id · Enter to save`
           : "Enter to save · Backspace to empty for the model list · Esc back";
   return renderLineField({
     title: "Chat model id",
@@ -451,6 +429,9 @@ export function ProvidersWizard(props: {
   if (w.phase === "api_key") {
     const envHint = envHintForWizard(w);
     const emptyMeans = emptyKeyMeaningForWizard(w);
+    // ATO-1066: the shared compat key used to reach a server on another
+    // computer; say so while the operator can still type its own key.
+    const sharedNote = sharedKeyNotSentNote(w);
     return (
       <Box
         flexDirection="column"
@@ -467,6 +448,7 @@ export function ProvidersWizard(props: {
           Saved to <Text color={theme.colors.accent}>{".env"}</Text> as{" "}
           {envHint} (mode 0600). {emptyMeans}
         </Text>
+        {sharedNote ? <Text color={theme.colors.warn}>{sharedNote}</Text> : null}
         {/* The api_key screen is where paste matters most: keys are
             never typed by hand. Same adapter, same burst path. */}
         <PasteFieldTarget onPasteText={pasteIntoProvidersWizard}>

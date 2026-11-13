@@ -141,10 +141,58 @@ export function envHintForWizard(wizard: ProvidersWizardState): string {
     ? findProviderPreset(wizard.presetId)
     : undefined;
   if (preset) return preset.envVar;
+  // ATO-1066: a key for a server on another computer gets a variable of
+  // its own (`saveProviderWizardToConfig`); the shared one is never read
+  // for it, so naming it here would promise the key a home it never uses.
+  if (wizard.kind === "openai-compatible" && targetsOtherComputer(wizard)) {
+    return wizard.providerId
+      ? networkComputerKeyEnvVar(wizard.providerId)
+      : "ATOMIC_AGENT_KEY_<connection id>";
+  }
   if (wizard.kind === "openrouter") return "OPENROUTER_API_KEY";
   if (wizard.kind === "aimlapi") return "AIMLAPI_API_KEY";
   if (wizard.kind === "gemini") return "GEMINI_API_KEY";
   return "OPENAI_COMPAT_API_KEY";
+}
+
+/** `.env` variable for the key of a server on another computer: `custom-192-168-1-20-8080` -> `ATOMIC_AGENT_KEY_CUSTOM_192_168_1_20_8080`. */
+export function networkComputerKeyEnvVar(providerId: string): string {
+  return `ATOMIC_AGENT_KEY_${providerId.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}`;
+}
+
+function targetsOtherComputer(wizard: ProvidersWizardState): boolean {
+  return (
+    !wizard.presetId &&
+    wizard.kind === "openai-compatible" &&
+    isOtherComputerOnNetworkUrl(baseUrlForWizard(wizard))
+  );
+}
+
+/** The shared compat variables, in the order the resolver reads them. */
+const SHARED_COMPAT_KEY_VARS = [
+  "OPENAI_COMPAT_API_KEY",
+  "OPENAI_API_KEY",
+  "ATOMIC_AGENT_OPENAI_API_KEY",
+] as const;
+
+/**
+ * ATO-1066: why a server on another computer gets no key although a
+ * shared compat variable is set, or `null` when there is nothing to
+ * explain. Earlier builds sent that variable to such a server, so an
+ * operator who kept a LAN server's key there would otherwise see it
+ * stop working with no word as to why.
+ */
+export function sharedKeyNotSentNote(wizard: ProvidersWizardState): string | null {
+  if (!targetsOtherComputer(wizard) || apiKeyForWizard(wizard)) return null;
+  const set = SHARED_COMPAT_KEY_VARS.find((name) => {
+    const value = process.env[name];
+    return value !== undefined && value.length > 0;
+  });
+  if (!set) return null;
+  return (
+    `${set} is not sent to other computers on your network. ` +
+    "If this server needs a key, type the server's key here, or name its variable with apiKeyEnvVar in config.json."
+  );
 }
 
 /**

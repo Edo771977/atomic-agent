@@ -11,6 +11,7 @@ import {
   apiKeyPhaseError,
   emptyKeyMeaningForWizard,
   envHintForWizard,
+  sharedKeyNotSentNote,
   verifyTargetForWizard,
   wizardKeyIsOptional,
 } from "./providers-wizard-target.js";
@@ -495,5 +496,42 @@ describe("the shared compat key and a server on another computer (ATO-1066)", ()
       baseUrl: "http://192.168.1.20:8080",
     });
     expect(apiKeyForWizard(wizard)).toBe("lan-literal");
+  });
+});
+
+describe("sharedKeyNotSentNote (ATO-1066)", () => {
+  // A LAN server's key used to live in OPENAI_COMPAT_API_KEY. It is no
+  // longer sent there, so an operator upgrading must be told why the
+  // server suddenly sees no key.
+  beforeEach(() => {
+    for (const key of ENV_KEYS) delete process.env[key];
+  });
+  afterEach(() => {
+    for (const key of ENV_KEYS) delete process.env[key];
+  });
+
+  function lan(apiKeyBuffer = "", baseUrlLine = "http://192.168.1.20:8080") {
+    return { ...wizardFor("openai-compatible"), baseUrlLine, apiKeyBuffer };
+  }
+
+  it("names the shared variable that is set and what to do instead", () => {
+    process.env.OPENAI_API_KEY = "sk-SHARED";
+    const note = sharedKeyNotSentNote(lan());
+    expect(note).toContain("OPENAI_API_KEY is not sent to other computers on your network");
+    expect(note).toContain("type the server's key");
+    expect(note).toContain("apiKeyEnvVar");
+  });
+
+  it("stays quiet when it has nothing to explain", () => {
+    expect(sharedKeyNotSentNote(lan())).toBeNull();
+    process.env.OPENAI_COMPAT_API_KEY = "sk-SHARED";
+    expect(sharedKeyNotSentNote(lan("lan-key"))).toBeNull();
+    expect(sharedKeyNotSentNote(lan("", "https://api.example.com"))).toBeNull();
+    expect(sharedKeyNotSentNote(lan("", "http://127.0.0.1:8080"))).toBeNull();
+  });
+
+  it("does not promise the shared variable as the key's home", () => {
+    expect(envHintForWizard(lan())).not.toBe("OPENAI_COMPAT_API_KEY");
+    expect(envHintForWizard(lan())).toContain("ATOMIC_AGENT_KEY_");
   });
 });

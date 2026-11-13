@@ -155,8 +155,12 @@ describe("ProvidersWizard chat model step", () => {
       vi.fn(async () => ({ ok: false, status: 403 })),
     );
 
+    // A key went out, so "rejected" is the truth; without one the line
+    // says no key was sent (below).
     const { lastFrame } = render(
-      <ProvidersWizard wizard={chatModelStep("https://refused.example")} />,
+      <ProvidersWizard
+        wizard={{ ...chatModelStep("https://refused.example"), apiKeyBuffer: "sk-typed" }}
+      />,
     );
     await flush();
 
@@ -178,12 +182,45 @@ describe("ProvidersWizard chat model step", () => {
       phase: "chat_model_line" as const,
       presetId: "groq",
       baseUrlLine: "https://api.groq.com/openai",
+      apiKeyBuffer: "gsk-typed",
     };
     const { lastFrame } = render(<ProvidersWizard wizard={wizard} />);
     await flush();
 
     const text = stripAnsi(lastFrame() ?? "");
     expect(text).toContain("Groq rejected this key");
+  });
+});
+
+describe("ProvidersWizard and the shared compat key (ATO-1066)", () => {
+  beforeEach(() => {
+    process.env.OPENAI_COMPAT_API_KEY = "sk-SHARED";
+  });
+  afterEach(() => {
+    delete process.env.OPENAI_COMPAT_API_KEY;
+    vi.unstubAllGlobals();
+  });
+
+  it("says on the key screen that the shared key does not go to another computer", () => {
+    const wizard = {
+      ...createProvidersWizardState("add", { kind: "openai-compatible" }),
+      phase: "api_key" as const,
+      baseUrlLine: "http://192.168.1.20:8080",
+    };
+    const text = stripAnsi(render(<ProvidersWizard wizard={wizard} />).lastFrame() ?? "").replace(/\s+/g, " ");
+    expect(text).toContain("OPENAI_COMPAT_API_KEY is not sent to other computers");
+    expect(text).not.toContain("as OPENAI_COMPAT_API_KEY");
+  });
+
+  it("does not call a key rejected when none was sent", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: false, status: 401 })));
+    const { lastFrame } = render(
+      <ProvidersWizard wizard={chatModelStep("http://192.168.1.20:8080")} />,
+    );
+    await flush();
+    const text = stripAnsi(lastFrame() ?? "").replace(/\s+/g, " ");
+    expect(text).not.toContain("rejected this key");
+    expect(text).toContain("no key was sent");
   });
 });
 
