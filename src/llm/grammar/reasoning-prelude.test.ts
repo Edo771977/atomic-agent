@@ -4,6 +4,7 @@ import { gbnfAccepts } from "./gbnf-test-helpers.js";
 import {
   LLAMA_SERVER_GBNF_MAX_REPETITION,
   buildReasoningPreludeRules,
+  withReasoningBudget,
   withUnboundedReasoningPrelude,
 } from "./reasoning-prelude.js";
 
@@ -122,5 +123,56 @@ describe("buildReasoningPreludeRules bound vs llama.cpp's per-quantifier limit (
     const lifted = withUnboundedReasoningPrelude(small);
     expect(lifted).toContain("think-body ::= think-char*");
     expect(lifted).not.toContain("think-char{0,1999}");
+  });
+});
+
+describe("withReasoningBudget re-bounds the prelude per request (a local fusion worker)", () => {
+  const SENTINEL = "</think>";
+  const grammarWith = (stem: string, sentinel: string, open: string | undefined, chars: number) =>
+    `root ::= ${stem}-prelude tool-call-array\n${buildReasoningPreludeRules(stem, sentinel, open, chars)}\ntool-call-array ::= "["\n`;
+
+  it("bounds an unbounded prelude, deriving the one-character unit from the fragment rule", () => {
+    const base = grammarWith("think", SENTINEL, undefined, 0);
+    const bounded = withReasoningBudget(base, 6000);
+    // The same rules a base grammar built with that bound carries.
+    for (const line of buildReasoningPreludeRules("think", SENTINEL, undefined, 6000).split("\n")) {
+      expect(bounded.split("\n")).toContain(line);
+    }
+    expect(gbnfAccepts(bounded, "think-body", "x".repeat(6000))).toBe(true);
+    expect(gbnfAccepts(bounded, "think-body", "x".repeat(6001))).toBe(false);
+    expect(gbnfAccepts(bounded, "think-body", "a</b".repeat(100))).toBe(true);
+  });
+
+  it("replaces a chained bound with the new one, leaving no stale chain rule", () => {
+    const base = grammarWith("think", SENTINEL, undefined, 8000);
+    const tighter = withReasoningBudget(base, 2048);
+    expect(tighter).not.toMatch(/^think-body-[3-9] ::= /m);
+    expect(gbnfAccepts(tighter, "think-body", "x".repeat(2048))).toBe(true);
+    expect(gbnfAccepts(tighter, "think-body", "x".repeat(2049))).toBe(false);
+    const looser = withReasoningBudget(grammarWith("think", SENTINEL, undefined, 1024), 8000);
+    expect(gbnfAccepts(looser, "think-body", "x".repeat(8000))).toBe(true);
+    expect(gbnfAccepts(looser, "think-body", "x".repeat(8001))).toBe(false);
+  });
+
+  it("gives back the same bytes for the bound the base already has", () => {
+    for (const chars of [1024, 6000]) {
+      const base = grammarWith("think", SENTINEL, undefined, chars);
+      expect(withReasoningBudget(base, chars)).toBe(base);
+    }
+  });
+
+  it("works on the Gemma channel stem and keeps its forced opener", () => {
+    const base = grammarWith("channel", "<channel|>", "<|channel>thought\n", 0);
+    const bounded = withReasoningBudget(base, 3000);
+    expect(bounded).toContain('channel-prelude ::= "<|channel>thought\\n" channel-body');
+    expect(gbnfAccepts(bounded, "channel-body", "x".repeat(3000))).toBe(true);
+    expect(gbnfAccepts(bounded, "channel-body", "x".repeat(3001))).toBe(false);
+  });
+
+  it("is the identity on a grammar without a prelude, and lifts the bound at 0", () => {
+    const plain = 'root ::= tool-call-array\ntool-call-array ::= "["\n';
+    expect(withReasoningBudget(plain, 2048)).toBe(plain);
+    const base = grammarWith("think", SENTINEL, undefined, 1024);
+    expect(withReasoningBudget(base, 0)).toBe(withUnboundedReasoningPrelude(base));
   });
 });

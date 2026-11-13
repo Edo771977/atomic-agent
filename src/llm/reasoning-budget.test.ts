@@ -2,10 +2,13 @@ import { describe, expect, it } from "vitest";
 
 import { USER_CONFIG_DEFAULTS } from "../config/config-schema.js";
 import {
+  DEFAULT_LOCAL_WORKER_REASONING_BUDGET_TOKENS,
   DEFAULT_REASONING_BUDGET_TOKENS,
+  LOCAL_WORKER_REASONING_BUDGET_TOKENS,
   REASONING_CHARS_PER_TOKEN,
   effectiveReasoningBudgetTokens,
   estimateReasoningTokens,
+  localWorkerReasoningBudgetTokens,
   reasoningBudgetChars,
 } from "./reasoning-budget.js";
 
@@ -47,5 +50,28 @@ describe("effective reasoning budget (ATO-607: no 1,999-char llama.cpp clamp)", 
     expect(effectiveReasoningBudgetTokens(0)).toBe(0);
     expect(effectiveReasoningBudgetTokens(-5)).toBe(0);
     expect(effectiveReasoningBudgetTokens(Number.NaN)).toBe(0);
+  });
+});
+
+describe("a local fusion worker's reasoning bound (workerReasoning on a grammar leg)", () => {
+  it("maps each workerReasoning level to its own bound, whatever the config says", () => {
+    expect(LOCAL_WORKER_REASONING_BUDGET_TOKENS).toEqual({ low: 512, medium: 1536, high: 4096 });
+    for (const configured of [0, 800, 32768]) {
+      expect(localWorkerReasoningBudgetTokens("low", configured)).toBe(512);
+      expect(localWorkerReasoningBudgetTokens("medium", configured)).toBe(1536);
+      expect(localWorkerReasoningBudgetTokens("high", configured)).toBe(4096);
+    }
+  });
+
+  it("is bounded by default when workerReasoning is unset and the config is unbounded", () => {
+    expect(DEFAULT_LOCAL_WORKER_REASONING_BUDGET_TOKENS).toBe(1536);
+    expect(localWorkerReasoningBudgetTokens(undefined, DEFAULT_REASONING_BUDGET_TOKENS)).toBe(1536);
+    expect(localWorkerReasoningBudgetTokens(undefined, 0)).toBe(1536);
+    expect(localWorkerReasoningBudgetTokens(undefined, Number.NaN)).toBe(1536);
+  });
+
+  it("keeps a configured localModels.reasoningBudgetTokens when workerReasoning is unset", () => {
+    expect(localWorkerReasoningBudgetTokens(undefined, 800)).toBe(800);
+    expect(localWorkerReasoningBudgetTokens(undefined, 8000.7)).toBe(8000);
   });
 });

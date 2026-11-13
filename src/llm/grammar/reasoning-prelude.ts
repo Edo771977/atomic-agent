@@ -150,6 +150,51 @@ export function withUnboundedReasoningPrelude(grammar: string): string {
 }
 
 /**
+ * The grammar with its reasoning body re-bounded to `budgetChars`, for
+ * a turn whose thinking has its own bound (a fusion worker on a local
+ * leg, `localWorkerReasoningBudgetTokens`). Per request: the base
+ * grammar and the prompt are untouched. The body's head line and any
+ * chained `think-body-K` rules are replaced in place by the chain for
+ * the new bound (`boundedBodyRules`), so a bound equal to the base
+ * grammar's gives back the same string. An unbounded base (budget 0)
+ * gains the one-character unit rule its bounded body needs, derived from
+ * the greedy fragment rule. `budgetChars <= 0` lifts the bound
+ * (`withUnboundedReasoningPrelude`). A grammar without a prelude is
+ * returned as is.
+ */
+export function withReasoningBudget(grammar: string, budgetChars: number): string {
+  if (!Number.isFinite(budgetChars) || budgetChars <= 0) return withUnboundedReasoningPrelude(grammar);
+  const stem = PRELUDE_STEM_RE.exec(grammar)?.[1];
+  if (stem === undefined) return grammar;
+  const bodyRule = `${stem}-body`;
+  const charRule = `${stem}-char`;
+  const lines = grammar.split("\n");
+  const head = lines.findIndex((line) => line.startsWith(`${bodyRule} ::= `));
+  if (head < 0) return grammar;
+  const chained = new RegExp(`^${bodyRule}-\\d+ ::= `);
+  const kept = lines.filter((line, idx) => idx === head || !chained.test(line));
+  const at = kept.findIndex((line) => line.startsWith(`${bodyRule} ::= `));
+  const hasCharRule = kept.some((line) => line.startsWith(`${charRule} ::= `));
+  const unit: string[] = [];
+  if (!hasCharRule) {
+    // `think-fragment ::= [^<]+ | "<" [^/] | ...` → the same alternatives
+    // one character at a time, as `buildReasoningPreludeRules` writes it.
+    const fragment = kept.find((line) => line.startsWith(`${stem}-fragment ::= `));
+    const derived = fragment?.replace(FRAGMENT_HEAD_RE, `${charRule} ::= $1`);
+    if (derived === undefined || derived === fragment) return grammar;
+    unit.push(derived);
+  }
+  kept.splice(at, 1, ...boundedBodyRules(bodyRule, charRule, Math.floor(budgetChars)), ...unit);
+  return kept.join("\n");
+}
+
+/** The prelude's rule stem (`think`, `channel`) from its root line. */
+const PRELUDE_STEM_RE = /^root ::= ([a-z]+)-prelude tool-call-array$/m;
+
+/** The greedy head of an unbounded fragment rule: `stem-fragment ::= [^<]+`. */
+const FRAGMENT_HEAD_RE = /^[a-z]+-fragment ::= (\[\^(?:\\.|[^\]\\])+\])\+/;
+
+/**
  * The grammar with the plain root — `root ::= tool-call-array`, no
  * prelude — for `localModels.thinking: "off"` on the hand-built prompt
  * path, where the prompt ends with the template's own disabled marker

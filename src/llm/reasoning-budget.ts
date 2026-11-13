@@ -1,3 +1,5 @@
+import type { ReasoningEffort } from "./provider/completion-types.js";
+
 /**
  * The think-block budget of a local reasoning model, and its units (F49).
  *
@@ -61,4 +63,47 @@ export function estimateReasoningTokens(reasoningText: string): number {
  */
 export function effectiveReasoningBudgetTokens(budgetTokens: number): number {
   return reasoningBudgetChars(budgetTokens) / REASONING_CHARS_PER_TOKEN;
+}
+
+/**
+ * The think-block bound of a fusion worker on a local (grammar) leg,
+ * per `llm.runMode.fusion.workerReasoning` level. A local llama-server
+ * has no reasoning-effort parameter, so the level is spelled as this
+ * per-request grammar bound (`withReasoningBudget`); a cloud leg keeps
+ * reading the effort from the body builder instead.
+ *
+ * Picked from the fusion bench above (500–7,152 reasoning tokens per
+ * tool step): `low` keeps the routine steps at the bench's low end,
+ * `medium` lets a typical step finish its thought and cuts the long
+ * tail that made workers miss their time limit, and `high` leaves room
+ * for a hard step while still stopping a runaway one.
+ */
+export const LOCAL_WORKER_REASONING_BUDGET_TOKENS: Readonly<Record<ReasoningEffort, number>> = {
+  low: 512,
+  medium: 1_536,
+  high: 4_096,
+};
+
+/**
+ * The bound a local worker gets when `workerReasoning` is unset: the
+ * `medium` level. A worker runs under a time limit at local speed, so
+ * the unbounded default of an ordinary turn
+ * (`DEFAULT_REASONING_BUDGET_TOKENS`) is what cut its answers.
+ */
+export const DEFAULT_LOCAL_WORKER_REASONING_BUDGET_TOKENS = LOCAL_WORKER_REASONING_BUDGET_TOKENS.medium;
+
+/**
+ * The reasoning bound, in budget tokens, for every step of a fusion
+ * worker on a local leg. An explicit `workerReasoning` level wins. Unset,
+ * a configured `localModels.reasoningBudgetTokens` (positive) is kept,
+ * since the person chose it; otherwise the worker default. Never `0`:
+ * a local worker is always bounded.
+ */
+export function localWorkerReasoningBudgetTokens(
+  level: ReasoningEffort | undefined,
+  configuredBudgetTokens: number,
+): number {
+  if (level !== undefined) return LOCAL_WORKER_REASONING_BUDGET_TOKENS[level];
+  const configured = effectiveReasoningBudgetTokens(configuredBudgetTokens);
+  return configured > 0 ? configured : DEFAULT_LOCAL_WORKER_REASONING_BUDGET_TOKENS;
 }
