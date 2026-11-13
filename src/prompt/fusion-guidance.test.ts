@@ -156,6 +156,12 @@ describe("the ### fusion prefix section", () => {
     expect(
       buildFusionGuidance({ ...FACTS, tokensPerSecond: 6.4 }).length,
     ).toBeLessThan(1900);
+    // A local leg's task-sizing clause is the one line that grows: one
+    // file or function and ~N new lines instead of "a big one".
+    expect(
+      buildFusionGuidance({ ...FACTS, tokensPerSecond: 6.4, workerMaxNewLines: 650 })
+        .length,
+    ).toBeLessThan(2000);
   });
 });
 

@@ -542,7 +542,7 @@ async function expandOne(
       error: row.error === undefined ? validated.error : `${validated.error}; ${row.error}`,
       notes: [
         ...(row.notes ?? []),
-        "re-brief the task yourself or split it in your next fusion.delegate",
+        "re-brief or split the task in your next fusion.delegate",
       ],
     };
   }

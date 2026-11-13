@@ -515,7 +515,7 @@ export function renderMergeBlock(merges: readonly MergeTaskSuggestion[]): string
   return [
     "",
     "",
-    `Merge needed: ${merges.length} task${merges.length === 1 ? "" : "s"} changed files that also changed in the folder while they ran. The folder's versions were kept. Delegate each merge below as a task (its instructions are in details.merges) or merge it yourself:`,
+    `Merge needed: ${merges.length} task${merges.length === 1 ? "" : "s"} changed files that also changed in the folder while they ran. The folder's versions were kept. Delegate each merge below as a task (its instructions are in details.merges), or tell the person:`,
     ...lines,
   ].join("\n");
 }

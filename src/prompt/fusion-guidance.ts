@@ -74,7 +74,7 @@ function fusionGuidanceLines(sizing: string): string {
     // F43: the status table now says `replaced the user's file sales.csv
     // (2,401 → 9 lines)` on the row; this is what to do about it.
     "A task that replaced a pre-existing file is not done until the file is restored (`os.fs.restore` in a worker) or the replacement was asked for.",
-    "Yours alone: the decision you were asked for, a part that only makes sense with this conversation in front of it, anything needing approval.",
+    "Yours alone: the decision you were asked for, judgement that only makes sense with this conversation; tell the person what only they can approve.",
     "Call `fusion.delegate` on its own, never alongside other tool calls.",
   ].join("\n");
 }
