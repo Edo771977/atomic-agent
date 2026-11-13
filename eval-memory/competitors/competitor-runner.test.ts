@@ -72,8 +72,8 @@ describe("runCompetitorScenario", () => {
     expect(adapter.ingested.map((t) => t.turnId)).toEqual(["t1", "t2"]);
     expect(result.adapterName).toBe("stub");
     expect(result.outcomes).toHaveLength(1);
-    expect(result.outcomes[0].substringMatch).toBe(true);
-    expect(result.outcomes[0].retrievedCount).toBe(1);
+    expect(result.outcomes[0]!.substringMatch).toBe(true);
+    expect(result.outcomes[0]!.retrievedCount).toBe(1);
   });
 
   it("returns null substringMatch when no gold is provided", async () => {
@@ -85,7 +85,7 @@ describe("runCompetitorScenario", () => {
       recallK: 1,
       llamaUrl: "http://localhost:19091",
     });
-    expect(result.outcomes[0].substringMatch).toBeNull();
+    expect(result.outcomes[0]!.substringMatch).toBeNull();
   });
 
   it("forwards recallK to the adapter and reports retrievedCount", async () => {
@@ -97,6 +97,6 @@ describe("runCompetitorScenario", () => {
       recallK: 7,
       llamaUrl: "http://localhost:19091",
     });
-    expect(adapter.recallCalls[0].k).toBe(7);
+    expect(adapter.recallCalls[0]!.k).toBe(7);
   });
 });

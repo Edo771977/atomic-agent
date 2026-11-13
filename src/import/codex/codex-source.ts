@@ -1,5 +1,5 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 /**
  * Read-only access to a `~/.codex` state directory (Codex CLI). This is
@@ -156,9 +156,8 @@ export class CodexSource {
       } catch {
         return;
       }
-      const basename = file.slice(file.lastIndexOf("/") + 1);
       metas.push({
-        id: basename.replace(/^rollout-/, "").replace(/\.jsonl$/, ""),
+        id: basename(file).replace(/^rollout-/, "").replace(/\.jsonl$/, ""),
         file,
         mtimeMs,
       });

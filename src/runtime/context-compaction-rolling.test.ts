@@ -85,6 +85,7 @@ describe("background rolling summary", () => {
     const rolling = f.stored().rollingSummary!;
     expect(f.complete.mock.calls.length).toBeGreaterThanOrEqual(2);
     expect(f.complete.mock.calls[0]![0]).toMatchObject({ slotId: 3, sessionId: "compaction:chat", providerId: "current" });
+    expect(f.complete.mock.calls[0]![0]).not.toHaveProperty("budgetOwnerSessionId");
     expect(rolling).toMatchObject({ summary: ROLLING, from: 0, model: "bg-model" });
     expect(safeCompactionCuts(f.stored().turns)).toContain(rolling.coveredThrough);
     // The next turn adds records the rolling summary has not seen.

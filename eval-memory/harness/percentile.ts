@@ -26,12 +26,12 @@ export function percentile(xs: readonly number[], fraction: number): number {
   if (fraction >= 1) return Math.max(...xs);
   const sorted = [...xs].sort((a, b) => a - b);
   const n = sorted.length;
-  if (n === 1) return sorted[0];
+  if (n === 1) return sorted[0]!;
   const h = (n - 1) * fraction;
   const floorH = Math.floor(h);
   const ceilH = Math.min(floorH + 1, n - 1);
   const frac = h - floorH;
-  return sorted[floorH] + frac * (sorted[ceilH] - sorted[floorH]);
+  return sorted[floorH]! + frac * (sorted[ceilH]! - sorted[floorH]!);
 }
 
 /**

@@ -23,6 +23,8 @@ import type { BatchLoopSignal } from "../dispatch/batch-contract.js";
 
 
 export interface LlmStreamParams {
+  /** Owning active turn for a sidecall; independent of its routing/breaker partition. */
+  budgetOwnerSessionId?: string;
   contextBudget?: { window: number | null; replyReserve: number };
   /** Rebuild and commit context for the actual attempted policy/window, including fallback. */
   prepareForLink?: (options: {
@@ -400,8 +402,10 @@ export interface StepContext {
    * The turn's `RunTurnOptions.toolFilter`, when one is set. The loop has
    * already applied it to `toolDescriptors`; the step applies it once
    * more to the per-request grammar, so a hidden tool is not merely
-   * absent from the catalog but impossible for a local model to emit —
+   * absent from the catalog but excluded from the request grammar —
    * `finish` included, which the static grammar lists unconditionally.
+   * Dispatch independently refuses excluded non-terminal calls and
+   * discovery targets, even when a provider ignores the offered tools.
    */
   toolFilter?: (name: string) => boolean;
   /**

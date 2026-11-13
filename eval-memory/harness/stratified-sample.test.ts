@@ -123,7 +123,7 @@ describe("summariseStrata", () => {
     const summary = summariseStrata(items, out, (it) => it.category);
     expect(summary.map((s) => s.key)).toEqual(["A", "B", "C", "D"]);
     expect(summary[0]).toMatchObject({ key: "A", before: 100, after: 50 });
-    expect(summary[0].fraction).toBeCloseTo(0.5, 6);
+    expect(summary[0]!.fraction).toBeCloseTo(0.5, 6);
     expect(summary[3]).toMatchObject({ key: "D", before: 10, after: 5 });
   });
 });

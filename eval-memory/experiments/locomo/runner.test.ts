@@ -23,6 +23,8 @@ function makeQ(
     durationMs: 1000,
     promptTokens: 500,
     predictedTokens: 200,
+    reason: "reply",
+    failureCategory: null,
   } as const;
 }
 
@@ -33,6 +35,7 @@ describe("summariseByCategory", () => {
         conversationId: "c1",
         profile: "fts5_only",
         sessionsFed: 2,
+        sessionsSkipped: 0,
         questionsAsked: 4,
         questions: [
           makeQ("fts5_only", "single_hop", 1, 1),
@@ -43,11 +46,14 @@ describe("summariseByCategory", () => {
         loadPhaseDurationMs: 5000,
         loadPhasePromptTokens: 2000,
         ok: true,
+        exitCode: 0, signal: null, timedOut: false, subprocessDurationMs: 5000, sessionId: "s-fts",
+        stderrTail: "", stderrAll: "", keptStateDir: null, keptWorkingDir: null, keptTracePath: null,
       },
       {
         conversationId: "c1",
         profile: "hybrid",
         sessionsFed: 2,
+        sessionsSkipped: 0,
         questionsAsked: 4,
         questions: [
           makeQ("hybrid", "single_hop", 1, 1),
@@ -58,6 +64,8 @@ describe("summariseByCategory", () => {
         loadPhaseDurationMs: 5000,
         loadPhasePromptTokens: 2000,
         ok: true,
+        exitCode: 0, signal: null, timedOut: false, subprocessDurationMs: 5000, sessionId: "s-hybrid",
+        stderrTail: "", stderrAll: "", keptStateDir: null, keptWorkingDir: null, keptTracePath: null,
       },
     ];
     const summary = summariseByCategory(results);

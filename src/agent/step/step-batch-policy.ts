@@ -16,6 +16,7 @@ import { getConfig } from "../../config/index.js";
 import type { ToolRegistry } from "../../tools/tool-registry.js";
 import { wouldRefuse as planModeWouldRefuse } from "../policies/plan-mode.js";
 import { wouldRefuse as fusionGateWouldRefuse } from "../policies/fusion-orchestrator-mode.js";
+import { toolFilterAdmits } from "../policies/tool-filter.js";
 import { executeBatch } from "../dispatch/batch-scheduler.js";
 import type { ToolDescriptor } from "../../prompt/stable-prefix.js";
 import { getDefaultArgsJsonSchema } from "../../prompt/default-tool-args-schemas.js";
@@ -126,8 +127,9 @@ export function createStepBatchPolicy(
     }
     return batch.calls.every(
       (call) =>
-        resourceClassFor(call.tool) !== "approval_gated" ||
-        gatedCallRunsUnattended(call.tool, posture),
+        toolFilterAdmits(call.tool, ctx.toolFilter) &&
+        (resourceClassFor(call.tool) !== "approval_gated" ||
+        gatedCallRunsUnattended(call.tool, posture)),
     );
   };
 
@@ -161,6 +163,7 @@ export function createStepBatchPolicy(
       return false;
     }
     return batch.calls.every((call) => {
+      if (!toolFilterAdmits(call.tool, ctx.toolFilter)) return false;
       const cls = resourceClassFor(call.tool);
       if (cls === "approval_gated") {
         if (isSoloRegardlessOfApproval(call.tool)) return false;
@@ -189,6 +192,13 @@ export function createStepBatchPolicy(
     error: BatchValidationError,
   ): { ok: true; batch: ToolCallBatch } | null => {
     if (!isApprovalGatedOnlyFailure(error)) return null;
+    // Validation classified aliases by their resolved names. Selection and
+    // admission must see those same names before choosing a survivor.
+    const calls = batch.calls.map((call) => {
+      const tool = resolveToolName(call.tool, deps.registry) ?? call.tool;
+      return tool === call.tool ? call : { ...call, tool };
+    });
+    if (calls.some((call, index) => call !== batch.calls[index])) batch = { ...batch, calls };
     // On the final step the tail terminal is the one call that can run:
     // every non-terminal call is refused at dispatch, so keeping the
     // first approval-gated call would lose the reply for a refusal.
@@ -251,7 +261,7 @@ export function createStepBatchPolicy(
       });
       return { ok: true, batch };
     }
-    const trim = trimBatchToFirstApprovalGated(batch, turnPolicyForTrim(deps));
+    const trim = trimBatchToFirstApprovalGated(batch, turnPolicyForTrim(deps, ctx.toolFilter));
     if (trim === null) return null;
     trimmedBatchNotice = formatBatchTrimNotice(trim);
     deps.onEvent?.({
@@ -553,6 +563,8 @@ export interface BatchTrimPolicy {
   /** The gate that would refuse `tool`, or `null` when it may run. */
   refusedBy?: (tool: string) => string | null;
   preferTool?: string;
+  /** A turn filter may leave useful reads after excluding every gated call. */
+  allowReadFallback?: boolean;
 }
 
 
@@ -569,27 +581,31 @@ export const TRIM_REFUSED_BY_FUSION_GATE = "refused by the fusion gate";
  * Build the trim policy from the step's dependencies — the same
  * getters the batch context carries (`isPlanMode`, `isFusionOrchestrator`
  * and the registry), read at trim time so a mode flipped mid-turn is
- * honoured the way the gates honour it. Plan mode is named first when
- * both would refuse, in the order the gates run.
+ * honoured the way the gates honour it. Tool-filter admission precedes
+ * the mode gates; plan mode is named first when both modes would refuse.
  */
 export function turnPolicyForTrim(
   deps: Pick<
     StepDependencies,
     "registry" | "isPlanMode" | "isFusionOrchestrator"
   >,
+  toolFilter?: StepContext["toolFilter"],
 ): BatchTrimPolicy {
   const planMode = deps.isPlanMode?.() ?? false;
   const orchestrator = deps.isFusionOrchestrator?.() ?? false;
-  if (!planMode && !orchestrator) return {};
+  if (!planMode && !orchestrator && toolFilter === undefined) return {};
   const ctx = { registry: deps.registry };
   return {
     refusedBy: (tool) =>
-      planMode && planModeWouldRefuse(tool, ctx)
+      !toolFilterAdmits(tool, toolFilter)
+        ? "refused by this turn's tool filter"
+        : planMode && planModeWouldRefuse(tool, ctx)
         ? TRIM_REFUSED_BY_PLAN_MODE
         : orchestrator && fusionGateWouldRefuse(tool, ctx)
           ? TRIM_REFUSED_BY_FUSION_GATE
           : null,
     ...(orchestrator ? { preferTool: ORCHESTRATOR_PREFERRED_TOOL } : {}),
+    ...(toolFilter === undefined ? {} : { allowReadFallback: true }),
   };
 }
 
@@ -627,6 +643,10 @@ export function trimBatchToFirstApprovalGated(
   }
   if (keptIdx === -1) {
     keptIdx = calls.findIndex((call, idx) => isGated(call) && runnable(idx));
+  }
+  if (keptIdx === -1 && policy.allowReadFallback) {
+    // Preserve permitted reads when the turn filter excluded all gated work.
+    keptIdx = calls.findIndex((call, idx) => resourceClassFor(call.tool) === "pure_read" && runnable(idx));
   }
   if (keptIdx === -1) {
     // Every gated call is refused: keep the first and let the gate

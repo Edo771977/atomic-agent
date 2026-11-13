@@ -71,6 +71,8 @@ export interface ModelSummaryRoute {
 }
 
 export interface ModelSummaryRequest {
+  /** Defaults to this session for foreground work; null explicitly denotes background work. */
+  budgetOwnerSessionId?: string | null;
   input: BuildPromptInput;
   prompt: BuiltPrompt;
   plan: CompactionPlan;
@@ -146,6 +148,7 @@ export async function summarizeWithModel(request: ModelSummaryRequest): Promise<
             : {}),
           grammar: "", slotId: request.sideCallSlotId(), cachePrompt: false,
           sessionId: `compaction:${state.id}`, providerId: route.providerId,
+          ...(request.budgetOwnerSessionId === null ? {} : { budgetOwnerSessionId: request.budgetOwnerSessionId ?? state.id }),
           maxTokens, maxOutputTokens: maxTokens,
           // A local OpenAI-compatible server is also asked not to think at all;
           // providers that cannot take that switch ignore it (see openai-build-body.ts).

@@ -1,6 +1,7 @@
 import { checkPlanMode } from "../policies/plan-mode.js";
 import { checkFusionOrchestrator, emptyFusionOrchestratorState } from "../policies/fusion-orchestrator-mode.js";
 import { toolSetAdmits, toolSetRefusal } from "../policies/step-tool-set.js";
+import { toolFilterAdmits } from "../policies/tool-filter.js";
 import type { ToolCallPayload } from "../../llm/grammar/tool-call-grammar.js";
 import { compressToolResult, type CompressedToolResult } from "../../compressor/result-compressor.js";
 import type { ToolRegistry } from "../../tools/tool-registry.js";
@@ -99,6 +100,27 @@ export function skillAlreadyLoadedResult(
  */
 /** The tool result a non-terminal call gets on the loop's final step. */
 export const FINAL_STEP_REFUSAL = "final step: only reply or finish run here";
+
+/**
+ * Offered schemas and a request grammar are not authorization: providers
+ * can return unoffered names, including through text/reasoning recovery.
+ * The step has resolved aliases to registered names before this gate.
+ * Refuse before loop accounting and cached-skill shortcuts; closing this
+ * session with reply/finish remains possible just as for step tool sets.
+ */
+export function runToolFilterGate(
+  input: BatchCallInput,
+  ctx: BatchExecutionContext,
+): CompressedToolResult | null {
+  const name = input.call.tool;
+  if (toolFilterAdmits(name, ctx.toolFilter)) return null;
+  return compressToolResult({
+    tool: name,
+    status: "error",
+    output: `\`${name}\` is not available in this turn; the call was not run. Use an allowed tool or report the blocked action in your reply.`,
+    details: { tool_filter: true, tool: name },
+  });
+}
 
 /**
  * Refuse a non-terminal call on the loop's reserved final step, or one

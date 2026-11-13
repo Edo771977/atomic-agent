@@ -1,6 +1,6 @@
 import type { BatchLoopSignal, BatchCallInput, BatchExecutionContext, BatchExecutionResult, BatchCallResult } from "./batch-contract.js";
 import { refuseUnregisteredTool } from "../policies/unknown-tool.js";
-import { refuseBeforeDispatch, skillAlreadyLoadedResult, runFinalStepGate, runPlanModeGate, runFusionOrchestratorGate, runSyncLoopGate, observeReadCoverage } from "./batch-gates.js";
+import { refuseBeforeDispatch, skillAlreadyLoadedResult, runFinalStepGate, runToolFilterGate, runPlanModeGate, runFusionOrchestratorGate, runSyncLoopGate, observeReadCoverage } from "./batch-gates.js";
 
 
 
@@ -152,6 +152,13 @@ export async function executeBatch(
       });
       continue;
     }
+    const filtered = runToolFilterGate(input, ctx);
+    if (filtered !== null) {
+      ctx.onCallStarted?.({ batchIndex: input.batchIndex, batchSize });
+      slots[input.batchIndex] = { ...slots[input.batchIndex]!, compressed: filtered, durationMs: 0 };
+      ctx.onCallFinished?.({ batchIndex: input.batchIndex, batchSize, result: filtered, durationMs: 0 });
+      continue;
+    }
     // A name the registry does not hold gets an error result naming the
     // closest real tools instead of ending the turn (`unknown-tool.ts`).
     // Like the plan-mode refusal below, it never spends a slot in the
@@ -267,6 +274,7 @@ export async function executeBatch(
         stepIndex: ctx.stepIndex,
         signal: ctx.signal,
         ...(ctx.toolRole !== undefined ? { toolRole: ctx.toolRole } : {}),
+        ...(ctx.toolFilter !== undefined ? { toolFilter: ctx.toolFilter } : {}),
         ...(ctx.readRoots !== undefined ? { readRoots: ctx.readRoots } : {}),
         ...(ctx.userGroundingTexts !== undefined
           ? { userGroundingTexts: ctx.userGroundingTexts }

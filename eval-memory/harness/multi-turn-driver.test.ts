@@ -134,7 +134,7 @@ describe("multi-turn-driver — integration with fake CLI", () => {
     // attempted before the driver sees the close).
     const m = res.stderrAll.match(/promptsSent=(\d+)\/20/);
     expect(m).not.toBeNull();
-    const sent = parseInt(m![1], 10);
+    const sent = parseInt(m![1]!, 10);
     expect(sent).toBeGreaterThanOrEqual(10);
     expect(sent).toBeLessThanOrEqual(11);
   });

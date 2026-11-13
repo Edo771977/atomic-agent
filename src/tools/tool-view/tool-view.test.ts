@@ -68,6 +68,13 @@ describe("buildToolViewTool under a tool role", () => {
     expect(tl.source).toBe("explicit");
   });
 
+  it("refuses an excluded target before returning its schema", async () => {
+    const tool = buildToolViewTool();
+    await expect(tool.run({ name: "memory.notes.store" }, {
+      ...ctxFor("builder"), ...{ toolFilter: (name: string) => name !== "memory.notes.store" },
+    })).rejects.toThrow(/not available in this turn/);
+  });
+
   it("still refuses a frequent tool the role already describes in full", async () => {
     const tool = buildToolViewTool();
     await expect(

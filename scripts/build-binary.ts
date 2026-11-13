@@ -49,7 +49,7 @@ function isAtLeast(
   actual: readonly [number, number, number],
   required: readonly [number, number, number],
 ): boolean {
-  for (let i = 0; i < 3; i += 1) {
+  for (const i of [0, 1, 2] as const) {
     if (actual[i] > required[i]) return true;
     if (actual[i] < required[i]) return false;
   }

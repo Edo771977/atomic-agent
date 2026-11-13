@@ -6,6 +6,7 @@ import {
 import { isAbsolute, relative, resolve as resolvePath } from "node:path";
 import { isInside } from "../../approval/fanout-scope.js";
 import { resolveFanoutScope } from "./fanout-paths.js";
+import { resolveUserPath } from "../os/expand-home.js";
 import { compressToolResult } from "../../compressor/result-compressor.js";
 import type { CompressedToolResult } from "../../compressor/result-compressor.js";
 import type { ResolvedRunMode } from "../../llm/run-mode/index.js";
@@ -39,7 +40,6 @@ import {
   contractForWave,
   dependencyWarnings,
   planWaves,
-  UNDELIVERED_STATUSES,
 } from "./contract-waves.js";
 import {
   notStartedResult,
@@ -56,6 +56,8 @@ import {
 } from "./local-grammar-smoke.js";
 import {
   renderMergeBlock,
+  rebaseScope,
+  rebaseText,
   runIsolatedWave,
   type KeptBranch,
   type MergeTaskSuggestion,
@@ -74,6 +76,7 @@ import {
 } from "./task-tree.js";
 import type { FusionRunRecorder, FusionRunStore } from "./run-checkpoint.js";
 import {
+  outcomeLogPath,
   rowCostUsd,
   taskOutcomeRecord,
   type FusionOutcomeSink,
@@ -102,7 +105,7 @@ import {
   unknownModels,
   type TaskLeg,
 } from "./role-models.js";
-import type { DelegateContract } from "./contract.js";
+import { provideSearchPaths, type DelegateContract } from "./contract.js";
 import { completionCostUsd, estimateUsageCostUsd } from "../../llm/provider/usage-cost.js";
 import {
   FusionTurnBudget,
@@ -130,7 +133,11 @@ import {
   type WorkerPricing,
   type WorkerTaskResult,
 } from "./worker-result.js";
-import { runSyntaxPass, type SyntaxCheckRunner } from "./syntax-pass.js";
+import { runSyntaxPass, syntaxPassFiles, type SyntaxCheckRunner } from "./syntax-pass.js";
+import { measuredTaskLegs, readRoutingHistory } from "./measured-routing.js";
+import { collectTaskArtifactManifests } from "./artifact-manifest-tasks.js";
+import { createCandidateIntegration, type CandidateIntegration, type CandidateIntegrationReport } from "./candidate-integration.js";
+import { readFusionWorkerMeta } from "../../session/fusion-worker-session.js";
 
 export const FUSION_DELEGATE_TOOL = "fusion.delegate";
 
@@ -170,6 +177,8 @@ export interface FusionDelegateDeps extends WorkerRunnerDeps {
    * only the orchestrator's instructions, as they did before.
    */
   resolveOriginalRequest?: (sessionId: string) => string | undefined;
+  /** Opaque SHA256 of known configured request identity; undefined means insufficient provenance. */
+  resolveRoutingIdentity?: (providerId: string) => string | undefined;
   /**
    * Pricing for the worker model on the worker leg, when any is known
    * (`resolveModelPricingFor`). Present, the status table header states
@@ -193,6 +202,8 @@ export interface FusionDelegateDeps extends WorkerRunnerDeps {
    * starts at the first fan-out). Only consulted when a cap is set.
    */
   turnBudget?: FusionTurnBudget;
+  /** Runtime physical-request ledger already charges newly completed calls. */
+  requestBudgetAccounting?: boolean;
   /** The orchestrator's priced spend so far this turn (`TurnUsageMeter.peekCostUsd`). */
   orchestratorTurnSpendUsd?: (sessionId: string) => number | undefined;
   /**
@@ -368,6 +379,9 @@ export function buildFusionDelegateTool(
       if (typeof resumeRequest === "string") {
         return error(`fusion.delegate: ${resumeRequest}`, { field: "resume" });
       }
+      if (mode.integration === "candidate" && resumeRequest !== null) {
+        return error("candidate integration is explicitly non-resumable; inspect the retained patch and plan a fresh fan-out", { reason: "candidate-nonresumable" });
+      }
       let resume: ResumePlan | undefined;
       let resumedFrom: ReturnType<FusionRunStore["load"]> = null;
       if (resumeRequest !== null) {
@@ -451,12 +465,24 @@ export function buildFusionDelegateTool(
       if (modelProblem !== undefined) {
         return error(modelProblem, { field: "tasks", reason: "unknown-model" });
       }
-      const taskLegs = resolveTaskLegs(
+      let taskLegs = resolveTaskLegs(
         parsed.tasks,
         workerLegRef,
         mode.roles,
         orchestratorLegRef,
       );
+      const routing = mode.measuredRouting?.enabled === true
+        ? measuredTaskLegs(parsed.tasks.filter((task) => resume === undefined || resume.rerun.includes(task.id)), taskLegs, workerLegRef, mode.roles, orchestratorLegRef, {
+          records: deps.agentStateDir === undefined ? [] : readRoutingHistory(outcomeLogPath(deps.agentStateDir)),
+          minSamples: mode.measuredRouting.minSamples,
+          days: mode.measuredRouting.days,
+          remainingOrchestrator: orchestratorCap - turnBudget.orchestratorTasks(ctx.sessionId) -
+            [...taskLegs.values()].filter((leg) => leg.orchestrator === true).length,
+          attempted: (id) => turnBudget.attempts(ctx.sessionId, id) > 0,
+          cliToolsStayOn: (provider) => deps.cliToolsStayOn?.(provider) === true,
+          identityFor: (provider) => deps.resolveRoutingIdentity?.(provider),
+        }) : undefined;
+      if (routing !== undefined) taskLegs = routing.legs;
       // Tasks sized past what a small local worker does well: run as
       // asked, never refused. Said on the approval line (before any
       // worker starts, when a person is asked) and on the result (the
@@ -665,7 +691,7 @@ export function buildFusionDelegateTool(
       // orchestrator left as the only party able to act — so the
       // operator is asked here instead, once, with the task list and the
       // directory in front of them.
-      const writeScope = resolveFanoutScope(parsed.tasks, ctx.workingDir);
+      let writeScope = resolveFanoutScope(parsed.tasks, ctx.workingDir);
       // Never into the agent's own state directory (ATO-1267).
       const intoState = scopeInsideStateDir(writeScope, deps.agentStateDir);
       if (intoState.length > 0) {
@@ -795,14 +821,47 @@ export function buildFusionDelegateTool(
         );
       }
 
+      const candidateOriginalDir = ctx.workingDir;
+      let candidate: CandidateIntegration | undefined;
+      if (mode.integration === "candidate") {
+        if (writeScope.some(path => !isInside(resolvePath(candidateOriginalDir), resolvePath(path)))) {
+          return error("candidate integration requires all declared write scopes inside the current project", { reason: "candidate-outside-project" });
+        }
+        try {
+          const remaining = capped ? turnBudget.timeLeftMs(ctx.sessionId, limits) : undefined;
+          const signal = remaining === undefined ? ctx.signal : AbortSignal.any([ctx.signal, AbortSignal.timeout(Math.max(0, remaining))]);
+          candidate = await createCandidateIntegration(candidateOriginalDir, { signal });
+        } catch (err) {
+          return error(`candidate integration could not stage a private workspace: ${err instanceof Error ? err.message : String(err)}`, { reason: "candidate-staging-failed", nonResumable: true });
+        }
+        const roots = [candidateOriginalDir, candidateOriginalDir.replace(/\\/g, "/")];
+        parsed.tasks = rebaseCandidateValue(parsed.tasks, roots, candidate.dir);
+        if (parsed.contract !== undefined) {
+          const originalInputs = parsed.contract.inputs;
+          parsed.contract = rebaseCandidateValue(parsed.contract, roots, candidate.dir);
+          // Resolve input identity independently of the prose rewriter: on
+          // Windows the original root may use any case. Keep only the
+          // declared suffix so generated temp prefixes cannot become globs.
+          if (originalInputs !== undefined) parsed.contract.inputs = originalInputs.map(path => {
+            try {
+              const absolute = resolveUserPath(path, candidateOriginalDir);
+              return isInside(candidateOriginalDir, absolute) ? relative(candidateOriginalDir, absolute) : path;
+            } catch { return path; }
+          });
+        }
+        writeScope = rebaseScope(writeScope, roots, candidate.dir);
+        ctx = { ...ctx, workingDir: candidate.dir, ...(ctx.readRoots === undefined ? {} : { readRoots: ctx.readRoots.map(path => rebaseText(path, roots, candidate!.dir)) }) };
+      }
+      try {
       // The orchestrator's brief is a summary, and summaries were thin
       // enough that workers built the wrong thing or scavenged the disk
       // for the missing spec. Every worker also gets what was asked.
       // A resumed run keeps the request it was started for: this turn's
       // own message is the person's "continue", not the job.
-      const originalRequest =
+      const request =
         resumedFrom?.originalRequest ??
         deps.resolveOriginalRequest?.(ctx.sessionId);
+      const originalRequest = request === undefined || candidate === undefined ? request : rebaseText(request, [candidateOriginalDir, candidateOriginalDir.replace(/\\/g, "/")], candidate.dir);
       // A local worker's time limit is sized from the machine's measured
       // speed (F19); a cloud leg has no such measurement and keeps the
       // configured ceiling.
@@ -840,6 +899,7 @@ export function buildFusionDelegateTool(
       // `contract:` line carries all of it.
       const waveWarnings: string[] =
         plan.cycle === undefined ? [] : [plan.cycle];
+      const dependencyCheckOutcomes = new Map<number, ContractCheckOutcome>();
 
       // A cap reached mid-fan-out stops what is running and starts
       // nothing more; the rows say why.
@@ -865,7 +925,7 @@ export function buildFusionDelegateTool(
                 const stop = budgetStop();
                 if (stop !== undefined) stopForBudget(stop);
               },
-              Math.max(0, timeLeft) + 50,
+              Math.max(0, timeLeft),
             );
       budgetTimer?.unref?.();
       const budgetOptionsFor = (pricing: WorkerPricing | undefined) =>
@@ -884,7 +944,7 @@ export function buildFusionDelegateTool(
                 // The service's own bill counts even for an unpriced worker.
                 const usd = completionCostUsd(usage, pricing);
                 if (usd !== undefined) {
-                  turnBudget.addWorkerSpend(ctx.sessionId, usd);
+                  turnBudget.addWorkerSpend(ctx.sessionId, usd, deps.requestBudgetAccounting === true);
                 }
                 const stop = budgetStop();
                 if (stop !== undefined) stopForBudget(stop);
@@ -915,7 +975,7 @@ export function buildFusionDelegateTool(
               onEscalationSpend: (_taskId: string, usd: number): void => {
                 escalationSpendUsd += usd;
                 run?.addSpend(usd);
-                turnBudget.addWorkerSpend(ctx.sessionId, usd);
+                turnBudget.addWorkerSpend(ctx.sessionId, usd, deps.requestBudgetAccounting === true);
                 const stop = budgetStop();
                 if (stop !== undefined) stopForBudget(stop);
               },
@@ -932,8 +992,22 @@ export function buildFusionDelegateTool(
       // Every worker session carries the request unclipped: its brief
       // may quote only the head (a local leg), and the input guard reads
       // the whole request for the files it names (`workerRequestRecord`).
+      const executionIdentities = new Map<string, string | undefined>();
       const workerDeps: FusionDelegateDeps = {
         ...deps,
+        ...(candidate === undefined ? {} : { ruleWorkdir: candidateOriginalDir }),
+        ...(deps.resolveRoutingIdentity === undefined ? {} : { runTurn: (session, message, options) => {
+          const taskId = readFusionWorkerMeta(session.metadata)?.taskId;
+          const provider = options.providerId;
+          if (taskId !== undefined) {
+            const identity = provider === taskLegs.get(taskId)?.providerId && provider !== undefined
+              ? deps.resolveRoutingIdentity?.(provider) : undefined;
+            // Once a task's identity changes between turns it stays unattributed.
+            if (!executionIdentities.has(taskId)) executionIdentities.set(taskId, identity);
+            else if (executionIdentities.get(taskId) !== identity) executionIdentities.set(taskId, undefined);
+          }
+          return deps.runTurn(session, message, options);
+        } }),
         ...(sideComplete === undefined ? {} : { escalationComplete: sideComplete }),
         ...(originalRequest === undefined
           ? {}
@@ -970,7 +1044,7 @@ export function buildFusionDelegateTool(
         : undefined;
       // The checkpoint (ATO-617): written after every task and wave, so a
       // run cut off by a crash or a quit can be resumed from where it was.
-      const run: FusionRunRecorder | undefined = deps.runCheckpoints?.start({
+      const run: FusionRunRecorder | undefined = candidate === undefined ? deps.runCheckpoints?.start({
         ...(resume === undefined ? {} : { runId: resume.runId }),
         sessionId: ctx.sessionId,
         workingDir: ctx.workingDir,
@@ -979,7 +1053,7 @@ export function buildFusionDelegateTool(
         tasks: parsed.tasks,
         waveCount: plan.waves.length,
         ...(resumedFrom === null ? {} : { resumedFrom }),
-      });
+      }) : undefined;
       // Priced per leg: a role model's task is recorded at its own price.
       const checkpointOptionsFor = (
         pricing: typeof workerPricing,
@@ -1101,7 +1175,7 @@ export function buildFusionDelegateTool(
           (r.status === "failed" && (r.error ?? "").startsWith("checks:")));
       const judgeOne: GateJudge = async (input) => {
         const stop = budgetStop();
-        if (stop !== undefined || ctx.signal.aborted) {
+        if (stop !== undefined || runSignal.aborted) {
           return {
             green: false,
             items: [],
@@ -1118,12 +1192,12 @@ export function buildFusionDelegateTool(
           target: judgeTarget!,
           pricing: judgePricing,
           complete: sideComplete!,
-          signal: ctx.signal,
+          signal: runSignal,
         });
         if (verdict.costUsd !== null && verdict.costUsd > 0) {
           judgeSpendUsd += verdict.costUsd;
           run?.addSpend(verdict.costUsd);
-          turnBudget.addWorkerSpend(ctx.sessionId, verdict.costUsd);
+          turnBudget.addWorkerSpend(ctx.sessionId, verdict.costUsd, deps.requestBudgetAccounting === true);
         }
         return verdict;
       };
@@ -1185,7 +1259,7 @@ export function buildFusionDelegateTool(
             ...(deps.knownSecrets === undefined
               ? {}
               : { knownSecrets: deps.knownSecrets() }),
-            signal: ctx.signal,
+            signal: runSignal,
             state: gateState,
             syntax: { runner: deps.syntaxCheck, roots: syntaxRoots },
             ...(judging
@@ -1436,14 +1510,14 @@ export function buildFusionDelegateTool(
                   childContract,
                   children,
                   ctx.workingDir,
-                  { results: rows, signal: ctx.signal },
+                  { results: rows, signal: runSignal },
                 );
                 const checks = await runContractChecks(
                   childContract.checks ?? [],
                   deps.runChecks,
                   {
                     workingDir: ctx.workingDir,
-                    signal: ctx.signal,
+                    signal: runSignal,
                     ...(deps.knownSecrets === undefined
                       ? {}
                       : { knownSecrets: deps.knownSecrets() }),
@@ -1500,7 +1574,81 @@ export function buildFusionDelegateTool(
             orchestratorTaskIds.filter((id) => !finished.has(id)).length,
             );
           }
+          // Worker completion alone does not establish that a required
+          // artifact is usable. Verify providers before releasing consumers,
+          // including rows carried from a checkpoint. Retry policy is separate.
+          const verifiedProviders = new Set<string>();
+          const previouslyReleased = new Set<string>();
+          const verifyProvider = async (id: string): Promise<void> => {
+            if (verifiedProviders.has(id)) return;
+            verifiedProviders.add(id);
+            const rechecking = previouslyReleased.has(id);
+            previouslyReleased.add(id);
+            let row = finished.get(id);
+            if (row?.status !== "ok") return;
+            const names = new Set((parsed.contract?.requires ?? []).map((r) => r.name));
+            const required = (parsed.contract?.provides ?? []).filter(
+              (p) => p.task === id && names.has(p.name),
+            );
+            if (required.length === 0) return;
+            const task = parsed.tasks.find((t) => t.id === id)!;
+            // F44 permits pathless `other` completion tokens as advisory
+            // ordering. They are never evidence that an artifact exists.
+            const verifiable = required.filter((p) => p.kind !== "other" ||
+              provideSearchPaths(p, parsed.contract!, task).length > 0);
+            const report = await inspectContractProvides(
+              { ...parsed.contract, provides: verifiable }, [task], ctx.workingDir,
+              { results: [row], signal: runSignal },
+            );
+            row = applyContractFindings([row], report.findings)[0]!;
+            if (report.findings.length !== verifiable.length || report.findings.some((f) => !f.present)) {
+              row = { ...row, status: "failed", error: "dependency: required provides are missing or cannot be verified" };
+            }
+            if (row.status === "ok") {
+              const stale = gateState.staleCheckIndices();
+              const own = (parsed.contract?.checks ?? []).flatMap((check, index) =>
+                check.task === id && (rechecking || !gateState.checkOutcomes.has(index) || stale.has(index))
+                  ? [{ check, index }] : [],
+              );
+              const checks = await runContractChecks(own.map((c) => c.check), deps.runChecks, {
+                workingDir: ctx.workingDir, signal: runSignal,
+                ...(deps.knownSecrets === undefined ? {} : { knownSecrets: deps.knownSecrets() }),
+              });
+              const previous = own.flatMap((c) => {
+                const outcome = dependencyCheckOutcomes.get(c.index) ?? gateState.checkOutcomes.get(c.index);
+                return outcome === undefined ? [] : [outcome];
+              });
+              own.forEach((c, i) => {
+                const outcome = checks.outcomes[i];
+                if (outcome !== undefined) dependencyCheckOutcomes.set(c.index, outcome);
+              });
+              row = applyPostMergeChecks([row], checks.outcomes, previous)[0]!;
+              if (checks.checksSkipped !== undefined) {
+                row = { ...row, status: "needs_orchestrator", error: `dependency: ${checks.checksSkipped}` };
+              }
+            }
+            // A fresh task-level gate covers its changed/declared paths,
+            // not an unchanged required artifact inferred from its contract.
+            const files = [...new Set([...(task.files ?? []), ...report.findings.flatMap((f) => f.where)])];
+            const gatedPaths = new Set(syntaxPassFiles(row, task).map((file) => resolvePath(ctx.workingDir, file)));
+            const uncovered = files.some((file) => !gatedPaths.has(resolvePath(ctx.workingDir, file)));
+            if (row.status === "ok" && (rechecking || !gateState.syntaxGated.has(id) || gateState.isStale(id) || uncovered)) {
+              [row] = await runSyntaxPass([row], [{ ...task, files }], {
+                runner: deps.syntaxCheck, workingDir: ctx.workingDir, roots: syntaxRoots, signal: runSignal,
+                ...(deps.knownSecrets === undefined ? {} : { knownSecrets: deps.knownSecrets() }),
+              });
+            }
+            if (row!.status !== "ok") gateState.verdicts.delete(id);
+            finished.set(id, row!);
+            run?.recordTask(row!);
+          };
           for (const [waveIndex, wave] of plan.waves.entries()) {
+            // An intervening worker can change check inputs through a shell,
+            // even with no file-tool telemetry. Deduplicate only this release.
+            verifiedProviders.clear();
+            for (const id of wave) {
+              for (const provider of plan.dependencies.get(id) ?? []) await verifyProvider(provider);
+            }
             waveWarnings.push(
               ...dependencyWarnings(wave, plan.dependencies, finished),
             );
@@ -1511,35 +1659,28 @@ export function buildFusionDelegateTool(
               ...waveWarnings,
               ...completedWaveNotes(finished),
             ]);
-            // With autoReplan on (ATO-941), a task whose provider did not
-            // close is held for the replan rather than run against inputs
-            // that are not there; its own dependents are held with it.
-            const held =
-              autoReplan > 0
-                ? wave.filter((id) =>
+            // Dependency readiness is mandatory; autoReplan only decides
+            // whether the planner is asked to retry the held work.
+            const held = wave.filter((id) =>
                     !finished.has(id) &&
                     (plan.dependencies.get(id) ?? []).some((provider) => {
                       const done = finished.get(provider);
-                      return (
-                        done !== undefined &&
-                        UNDELIVERED_STATUSES.has(done.status)
-                      );
+                      return done?.status !== "ok";
                     }),
-                  )
-                : [];
+                  );
             for (const id of held) {
               const task = parsed.tasks.find((t) => t.id === id)!;
               const waitingOn = (plan.dependencies.get(id) ?? []).filter(
                 (provider) => {
                   const done = finished.get(provider);
-                  return done !== undefined && UNDELIVERED_STATUSES.has(done.status);
+                  return done?.status !== "ok";
                 },
               );
               finished.set(
                 id,
                 notStartedResult(
                   task,
-                  `held for the replan: it depends on ${waitingOn.join(", ")}, which did not close`,
+                  `${autoReplan > 0 ? "held for the replan" : "dependency blocked"}: it depends on ${waitingOn.join(", ")}, which did not close${plan.cycle === undefined ? "" : `; ${plan.cycle}`}`,
                 ),
               );
             }
@@ -1571,8 +1712,6 @@ export function buildFusionDelegateTool(
             `the fan-out failed: ${err instanceof Error ? err.message : String(err)}`,
             { reason: "fan-out-failed" },
           );
-        } finally {
-          if (budgetTimer !== undefined) clearTimeout(budgetTimer);
         }
         // Each task this call actually started is one attempt at it this
         // turn; the replan bound (ATO-941) is counted against these. A task
@@ -1612,15 +1751,16 @@ export function buildFusionDelegateTool(
         }
         // Rows a cap cut short say so, so a cancelled worker is not read
         // as the operator's doing.
-        const budgetStopped = stoppedBy as TurnBudgetStop | undefined;
+        let budgetStopped = stoppedBy as TurnBudgetStop | undefined;
         if (budgetStopped !== undefined && !ctx.signal.aborted) {
+          const stopMessage = budgetStopped.message;
           results = results.map((r) =>
             r.status === "cancelled" && !r.error?.startsWith("not started:")
               ? {
                   ...r,
                   notes: [
                     ...(r.notes ?? []),
-                    `stopped by the turn's cap: ${budgetStopped.message}`,
+                    `stopped by the turn's cap: ${stopMessage}`,
                   ],
                 }
               : r,
@@ -1649,7 +1789,7 @@ export function buildFusionDelegateTool(
             parsed.contract,
             parsed.tasks,
             ctx.workingDir,
-            { results: allRows, signal: ctx.signal },
+            { results: allRows, signal: runSignal },
           );
           let out = applyContractFindings(rows, provides.findings);
           // A check a gate already ran in its task's workspace (isolation)
@@ -1667,7 +1807,7 @@ export function buildFusionDelegateTool(
             deps.runChecks,
             {
               workingDir: ctx.workingDir,
-              signal: ctx.signal,
+              signal: runSignal,
               ...(deps.knownSecrets === undefined
                 ? {}
                 : { knownSecrets: deps.knownSecrets() }),
@@ -1678,9 +1818,11 @@ export function buildFusionDelegateTool(
             out,
             checks.outcomes,
             ran
-              ? pending.flatMap((p) =>
-                  stale.has(p.index) ? [gateState.checkOutcomes.get(p.index)!] : [],
-                )
+              ? pending.flatMap((p) => {
+                  const previous = dependencyCheckOutcomes.get(p.index) ??
+                    (stale.has(p.index) ? gateState.checkOutcomes.get(p.index) : undefined);
+                  return previous === undefined ? [] : [previous];
+                })
               : [],
           );
           const byIndex = new Map(gateState.checkOutcomes);
@@ -1744,7 +1886,7 @@ export function buildFusionDelegateTool(
             runner: deps.syntaxCheck,
             workingDir: ctx.workingDir,
             roots: syntaxRoots,
-            signal: ctx.signal,
+            signal: runSignal,
             ...(deps.knownSecrets === undefined
               ? {}
               : { knownSecrets: deps.knownSecrets() }),
@@ -1869,6 +2011,14 @@ export function buildFusionDelegateTool(
         }
         // Workspaces kept for a retry are done with, retried or not.
         await releaseKept();
+        results = await collectTaskArtifactManifests(results, parsed.tasks, {
+          workingDir: ctx.workingDir, roots: syntaxRoots, signal: runSignal,
+          ...(parsed.contract === undefined ? {} : { contract: parsed.contract }),
+          checkOutcomes, findings: contract?.findings ?? [],
+        });
+        for (const row of results) {
+          if (row.artifactManifest !== undefined) run?.recordArtifactManifest(row.id, row.artifactManifest);
+        }
         // Automatic replanning (ATO-941): what did not close, from the
         // facts above, with the attempts it has left. The planner's next
         // step is held to `fusion.delegate` by the loop while any task is
@@ -1925,6 +2075,8 @@ export function buildFusionDelegateTool(
                   ? ""
                   : `, ${resume.needsConfirmation.length} not run again until the person agrees (${resume.needsConfirmation.map((r) => r.id).join(", ")})`
               }.`;
+        const checkpointNote = run?.checkpointWarning === undefined ? "" :
+          `\n\nThis Fusion run cannot be resumed: ${run.checkpointWarning}. Plan any remaining work again after an interruption.`;
 
         // Where each task ran (ATO-943): the model and role on the row, and
         // a note when it is not the worker leg or not where it asked to be.
@@ -2000,12 +2152,13 @@ export function buildFusionDelegateTool(
         // reading only the status merged nothing as if it were something.
         // Workers that were never served or timed out before a single step
         // count as nothing delivered too (ATO-234).
+        const candidateReport = candidate === undefined ? undefined : await candidate.finish({ rows: results, tasks: parsed.tasks, ...(parsed.contract === undefined ? {} : { contract: parsed.contract }), ...(deps.runChecks === undefined ? {} : { runChecks: deps.runChecks }), signal: runSignal });
         const outcome = delegateOutcome(results);
         // The outcome log and the turn receipt (counts only, never the
         // brief, the reply or an error's words). A task kept from
         // starting never ran on its model and is left out.
         try {
-          const ran = results.filter((r) => !(r.error ?? "").startsWith("not started:"));
+          const ran = results.filter((r) => ranNow.has(r.id) && !(r.error ?? "").startsWith("not started:"));
           const now = new Date();
           const outcomeRows = ran.map((r) => {
             const leg = taskLegs.get(r.id);
@@ -2029,6 +2182,9 @@ export function buildFusionDelegateTool(
                   model: leg?.model ?? workerModel,
                   leg: legKind,
                   role: leg?.orchestrator === true ? "orchestrator" : (leg?.role ?? null),
+                  taskRole: parsed.tasks.find((task) => task.id === r.id)?.role ?? null,
+                  ...(executionIdentities.get(r.id) !== undefined && executionIdentities.get(r.id) === deps.resolveRoutingIdentity?.(providerId)
+                    ? { routingIdentity: executionIdentities.get(r.id) } : {}),
                   attempt: turnBudget.attempts(ctx.sessionId, r.id),
                   pricing,
                   merge:
@@ -2040,7 +2196,9 @@ export function buildFusionDelegateTool(
               pricing,
             };
           });
-          deps.outcomeLog?.append(outcomeRows.map((o) => o.record));
+          // Inner task evidence is not acceptance of the final candidate.
+          // Candidate routing training stays off until promotion-aware records exist.
+          if (candidate === undefined) deps.outcomeLog?.append(outcomeRows.map((o) => o.record));
           deps.turnLedger?.noteFanout(ctx.sessionId, {
             tasks: outcomeRows.map(({ row, record, pricing }) => ({
               ok: row.status === "ok",
@@ -2081,6 +2239,9 @@ export function buildFusionDelegateTool(
           treeReport.splits + treeReport.rejected === 0
             ? ""
             : `\n\nTask tree: ${treeReport.splits} task${treeReport.splits === 1 ? "" : "s"} split by their workers, ${treeReport.rejected} proposal${treeReport.rejected === 1 ? "" : "s"} refused, ${treeReport.nodes} of ${treeReport.maxNodes} nodes used (depth limit ${treeReport.maxDepth}).`;
+        // In-flight completions and post-wave checks/judging may have
+        // settled since the first stop. Report the final totals.
+        budgetStopped = budgetStop() ?? stoppedBy;
         const budgetNote =
           budgetStopped === undefined
             ? ""
@@ -2089,7 +2250,7 @@ export function buildFusionDelegateTool(
           trips.length === 0
             ? ""
             : `\n\nStopped: ${trips.map(describeTrip).join("; ")}. ${FAILURE_BREAKER_INSTRUCTION}`;
-        return compressToolResult(
+        const result = compressToolResult(
           {
             tool: FUSION_DELEGATE_TOOL,
             status: outcome === "all_failed" ? "error" : "ok",
@@ -2115,13 +2276,14 @@ export function buildFusionDelegateTool(
               roleSpendUsd > 0
                 ? `\n\nRole models cost ${formatUsd(roleSpendUsd)} this fan-out.`
                 : ""
-            }${treeNote}${replan === undefined ? "" : renderReplanBlock(replan)}${renderMergeBlock(merges)}${resumeNote}${budgetNote}${breakerNote}${
+            }${treeNote}${replan === undefined ? "" : renderReplanBlock(replan)}${renderMergeBlock(merges)}${resumeNote}${checkpointNote}${budgetNote}${breakerNote}${
               sizeWarnings.length === 0
                 ? ""
                 : `\n\nWarning: ${sizeWarnings.join("; ")}.`
             }`,
             details: {
               tasks: results,
+              ...(routing === undefined ? {} : { routing: routing.decisions }),
               outcome,
               maxWorkers,
               requestedWorkers: requested,
@@ -2143,7 +2305,11 @@ export function buildFusionDelegateTool(
                 : { replan }),
               ...(treeReport === undefined ? {} : { taskTree: treeReport }),
               ...(sizeWarnings.length === 0 ? {} : { sizeWarnings }),
-              ...(run === undefined ? {} : { runId: run.runId }),
+              ...(run === undefined ? {} : run.checkpointWarning === undefined
+                ? { runId: run.runId } : { checkpointWarning: run.checkpointWarning }),
+              ...(results.some(r => r.artifactManifest !== undefined) ? {
+                artifactManifests: Object.fromEntries(results.flatMap(r => r.artifactManifest === undefined ? [] : [[r.id, r.artifactManifest]])),
+              } : {}),
               ...(resume === undefined
                 ? {}
                 : {
@@ -2164,21 +2330,47 @@ export function buildFusionDelegateTool(
                       kind: budgetStopped.kind,
                       spentUsd: budgetStopped.spentUsd,
                       elapsedMs: budgetStopped.elapsedMs,
+                      ...(budgetStopped.conservativeUsd === undefined ? {} : { conservativeUsd: budgetStopped.conservativeUsd }),
                     },
                   }),
             },
           },
           { maxSummaryLength: deps.outputCharCap + 400, maxTailLines: 2000 },
         );
+        return candidateReport === undefined ? result : candidateToolResult(result, candidateReport, candidate!.dir, candidateOriginalDir, deps.outputCharCap);
       } finally {
+        if (budgetTimer !== undefined) clearTimeout(budgetTimer);
         // Kept workspaces (a judged-red task's, for its retry) are removed
         // whatever happens after the waves: a throw in the retry, the
         // contract pass, the syntax pass or the judge included.
         endLiveFanout();
         await releaseKept();
       }
+      } catch (err) {
+        if (candidate === undefined) throw err;
+        const report = await candidate.reject(`candidate interrupted: ${err instanceof Error ? err.message : String(err)}`);
+        return candidateToolResult(error("candidate fan-out interrupted", { reason: "candidate-interrupted" }), report, candidate.dir, candidateOriginalDir, deps.outputCharCap);
+      } finally {
+        await candidate?.cleanup();
+      }
     },
   };
+}
+
+/** Rebase parsed JSON strings without changing path escaping or task identities. */
+function rebaseCandidateValue<T>(value: T, roots: readonly string[], to: string): T {
+  if (typeof value === "string") return rebaseText(value, roots, to) as T;
+  if (Array.isArray(value)) return value.map(item => rebaseCandidateValue(item, roots, to)) as T;
+  if (value !== null && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, item]) => [rebaseText(key, roots, to), rebaseCandidateValue(item, roots, to)])) as T;
+  return value;
+}
+
+function candidateToolResult(result: CompressedToolResult, report: CandidateIntegrationReport, candidateDir: string, originalDir: string, cap: number): CompressedToolResult {
+  const note = report.status === "promoted" ? "Candidate promoted after final integration checks." : `Candidate rejected; file promotion did not complete. ${report.reason ?? ""}`;
+  const recovery = (report.patch === undefined ? "" : ` Changes retained at ${report.patch.path}${report.patch.filesDir === undefined ? "" : ` and ${report.patch.filesDir}`}.`) + (report.retainedWorkspace === undefined ? "" : ` Recovery workspace retained at ${report.retainedWorkspace}; remove it manually after recovery.`) + (report.heldArtifactsDir === undefined ? "" : ` Held task artifacts: ${report.heldArtifactsDir}.`) + (report.rollbackConflicts === undefined ? "" : ` Rollback left these concurrently changed or unwritable paths for review: ${report.rollbackConflicts.join(", ")}.`);
+  const details = rebaseCandidateValue(result.details, [candidateDir, candidateDir.replace(/\\/g, "/")], originalDir);
+  delete details.runId;
+  return compressToolResult({ tool: result.tool, status: report.status === "rejected" ? "error" : result.status, output: `${note}${recovery} Candidate mode is non-resumable.\n\n${rebaseText(result.fullOutput ?? result.summary, [candidateDir, candidateDir.replace(/\\/g, "/")], originalDir)}`, details: { ...details, candidateIntegration: report } }, { maxSummaryLength: cap + 800, maxTailLines: 2000 });
 }
 
 /**

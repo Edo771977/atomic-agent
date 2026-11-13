@@ -124,4 +124,20 @@ describe("tool.search", () => {
     await expect(tool.run({}, ctx)).rejects.toThrow("query");
     await expect(tool.run({ query: "x", limit: "3" }, ctx)).rejects.toThrow("limit");
   });
+
+  it.each(["full", "builder", "orchestrator"] as const)("honors a custom filter before revealing a schema for the %s role", async toolRole => {
+    const search = buildToolSearchTool({ catalog: () => ({ descriptors: [{ name: "os.git.show", summary: "Show a commit", argsSchema: "EXCLUDED_SCHEMA" }], deferred: new Set(["os.git.show"]) }) });
+    const result = await search.run({ query: "os.git.show", limit: 1 }, { ...ctx, toolRole, toolFilter: name => name !== "os.git.show" });
+    expect(result.details.results).toEqual([]);
+    expect(result.details.toolsLoaded ?? []).toEqual([]);
+    expect(JSON.stringify(result)).not.toContain("EXCLUDED_SCHEMA");
+  });
+
+  it("filters before the hit limit so excluded matches do not displace an eligible schema", async () => {
+    const allowed = { ...calendar, name: "mcp.gcal.create_meeting" };
+    const search = buildToolSearchTool({ catalog: () => ({ descriptors: [calendar, allowed], deferred: new Set([calendar.name, allowed.name]) }) });
+    const result = await search.run({ query: calendar.name, limit: 1 }, { ...ctx, toolFilter: name => name !== calendar.name });
+    expect(result.details.results).toEqual([allowed.name]);
+    expect((result.details.toolsLoaded as Array<{ name: string }>).map(t => t.name)).toEqual([allowed.name]);
+  });
 });

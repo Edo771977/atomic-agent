@@ -121,7 +121,7 @@ describe("formatDiagnosticsEntry", () => {
     expect(out).toContain("timedOut:    true");
     expect(out).toContain("emptyReplies:    54");
     // reason histogram keys are sorted alphabetically
-    const reasonBlock = out.split("reasonHistogram:\n")[1].split("failureCategoryHistogram:")[0];
+    const reasonBlock = out.split("reasonHistogram:\n")[1]!.split("failureCategoryHistogram:")[0]!;
     const lines = reasonBlock.trim().split("\n").map((s) => s.trim());
     expect(lines).toEqual(["max_steps: 54", "reply: 94"]);
     expect(out).toContain("keptStateDir:    /tmp/foo-state");
@@ -132,7 +132,7 @@ describe("formatDiagnosticsEntry", () => {
   it("clamps stderr to STDERR_TAIL_MAX_LEN", () => {
     const huge = "x".repeat(STDERR_TAIL_MAX_LEN * 3);
     const out = formatDiagnosticsEntry(baseEntry({ stderrTail: huge }));
-    const block = out.split("stderrTail (last 4KB):\n")[1].split("---")[0].trimEnd();
+    const block = out.split("stderrTail (last 4KB):\n")[1]!.split("---")[0]!.trimEnd();
     expect(block.length).toBe(STDERR_TAIL_MAX_LEN);
   });
 

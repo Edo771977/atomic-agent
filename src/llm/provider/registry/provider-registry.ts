@@ -76,7 +76,8 @@ export class ProviderRegistry {
     const resolved = resolveLlmConfig(config);
     const built = new Map<string, LlmProvider>();
     const entries = new Map<string, LlmProviderConfigEntry>();
-    for (const entry of resolved.providers) {
+    for (const configured of resolved.providers) {
+      const entry = structuredClone(configured);
       const factory = getProviderFactory(entry.kind);
       if (!factory) {
         throw new Error(
@@ -91,7 +92,7 @@ export class ProviderRegistry {
       );
       if (provider) {
         built.set(entry.id, provider);
-        entries.set(entry.id, entry);
+        entries.set(entry.id, structuredClone(entry));
       }
     }
     if (!built.has(resolved.activeTextProvider)) {
@@ -117,6 +118,15 @@ export class ProviderRegistry {
 
   getProvider(id: string): LlmProvider | undefined {
     return this.providers.get(id);
+  }
+
+  /** Identity fields of the entry that successfully built the loaded handle.
+   * Defensive primitive-only copy; excludes credentials and unrelated options.
+   */
+  getLoadedEntrySnapshot(id: string): Readonly<Pick<LlmProviderConfigEntry, "id" | "kind" | "url" | "baseUrl" | "defaultChatModel">> | undefined {
+    const entry = this.entries.get(id);
+    return entry === undefined ? undefined : { id: entry.id, kind: entry.kind, url: entry.url,
+      baseUrl: entry.baseUrl, defaultChatModel: entry.defaultChatModel };
   }
 
   listIds(): readonly string[] {
@@ -184,10 +194,11 @@ export class ProviderRegistry {
     ctx: Omit<ProviderFactoryContext, "entry">,
   ): Promise<void> {
     registerBuiltInProviderKinds();
-    const entry = resolveLlmConfig(config).providers.find((p) => p.id === id);
-    if (!entry) {
+    const configured = resolveLlmConfig(config).providers.find((p) => p.id === id);
+    if (!configured) {
       throw new Error(`llm provider "${id}" is not configured`);
     }
+    const entry = structuredClone(configured);
     const factory = getProviderFactory(entry.kind);
     if (!factory) {
       throw new Error(
@@ -200,7 +211,7 @@ export class ProviderRegistry {
     }
     const provider = await factory({ ...ctx, config, entry });
     this.providers.set(id, provider);
-    this.entries.set(id, entry);
+    this.entries.set(id, structuredClone(entry));
   }
 
   async mergeProvidersFromConfig(
@@ -210,7 +221,8 @@ export class ProviderRegistry {
     registerBuiltInProviderKinds();
     const resolved = resolveLlmConfig(config);
     const added: string[] = [];
-    for (const entry of resolved.providers) {
+    for (const configured of resolved.providers) {
+      const entry = structuredClone(configured);
       if (this.providers.has(entry.id)) continue;
       const factory = getProviderFactory(entry.kind);
       if (!factory) {
@@ -226,7 +238,7 @@ export class ProviderRegistry {
       );
       if (!provider) continue;
       this.providers.set(entry.id, provider);
-      this.entries.set(entry.id, entry);
+      this.entries.set(entry.id, structuredClone(entry));
       added.push(entry.id);
     }
     return added;

@@ -10,10 +10,12 @@ import type { BreakerTrip } from "./failure-breaker.js";
  * the workers still running, and the orchestrator is told to say so in
  * plain words. Both unset (the default): nothing here is consulted.
  *
- * Money is the orchestrator's priced spend so far this turn (the turn
- * usage meter) plus every worker's, each completion priced with its
- * prompt-cache discount (`estimateUsageCostUsd`). Unpriced tokens — a
- * local leg — count as $0: the cap is about the bill.
+ * The runtime's USD ledger reserves each physical text request before
+ * sending, then settles usage (or a conservative bound if it is lost).
+ * Carried/external spend is additive; usage display callbacks identify
+ * already-accounted requests. Explicit local/subscription legs stay
+ * unpriced; unknown paid pricing is refused by the runtime request seam.
+ * Legacy embedders without that seam retain meter/worker observation.
  *
  * One instance per runtime, reset per fusion turn by the turn's own
  * start (`clearFanoutTurnGrant`), so a cap is never carried from one
@@ -30,11 +32,19 @@ export interface TurnBudgetStop {
   message: string;
   spentUsd: number;
   elapsedMs: number;
+  /** Conservative charges for dispatched requests that never supplied final usage. */
+  conservativeUsd?: number;
 }
 
 interface TurnState {
+  active: boolean;
   startedAt: number;
   workerUsd: number;
+  requestLimits?: TurnBudgetLimits;
+  requestUsd: number;
+  externalUsd: number;
+  heldUsd: number;
+  conservativeUsd: number;
   /** The orchestrator's meter reading when the turn began; spend is the delta. */
   orchestratorBaseUsd: number;
   /**
@@ -113,6 +123,7 @@ function continuationRoot(
 
 export class FusionTurnBudget {
   private readonly turns = new Map<string, TurnState>();
+  private readonly owners = new Map<string, { parent: string; state: TurnState }>();
 
   constructor(private readonly now: () => number = Date.now) {}
 
@@ -121,10 +132,13 @@ export class FusionTurnBudget {
    * zero. `orchestratorBaseUsd` is what the orchestrator's meter already
    * reads (non-zero when the bucket outlives a turn, as on the sidecar).
    */
-  begin(sessionId: string, orchestratorBaseUsd = 0): void {
+  begin(sessionId: string, orchestratorBaseUsd = 0, requestLimits?: TurnBudgetLimits): void {
     this.turns.set(sessionId, {
+      active: true,
       startedAt: this.now(),
       workerUsd: 0,
+      ...(requestLimits?.usd === undefined && requestLimits?.timeMs === undefined ? {} : { requestLimits: { ...requestLimits } }),
+      requestUsd: 0, externalUsd: 0, heldUsd: 0, conservativeUsd: 0,
       orchestratorBaseUsd,
       attempts: new Map(),
       family: new Map(),
@@ -143,8 +157,10 @@ export class FusionTurnBudget {
       // No turn start was seen (an embedder, a test): the clock starts
       // at the first fan-out instead.
       state = {
+        active: true,
         startedAt: this.now(),
         workerUsd: 0,
+        requestUsd: 0, externalUsd: 0, heldUsd: 0, conservativeUsd: 0,
         orchestratorBaseUsd: 0,
         attempts: new Map(),
         family: new Map(),
@@ -160,9 +176,72 @@ export class FusionTurnBudget {
     return state;
   }
 
-  addWorkerSpend(sessionId: string, usd: number): void {
+  addWorkerSpend(sessionId: string, usd: number, alreadyAccounted = false): void {
     if (!Number.isFinite(usd) || usd <= 0) return;
-    this.turn(sessionId).workerUsd += usd;
+    const state = this.turn(sessionId);
+    state.workerUsd += usd;
+    if (state.requestLimits?.usd !== undefined && !alreadyAccounted) state.externalUsd += usd;
+  }
+
+  /** Bind only while the worker is alive; retain the owning turn generation. */
+  bindSession(sessionId: string, parent: string): void {
+    this.owners.set(sessionId, { parent, state: this.turn(parent) });
+  }
+
+  unbindSession(sessionId: string): void { this.owners.delete(sessionId); }
+
+  /** Keep receipts/counts, but do not apply an ended turn's policy to background work. */
+  end(sessionId: string): void {
+    const state = this.turns.get(sessionId);
+    if (state !== undefined) state.active = false;
+  }
+
+  private requestState(sessionId: string): TurnState | undefined {
+    const owner = this.owners.get(sessionId);
+    if (owner !== undefined) {
+      if (this.turns.get(owner.parent) !== owner.state || !owner.state.active) throw new Error("the request's owning turn has ended");
+      return owner.state;
+    }
+    return this.turns.get(sessionId);
+  }
+
+  requestLimits(sessionId: string): TurnBudgetLimits | undefined {
+    const state = this.requestState(sessionId);
+    return state?.active ? state.requestLimits : undefined;
+  }
+
+  requestTimeLeftMs(sessionId: string): number | undefined {
+    const state = this.requestState(sessionId);
+    return state?.requestLimits?.timeMs === undefined ? undefined : state.requestLimits.timeMs - (this.now() - state.startedAt);
+  }
+
+  /** Synchronous admission prevents concurrent requests from sharing the same dollars. */
+  reserveRequest(sessionId: string, upperUsd: number): { settle(actualUsd?: number): void; release(): void } {
+    const state = this.requestState(sessionId);
+    const cap = state?.requestLimits?.usd;
+    if (state === undefined || !state.active || cap === undefined) throw new Error("no active USD request budget for this session");
+    if (!Number.isFinite(upperUsd) || upperUsd < 0) throw new Error("request budget estimate is not finite");
+    const committed = state.requestUsd + state.externalUsd;
+    if (committed + state.heldUsd + upperUsd > cap + 1e-10) {
+      throw new Error(`turn budget cannot cover this request: ${formatUsd(upperUsd)} reserved cost would exceed the ${formatUsd(cap)} cap (${formatUsd(committed)} accounted, ${formatUsd(state.heldUsd)} held)`);
+    }
+    state.heldUsd += upperUsd;
+    let settled = false;
+    const release = (): boolean => {
+      if (settled) return false;
+      settled = true;
+      state.heldUsd = Math.max(0, state.heldUsd - upperUsd);
+      return true;
+    };
+    return {
+      release: () => { release(); },
+      settle: actualUsd => {
+        if (!release()) return;
+        const known = actualUsd !== undefined && Number.isFinite(actualUsd) && actualUsd >= 0;
+        state.requestUsd += known ? actualUsd : upperUsd;
+        if (!known) state.conservativeUsd += upperUsd;
+      },
+    };
   }
 
   /** Count one run of `taskId` this turn; returns the count so far. */
@@ -338,15 +417,20 @@ export class FusionTurnBudget {
       orchestratorMeterUsd - state.orchestratorBaseUsd,
     );
     const elapsedMs = this.now() - state.startedAt;
-    const spentUsd = orchestratorUsd + state.workerUsd;
+    const spentUsd = state.requestLimits?.usd === undefined
+      ? orchestratorUsd + state.workerUsd
+      : state.requestUsd + state.externalUsd;
     if (limits.usd !== undefined && spentUsd >= limits.usd) {
       return {
         kind: "usd",
         spentUsd,
         elapsedMs,
+        ...(state.conservativeUsd > 0 ? { conservativeUsd: state.conservativeUsd } : {}),
         message:
-          `the spend cap for this turn is reached: ${formatUsd(spentUsd)} spent ` +
-          `(${formatUsd(orchestratorUsd)} planning, ${formatUsd(state.workerUsd)} workers) ` +
+          `the spend cap for this turn is reached: ${formatUsd(spentUsd)} ${state.requestLimits?.usd === undefined ? "spent" : "accounted"} ` +
+          (state.requestLimits?.usd === undefined
+            ? `(${formatUsd(orchestratorUsd)} planning, ${formatUsd(state.workerUsd)} workers) `
+            : `(${formatUsd(state.requestUsd)} requests, ${formatUsd(state.externalUsd)} carried or other spend) `) +
           `of the ${formatUsd(limits.usd)} allowed by llm.runMode.fusion.turnBudgetUsd`,
       };
     }
@@ -355,6 +439,7 @@ export class FusionTurnBudget {
         kind: "time",
         spentUsd,
         elapsedMs,
+        ...(state.conservativeUsd > 0 ? { conservativeUsd: state.conservativeUsd } : {}),
         message:
           `the time cap for this turn is reached: ${formatMinutes(elapsedMs)} ` +
           `of the ${formatMinutes(limits.timeMs)} allowed by llm.runMode.fusion.turnTimeBudgetMs`,

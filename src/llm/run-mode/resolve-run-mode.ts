@@ -88,6 +88,8 @@ export type ResolvedRunMode = {
    * names at least one provider that exists. Optional for fixtures.
    */
   roles?: FusionRoleModels;
+  /** Explicit opt-in; evidence is task-check coverage, not an integration guarantee. */
+  measuredRouting?: { enabled: true; minSamples: number; days: number };
   /** `llm.runMode.fusion.autoReplan`, present only when set above 0 (ATO-941). */
   autoReplan?: number;
   /**
@@ -95,6 +97,8 @@ export type ResolvedRunMode = {
    * (ATO-946): each task works in its own workspace and is merged back.
    */
   isolation?: "worktree";
+  /** Present only for explicit whole-fanout candidate promotion; default integration remains direct. */
+  integration?: "candidate";
   /**
    * `llm.runMode.fusion.localFormatCheck`, present only when turned off
    * (`false`): no one-call format check before a fan-out on a local
@@ -372,10 +376,16 @@ export function resolveRunMode(
     escalation,
     judge,
     ...(roles === undefined ? {} : { roles }),
+    ...(fusion?.measuredRouting?.enabled === true ? { measuredRouting: {
+      enabled: true as const,
+      minSamples: fusion.measuredRouting.minSamples ?? 8,
+      days: fusion.measuredRouting.days ?? 30,
+    } } : {}),
     ...(fusion?.autoReplan !== undefined && fusion.autoReplan > 0
       ? { autoReplan: fusion.autoReplan }
       : {}),
     ...(fusion?.isolation === "worktree" ? { isolation: "worktree" as const } : {}),
+    ...(fusion?.integration === "candidate" ? { integration: "candidate" as const } : {}),
     ...(fusion?.localFormatCheck === false ? { localFormatCheck: false as const } : {}),
     ...resolveTaskTree(fusion?.taskTree),
     ...(fusion?.turnBudgetUsd !== undefined && fusion.turnBudgetUsd > 0

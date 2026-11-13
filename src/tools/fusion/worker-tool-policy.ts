@@ -21,11 +21,13 @@ import { roleAdmits, type ToolRole } from "../tool-roles.js";
  * Reach of the filter: it removes a descriptor from the prompt catalog
  * on every transport and from the native `tools` payload for every tool
  * but the two terminal ones — `descriptorsToOpenAiTools` appends `reply`
- * and `finish` unconditionally, and the GBNF grammar is built once per
- * runtime, not per turn. So `finish` is hidden from a worker's catalog,
+ * and `finish` unconditionally. The per-step GBNF grammar also excludes
+ * hidden names. `finish` is hidden from a worker's catalog and grammar,
  * not made uncallable; a worker that calls it anyway only ends its own
  * throwaway session, which the orchestrator reads the same way as a
- * reply. A hard per-turn deny lives in the registry, not here.
+ * reply. Dispatch enforces this filter for non-terminal calls even when
+ * a provider emits an unoffered name or a textual call is recovered;
+ * tool.view cannot load a hidden tool back into the session.
  */
 export const WORKER_EXCLUDED_TOOLS: ReadonlySet<string> = new Set([
   "fusion.delegate",

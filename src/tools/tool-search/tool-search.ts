@@ -79,6 +79,7 @@ export function buildToolSearchTool(deps: ToolSearchDeps): ToolDefinition {
           d.name !== "finish" &&
           d.name !== TOOL_SEARCH_NAME &&
           d.name !== "tool.view" &&
+          ctx.toolFilter?.(d.name) !== false &&
           !hiddenFromTurn(role, d.name),
       );
       // In full in this turn's `### tools`: admitted by the role, not

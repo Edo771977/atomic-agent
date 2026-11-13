@@ -19,6 +19,7 @@
  * deterministic.
  */
 
+import { join } from "node:path";
 import {
   getProfilePromptBudgetMs,
   type CampaignProfileName,
@@ -109,6 +110,9 @@ export interface LocomoQuestionResult {
   durationMs: number;
   promptTokens: number;
   predictedTokens: number;
+  /** Terminal reason and failure category from the question's trace turn. */
+  reason: string | null;
+  failureCategory: string | null;
 }
 
 export interface LocomoConversationResult {
@@ -127,16 +131,21 @@ export interface LocomoConversationResult {
   loadPhasePromptTokens: number;
   /** Synthetic — true when the agent subprocess exited cleanly. */
   ok: boolean;
-  /** Exit code of the child agent subprocess. -1 == timed out. */
-  exitCode: number;
+  /** Child exit code; null when terminated by a signal. */
+  exitCode: number | null;
+  signal: NodeJS.Signals | null;
+  subprocessDurationMs: number;
+  sessionId: string | null;
   /** True when `driveMultiTurn` enforced the wall-clock timeout. */
   timedOut: boolean;
   /** Last ~2 KB of subprocess stderr — diagnostic for failed runs. */
   stderrTail: string;
+  stderrAll: string;
   /** When `keepStateDir: true`, the absolute path to the kept state dir; null otherwise. */
   keptStateDir: string | null;
   /** When `keepStateDir: true`, the absolute path to the kept working dir; null otherwise. */
   keptWorkingDir: string | null;
+  keptTracePath: string | null;
 }
 
 /**
@@ -208,10 +217,17 @@ export async function runLocomoConversation(
     loadPhasePromptTokens,
     ok: scenario.result.exitCode === 0 && !scenario.result.timedOut,
     exitCode: scenario.result.exitCode,
+    signal: scenario.result.signal,
+    subprocessDurationMs: scenario.result.durationMs,
+    sessionId: scenario.result.sessionId,
     timedOut: scenario.result.timedOut,
     stderrTail: scenario.result.stderrTail ?? "",
+    stderrAll: scenario.result.stderrAll,
     keptStateDir: opts.keepStateDir ? scenario.stateDir : null,
     keptWorkingDir: opts.keepStateDir ? scenario.workingDir : null,
+    keptTracePath: opts.keepStateDir && scenario.result.sessionId !== null
+      ? join(scenario.stateDir, "traces", `${scenario.result.sessionId}.ndjson`)
+      : null,
   };
 }
 
@@ -252,6 +268,8 @@ function scoreQuestion(
     durationMs: turn?.durationMs ?? 0,
     promptTokens: turn?.promptTokens ?? 0,
     predictedTokens: turn?.predictedTokens ?? 0,
+    reason: turn?.reason ?? null,
+    failureCategory: turn?.failureCategory ?? null,
   };
 }
 

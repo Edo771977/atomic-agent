@@ -13,6 +13,7 @@
  */
 import { mkdir, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { gzipSync } from "node:zlib";
 
 import ExcelJS from "exceljs";
@@ -27,21 +28,19 @@ import {
   TextRun,
 } from "docx";
 
-const FIXTURES_DIR = resolve(
-  new URL("../src/tools/os/test-fixtures", import.meta.url).pathname,
-);
+export const DEFAULT_FIXTURES_DIR = fileURLToPath(new URL("../src/tools/os/test-fixtures", import.meta.url));
 
-async function writeFixture(name: string, data: Buffer | Uint8Array): Promise<void> {
+async function writeFixture(fixturesDir: string, name: string, data: Buffer | Uint8Array): Promise<void> {
   const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
-  await writeFile(join(FIXTURES_DIR, name), buf);
+  await writeFile(join(fixturesDir, name), buf);
   console.log(`✓ wrote ${name} (${buf.length} bytes)`);
 }
 
-async function generatePdf(): Promise<void> {
+async function generatePdf(fixturesDir: string): Promise<void> {
   const doc = new PDFDocument({ autoFirstPage: false });
   const chunks: Buffer[] = [];
-  doc.on("data", (c) => chunks.push(c as Buffer));
-  const done = new Promise<void>((res) => doc.on("end", () => res()));
+  doc.on("data", (chunk: Buffer) => chunks.push(chunk));
+  const done = new Promise<void>((res, reject) => doc.once("end", () => res()).once("error", reject));
   doc.addPage();
   doc.fontSize(20).text("Sample PDF");
   doc.fontSize(12).text("First page: hello from page 1.");
@@ -50,10 +49,10 @@ async function generatePdf(): Promise<void> {
   doc.fontSize(12).text("Second page: magos omnissiah vult.");
   doc.end();
   await done;
-  await writeFixture("sample.pdf", Buffer.concat(chunks));
+  await writeFixture(fixturesDir, "sample.pdf", Buffer.concat(chunks));
 }
 
-async function generateDocx(): Promise<void> {
+async function generateDocx(fixturesDir: string): Promise<void> {
   const doc = new DocxDocument({
     sections: [
       {
@@ -79,10 +78,10 @@ async function generateDocx(): Promise<void> {
     ],
   });
   const buf = await Packer.toBuffer(doc);
-  await writeFixture("sample.docx", buf);
+  await writeFixture(fixturesDir, "sample.docx", buf);
 }
 
-async function generateXlsx(): Promise<void> {
+async function generateXlsx(fixturesDir: string): Promise<void> {
   const wb = new ExcelJS.Workbook();
   const s1 = wb.addWorksheet("Revenue");
   s1.addRow(["Quarter", "Amount", "Notes"]);
@@ -94,7 +93,7 @@ async function generateXlsx(): Promise<void> {
   s2.addRow(["Blessing", "Complete"]);
 
   const buf = await wb.xlsx.writeBuffer();
-  await writeFixture("sample.xlsx", Buffer.from(buf));
+  await writeFixture(fixturesDir, "sample.xlsx", Buffer.from(buf));
 }
 
 /**
@@ -102,7 +101,7 @@ async function generateXlsx(): Promise<void> {
  * Uses only \par separators and ASCII content so any reasonable parser can
  * extract the text. Good enough to test the happy path.
  */
-async function generateRtf(): Promise<void> {
+async function generateRtf(fixturesDir: string): Promise<void> {
   const body = [
     "{\\rtf1\\ansi\\ansicpg1252",
     "{\\fonttbl{\\f0\\fnil Calibri;}}",
@@ -111,7 +110,7 @@ async function generateRtf(): Promise<void> {
     "Third line: omnissiah vult.",
     "}",
   ].join("\n");
-  await writeFixture("sample.rtf", Buffer.from(body, "utf8"));
+  await writeFixture(fixturesDir, "sample.rtf", Buffer.from(body, "utf8"));
 }
 
 /**
@@ -119,7 +118,7 @@ async function generateRtf(): Promise<void> {
  * no compression) and a `content.xml` with the body text. We hand-craft a
  * minimal one — easier than pulling a library.
  */
-async function generateOdt(): Promise<void> {
+async function generateOdt(fixturesDir: string): Promise<void> {
   const zip = new JSZip();
   zip.file("mimetype", "application/vnd.oasis.opendocument.text", {
     compression: "STORE",
@@ -144,14 +143,14 @@ async function generateOdt(): Promise<void> {
 </manifest:manifest>`;
   zip.file("META-INF/manifest.xml", manifest);
   const buf = await zip.generateAsync({ type: "nodebuffer" });
-  await writeFixture("sample.odt", buf);
+  await writeFixture(fixturesDir, "sample.odt", buf);
 }
 
 /**
  * PPTX is a Zip container with per-slide XML files under `ppt/slides/`.
  * Create two slides with a heading and body text each.
  */
-async function generatePptx(): Promise<void> {
+async function generatePptx(fixturesDir: string): Promise<void> {
   const zip = new JSZip();
   const contentTypes = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
@@ -193,7 +192,7 @@ async function generatePptx(): Promise<void> {
     slideXml("Slide Two", "Second slide body content."),
   );
   const buf = await zip.generateAsync({ type: "nodebuffer" });
-  await writeFixture("sample.pptx", buf);
+  await writeFixture(fixturesDir, "sample.pptx", buf);
 }
 
 /**
@@ -207,13 +206,13 @@ async function generatePptx(): Promise<void> {
  *   empty/             (directory marker)
  * so the tool-level tests can check list + extract + read_entry uniformly.
  */
-async function generateZipArchive(): Promise<void> {
+async function generateZipArchive(fixturesDir: string): Promise<void> {
   const zip = new JSZip();
   zip.file("hello.txt", "Hello from the archive.\n");
   zip.folder("nested")?.file("world.txt", "Nested payload.\n");
   zip.folder("empty");
   const buf = await zip.generateAsync({ type: "nodebuffer" });
-  await writeFixture("sample.zip", buf);
+  await writeFixture(fixturesDir, "sample.zip", buf);
 }
 
 function packTar(entries: Array<{ name: string; body?: Buffer; type: "file" | "directory" }>): Promise<Buffer> {
@@ -234,7 +233,7 @@ function packTar(entries: Array<{ name: string; body?: Buffer; type: "file" | "d
   });
 }
 
-async function generateTarArchives(): Promise<void> {
+async function generateTarArchives(fixturesDir: string): Promise<void> {
   const entries: Array<{ name: string; body?: Buffer; type: "file" | "directory" }> = [
     { name: "hello.txt", body: Buffer.from("Hello from the archive.\n", "utf8"), type: "file" },
     { name: "nested/", type: "directory" },
@@ -246,42 +245,46 @@ async function generateTarArchives(): Promise<void> {
     { name: "empty/", type: "directory" },
   ];
   const tar = await packTar(entries);
-  await writeFixture("sample.tar", tar);
-  await writeFixture("sample.tar.gz", gzipSync(tar));
+  await writeFixture(fixturesDir, "sample.tar", tar);
+  await writeFixture(fixturesDir, "sample.tar.gz", gzipSync(tar));
 }
 
-async function generateGzFixture(): Promise<void> {
+async function generateGzFixture(fixturesDir: string): Promise<void> {
   const payload = Buffer.from("single file gzip payload\n", "utf8");
-  await writeFixture("sample.txt.gz", gzipSync(payload));
+  await writeFixture(fixturesDir, "sample.txt.gz", gzipSync(payload));
 }
 
-async function generatePlain(): Promise<void> {
+async function generatePlain(fixturesDir: string): Promise<void> {
   await writeFixture(
+    fixturesDir,
     "sample.txt",
     Buffer.from("Plain text fixture.\nSecond line.\n", "utf8"),
   );
   await writeFixture(
+    fixturesDir,
     "sample.md",
     Buffer.from("# Title\n\nParagraph text.\n", "utf8"),
   );
 }
 
-async function main(): Promise<void> {
-  await mkdir(FIXTURES_DIR, { recursive: true });
-  await generatePdf();
-  await generateDocx();
-  await generateXlsx();
-  await generateRtf();
-  await generateOdt();
-  await generatePptx();
-  await generatePlain();
-  await generateZipArchive();
-  await generateTarArchives();
-  await generateGzFixture();
-  console.log(`\nFixtures written to ${FIXTURES_DIR}`);
+export async function generateFixtures(fixturesDir = DEFAULT_FIXTURES_DIR): Promise<void> {
+  await mkdir(fixturesDir, { recursive: true });
+  await generatePdf(fixturesDir);
+  await generateDocx(fixturesDir);
+  await generateXlsx(fixturesDir);
+  await generateRtf(fixturesDir);
+  await generateOdt(fixturesDir);
+  await generatePptx(fixturesDir);
+  await generatePlain(fixturesDir);
+  await generateZipArchive(fixturesDir);
+  await generateTarArchives(fixturesDir);
+  await generateGzFixture(fixturesDir);
+  console.log(`\nFixtures written to ${fixturesDir}`);
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+if (process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  generateFixtures(process.argv[2]).catch((err) => {
+    console.error(err);
+    process.exitCode = 1;
+  });
+}

@@ -20,6 +20,7 @@ import type { JudgeSummary } from "./judge.js";
 import { CHECK_OUTPUT_CHARS, tailClip } from "./contract-checks.js";
 import { describeChanges, FileChangeLog, type FileChange } from "./worker-changes.js";
 import { describeSyntax, type TaskSyntaxSummary } from "./syntax-pass.js";
+import type { ArtifactManifest } from "./artifact-manifest-types.js";
 
 /**
  * The note on a task a worker could not finish because a step needs the
@@ -233,6 +234,8 @@ export interface WorkerTaskResult {
    * the row's `error` and made it `failed`.
    */
   syntax?: TaskSyntaxSummary;
+  /** Runtime file/check/dependency evidence; a worker reply cannot populate it. */
+  artifactManifest?: ArtifactManifest;
   /**
    * The worker's self-check found something and it got its one notice
    * (`worker-self-check.ts`). For the outcome log; nothing renders it.
@@ -1236,6 +1239,9 @@ function renderBlock(
   });
   const diagnosis = [
     ...(changed === null ? [] : [changed]),
+    ...(result.artifactManifest === undefined ? [] : [
+      `manifest: ${result.artifactManifest.coverage.source}, ${result.artifactManifest.artifacts.filter(e => e.sha256 !== undefined).length} hashed, ${result.artifactManifest.coverage.complete ? "complete" : "incomplete"}; inspect details.artifactManifests[task id]`,
+    ]),
     ...(result.replacedInputs ?? []).map(describeReplacedInput),
     ...(result.hint ? [`hint: ${result.hint}`] : []),
     ...(result.checks

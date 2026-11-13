@@ -20,6 +20,22 @@ const providers = [
 ];
 
 describe("parseLlmRunModeConfig", () => {
+  it("round-trips measured routing opt-in without changing absent defaults", () => {
+    const raw = { fusion: { measuredRouting: { enabled: true, minSamples: 12, days: 14 } } };
+    const first = parseLlmRunModeConfig(raw, providers, "llm.runMode");
+    expect(first).toEqual(raw);
+    expect(parseLlmRunModeConfig(JSON.parse(JSON.stringify(first)), providers, "llm.runMode")).toEqual(first);
+    expect(parseLlmRunModeConfig({ fusion: {} }, providers, "llm.runMode").fusion).toEqual({});
+  });
+  it.each([null, true, [], { enabled: "yes" }, { minSamples: 2 }, { minSamples: 1001 }, { days: 0 }, { days: 366 }])("rejects invalid measured routing %j", (measuredRouting) => {
+    expect(() => parseLlmRunModeConfig({ fusion: { measuredRouting } }, providers, "llm.runMode")).toThrow(ConfigValidationError);
+  });
+  it("round-trips opt-in integration while keeping existing configs unchanged", () => {
+    for (const integration of ["direct", "candidate"]) expect(parseLlmRunModeConfig({ fusion: { integration } }, providers, "llm.runMode")).toEqual({ fusion: { integration } });
+    expect(parseLlmRunModeConfig({ fusion: {} }, providers, "llm.runMode")).toEqual({ fusion: {} });
+    expect(() => parseLlmRunModeConfig({ fusion: { integration: true } }, providers, "llm.runMode")).toThrow(/integration/);
+    expect(parseLlmRunModeConfig({ fusion: { integration: "future-mode" } }, providers, "llm.runMode")).toEqual({ fusion: {} });
+  });
   it("accepts an empty block", () => {
     expect(parseLlmRunModeConfig({}, providers, "llm.runMode")).toEqual({});
   });

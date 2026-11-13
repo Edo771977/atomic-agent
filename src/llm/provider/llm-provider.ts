@@ -104,6 +104,8 @@ export interface VisionResult {
 }
 
 export interface LlmProvider {
+  /** Calls CompletionRequest.requestBudget before every physical text send. */
+  readonly supportsRequestBudget?: boolean;
   readonly id: string;
   readonly name: string;
   readonly capabilities: ProviderCapabilities;
@@ -112,6 +114,8 @@ export interface LlmProvider {
    * it — named in the refusal when that model cannot read images.
    */
   readonly chatModelId?: string | undefined;
+  /** Actual text client's effective base when observable; internal identity metadata, never a logged URL. */
+  readonly textRequestBaseUrl?: string | undefined;
   /**
    * Native tool mapper. Absent for grammar-only llama-server providers
    * where GBNF enforces the wire shape instead.

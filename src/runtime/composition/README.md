@@ -23,6 +23,10 @@ Bootstrap awaits local preparation, skills seeding/discovery, memory stores and 
 
 Catalog entries, dropped skill count, loop grammar, transport and serving-provider capabilities are read through live callbacks. runtime.grammar remains a plain boot snapshot; the loop's MCP grammar is live and the local profile manager retains its separate grammar state. Turning the public field into a getter would change the contract. Memory's tool-transport posture is the original boot snapshot; completion and side-call slot resolution remain callbacks.
 
+[fusion-routing-identity.ts](fusion-routing-identity.ts) derives opaque configured-request fingerprints for opt-in measured worker routing. The catalog supplies its live config and existing local-model getter. Unknown adapters, dynamic external local models, automatic selectors and query-routed endpoints remain unidentified; no inference or network probe runs. Fingerprints partition known provider/model configuration changes and are not served-model attestation. Worker dispatch and completion must agree before a history row can carry that identity.
+
+The catalog compares cloud request identity against the provider registry's successfully loaded entry snapshot; a live edit does not prove a loaded adapter changed. The registry copies factory inputs and exposes only defensive identity fields after construction succeeds. For managed local text, the loaded provider exposes its effective client base and tracked model ID: `entry.url` belongs to vision, while text follows its client override or current main URL. These actual text bindings must match the configured managed target before history is attributed.
+
 Each component receives the shared handles it actually needs. The channel recipe intentionally receives the complete public facade; other recipes use named handles and narrow callbacks. [Normal teardown](../docs/lifecycle.md) preserves current order and limitations, including the absence of universal startup rollback.
 
 ## Checks

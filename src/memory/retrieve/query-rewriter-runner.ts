@@ -65,6 +65,7 @@ export interface QueryRewriterTraceEvent {
  * `REWRITER_SLOT_ID` (`-1`) when none was given — pinned by tests.
  */
 export type RewriterLlmComplete = (params: {
+  budgetOwnerSessionId?: string;
   prompt: string;
   grammar: string;
   /**
@@ -193,6 +194,7 @@ export function createQueryRewriterRunner(
             // sticky override, and the next main step went to the next
             // link (often a local server that is not running).
             sessionId: `rewriter:${input.sessionId}`,
+            budgetOwnerSessionId: input.sessionId,
             signal: ac.signal,
           }),
           timeoutPromise,

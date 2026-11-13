@@ -79,6 +79,8 @@ export function normaliseOpenAiUsage(
   const totalTokens = Number(usage.total_tokens ?? 0);
   const output = readOutputTokens(usage, promptTokens, reportedCompletion, totalTokens);
   return {
+    ...([usage.prompt_tokens, usage.completion_tokens].every(value => typeof value === "number" && Number.isFinite(value) && value >= 0)
+      ? {} : { incomplete: true as const }),
     promptTokens,
     completionTokens: output.completionTokens,
     totalTokens,

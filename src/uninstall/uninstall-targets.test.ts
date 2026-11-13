@@ -132,4 +132,40 @@ describe("isSafeToRemove", () => {
     expect(isSafeToRemove("/usr", home)).toBe(false);
     expect(isSafeToRemove("/etc", home)).toBe(false);
   });
+
+  const windowsHome = "C:\\org\\users\\operator";
+  it.each(["\\\\?\\", "\\\\.\\"])("rejects namespace %s aliases of protected and app paths without filesystem access", prefix => {
+    for (const target of [windowsHome, "C:\\org\\users", "C:\\", "C:\\Windows", "C:\\apps\\atomic-agent"]) {
+      expect(isSafeToRemove(prefix + target, windowsHome, "win32")).toBe(false);
+    }
+    // An aliased home must not make its ordinary spelling appear unrelated.
+    expect(isSafeToRemove(windowsHome, prefix + windowsHome, "win32")).toBe(false);
+    expect(isSafeToRemove("C:\\org\\users", prefix + windowsHome, "win32")).toBe(false);
+  });
+
+  it.each([
+    String.raw`\\?\UNC\server\share`,
+    String.raw`\\?\UNC\server\share\Windows`,
+    String.raw`\\?\UNC\server\share\apps\atomic-agent`,
+    String.raw`\\.\UNC\server\share`,
+    String.raw`\\.\UNC\server\share\Windows`,
+    String.raw`\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1\Windows`,
+    String.raw`\\?\Volume{00000000-0000-0000-0000-000000000000}\app\state`,
+    String.raw`\\.\PhysicalDrive0`,
+    String.raw`\??\C:\org\users\operator`,
+    "//?/C:/org/users/operator",
+    "//./C:/apps/atomic-agent",
+    String.raw`\\\?\C:\apps\atomic-agent`,
+  ])("rejects unsupported Windows namespace target %s lexically", target => {
+    expect(isSafeToRemove(target, windowsHome, "win32")).toBe(false);
+  });
+
+  it("retains ordinary Windows app targets and POSIX case-sensitive path meanings", () => {
+    expect(isSafeToRemove("C:\\org\\users\\operator\\.atomic-agent", windowsHome, "win32")).toBe(true);
+    expect(isSafeToRemove("D:\\apps\\atomic-agent", windowsHome, "win32")).toBe(true);
+    expect(isSafeToRemove("\\\\server\\share\\apps\\atomic-agent", windowsHome, "win32")).toBe(true);
+    expect(isSafeToRemove("/home/Operator", "/home/operator", "linux")).toBe(true);
+    expect(isSafeToRemove("/home/operator", "/home/operator", "linux")).toBe(false);
+    expect(isSafeToRemove("//?/app/state", "/home/operator", "linux")).toBe(true);
+  });
 });

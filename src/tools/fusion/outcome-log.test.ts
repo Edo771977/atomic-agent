@@ -51,6 +51,15 @@ const CONTEXT = {
 };
 
 describe("fusion outcome records", () => {
+  it("records narrow task-check acceptance without trusting judge-only or escalated success", () => {
+    const make = (over: Partial<WorkerTaskResult>) => taskOutcomeRecord(row(over), { ...CONTEXT, taskRole: null }, "s", new Date());
+    expect(make({ checks: { total: 2, failed: 0 } })).toMatchObject({ acceptance: "checks-passed", acceptanceScope: "task-checks", taskRole: null });
+    expect(make({ status: "failed", checks: { total: 2, failed: 1 } }).acceptance).toBe("checks-failed");
+    expect(make({ checks: { total: 0, failed: 0 } }).acceptance).toBeUndefined();
+    expect(make({ checks: { total: 1, failed: 0 }, escalations: 1 }).acceptance).toBeUndefined();
+    expect(make({}).acceptance).toBeUndefined();
+    expect(taskOutcomeRecord(row({ checks: { total: 1, failed: 0 } }), { ...CONTEXT, merge: "held" }, "s", new Date()).acceptance).toBeUndefined();
+  });
   it("carries counts and categories, never the reply, title or error", () => {
     const record = taskOutcomeRecord(
       row({

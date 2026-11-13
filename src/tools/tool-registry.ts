@@ -38,6 +38,8 @@ export interface ToolContext {
    * (load it). Absent ⇒ `full`.
    */
   toolRole?: ToolRole;
+  /** Turn admission policy, also applied to discovery targets by tool.view. */
+  toolFilter?: (name: string) => boolean;
   /**
    * Absolute paths the user named in this session's own messages
    * (`userNamedPaths`, `src/tools/read-scope/`), recomputed by the step

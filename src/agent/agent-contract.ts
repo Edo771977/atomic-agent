@@ -604,14 +604,16 @@ export interface RunTurnOptions {
    */
   ephemeral?: boolean;
   /**
-   * Hide tools from this turn. Applied to the descriptors handed to every
+   * Restrict tools for this turn. Applied to the descriptors handed to every
    * step, composed with the finalization-step filter, so under native
    * tools the hidden tool also leaves the wire payload — the step builds
    * `tools` from the same descriptors. The two terminal tools are the
    * exception: the OpenAI adapter appends `reply` / `finish` to the wire
    * unconditionally, so filtering them only hides them from the prompt
-   * catalog. Used to keep a worker from delegating further, scheduling,
-   * or writing memory.
+   * catalog. Dispatch also refuses excluded non-terminal calls after
+   * canonical name resolution, and tool.view refuses excluded targets.
+   * Terminals keep their own-session closing semantics. Used to keep a
+   * worker from delegating further, scheduling, or writing memory.
    */
   toolFilter?: (name: string) => boolean;
   /**

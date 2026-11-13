@@ -42,6 +42,9 @@ export function buildToolViewTool(deps: ToolViewDeps = {}): ToolDefinition {
       if (typeof name !== "string" || name.length === 0) {
         throw new Error("tool.view: `name` must be a non-empty string");
       }
+      if (ctx.toolFilter?.(name) === false) {
+        throw new Error(`tool.view: "${name}" is not available in this turn`);
+      }
       const catalog = deps.deferred?.();
       const deferred = catalog?.deferred.has(name) === true;
       const d =

@@ -143,6 +143,8 @@ export interface BatchExecutionContext {
    * never reaches the registry; terminals are exempt as everywhere.
    */
   toolSet?: StepToolSet;
+  /** Turn admission policy; terminal tools retain their own-session closing semantics. */
+  toolFilter?: (name: string) => boolean;
   /**
    * Plan mode, read at dispatch time rather than passed as a boolean.
    *

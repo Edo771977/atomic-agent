@@ -14,6 +14,7 @@ import {
   type PriorFile,
 } from "./fs-replace-guard.js";
 import type { FileRestoreStore } from "./fs-restore-store.js";
+import { inputPathIdentity } from "./fs-input-path-identity.js";
 
 export {
   REPLACE_VERBS,
@@ -128,7 +129,8 @@ export interface InputRefusal {
 export async function checkInputReplacement(
   input: InputGuardInput,
 ): Promise<InputRefusal | null> {
-  if (input.declaredInputs?.includes(input.absolute)) {
+  const identity = inputPathIdentity(input.absolute);
+  if (input.declaredInputs?.some(path => inputPathIdentity(path) === identity)) {
     return refusal("contract", input);
   }
   // `input.overwrite` is deliberately not read (ATO-851): only the

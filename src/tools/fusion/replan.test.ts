@@ -111,10 +111,10 @@ describe("automatic replanning (ATO-941)", () => {
     expect(third.summary).toContain("NO REPLANS LEFT (2 used)");
   });
 
-  it("is off by default: dependents run and nothing is sent back", async () => {
+  it("does not automatically retry when off, but still holds blocked dependents", async () => {
     const { d, ran } = deps(new Set(["core"]), { resolveRunMode: () => mode({ autoReplan: undefined }) });
     const result = await buildFusionDelegateTool(d).run(ORDERED, ctx());
-    expect(ran).toEqual(["core", "ui"]);
+    expect(ran).toEqual(["core"]);
     expect(result.details.replan).toBeUndefined();
     expect(result.summary).not.toContain("REPLAN");
   });

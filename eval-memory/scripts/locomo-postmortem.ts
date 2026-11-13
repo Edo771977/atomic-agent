@@ -35,16 +35,17 @@ function resolveTracePath(input: string): string {
     const tracesDir = resolve(abs, "traces");
     try {
       const list = readdirSync(tracesDir).filter((f) => f.endsWith(".ndjson"));
-      if (list.length === 1) return resolve(tracesDir, list[0]);
+      if (list.length === 1) return resolve(tracesDir, list[0]!);
       if (list.length > 1) {
         // Pick the largest (longest run) — heuristic for the canonical session.
         const sorted = list
           .map((f) => ({ f, size: statSync(resolve(tracesDir, f)).size }))
           .sort((a, b) => b.size - a.size);
+        const largest = sorted[0]!;
         process.stderr.write(
-          `[postmortem] multiple traces under ${tracesDir}; picking largest: ${sorted[0].f} (${sorted[0].size} bytes)\n`,
+          `[postmortem] multiple traces under ${tracesDir}; picking largest: ${largest.f} (${largest.size} bytes)\n`,
         );
-        return resolve(tracesDir, sorted[0].f);
+        return resolve(tracesDir, largest.f);
       }
     } catch {
       /* fall through */
@@ -53,8 +54,8 @@ function resolveTracePath(input: string): string {
     // keptTracePath line.
     try {
       const diag = readFileSync(resolve(abs, "run-diagnostics.txt"), "utf8");
-      const m = diag.match(/^keptTracePath:\s+(.+)$/m);
-      if (m && m[1] !== "-") return resolve(m[1].trim());
+      const path = diag.match(/^keptTracePath:\s+(.+)$/m)?.[1];
+      if (path !== undefined && path !== "-") return resolve(path.trim());
     } catch {
       /* fall through */
     }
@@ -65,13 +66,14 @@ function resolveTracePath(input: string): string {
 }
 
 async function main(argv: readonly string[]): Promise<number> {
-  if (argv.length === 0) {
+  const [input] = argv;
+  if (input === undefined) {
     process.stderr.write(
       "usage: tsx eval-memory/scripts/locomo-postmortem.ts <trace.ndjson|stateDir|reportDir>\n",
     );
     return 2;
   }
-  const path = resolveTracePath(argv[0]);
+  const path = resolveTracePath(input);
   process.stderr.write(`[postmortem] analyzing: ${path}\n`);
   const raw = readFileSync(path, "utf8");
   let skipped = 0;

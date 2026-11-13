@@ -1,4 +1,5 @@
 import { isAbsolute } from "node:path";
+import { inputPathIdentity } from "./fs-input-path-identity.js";
 
 /**
  * Which files a session may edit in place but never replace — the
@@ -18,7 +19,13 @@ export class DeclaredInputsRegistry {
 
   /** Declare `paths` (absolute, already resolved) for `sessionId`; replaces any earlier list. */
   declare(sessionId: string, paths: readonly string[]): void {
-    const absolute = [...new Set(paths.filter((path) => isAbsolute(path)))];
+    const identities = new Set<string>();
+    const absolute = paths.filter(path => {
+      if (!isAbsolute(path)) return false;
+      const identity = inputPathIdentity(path);
+      if (identities.has(identity)) return false;
+      identities.add(identity); return true;
+    });
     if (absolute.length === 0) {
       this.bySession.delete(sessionId);
       return;

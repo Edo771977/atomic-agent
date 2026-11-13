@@ -92,26 +92,32 @@ function isRecord(value: unknown): value is OutcomeRecord {
 }
 
 /** Parses NDJSON text, skipping lines that are not outcome records. */
-export function parseOutcomeLines(text: string): OutcomeRecord[] {
-  const out: OutcomeRecord[] = [];
+function* outcomeLines(text: string): Generator<OutcomeRecord> {
   for (const line of text.split("\n")) {
     if (line.trim().length === 0) continue;
     try {
       const parsed: unknown = JSON.parse(line);
-      if (isRecord(parsed)) out.push(parsed);
+      if (isRecord(parsed)) yield parsed;
     } catch {
       // A torn last line (a crash mid-append) is skipped.
     }
   }
-  return out;
+}
+
+export function parseOutcomeLines(text: string): OutcomeRecord[] {
+  return Array.from(outcomeLines(text));
 }
 
 /** The live file and its rotated ones, oldest first. Missing files read as empty. */
 export function readOutcomeRecords(
   path: string,
   read: (file: string) => string = (file) => readFileSync(file, "utf8"),
+  options: { maxRecords?: number; accept?: (record: OutcomeRecord) => boolean } = {},
 ): OutcomeRecord[] {
   const records: OutcomeRecord[] = [];
+  const maxRecords = options.maxRecords === undefined ? Infinity : Math.max(0, Math.floor(options.maxRecords));
+  if (maxRecords === 0) return records;
+  let next = 0;
   for (const file of outcomeLogFiles(path).reverse()) {
     let text: string;
     try {
@@ -119,9 +125,13 @@ export function readOutcomeRecords(
     } catch {
       continue;
     }
-    records.push(...parseOutcomeLines(text));
+    for (const record of outcomeLines(text)) {
+      if (options.accept?.(record) === false) continue;
+      if (records.length < maxRecords) records.push(record);
+      else { records[next] = record; next = (next + 1) % maxRecords; }
+    }
   }
-  return records;
+  return next === 0 ? records : records.slice(next).concat(records.slice(0, next));
 }
 
 function median(values: number[]): number {

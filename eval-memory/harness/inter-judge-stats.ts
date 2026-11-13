@@ -45,7 +45,7 @@ export function withinOneAgreement(
   if (a.length === 0) return 0;
   let hits = 0;
   for (let i = 0; i < a.length; i += 1) {
-    if (Math.abs(a[i] - b[i]) <= 1) hits += 1;
+    if (Math.abs(a[i]! - b[i]!) <= 1) hits += 1;
   }
   return hits / a.length;
 }
@@ -66,9 +66,12 @@ export function confusionMatrix(
     new Array<number>(levels).fill(0),
   );
   for (let i = 0; i < a.length; i += 1) {
-    assertInRange(a[i], levels, "a");
-    assertInRange(b[i], levels, "b");
-    mat[a[i] - 1][b[i] - 1] += 1;
+    const aScore = a[i]!;
+    const bScore = b[i]!;
+    assertInRange(aScore, levels, "a");
+    assertInRange(bScore, levels, "b");
+    const row = mat[aScore - 1]!;
+    row[bScore - 1] = row[bScore - 1]! + 1;
   }
   return mat;
 }
@@ -92,17 +95,17 @@ export function cohenKappa(
   const rowSums = C.map((row) => row.reduce((s, v) => s + v, 0));
   const colSums = new Array<number>(levels).fill(0);
   for (let i = 0; i < levels; i += 1) {
-    for (let j = 0; j < levels; j += 1) colSums[j] += C[i][j];
+    for (let j = 0; j < levels; j += 1) colSums[j] = colSums[j]! + C[i]![j]!;
   }
   const w = buildWeightMatrix(levels, weighting);
   let observed = 0;
   let expected = 0;
   for (let i = 0; i < levels; i += 1) {
     for (let j = 0; j < levels; j += 1) {
-      const oij = C[i][j] / n;
-      const eij = (rowSums[i] * colSums[j]) / (n * n);
-      observed += w[i][j] * oij;
-      expected += w[i][j] * eij;
+      const oij = C[i]![j]! / n;
+      const eij = (rowSums[i]! * colSums[j]!) / (n * n);
+      observed += w[i]![j]! * oij;
+      expected += w[i]![j]! * eij;
     }
   }
   if (expected === 1) return 0;
@@ -113,22 +116,18 @@ function buildWeightMatrix(
   levels: number,
   weighting: KappaWeighting,
 ): number[][] {
-  const mat: number[][] = Array.from({ length: levels }, () =>
-    new Array<number>(levels).fill(0),
-  );
-  for (let i = 0; i < levels; i += 1) {
-    for (let j = 0; j < levels; j += 1) {
+  return Array.from({ length: levels }, (_, i) =>
+    Array.from({ length: levels }, (_, j) => {
       if (weighting === "unweighted") {
-        mat[i][j] = i === j ? 1 : 0;
+        return i === j ? 1 : 0;
       } else if (weighting === "linear") {
-        mat[i][j] = 1 - Math.abs(i - j) / (levels - 1);
+        return 1 - Math.abs(i - j) / (levels - 1);
       } else {
         const d = (i - j) / (levels - 1);
-        mat[i][j] = 1 - d * d;
+        return 1 - d * d;
       }
-    }
-  }
-  return mat;
+    }),
+  );
 }
 
 function assertSameLength(a: readonly number[], b: readonly number[]): void {

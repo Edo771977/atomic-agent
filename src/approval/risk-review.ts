@@ -402,6 +402,7 @@ export async function runRiskReview(
 export type RiskReviewCompletionParams = Pick<
   CompletionRequest,
   | "prompt"
+  | "budgetOwnerSessionId"
   | "chat"
   | "cachePrompt"
   | "temperature"
@@ -486,6 +487,7 @@ export function createModelRiskReviewer(deps: ModelRiskReviewerDeps): RiskReview
       const partition = `${RISK_REVIEW_SESSION_PREFIX}${sessionId}`;
       const common = {
         sessionId: partition,
+        budgetOwnerSessionId: sessionId,
         temperature: 0,
         disableThinking: true,
         ...(providerId !== undefined ? { providerId } : {}),

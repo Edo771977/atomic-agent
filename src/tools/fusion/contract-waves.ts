@@ -13,15 +13,12 @@ import type { WorkerTaskResult, WorkerTaskStatus } from "./worker-result.js";
  *
  * So the fan-out runs in waves: a task that requires X depends on every
  * task that provides X; wave 1 is every task with no unmet dependency,
- * and each later wave is the tasks whose dependencies have all finished
- * — with any status. A provider that ended `failed`, `cancelled`,
- * `no_changes` or `needs_orchestrator` did not deliver, but its
- * dependent still runs: the orchestrator gets every report either way,
- * and the dependent's CONTRACT block carries a warning naming what did
- * not arrive (`dependencyWarnings`, through the F44 warning slot).
+ * and later waves can start only after successful providers have been
+ * verified. Incomplete providers hold their dependents whether or not
+ * automatic replanning is enabled.
  *
- * A cycle in the requires is one wave, in the order given, with a
- * warning. A contract without `requires`, or whose requires name
+ * A cyclic remainder is held, with a warning; independent earlier waves
+ * can still run. A contract without `requires`, or whose requires name
  * nothing any task provides, orders nothing: one wave, exactly the
  * fan-out that ran before waves existed.
  */
@@ -33,7 +30,7 @@ export interface WavePlan {
    * with duplicates dropped. Empty when the contract orders nothing.
    */
   dependencies: ReadonlyMap<string, readonly string[]>;
-  /** The warning when the requires form a cycle; the plan is then one wave. */
+  /** The warning when the final wave cannot start because of a cycle. */
   cycle?: string;
 }
 
@@ -77,9 +74,9 @@ function describeCycle(
   return [...path.slice(path.indexOf(node)), node].join(" → ");
 }
 
-/** `requires form a cycle (a → b → a), so the tasks run in one wave in the order given` */
+/** A cycle must be replanned rather than treated as satisfied dependencies. */
 export function describeCycleWarning(cycle: string): string {
-  return `requires form a cycle (${cycle}), so the tasks run in one wave in the order given`;
+  return `requires form a cycle (${cycle}); tasks with unmet dependencies are not started`;
 }
 
 export function planWaves(
@@ -96,7 +93,7 @@ export function planWaves(
     );
     if (wave.length === 0) {
       return {
-        waves: [[...taskIds]],
+        waves: [...waves, remaining],
         dependencies,
         cycle: describeCycleWarning(describeCycle(remaining, dependencies)),
       };
@@ -114,6 +111,9 @@ export const UNDELIVERED_STATUSES: ReadonlySet<WorkerTaskStatus> = new Set([
   "cancelled",
   "no_changes",
   "needs_orchestrator",
+  "max_steps",
+  "timeout",
+  "queued",
 ]);
 
 /**

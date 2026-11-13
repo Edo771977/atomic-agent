@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -111,7 +111,7 @@ const TASKS = [
 const ORDERED = {
   tasks: TASKS.slice(0, 2),
   contract: {
-    provides: [{ task: "t1", kind: "other", name: "done" }],
+    provides: [{ task: "t1", kind: "other", name: "done", in: "" }],
     requires: [{ task: "t2", name: "done" }],
   },
 };
@@ -129,6 +129,8 @@ describe("resuming a fusion run (ATO-617)", () => {
   let store: FusionRunStore;
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), "fusion-resume-"));
+    ORDERED.contract.provides[0]!.in = join(dir, "done.txt");
+    writeFileSync(ORDERED.contract.provides[0]!.in, "done");
     store = new FusionRunStore({ dir });
   });
   afterEach(() => {
@@ -198,7 +200,7 @@ describe("resuming a fusion run (ATO-617)", () => {
     it("writes nothing without a store", async () => {
       const d = deps({});
       await buildFusionDelegateTool(d).run(ORDERED, ctx());
-      expect(readdirSync(dir)).toEqual([]);
+      expect(readdirSync(dir).filter((f) => f.endsWith(".json"))).toEqual([]);
     });
   });
 
@@ -220,6 +222,76 @@ describe("resuming a fusion run (ATO-617)", () => {
       expect(planResume(store.load(run.runId)!).rerun).toContain("t1");
     });
 
+    it("re-runs a never-served queued task instead of carrying it as settled", () => {
+      const run = store.start({ sessionId: "s-parent", workingDir: "/repo", args: { tasks: TASKS }, tasks: TASKS, waveCount: 1 });
+      run.recordTask(row("t1", { status: "queued", stepCount: 0 }));
+      run.finish("interrupted");
+      const plan = planResume(store.load(run.runId)!);
+      expect(plan.carried).toEqual([]);
+      expect(plan.rerun).toEqual(["t1", "t2", "t3"]);
+    });
+
+    it("still requires confirmation if a queued row recorded side effects", () => {
+      const run = store.start({ sessionId: "s-parent", workingDir: "/repo", args: { tasks: TASKS }, tasks: TASKS, waveCount: 1 });
+      run.noteTool("t1", "os.shell.run");
+      run.recordTask(row("t1", { status: "queued", stepCount: 0 }));
+      run.finish("interrupted");
+      const saved = store.load(run.runId)!;
+      expect(planResume(saved).needsConfirmation.map(r => r.id)).toEqual(["t1"]);
+      expect(planResume(saved, ["t1"]).rerun).toEqual(["t1", "t2", "t3"]);
+    });
+
+    it("loads legacy v1 rows but does not call unknown file-change coverage green", () => {
+      const saved = cutOff(["t1"]);
+      const result = saved.tasks[0]!.result!;
+      result.tools.writes = 1;
+      delete result.artifactMetadata;
+      delete result.changes;
+      writeFileSync(join(dir, `${saved.runId}.json`), JSON.stringify(saved));
+      const loaded = store.load(saved.runId)!;
+      expect(loaded).not.toBeNull();
+      const carried = planResume(loaded).carried[0]!;
+      expect(carried.status).toBe("needs_orchestrator");
+      expect(carried.error).toContain("coverage is incomplete");
+    });
+
+    it("does not silently pass artifacts when the recorded path bound overflowed", () => {
+      const run = store.start({ sessionId: "s-parent", workingDir: "/repo", args: { tasks: TASKS }, tasks: TASKS, waveCount: 1 });
+      run.recordTask(row("t1", { changes: Array.from({ length: 300 }, (_, i) => ({ path: `file-${i}.js`, kind: "new" as const })) }));
+      run.finish("interrupted");
+      expect(planResume(store.load(run.runId)!).carried[0]!.status).toBe("needs_orchestrator");
+    });
+
+    it.each(["os.shell.run", "os.fs.archive.extract", "skill.run_script", "os.git.checkout"])("does not call legacy %s write coverage complete", tool => {
+      const saved = cutOff(["t1"]);
+      const result = saved.tasks[0]!.result!;
+      result.tools = { calls: 1, errors: 0, writes: 0, byTool: { [tool]: 1 } };
+      delete result.artifactMetadata;
+      delete result.changes;
+      delete result.shellRan;
+      writeFileSync(join(dir, `${saved.runId}.json`), JSON.stringify(saved));
+      expect(planResume(store.load(saved.runId)!).carried[0]!.status).toBe("needs_orchestrator");
+    });
+
+    it.each(["os.fs.move", "os.fs.trash", "os.fs.restore", "os.fs.patch"])("does not trust legacy %s coverage when the narrow writes counter is zero", tool => {
+      const saved = cutOff(["t1"]);
+      const result = saved.tasks[0]!.result!;
+      result.tools = { calls: 1, errors: 0, writes: 0, byTool: { [tool]: 1 } };
+      delete result.artifactMetadata;
+      delete result.changes;
+      writeFileSync(join(dir, `${saved.runId}.json`), JSON.stringify(saved));
+      expect(planResume(store.load(saved.runId)!).carried[0]!.status).toBe("needs_orchestrator");
+    });
+
+    it.each(["os.fs.read", "os.fs.list", "os.fs.hash"])("keeps legacy read-only %s results settled", tool => {
+      const saved = cutOff(["t1"]);
+      const result = saved.tasks[0]!.result!;
+      result.tools = { calls: 1, errors: 0, writes: 0, byTool: { [tool]: 1 } };
+      delete result.artifactMetadata;
+      delete result.changes;
+      expect(planResume(saved).carried[0]!.status).toBe("ok");
+    });
+
     it("holds a task with side effects for the person's yes", () => {
       const checkpoint = cutOff(["t1"], ["t2"]);
       const plan = planResume(checkpoint);
@@ -237,6 +309,44 @@ describe("resuming a fusion run (ATO-617)", () => {
   });
 
   describe("fusion.delegate { resume }", () => {
+    it("reports non-resumability without advertising a run id when the original request exceeds the checkpoint budget", async () => {
+      const d = deps({ workingDir: dir, runCheckpoints: store, resolveOriginalRequest: () => "x".repeat(8 * 1024 * 1024) });
+      const result = await buildFusionDelegateTool(d).run({ tasks: [{ id: "one", title: "One", instructions: "work" }] }, ctx({ workingDir: dir }));
+      expect(d.ran).toEqual(["one"]);
+      expect(result.details.runId).toBeUndefined();
+      expect(result.details.checkpointWarning).toContain("8 MiB");
+      expect(result.summary).toContain("cannot be resumed");
+    });
+
+    it("does not resume an untracked shell-written artifact as all_ok", async () => {
+      writeFileSync(join(dir, "bad.js"), "const = ;");
+      const run = store.start({ sessionId: "s-parent", workingDir: dir, args: { tasks: TASKS.slice(0, 1) }, tasks: TASKS.slice(0, 1), waveCount: 1 });
+      run.recordTask(row("t1", { shellRan: true, tools: { calls: 1, errors: 0, writes: 0, byTool: { "os.shell.run": 1 } } }));
+      run.finish("interrupted");
+      const d = deps({ workingDir: dir, runCheckpoints: store });
+      const result = await buildFusionDelegateTool(d).run({ resume: run.runId }, ctx({ workingDir: dir }));
+      expect(d.ran).toEqual([]);
+      expect((result.details.tasks as WorkerTaskResult[])[0]!.status).toBe("needs_orchestrator");
+      expect(result.details.outcome).not.toBe("all_ok");
+    });
+
+    it("verifies undeclared observed artifacts after a crash before syntax verification", async () => {
+      writeFileSync(join(dir, "bad.js"), "const = ;");
+      const run = store.start({ sessionId: "s-parent", workingDir: dir, args: { tasks: TASKS.slice(0, 1) }, tasks: TASKS.slice(0, 1), waveCount: 1 });
+      run.recordTask(row("t1", { changes: [{ path: "bad.js", kind: "new", addedLines: 1, removedLines: 0 }], tools: { calls: 1, errors: 0, writes: 1, byTool: { "os.fs.write": 1 } } }));
+      run.finish("interrupted");
+      const checked: string[] = [];
+      const d = deps({ workingDir: dir, runCheckpoints: store, syntaxCheck: async files => {
+        checked.push(...files);
+        return { results: files.map(file => ({ file, ok: false, checker: "javascript", error: "parse failed" })) };
+      } });
+      const result = await buildFusionDelegateTool(d).run({ resume: run.runId }, ctx({ workingDir: dir }));
+      expect(d.ran).toEqual([]);
+      expect(checked).toEqual([join(dir, "bad.js")]);
+      expect((result.details.tasks as WorkerTaskResult[])[0]!.status).toBe("failed");
+      expect(result.details.outcome).not.toBe("all_ok");
+    });
+
     it("re-dispatches only the unfinished tasks and reports the rest from the checkpoint", async () => {
       const checkpoint = cutOff(["t1"]);
       const d = deps({ runCheckpoints: store });

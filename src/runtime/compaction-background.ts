@@ -123,6 +123,7 @@ export function createBackgroundCompaction(deps: BackgroundCompactionDependencie
     let written: { summary: string; model: string | null };
     try {
       written = await summarizeWithModel({
+        budgetOwnerSessionId: null,
         input, prompt, plan: { ...plan, from, through: source.through, summaryMaxTokens: maxTokens }, config: jobConfig, route,
         previous: rolling?.summary ?? base?.summary ?? "",
         source: { text: source.text, maxContextTokens: 0, contextAt: () => "" },
