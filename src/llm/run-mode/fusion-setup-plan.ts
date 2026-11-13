@@ -5,6 +5,7 @@ import {
   type UserLlmRunModeConfig,
 } from "../../config/llm-run-mode-config.js";
 import { SUBSCRIPTION_CLI_KIND } from "../../config/provider-auth-mode.js";
+import { modelTierKey, modelTierOf, type ModelTier } from "../provider/presets/model-tiers.js";
 import type { ProviderKeyStatus } from "../provider/provider-key.js";
 import type { SubscriptionCliState } from "../provider/subscription-cli/subscription-cli-status.js";
 
@@ -27,6 +28,8 @@ export interface FusionSetupProviderFact {
   readonly envVar: string | null;
   /** `subscriptionCli.cli` of a subscription entry, else null. */
   readonly subscriptionCli: string | null;
+  /** The entry's `defaultChatModel`: what serves its turns. */
+  readonly defaultChatModel?: string | null;
 }
 
 export interface FusionSetupCliFact {
@@ -74,6 +77,10 @@ export interface FusionSetupLeg {
   readonly priced: boolean;
   /** One line on why this leg was picked. */
   readonly why: string;
+  /** The model that serves it (`defaultChatModel`), null for the provider's own default. */
+  readonly model: string | null;
+  /** Its Cheap/Balanced/Best tier for this provider, when the tier table lists it. */
+  readonly tier: ModelTier | null;
 }
 
 export interface FusionSetupChange {
@@ -95,6 +102,11 @@ export type FusionSetupPlan =
   | {
       readonly ok: true;
       readonly orchestrator: FusionSetupLeg;
+      /**
+       * Every orchestrator that can answer, in the planner's order (the
+       * first is its pick); more than one means the person may choose.
+       */
+      readonly candidates: readonly FusionSetupLeg[];
       readonly worker: FusionSetupLeg;
       /** What the write changes; empty means everything is already set. */
       readonly changes: readonly FusionSetupChange[];
@@ -136,14 +148,24 @@ function orchestratorReady(facts: FusionSetupFacts, p: FusionSetupProviderFact):
   return p.keyState === "present";
 }
 
-function leg(p: { id: string; kind: string }, why: string): FusionSetupLeg {
+function leg(
+  p: { id: string; kind: string; subscriptionCli?: string | null },
+  why: string,
+  model: string | null = null,
+): FusionSetupLeg {
   return {
     providerId: p.id,
     kind: p.kind,
     priced: p.kind !== LOCAL_PROVIDER_KIND && p.kind !== SUBSCRIPTION_CLI_KIND,
     why,
+    model,
+    tier: model === null ? null : modelTierOf(modelTierKey(p.kind, p.subscriptionCli ?? undefined), model),
   };
 }
+
+/** Strongest first; a model the tier table does not list sits between Balanced and Cheap. */
+const TIER_RANK: Readonly<Record<ModelTier, number>> = { best: 0, balanced: 1, cheap: 3 };
+const tierRank = (l: FusionSetupLeg): number => (l.tier === null ? 2 : TIER_RANK[l.tier]);
 
 function freeId(base: string, taken: readonly string[]): string {
   if (!taken.includes(base)) return base;
@@ -182,45 +204,60 @@ function storedOrchestratorState(
   return { state: "unverified", why: "its key could not be checked" };
 }
 
-function pickOrchestrator(facts: FusionSetupFacts):
-  | { leg: FusionSetupLeg; addProvider?: UserLlmProviderEntry; warnings: string[] }
-  | { problems: string[] } {
-  const stored = facts.runMode?.fusion?.orchestratorProvider;
-  const byId = (id: string | undefined) => facts.providers.find((p) => p.id === id);
-  const warnings: string[] = [];
-  if (stored !== undefined) {
-    const st = storedOrchestratorState(facts, stored);
-    const storedEntry = byId(stored);
-    if (storedEntry && st.state === "ready") {
-      return { leg: leg(storedEntry, "the orchestrator already set for fusion"), warnings };
-    }
-    if (storedEntry && st.state === "unverified") {
-      warnings.push(
-        `${stored} (the orchestrator already set) could not be verified: ${st.why}; kept. Check it with: atomic-agent providers status`,
-      );
-      return { leg: leg(storedEntry, "the orchestrator already set for fusion"), warnings };
-    }
-    if (st.state === "broken") {
-      warnings.push(`${stored} (the orchestrator already set) is replaced: ${st.why}.`);
-    }
-  }
-  const found = pickFresh(facts);
-  if ("problems" in found) return { problems: [...warnings, ...found.problems] };
-  return { ...found, warnings };
+interface OrchestratorCandidate {
+  readonly leg: FusionSetupLeg;
+  readonly addProvider?: UserLlmProviderEntry;
 }
 
-function pickFresh(facts: FusionSetupFacts):
-  | { leg: FusionSetupLeg; addProvider?: UserLlmProviderEntry }
-  | { problems: string[] } {
-  const keyed = facts.providers.filter((p) => !isSubscription(p) && orchestratorReady(facts, p));
-  const active = keyed.find((p) => p.id === facts.activeTextProvider);
-  const firstKeyed = active ?? keyed[0];
-  if (firstKeyed) {
-    return { leg: leg(firstKeyed, "a configured cloud provider with a key") };
+/**
+ * Every orchestrator that can answer now, best first:
+ *  1. the stored fusion orchestrator, unless it is definitely not ready;
+ *  2. the active text provider, when it is a cloud provider;
+ *  3. a signed-in subscription CLI (an entry, else a new Claude Code one);
+ *  4. other keyed cloud providers, Best/Balanced tier models first.
+ * A key alone says nothing about strength (it may be there for a cheap or
+ * embedding model), so a configured, signed-in subscription comes before
+ * a keyed provider the person did not make active.
+ */
+function orchestratorCandidates(facts: FusionSetupFacts): {
+  candidates: OrchestratorCandidate[];
+  warnings: string[];
+} {
+  const fusion = facts.runMode?.fusion;
+  const stored = fusion?.orchestratorProvider;
+  const warnings: string[] = [];
+  const out: OrchestratorCandidate[] = [];
+  const push = (c: OrchestratorCandidate): void => {
+    if (!out.some((o) => o.leg.providerId === c.leg.providerId)) out.push(c);
+  };
+  const entryLeg = (p: FusionSetupProviderFact, why: string): FusionSetupLeg =>
+    leg(p, why, (p.id === stored ? fusion?.orchestratorModel : undefined) ?? p.defaultChatModel ?? null);
+
+  if (stored !== undefined) {
+    const st = storedOrchestratorState(facts, stored);
+    const entry = facts.providers.find((p) => p.id === stored);
+    if (st.state === "broken") {
+      warnings.push(`${stored} (the orchestrator already set) is replaced: ${st.why}.`);
+    } else if (entry) {
+      if (st.state === "unverified") {
+        warnings.push(
+          `${stored} (the orchestrator already set) could not be verified: ${st.why}; kept. Check it with: atomic-agent providers status`,
+        );
+      }
+      push({ leg: entryLeg(entry, "the orchestrator already set for fusion") });
+    }
   }
-  const sub = facts.providers.find((p) => isSubscription(p) && orchestratorReady(facts, p));
-  if (sub) return { leg: leg(sub, "a configured subscription CLI that is signed in") };
-  if (cliReady(facts, "claude")) {
+  const active = facts.providers.find((p) => p.id === facts.activeTextProvider);
+  if (active && orchestratorReady(facts, active)) {
+    push({ leg: entryLeg(active, "your active cloud provider") });
+  }
+  for (const p of facts.providers) {
+    if (isSubscription(p) && orchestratorReady(facts, p)) {
+      push({ leg: entryLeg(p, "a configured subscription CLI that is signed in") });
+    }
+  }
+  const claudeEntry = facts.providers.some((p) => isSubscription(p) && p.subscriptionCli === "claude");
+  if (cliReady(facts, "claude") && !claudeEntry) {
     const id = freeId("claude-cli", facts.providers.map((p) => p.id));
     const addProvider: UserLlmProviderEntry = {
       id,
@@ -228,11 +265,61 @@ function pickFresh(facts: FusionSetupFacts):
       ...(facts.claudeCliDefaultModel ? { defaultChatModel: facts.claudeCliDefaultModel } : {}),
       subscriptionCli: { cli: "claude" },
     };
-    return {
-      leg: leg(addProvider, "your signed-in Claude Code subscription (new provider entry)"),
+    push({
+      leg: leg(
+        { id, kind: SUBSCRIPTION_CLI_KIND, subscriptionCli: "claude" },
+        "your signed-in Claude Code subscription (new provider entry)",
+        facts.claudeCliDefaultModel,
+      ),
       addProvider,
+    });
+  }
+  const keyed = facts.providers
+    .filter((p) => !isSubscription(p) && orchestratorReady(facts, p))
+    .map((p, i) => ({ l: entryLeg(p, "a configured cloud provider with a key"), i }))
+    .sort((a, b) => tierRank(a.l) - tierRank(b.l) || a.i - b.i);
+  for (const { l } of keyed) push({ leg: l });
+  return { candidates: out, warnings };
+}
+
+function pickOrchestrator(
+  facts: FusionSetupFacts,
+  pick: string | undefined,
+):
+  | {
+      leg: FusionSetupLeg;
+      addProvider?: UserLlmProviderEntry;
+      candidates: FusionSetupLeg[];
+      warnings: string[];
+    }
+  | { problems: string[] } {
+  const { candidates, warnings } = orchestratorCandidates(facts);
+  if (candidates.length === 0) {
+    return { problems: [...warnings, ...noOrchestratorProblems(facts)] };
+  }
+  const chosen =
+    pick === undefined ? candidates[0] : candidates.find((c) => c.leg.providerId === pick);
+  if (!chosen) {
+    return {
+      problems: [
+        `${pick} cannot orchestrate now; ready: ${candidates.map((c) => c.leg.providerId).join(", ")}.`,
+      ],
     };
   }
+  if (chosen.leg.tier === "cheap") {
+    warnings.push(
+      `${chosen.leg.model} is the Cheap tier for ${chosen.leg.providerId}. The orchestrator plans and reviews every task, so a Balanced or Best model does better; change its model in the TUI: Manage › LLM.`,
+    );
+  }
+  return {
+    leg: chosen.leg,
+    ...(chosen.addProvider ? { addProvider: chosen.addProvider } : {}),
+    candidates: candidates.map((c) => c.leg),
+    warnings,
+  };
+}
+
+function noOrchestratorProblems(facts: FusionSetupFacts): string[] {
   const problems: string[] = [];
   for (const p of facts.providers) {
     if (isLocal(p) || isSubscription(p)) continue;
@@ -260,7 +347,7 @@ function pickFresh(facts: FusionSetupFacts):
   problems.unshift(
     `No strong model to orchestrate. Add a cloud provider with an API key (${CLOUD_KEY_HINT.replace(/^or /, "")}), or sign in to Claude Code.`,
   );
-  return { problems };
+  return problems;
 }
 
 function pickWorker(facts: FusionSetupFacts): { leg: FusionSetupLeg } | { problems: string[] } {
@@ -312,6 +399,8 @@ export interface FusionSetupOptions {
   readonly judge?: boolean;
   /** `isolation: "worktree"`. */
   readonly isolation?: boolean;
+  /** The orchestrator the person picked (a candidate's provider id); default: the planner's first. */
+  readonly orchestrator?: string;
 }
 
 /** Propose the two legs and the preset's settings, or say what is missing. */
@@ -319,7 +408,7 @@ export function planFusionSetup(
   facts: FusionSetupFacts,
   options: FusionSetupOptions = {},
 ): FusionSetupPlan {
-  const o = pickOrchestrator(facts);
+  const o = pickOrchestrator(facts, options.orchestrator);
   const w = pickWorker(facts);
   if ("problems" in o || "problems" in w) {
     return {
@@ -410,6 +499,7 @@ export function planFusionSetup(
   return {
     ok: true,
     orchestrator,
+    candidates: o.candidates,
     worker,
     changes,
     unchanged,

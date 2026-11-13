@@ -48,7 +48,7 @@ describe("planFusionSetup: detection matrix", () => {
 
   it.each([
     // [cloud key, claude CLI, local model] -> orchestrator | null
-    ["key", "ready", true, "openrouter"],
+    ["key", "ready", true, "claude-cli"],
     ["key", "signed_out", true, "openrouter"],
     ["none", "ready", true, "claude-cli"],
     ["none", "signed_out", true, null],
@@ -69,12 +69,51 @@ describe("planFusionSetup: detection matrix", () => {
     expect(plan.worker?.providerId).toBe("local-llama");
   });
 
-  it("prefers a configured cloud provider over the subscription CLI", () => {
+  it("a key alone does not beat a signed-in subscription: the CLI first, the key listed", () => {
     const plan = planFusionSetup(facts({ providers: [LOCAL, OPENROUTER("present")], claude: signedIn }));
+    if (!plan.ok) throw new Error("expected ok");
+    expect(plan.orchestrator.providerId).toBe("claude-cli");
+    expect(plan.orchestrator.priced).toBe(false);
+    expect(plan.candidates.map((c) => c.providerId)).toEqual(["claude-cli", "openrouter"]);
+  });
+
+  it("the active cloud provider comes before a subscription CLI", () => {
+    const plan = planFusionSetup(facts({ providers: [LOCAL, OPENROUTER("present")], claude: signedIn, active: "openrouter" }));
+    if (!plan.ok) throw new Error("expected ok");
+    expect(plan.orchestrator.providerId).toBe("openrouter");
+    expect(plan.orchestrator.why).toMatch(/active/);
+    expect(plan.write.addProvider).toBeUndefined();
+    expect(plan.candidates.map((c) => c.providerId)).toEqual(["openrouter", "claude-cli"]);
+  });
+
+  it("among keyed providers that are not active, a Best/Balanced model beats a Cheap one", () => {
+    const cheap: FusionSetupProviderFact = { ...OPENROUTER("present"), id: "or-cheap", defaultChatModel: "deepseek/deepseek-v4-flash" };
+    const best: FusionSetupProviderFact = { ...OPENROUTER("present"), id: "or-best", defaultChatModel: "anthropic/claude-sonnet-5" };
+    const plan = planFusionSetup(facts({ providers: [LOCAL, cheap, best] }));
+    if (!plan.ok) throw new Error("expected ok");
+    expect(plan.orchestrator).toMatchObject({ providerId: "or-best", tier: "best", model: "anthropic/claude-sonnet-5" });
+    expect(plan.candidates.map((c) => c.providerId)).toEqual(["or-best", "or-cheap"]);
+    expect(plan.warnings.join("\n")).not.toMatch(/Cheap tier/);
+  });
+
+  it("warns when the orchestrator model is in the Cheap tier", () => {
+    const cheap: FusionSetupProviderFact = { ...OPENROUTER("present"), defaultChatModel: "deepseek/deepseek-v4-flash" };
+    const plan = planFusionSetup(facts({ providers: [LOCAL, cheap], active: "openrouter" }));
+    if (!plan.ok) throw new Error("expected ok");
+    expect(plan.orchestrator.tier).toBe("cheap");
+    expect(plan.warnings.join("\n")).toMatch(/deepseek\/deepseek-v4-flash is the Cheap tier for openrouter/);
+  });
+
+  it("a picked candidate replaces the suggestion; an unknown pick is refused with the ready list", () => {
+    const f = facts({ providers: [LOCAL, OPENROUTER("present")], claude: signedIn });
+    const plan = planFusionSetup(f, { orchestrator: "openrouter" });
     if (!plan.ok) throw new Error("expected ok");
     expect(plan.orchestrator.providerId).toBe("openrouter");
     expect(plan.write.addProvider).toBeUndefined();
-    expect(plan.orchestrator.priced).toBe(true);
+    expect(plan.write.fusion).toMatchObject({ escalation: "advisor", turnBudgetUsd: 1 });
+    const bad = planFusionSetup(f, { orchestrator: "nope" });
+    if (bad.ok) throw new Error("expected refusal");
+    expect(bad.problems.join("\n")).toMatch(/nope cannot orchestrate now; ready: claude-cli, openrouter/);
   });
 
   it("adds a Claude Code entry with no key when only the CLI is signed in", () => {

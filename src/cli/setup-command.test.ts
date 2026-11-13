@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PassThrough } from "node:stream";
 
 import { resetConfigCache } from "../config/config-cache.js";
 import { getUserConfigPath, writeUserConfigFileSync } from "../config/config-file.js";
@@ -235,6 +236,74 @@ describe("atomic-agent setup fusion", () => {
     expect(h.out()).toMatch(/llm\.runMode\.fusion\.escalation\s+"future-mode" kept \(set by a newer version\)/);
     expect(h.out()).not.toMatch(/escalation\s+\(unset\)/);
     expect(fileJson().llm.runMode?.fusion?.escalation).toBe("future-mode");
+  });
+
+  describe("choosing the orchestrator", () => {
+    const ready = { checkCli: async () => ({ state: "ready" as const, fix: null }) };
+
+    /** A terminal: input that says it is a TTY, answers fed as lines. */
+    function tty(...answers: string[]) {
+      const input = Object.assign(new PassThrough(), { isTTY: true });
+      const output = new PassThrough();
+      let asked = "";
+      output.on("data", (b: Buffer) => { asked += b.toString(); });
+      for (const a of answers) input.write(`${a}\n`);
+      return { terminal: { input, output }, asked: () => asked };
+    }
+
+    it("a key that is not active does not beat signed-in Claude Code; --yes lists the alternative", async () => {
+      seed();
+      const h = harness(ready);
+      expect(await setupCommand(["fusion", "--yes"], h.deps)).toBe(0);
+      expect(fileJson().llm.activeTextProvider).toBe("claude-cli");
+      expect(h.out()).toMatch(/orchestrator\s+claude-cli · cli-default .*subscription, flat rate/);
+      expect(h.out()).toMatch(/Also ready to orchestrate:\n\s+openrouter · x\/y\s+— billed per token/);
+      expect(h.out()).toMatch(/--orchestrator <provider-id>/);
+    });
+
+    it("on a terminal it lists the ready ones and the person picks by number", async () => {
+      seed();
+      const t = tty("2", "y");
+      const h = harness(ready, { confirm: undefined, terminal: t.terminal });
+      expect(await setupCommand(["fusion"], h.deps)).toBe(0);
+      expect(h.out()).toMatch(/1\) claude-cli · cli-default\s+— subscription, flat rate\s+\(suggested\)/);
+      expect(h.out()).toMatch(/2\) openrouter · x\/y\s+— billed per token/);
+      expect(t.asked()).toMatch(/Which one\? \[1-2, Enter = 1\]/);
+      expect(t.asked()).toMatch(/Apply these changes\?/);
+      const llm = fileJson().llm as { activeTextProvider: string; providers: Array<{ id: string }>; runMode: { fusion: Record<string, unknown> } };
+      expect(llm.activeTextProvider).toBe("openrouter");
+      expect(llm.providers.map((p) => p.id)).not.toContain("claude-cli");
+      expect(llm.runMode.fusion).toMatchObject({ orchestratorProvider: "openrouter", turnBudgetUsd: 1 });
+    });
+
+    it("Enter keeps the suggestion; a wrong answer is asked again", async () => {
+      seed();
+      const t = tty("7", "", "yes");
+      const h = harness(ready, { confirm: undefined, terminal: t.terminal });
+      expect(await setupCommand(["fusion"], h.deps)).toBe(0);
+      expect(t.asked()).toMatch(/Type a number from 1 to 2/);
+      expect(fileJson().llm.activeTextProvider).toBe("claude-cli");
+    });
+
+    it("not a terminal: nothing is asked, and it still says to use --yes", async () => {
+      seed();
+      const input = Object.assign(new PassThrough(), { isTTY: false });
+      const h = harness(ready, { confirm: undefined, terminal: { input, output: new PassThrough() } });
+      expect(await setupCommand(["fusion"], h.deps)).toBe(1);
+      expect(h.out()).not.toMatch(/Which one/);
+      expect(h.out()).toMatch(/re-run with --yes/);
+    });
+
+    it("--orchestrator picks without asking; an id that cannot answer is refused", async () => {
+      seed();
+      const h = harness(ready);
+      expect(await setupCommand(["fusion", "--yes", "--orchestrator", "openrouter"], h.deps)).toBe(0);
+      expect(fileJson().llm.activeTextProvider).toBe("openrouter");
+      const bad = harness(ready);
+      expect(await setupCommand(["fusion", "--yes", "--orchestrator", "local-llama"], bad.deps)).toBe(1);
+      expect(bad.out()).toMatch(/local-llama cannot orchestrate now/);
+      expect(await setupCommand(["fusion", "--orchestrator"], harness().deps)).toBe(2);
+    });
   });
 
   it("usage errors exit 2", async () => {

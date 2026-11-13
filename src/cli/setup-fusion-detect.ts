@@ -121,6 +121,7 @@ export async function detectFusionSetup(
         ? dotenvKeyForProviderKind(p.kind as Parameters<typeof dotenvKeyForProviderKind>[0])
         : null),
     subscriptionCli: p.subscriptionCli?.cli ?? null,
+    defaultChatModel: p.defaultChatModel ?? null,
   }));
 
   const wanted = new Set<SubscriptionCliName>(["claude"]);

@@ -1,5 +1,3 @@
-import { createInterface } from "node:readline/promises";
-
 import { ConfigValidationError, getUserConfigPath, resolveStateDir } from "../config/index.js";
 import { applyFusionSetupInConfig } from "../config/fusion-setup-commands.js";
 import {
@@ -9,7 +7,9 @@ import {
   type FusionSetupLeg,
   type FusionSetupPlan,
 } from "../llm/run-mode/fusion-setup-plan.js";
+import { MODEL_TIER_LABELS } from "../llm/provider/presets/model-tiers.js";
 import { detectFusionSetup, type FusionDetectDeps } from "./setup-fusion-detect.js";
+import { createSetupPrompter, type SetupPrompter, type SetupTerminal } from "./setup-terminal-prompt.js";
 
 /**
  * `atomic-agent setup fusion [--yes] [--dry-run]`: one command from a
@@ -21,35 +21,41 @@ import { detectFusionSetup, type FusionDetectDeps } from "./setup-fusion-detect.
  */
 const HELP = [
   "Usage: atomic-agent setup fusion [--yes] [--dry-run] [--judge] [--isolation]",
+  "                                 [--orchestrator <provider-id>]",
   "",
   "Sets up Fusion: a strong model orchestrates (a cloud provider with a key, or",
   "your signed-in Claude Code subscription) and the local model runs the workers.",
-  "Shows what it will change and asks first.",
+  "Shows what it will change and asks first. When more than one strong model is",
+  "ready it lists them and asks which one orchestrates.",
   "",
   "  --yes        Apply without asking",
   "  --dry-run    Print the plan; write nothing",
   "  --judge      Also turn on the judge (a task closes only on a green checklist)",
   "  --isolation  Also give each worker task its own workspace (worktree)",
+  "  --orchestrator <provider-id>",
+  "               Orchestrate with this ready provider instead of the suggested one",
 ].join("\n");
 
 export interface SetupCommandDeps {
   readonly write?: (text: string) => void;
   readonly stateDir?: string;
   readonly detect?: FusionDetectDeps;
-  /** Ask the person; default reads a line from a terminal, refuses otherwise. */
+  /** Ask the person; default reads a line from the terminal, refuses otherwise. */
   readonly confirm?: (question: string) => Promise<boolean | "no-tty">;
+  /** Where the default questions are read and asked (default: stdin/stdout). */
+  readonly terminal?: SetupTerminal;
   readonly apply?: typeof applyFusionSetupInConfig;
 }
 
-async function terminalConfirm(question: string): Promise<boolean | "no-tty"> {
-  if (!process.stdin.isTTY) return "no-tty";
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
-  try {
-    const answer = (await rl.question(question)).trim().toLowerCase();
-    return answer === "y" || answer === "yes";
-  } finally {
-    rl.close();
-  }
+function price(l: FusionSetupLeg): string {
+  return l.kind === "llama-server" ? "local" : l.priced ? "billed per token" : "subscription, flat rate";
+}
+
+/** `openrouter · some/model (Best tier)`: the provider AND the model that serves it. */
+function legName(l: FusionSetupLeg): string {
+  if (l.kind === "llama-server") return l.providerId;
+  const tier = l.tier ? ` (${MODEL_TIER_LABELS[l.tier]} tier)` : "";
+  return `${l.providerId} · ${l.model ?? "its default model"}${tier}`;
 }
 
 function show(value: unknown): string {
@@ -58,8 +64,7 @@ function show(value: unknown): string {
 
 function legLine(label: string, l: FusionSetupLeg | null): string {
   if (!l) return `  ${label.padEnd(13)} (none available)`;
-  const price = l.kind === "llama-server" ? "local" : l.priced ? "billed per token" : "subscription, flat rate";
-  return `  ${label.padEnd(13)} ${l.providerId}  — ${l.why}; ${price}`;
+  return `  ${label.padEnd(13)} ${legName(l)}  — ${l.why}; ${price(l)}`;
 }
 
 function changeLine(c: FusionSetupChange): string {
@@ -81,6 +86,15 @@ export function renderFusionPlan(plan: FusionSetupPlan): string {
   if (!plan.ok) {
     lines.push("Can't set it up yet:", ...plan.problems.map((p) => `  - ${p}`), "");
     return `${lines.join("\n")}\n`;
+  }
+  if (plan.candidates.length > 1) {
+    const others = plan.candidates.filter((c) => c.providerId !== plan.orchestrator.providerId);
+    lines.push(
+      "Also ready to orchestrate:",
+      ...others.map((c) => `  ${legName(c)}  — ${price(c)}`),
+      "  pick one with: atomic-agent setup fusion --orchestrator <provider-id>",
+      "",
+    );
   }
   if (plan.warnings.length > 0) {
     lines.push(...plan.warnings.map((w) => `  ! ${w}`), "");
@@ -104,17 +118,70 @@ export function renderFusionPlan(plan: FusionSetupPlan): string {
   return `${lines.join("\n")}\n`;
 }
 
+/**
+ * More than one orchestrator is ready and a person is at the terminal:
+ * list them and ask, Enter keeping the planner's pick. Null when nothing
+ * was asked (not a terminal) or the input ended.
+ */
+async function pickOrchestrator(
+  candidates: readonly FusionSetupLeg[],
+  prompter: SetupPrompter,
+  write: (t: string) => void,
+): Promise<string | null> {
+  write(
+    [
+      "More than one strong model can orchestrate:",
+      ...candidates.map(
+        (c, i) => `  ${i + 1}) ${legName(c)}  — ${price(c)}${i === 0 ? "  (suggested)" : ""}`,
+      ),
+      "",
+    ].join("\n"),
+  );
+  let question = `Which one? [1-${candidates.length}, Enter = 1] `;
+  for (;;) {
+    const answer = await prompter.ask(question);
+    if (answer === "no-tty" || answer === null) return null;
+    const t = answer.trim();
+    if (t === "") return candidates[0]!.providerId;
+    const n = Number(t);
+    if (Number.isInteger(n) && n >= 1 && n <= candidates.length) return candidates[n - 1]!.providerId;
+    const byId = candidates.find((c) => c.providerId === t);
+    if (byId) return byId.providerId;
+    question = `Type a number from 1 to ${candidates.length} (Enter = 1): `;
+  }
+}
+
 async function setupFusion(args: readonly string[], deps: SetupCommandDeps): Promise<number> {
+  const prompter = createSetupPrompter(deps.terminal);
+  try {
+    return await runSetupFusion(args, deps, prompter);
+  } finally {
+    prompter.close();
+  }
+}
+
+async function runSetupFusion(
+  args: readonly string[],
+  deps: SetupCommandDeps,
+  prompter: SetupPrompter,
+): Promise<number> {
   const write = deps.write ?? ((t: string) => { process.stdout.write(t); });
   let yes = false;
   let dryRun = false;
   let judge = false;
   let isolation = false;
-  for (const a of args) {
+  let orchestrator: string | undefined;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
     if (a === "--yes" || a === "-y") yes = true;
     else if (a === "--dry-run") dryRun = true;
     else if (a === "--judge") judge = true;
     else if (a === "--isolation") isolation = true;
+    else if (a === "--orchestrator") {
+      const v = args[++i];
+      if (!v || v.startsWith("-")) { write(`--orchestrator needs a provider id\n\n${HELP}\n`); return 2; }
+      orchestrator = v;
+    }
     else if (a === "-h" || a === "--help") { write(`${HELP}\n`); return 0; }
     else { write(`unknown option "${a}"\n\n${HELP}\n`); return 2; }
   }
@@ -128,7 +195,14 @@ async function setupFusion(args: readonly string[], deps: SetupCommandDeps): Pro
     write(`${err.message}\n\nFix or move ${configPath}, then run this again. Nothing was written.\n`);
     return 1;
   }
-  const plan = planFusionSetup(facts, { judge, isolation });
+  let plan = planFusionSetup(facts, { judge, isolation, ...(orchestrator ? { orchestrator } : {}) });
+  if (plan.ok && plan.candidates.length > 1 && !yes && !dryRun && orchestrator === undefined && prompter.isTerminal) {
+    const picked = await pickOrchestrator(plan.candidates, prompter, write);
+    if (picked !== null && picked !== plan.orchestrator.providerId) {
+      plan = planFusionSetup(facts, { judge, isolation, orchestrator: picked });
+    }
+    write("\n");
+  }
   write(renderFusionPlan(plan));
   if (!plan.ok) return 1;
   if (plan.changes.length === 0) {
@@ -140,7 +214,13 @@ async function setupFusion(args: readonly string[], deps: SetupCommandDeps): Pro
     return 0;
   }
   if (!yes) {
-    const answer = await (deps.confirm ?? terminalConfirm)("Apply these changes? [y/N] ");
+    const confirm =
+      deps.confirm ??
+      (async (q: string) => {
+        const a = await prompter.ask(q);
+        return a === "no-tty" ? a : a !== null && /^(y|yes)$/i.test(a.trim());
+      });
+    const answer = await confirm("Apply these changes? [y/N] ");
     if (answer === "no-tty") {
       write("Not a terminal, so nothing was asked or written; re-run with --yes to apply.\n");
       return 1;
