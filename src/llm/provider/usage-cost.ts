@@ -86,6 +86,39 @@ export function isLongContextUsage(
   return long !== undefined && usage.promptTokens > long.thresholdTokens;
 }
 
+/** Every rate of one share of a completion, USD per million tokens. */
+export interface UsageRates {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+}
+
+/**
+ * The long-context block's rates, or `undefined` without one. A cache
+ * rate the block leaves out keeps the base model's ratio to its input
+ * (`long.input x base.cacheWrite / base.input`): vendors scale the cache
+ * rates with the input rate. With no base cache rate (or a free base
+ * input, where no ratio exists) it is the long input rate, or the base
+ * cache rate when that is higher.
+ */
+export function longContextRates(
+  pricing: NonNullable<ResolvedModel["pricing"]>,
+): UsageRates | undefined {
+  const long = pricing.longContext;
+  if (long === undefined) return undefined;
+  const scaled = (base: number | undefined): number => {
+    if (base === undefined) return long.input;
+    return pricing.input > 0 ? (long.input * base) / pricing.input : Math.max(long.input, base);
+  };
+  return {
+    input: long.input,
+    output: long.output,
+    cacheRead: long.cacheRead ?? scaled(pricing.cacheRead),
+    cacheWrite: long.cacheWrite ?? scaled(pricing.cacheWrite),
+  };
+}
+
 function estimate(
   usage: CompletionUsage,
   pricing: NonNullable<ResolvedModel["pricing"]> | undefined,
@@ -95,11 +128,11 @@ function estimate(
   if (reported !== undefined) return reported;
   if (pricing === undefined) return 0;
   // A prompt above the long-context threshold is billed entirely at the
-  // long-context rates; unknown cache rates there fall back to its input.
-  const long = pricing.longContext;
+  // long-context rates (`longContextRates`).
+  const long = longContextRates(pricing);
   const rates =
     long !== undefined && oneCompletion && isLongContextUsage(usage, pricing)
-      ? { input: long.input, output: long.output, cacheRead: long.cacheRead ?? long.input, cacheWrite: long.cacheWrite ?? long.input }
+      ? long
       : { input: pricing.input, output: pricing.output, cacheRead: pricing.cacheRead ?? pricing.input, cacheWrite: pricing.cacheWrite ?? pricing.input };
   const cached = Math.min(
     Math.max(0, usage.cachedTokens ?? 0),

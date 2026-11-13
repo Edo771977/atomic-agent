@@ -196,6 +196,15 @@ describe("request budget scope", () => {
       expect(spent(budget)).toBeCloseTo(2 * (1_000 * 3 + 1_000 * 15) / 1_000_000, 9);
     });
 
+    it("reserves a long-context cache-write rate derived from the base ratio", () => {
+      // No long cacheWrite: 6 x (3.75 / 3) = $7.50, above the long input rate.
+      const priced = { ...model, pricing: { ...model.pricing!, longContext: { thresholdTokens: 100_000, input: 6, output: 22.5 } } } as ResolvedModel;
+      const body = () => ({ model: "m", messages: [{ role: "user", content: "a".repeat(120_000) }] });
+      // At $6 the bound is ~$0.83; at $7.50 ~$1.01.
+      expect(() => scoped(0.9, priced).scope().beforeSend(body())).toThrow(/budget|cap/i);
+      expect(() => scoped(1.1, priced).scope().beforeSend(body())).not.toThrow();
+    });
+
     it("reserves long-context rates when the bound input can exceed the threshold", () => {
       const priced = { ...model, pricing: { ...model.pricing!, longContext: { thresholdTokens: 100_000, input: 6, output: 22.5, cacheWrite: 7.5, cacheRead: 0.6 } } } as ResolvedModel;
       const body = () => ({ model: "m", messages: [{ role: "user", content: "a".repeat(120_000) }] });

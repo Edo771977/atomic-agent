@@ -2,7 +2,7 @@ import type { CompletionRequest, CompletionRequestBudget, CompletionResult, Comp
 import type { LlmProvider } from "../llm/provider/llm-provider.js";
 import type { LlmProviderConfigEntry } from "../llm/provider/registry/provider-types.js";
 import type { ResolvedModel } from "../llm/provider/model-resolver.js";
-import { completionCostUsd, reportedCostUsd } from "../llm/provider/usage-cost.js";
+import { completionCostUsd, longContextRates, reportedCostUsd } from "../llm/provider/usage-cost.js";
 import { readErrnoCode } from "../llm/errno-code.js";
 import { modelParamProfile } from "../llm/provider/openai/model-params.js";
 import type { FusionTurnBudget } from "../tools/fusion/turn-budget.js";
@@ -149,9 +149,10 @@ export function createRequestBudgetScope(
       const multiplier = serviceTierMultiplier(body, pricing!);
       // The bound can cross a long-context threshold the real prompt does
       // not: reserving the higher tier then only overestimates.
-      const long = pricing!.longContext !== undefined && inputTokens > pricing!.longContext.thresholdTokens ? pricing!.longContext : undefined;
+      const long = pricing!.longContext !== undefined && inputTokens > pricing!.longContext.thresholdTokens ? longContextRates(pricing!) : undefined;
       const inputRates = [pricing!.input, pricing!.cacheWrite ?? pricing!.input, pricing!.cacheRead ?? pricing!.input];
-      if (long !== undefined) inputRates.push(long.input, long.cacheWrite ?? long.input, long.cacheRead ?? long.input);
+      // Missing long cache rates are derived exactly as settlement derives them.
+      if (long !== undefined) inputRates.push(long.input, long.cacheWrite, long.cacheRead);
       const inputRate = Math.max(...inputRates);
       const outputRate = long === undefined ? pricing!.output : Math.max(pricing!.output, long.output);
       const copies = [body.n, body.best_of].filter(value => value !== undefined);

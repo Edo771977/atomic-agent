@@ -135,6 +135,15 @@ describe("long-context pricing", () => {
     expect(estimateSummedUsageCostUsd({ ...summed, costUsd: 0.5 }, pricing)).toBe(0.5);
   });
 
+  it("derives missing long-context cache rates from the base cache ratios", () => {
+    const usd = estimateUsageCostUsd(
+      { promptTokens: 300_000, completionTokens: 0, totalTokens: 300_000, cachedTokens: 100_000, cacheWriteTokens: 50_000 },
+      { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75, longContext: { thresholdTokens: 200_000, input: 6, output: 22.5 } },
+    );
+    // Writes at 6 x 3.75/3 = 7.5, reads at 6 x 0.3/3 = 0.6.
+    expect(usd).toBeCloseTo((150_000 * 6 + 100_000 * 0.6 + 50_000 * 7.5) / 1_000_000, 9);
+  });
+
   it("still lets a reported bill win", () => {
     expect(completionCostUsd({ promptTokens: 300_000, completionTokens: 0, totalTokens: 300_000, costUsd: 0.5 }, pricing)).toBe(0.5);
   });
