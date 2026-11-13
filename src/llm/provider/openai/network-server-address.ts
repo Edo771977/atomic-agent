@@ -29,7 +29,9 @@ const SCHEME = /^[a-z][a-z0-9+.-]*:\/\//i;
  * `true` for a server on the local network that is not this machine:
  * RFC 1918 / link-local / unique-local / CGNAT-Tailscale (100.64/10)
  * addresses (also written IPv4-mapped, `[::ffff:192.168.1.20]`) and
- * `.local`, `.lan`, `.internal`, `.home.arpa` or single-label names.
+ * the own-network names `isLocalServerUrl` lists (`.local`, `.lan`,
+ * `.ts.net`, ..., nip.io / sslip.io by the address they spell) or
+ * single-label names.
  * Loopback (the whole 127/8 block included) and the unspecified `0.0.0.0`
  * / `::` are this machine and answer `false`.
  */

@@ -130,6 +130,42 @@ describe("address classification edge cases", () => {
     }
   });
 
+  it("counts private-network name suffixes as the operator's network", () => {
+    for (const url of [
+      "https://gpu.tail1234.ts.net",
+      "https://nas.home",
+      "https://gpu.localdomain",
+      "http://localhost.localdomain",
+      "https://gpu.corp",
+      "https://wiki.intranet:8443",
+    ]) {
+      expect(isOtherComputerOnNetworkUrl(url), url).toBe(true);
+    }
+    // Only as a whole label: a public name that merely ends in the letters.
+    for (const url of ["https://example.com", "https://notts.net", "https://myhome", "https://mycorp.com"]) {
+      expect(isOtherComputerOnNetworkUrl(url), url).toBe(url === "https://myhome");
+    }
+  });
+
+  it("classifies a nip.io / sslip.io name by the address inside it", () => {
+    for (const url of [
+      "https://192.168.1.5.nip.io",
+      "https://app.10.0.0.7.sslip.io",
+      "https://192-168-1-5.nip.io",
+      "https://app-10-0-0-7.sslip.io",
+      "https://c0a80105.nip.io",
+      // Unreadable: the name resolves to whatever is inside, so conservatively ours.
+      "https://whatever.nip.io",
+      // Loopback inside a public DNS name is not "this machine" lexically.
+      "http://127.0.0.1.nip.io",
+    ]) {
+      expect(isOtherComputerOnNetworkUrl(url), url).toBe(true);
+    }
+    for (const url of ["https://8.8.8.8.nip.io", "https://8-8-8-8.sslip.io", "https://08080808.nip.io"]) {
+      expect(isOtherComputerOnNetworkUrl(url), url).toBe(false);
+    }
+  });
+
   it("treats the IPv6 unspecified address like 0.0.0.0: this machine", () => {
     expect(isLocalProviderUrl("http://[::]:8080")).toBe(true);
     expect(isLocalServerUrl("http://[::]:8080")).toBe(true);

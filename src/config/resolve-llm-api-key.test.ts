@@ -113,6 +113,22 @@ describe("resolveLlmProviderApiKey: the shared OpenAI key goes only over https o
     expect(resolveLlmProviderApiKey({ ...compat("http://8.8.8.8"), kind: "qwen-openai-compatible" })).toBeUndefined();
   });
 
+  it("sends no shared key over https to a name of the operator's own network", () => {
+    withSharedKey();
+    for (const url of [
+      "https://gpu.tail1234.ts.net",
+      "https://nas.home",
+      "https://gpu.localdomain",
+      "https://gpu.corp",
+      "https://wiki.intranet",
+      "https://192.168.1.5.nip.io",
+      "https://whatever.sslip.io",
+    ]) {
+      expect(resolveLlmProviderApiKey(compat(url)), url).toBeUndefined();
+    }
+    expect(resolveLlmProviderApiKey(compat("https://8.8.8.8.nip.io"))).toBe("sk-shared");
+  });
+
   it("keeps the fallback over plain http to this machine", () => {
     withSharedKey();
     for (const url of ["http://localhost:8080", "http://127.0.0.2:8080", "http://[::1]:8080", "http://0.0.0.0:8080", "http://[::]:8080", "http://localhost.:8080"]) {
