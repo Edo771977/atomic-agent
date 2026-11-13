@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { mkdtempSync, rmSync, readFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -133,6 +133,73 @@ describe("ZipBackend", () => {
           /entry_exceeds_max_entry_bytes/.test(s.reason),
         ),
       ).toBe(true);
+    });
+  });
+});
+
+describe("ZipBackend symlink containment", () => {
+  const LINK = { unixPermissions: 0o120777 };
+
+  it("does not write through a chain of symlinks the archive created", async () => {
+    const zip = new JSZip();
+    zip.folder("x");
+    zip.file("x/up", "..", LINK);
+    zip.file("x/up/e", "..", LINK);
+    zip.file("x/up/e/pwned.txt", "pwned");
+    const buf = await zip.generateAsync({ type: "nodebuffer", platform: "UNIX" });
+    await withTmp(async (root) => {
+      const dest = join(root, "ws", "out");
+      const report = await new ZipBackend().extract(buf, {
+        destDir: dest,
+        overwrite: true,
+        followSymlinks: true,
+        limits: DEFAULT_EXTRACT_LIMITS,
+      });
+      expect(existsSync(join(root, "ws", "pwned.txt"))).toBe(false);
+      expect(existsSync(join(dest, "pwned.txt"))).toBe(false);
+      expect(
+        report.skippedEntries.some((s) => s.path === "x/up/e/pwned.txt"),
+      ).toBe(true);
+    });
+  });
+
+  it("removes an escaping chained link even when extraction fails later", async () => {
+    const zip = new JSZip();
+    zip.folder("d");
+    zip.file("d/b", "..", LINK);
+    zip.file("a", "d/b/..", LINK);
+    // A file over an existing directory: the write throws (EISDIR).
+    zip.folder("z");
+    zip.file("z", "boom");
+    const buf = await zip.generateAsync({ type: "nodebuffer", platform: "UNIX" });
+    await withTmp(async (root) => {
+      const dest = join(root, "out");
+      await expect(
+        new ZipBackend().extract(buf, {
+          destDir: dest,
+          overwrite: true,
+          followSymlinks: true,
+          limits: DEFAULT_EXTRACT_LIMITS,
+        }),
+      ).rejects.toThrow();
+      expect(() => lstatSync(join(dest, "a"))).toThrow();
+      expect(existsSync(join(dest, "d", "b"))).toBe(true);
+    });
+  });
+
+  it("keeps a symlink that stays inside destDir", async () => {
+    const zip = new JSZip();
+    zip.file("real.txt", "ok");
+    zip.file("alias", "real.txt", LINK);
+    const buf = await zip.generateAsync({ type: "nodebuffer", platform: "UNIX" });
+    await withTmp(async (dest) => {
+      await new ZipBackend().extract(buf, {
+        destDir: dest,
+        overwrite: true,
+        followSymlinks: true,
+        limits: DEFAULT_EXTRACT_LIMITS,
+      });
+      expect(await readFile(join(dest, "alias"), "utf8")).toBe("ok");
     });
   });
 });

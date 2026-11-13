@@ -260,3 +260,111 @@ describe("a read outside the scope asks through the ladder", () => {
     expect(widenedReadRoot(join(work, "src", "absent.ts"))).toBe(join(work, "src"));
   });
 });
+
+describe("a read naming several outside paths asks about each", () => {
+  let work: string;
+  let registry: ToolRegistry;
+  let gate: ApprovalGate;
+  let prompts: ApprovalRequest[];
+  let decide: (request: ApprovalRequest) => { approved: boolean; grant?: "category" };
+  let ran: number;
+
+  beforeEach(() => {
+    work = mkdtempSync(join(tmpdir(), "read-ask-multi-"));
+    prompts = [];
+    ran = 0;
+    decide = () => ({ approved: true });
+    gate = new ApprovalGate({
+      level: 3 as ApprovalLevel,
+      emit: (request) => {
+        prompts.push(request);
+        queueMicrotask(() =>
+          gate.resolve({ approvalId: request.approvalId, ...decide(request) }),
+        );
+      },
+    });
+    registry = new ToolRegistry();
+    for (const name of ["os.fs.diff", "os.fs.move", "verify.syntax"]) {
+      registry.register({
+        name,
+        description: name,
+        readonly: true,
+        run: async () => {
+          ran += 1;
+          return compressToolResult({ tool: name, status: "ok", output: "", details: {} });
+        },
+      });
+    }
+    confineReads(registry, {
+      grantedDirs: () => [],
+      readScope: () => "working-dir",
+      approvals: { approvals: gate, approvalRequired: true },
+      shellEnv: { home: "/srv/homes/me", platform: "linux" },
+    });
+  });
+
+  afterEach(() => {
+    rmSync(work, { recursive: true, force: true });
+  });
+
+  const ctx = (): ToolContext => ({
+    sessionId: "s-plain",
+    workingDir: work,
+    stepIndex: 0,
+    signal: new AbortController().signal,
+  });
+
+  it("a yes for the first path does not let the second through unasked", async () => {
+    const result = await registry.invoke(
+      "os.fs.diff",
+      { aPath: "/srv/public/notes.txt", bPath: "/root/.ssh/id_rsa" },
+      ctx(),
+    );
+    expect(result.status).toBe("ok");
+    expect(prompts.map((p) => p.affectedResources)).toEqual([
+      ["/srv/public"],
+      ["/root/.ssh"],
+    ]);
+    expect(ran).toBe(1);
+  });
+
+  it("a no for a later path refuses the whole call", async () => {
+    decide = (request) => ({
+      approved: !(request.affectedResources ?? []).includes("/root/.ssh"),
+    });
+    const result = await registry.invoke(
+      "os.fs.diff",
+      { aPath: "/srv/public/notes.txt", bPath: "/root/.ssh/id_rsa" },
+      ctx(),
+    );
+    expect(result.status).toBe("error");
+    expect(prompts).toHaveLength(2);
+    expect(ran).toBe(0);
+  });
+
+  it("checks every move source and every syntax-check file", async () => {
+    await registry.invoke(
+      "os.fs.move",
+      { moves: [{ from: "/srv/a/x", to: "x" }, { from: "/srv/b/y", to: "y" }] },
+      ctx(),
+    );
+    await registry.invoke("verify.syntax", { files: ["/srv/c/1.ts", "/srv/d/2.ts"] }, ctx());
+    expect(prompts.map((p) => p.affectedResources)).toEqual([
+      ["/srv/a"],
+      ["/srv/b"],
+      ["/srv/c"],
+      ["/srv/d"],
+    ]);
+    expect(ran).toBe(2);
+  });
+
+  it("paths under one approved directory are asked about once", async () => {
+    await registry.invoke(
+      "os.fs.diff",
+      { aPath: "/srv/public/a.txt", bPath: "/srv/public/b.txt" },
+      ctx(),
+    );
+    expect(prompts).toHaveLength(1);
+    expect(ran).toBe(1);
+  });
+});

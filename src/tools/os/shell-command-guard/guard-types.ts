@@ -10,6 +10,21 @@ export interface GuardInput {
   cmd: string;
   rawArgs: readonly string[];
   cwd: string;
+  /**
+   * The full line handed to the OS shell, when the command runs in a
+   * subshell. `cmd`/`rawArgs` are then only its whitespace tokens, which
+   * lose newlines and blur where one command ends and the next begins,
+   * so the engine reads this to keep a first-word allow from covering a
+   * chained command.
+   */
+  shellLine?: string;
+  /**
+   * `"posix"` when `shellLine` runs under `sh -c`: its single-quoted
+   * spans are literal text, so metacharacters inside them do not make
+   * the line compound. Absent (cmd.exe, which has no single quotes):
+   * every metacharacter counts.
+   */
+  shellQuoting?: "posix";
 }
 
 export interface NormalisedCommand {

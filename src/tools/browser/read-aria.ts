@@ -9,6 +9,7 @@ import {
   type BrowserDomainPolicy,
 } from "./browser-domain-policy.js";
 import { AriaSnapshotStore, parseAriaViewMode, readAriaView } from "./aria-view.js";
+import { localPageMessage } from "./gate-page-read.js";
 
 const REF_PATTERN = /^[a-zA-Z0-9]+$/;
 
@@ -57,6 +58,7 @@ export function buildBrowserReadAriaTool(
           ...(ctx.modelMode ? { modelMode: ctx.modelMode } : {}),
           ...(ctx.contextWindowTokens !== undefined ? { contextWindowTokens: ctx.contextWindowTokens } : {}),
           sessionId: ctx.sessionId,
+          local: { reader: ctx },
         },
         policy,
         store,
@@ -76,6 +78,14 @@ export function buildBrowserReadAriaTool(
           status: "error",
           output: `browser.read_aria: ${result.host} has not been opened in your own Chrome this session`,
           details: { host: result.host, reason: "user_site_not_cleared" },
+        });
+      }
+      if (result.kind === "local_file_refused") {
+        return compressToolResult({
+          tool: "browser.read_aria",
+          status: "error",
+          output: localPageMessage("browser.read_aria", result.path, result.why),
+          details: { path: result.path, reason: "local_file_refused" },
         });
       }
       if (result.kind === "error") {

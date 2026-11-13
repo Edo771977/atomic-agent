@@ -64,7 +64,9 @@ export function buildBrowserTypeTool(
         clearFirst: rawArgs.clearFirst === true,
       });
       if (pressEnter) {
-        const landed = await recheckLandedPage(backend, policy, "browser.type");
+        const landed = await recheckLandedPage(backend, policy, "browser.type", undefined, {
+          reader: ctx,
+        });
         if (landed) return landed;
       }
       return compressToolResult({

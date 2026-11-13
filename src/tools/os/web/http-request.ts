@@ -106,6 +106,8 @@ export function buildOsHttpRequestTool(
             cwd: ctx.workingDir,
             signal: ctx.signal,
             maxResponseBytes: httpCfg.maxResponseBytes,
+            isHostAllowed: (hostname) =>
+              hostAllowed(hostname, httpCfg.hostAllowlist),
           },
         );
       } catch (err) {

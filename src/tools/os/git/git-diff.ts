@@ -1,6 +1,6 @@
 import { compressToolResult } from "../../../compressor/result-compressor.js";
 import type { ToolDefinition } from "../../tool-registry.js";
-import { requireGitSuccess, runGit } from "./git-runner.js";
+import { requireGitSuccess, revisionArg, runGit } from "./git-runner.js";
 
 export const osGitDiffTool: ToolDefinition = {
   name: "os.git.diff",
@@ -12,7 +12,7 @@ export const osGitDiffTool: ToolDefinition = {
     const revisionRange =
       typeof rawArgs.revisionRange === "string" &&
       rawArgs.revisionRange.length > 0
-        ? rawArgs.revisionRange
+        ? revisionArg("os.git.diff", "revisionRange", rawArgs.revisionRange)
         : undefined;
     const staged = rawArgs.staged === true;
     const context = parseContext(rawArgs.context, 3);

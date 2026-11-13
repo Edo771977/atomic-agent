@@ -193,7 +193,14 @@ export function buildOsShellTool(options: OsShellToolOptions): ToolDefinition {
       : null;
     const guardInput =
       useShell && guardTokens && guardTokens.length > 0
-        ? { cmd: guardTokens[0]!, rawArgs: guardTokens.slice(1), cwd }
+        ? {
+            cmd: guardTokens[0]!,
+            rawArgs: guardTokens.slice(1),
+            cwd,
+            shellLine: commandLine,
+            // `sh -c` on POSIX; cmd.exe has no single quotes.
+            ...(process.platform === "win32" ? {} : { shellQuoting: "posix" as const }),
+          }
         : { cmd, rawArgs: execArgs, cwd };
     const gogProbe = guardInput.cmd;
 

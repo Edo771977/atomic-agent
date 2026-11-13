@@ -120,6 +120,12 @@ export interface ExecuteGuardedHttpOptions {
   retry?: HttpRetryConfig;
   /** Injectable sleep so retry-backoff tests do not wait in real time. */
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
+  /**
+   * The caller's host allowlist, applied to every redirect hop: a
+   * Location outside it is not followed and the request fails. Omitted
+   * means no restriction.
+   */
+  isHostAllowed?: (hostname: string) => boolean;
 }
 
 /**
@@ -377,6 +383,12 @@ async function sendGuardedRequestOnce(
       const nextMethod: HttpMethod = dropsToGet ? "GET" : method;
       const nextBody = dropsToGet ? undefined : body;
       const nextUrl = parseHttpUrl(parsed.redirectUrl);
+      if (opts.isHostAllowed && !opts.isHostAllowed(nextUrl.hostname)) {
+        throw new Error(
+          `os.http.request: ${currentUrl.toString()} redirected to ${nextUrl.toString()}, ` +
+            `whose host ${nextUrl.hostname} is not in config.http.hostAllowlist; the redirect was not followed`,
+        );
+      }
       // A POST (or any hop with a body) is approved for the origin the
       // person saw. A 307/308 that would carry it to another origin is
       // not followed: the model gets the Location back and has to make a

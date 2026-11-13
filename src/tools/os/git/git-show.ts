@@ -1,6 +1,6 @@
 import { compressToolResult } from "../../../compressor/result-compressor.js";
 import type { ToolDefinition } from "../../tool-registry.js";
-import { requireGitSuccess, runGit } from "./git-runner.js";
+import { requireGitSuccess, revisionArg, runGit } from "./git-runner.js";
 
 export interface GitShowFileChange {
   path: string;
@@ -19,7 +19,7 @@ export const osGitShowTool: ToolDefinition = {
     const repo = typeof rawArgs.repo === "string" ? rawArgs.repo : undefined;
     const revision =
       typeof rawArgs.revision === "string" && rawArgs.revision.length > 0
-        ? rawArgs.revision
+        ? revisionArg("os.git.show", "revision", rawArgs.revision)
         : "HEAD";
     const includePatch = rawArgs.patch !== false;
 

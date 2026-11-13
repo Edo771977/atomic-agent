@@ -685,11 +685,13 @@ export class ApprovalGate {
         ? `auto-approved (session grant: ${host})`
         : null;
     }
-    if (request.grantKey !== undefined) {
-      // A keyed request (an HTTP call to one origin) is answered only by
-      // a grant for the same key, never by a whole-category grant.
-      if (grants.scoped.has(scopedGrantId(request.category, request.grantKey))) {
-        return `auto-approved (session grant: ${request.grantKey})`;
+    const grantKey = sessionGrantKey(request);
+    if (grantKey !== undefined) {
+      // A keyed request (an HTTP call to one origin, one MCP tool) is
+      // answered only by a grant for the same key, never by a
+      // whole-category grant.
+      if (grants.scoped.has(scopedGrantId(request.category, grantKey))) {
+        return `auto-approved (session grant: ${grantKey})`;
       }
       return null;
     }
@@ -974,8 +976,9 @@ export class ApprovalGate {
     }
     const grants = this.grantsForSession(request.sessionId);
     if (scope === "category") {
-      if (request.grantKey !== undefined) {
-        grants.scoped.add(scopedGrantId(request.category, request.grantKey));
+      const grantKey = sessionGrantKey(request);
+      if (grantKey !== undefined) {
+        grants.scoped.add(scopedGrantId(request.category, grantKey));
         return;
       }
       grants.categories.add(request.category);
@@ -1092,6 +1095,19 @@ export class ApprovalGate {
   pendingCount(): number {
     return this.pending.size;
   }
+}
+
+/**
+ * The key a session grant on `request` is stored and matched under.
+ * `other` is the catch-all category (MCP tools, filesystem mutations
+ * outside home, uncategorised tools), so a key-less grant there would let
+ * "allow in this chat" on one tool silence every other tool that asks as
+ * `other`. A key-less `other` request is therefore keyed by its tool name.
+ */
+function sessionGrantKey(request: ApprovalRequest): string | undefined {
+  if (request.grantKey !== undefined) return request.grantKey;
+  if (request.category === "other") return `tool:${request.tool}`;
+  return undefined;
 }
 
 /**

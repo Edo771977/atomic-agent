@@ -13,6 +13,9 @@ import {
   type BrowserDomainPolicy,
 } from "./browser-domain-policy.js";
 import { gateBrowserUrl, recheckLandedPage } from "./gate-browser-url.js";
+import { statSync } from "node:fs";
+import { dirname, sep } from "node:path";
+import { localFileOfUrl } from "../read-scope/read-scope-targets.js";
 
 const SAFE_SCHEMES = new Set(["http:", "https:"]);
 
@@ -25,6 +28,32 @@ export function isSafeUrl(url: string): boolean {
   try {
     const parsed = new URL(url);
     return SAFE_SCHEMES.has(parsed.protocol);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * What a `browser_nonweb` session grant on `url` covers. A local page is
+ * granted per directory (`file:<dir>`), so "allow in this chat" on one
+ * HTML report never covers every file:// URL on the machine. Other
+ * non-web URLs keep the whole-category grant. A directory URL (a
+ * `file://` listing, `…/dir/` or a path that is a directory) keys to that
+ * directory itself, never to its parent.
+ */
+export function nonWebGrantKey(url: string): string | undefined {
+  const file = localFileOfUrl(url);
+  if (file === null) return undefined;
+  if (/[\\/]$/.test(file)) {
+    const trimmed = file.replace(/[\\/]+$/, "");
+    return `file:${trimmed === "" ? sep : trimmed}`;
+  }
+  return `file:${isDirectory(file) ? file : dirname(file)}`;
+}
+
+function isDirectory(path: string): boolean {
+  try {
+    return statSync(path).isDirectory();
   } catch {
     return false;
   }
@@ -74,12 +103,14 @@ export function buildBrowserNavigateTool(
       const refused = await gateBrowserUrl(options, policy, "browser.navigate", url, ctx);
       if (refused) return refused;
       if (!isSafeUrl(url)) {
+        const grantKey = nonWebGrantKey(url);
         await requireApproval(
           options,
           {
             sessionId: ctx.sessionId,
             tool: "browser.navigate",
             category: "browser_nonweb",
+            ...(grantKey !== undefined ? { grantKey } : {}),
             reason: "non-http(s) URL requested",
             preview: url,
             affectedResources: [url],
@@ -95,9 +126,12 @@ export function buildBrowserNavigateTool(
         ...(waitUntil !== undefined ? { waitUntil } : {}),
         ...(timeoutMs !== undefined ? { timeoutMs } : {}),
       });
-      const landed = await recheckLandedPage(backend, policy, "browser.navigate", result.url);
+      const landed = await recheckLandedPage(backend, policy, "browser.navigate", result.url, {
+        reader: ctx,
+        allowUrl: url,
+      });
       if (landed) return landed;
-      const worldSnapshot = await captureWorldSnapshot(backend, ctx, policy, store);
+      const worldSnapshot = await captureWorldSnapshot(backend, ctx, policy, store, url);
       return compressToolResult({
         tool: "browser.navigate",
         status: "ok",

@@ -251,6 +251,61 @@ describe("ApprovalGate", () => {
     expect(emitted).toBe(4);
   });
 
+  it("an `other` grant for one tool never answers another tool's request", async () => {
+    const asked: string[] = [];
+    const gate = new ApprovalGate({
+      level: 3,
+      emit: (req) => {
+        asked.push(req.tool);
+        setImmediate(() =>
+          gate.resolve({
+            approvalId: req.approvalId,
+            approved: true,
+            grant: "category",
+          }),
+        );
+      },
+    });
+    const mcp = {
+      sessionId: "s",
+      tool: "mcp__weather__forecast",
+      category: "other",
+      reason: "call MCP tool forecast on server weather",
+      grantKey: "mcp__weather__forecast",
+    } as const;
+    await gate.request(mcp);
+    // Neither a keyed MCP grant nor a key-less `other` grant is a
+    // whole-category grant.
+    expect(gate.sessionGrants("s").categories).toEqual([]);
+    const write = await gate.request({
+      sessionId: "s",
+      tool: "os.fs.write",
+      category: "other",
+      reason: "write /etc/cron.d/x",
+    });
+    expect(write.reason ?? "").not.toMatch(/session grant/);
+    expect(asked).toEqual(["mcp__weather__forecast", "os.fs.write"]);
+    expect(gate.sessionGrants("s").categories).toEqual([]);
+
+    // Each grant still answers its own tool.
+    await gate.request(mcp);
+    await gate.request({
+      sessionId: "s",
+      tool: "os.fs.write",
+      category: "other",
+      reason: "write /etc/cron.d/y",
+    });
+    expect(asked).toHaveLength(2);
+    // A key-less `other` grant on os.fs.write never answers a third tool.
+    await gate.request({
+      sessionId: "s",
+      tool: "os.fs.trash",
+      category: "other",
+      reason: "trash /etc/x",
+    });
+    expect(asked).toHaveLength(3);
+  });
+
   it("a whole-category grant does not answer a keyed request (ATO-1182)", async () => {
     let emitted = 0;
     const gate = new ApprovalGate({

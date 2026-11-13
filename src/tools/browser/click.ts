@@ -61,7 +61,9 @@ export function buildBrowserClickTool(
         ...(modifiers !== undefined ? { modifiers } : {}),
       };
       const result = await backend.click(payload);
-      const landed = await recheckLandedPage(backend, policy, "browser.click");
+      const landed = await recheckLandedPage(backend, policy, "browser.click", undefined, {
+        reader: ctx,
+      });
       if (landed) return landed;
       return compressToolResult({
         tool: "browser.click",

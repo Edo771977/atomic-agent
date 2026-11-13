@@ -135,9 +135,11 @@ export class ReadOutsideApprover {
   /**
    * Let `tool`'s call through, or not. `outsideOf(roots)` names the
    * first path the call reaches outside `roots` (or `null`); when there
-   * is one, the operator is asked with `promptFor(path, root)`. Resolves
-   * `null` when the call may run (nothing outside, or approved — and
-   * then `root` is remembered), or the refusal when it was denied.
+   * is one, the operator is asked with `promptFor(path, root)`, then the
+   * call is re-checked and every further outside path is asked about in
+   * turn. Resolves `null` when the call may run (nothing outside, or all
+   * approved — each `root` is remembered), or the refusal for the first
+   * path that was denied.
    */
   admit(
     tool: string,
@@ -146,37 +148,45 @@ export class ReadOutsideApprover {
     promptFor: (path: string, root: string) => ReadOutsidePrompt,
   ): Promise<CompressedToolResult | null> {
     return this.queue.run(ctx.sessionId, async () => {
-      const roots = this.roots(ctx);
-      const path = outsideOf(roots);
-      if (path === null) return null;
-      const root = widenedReadRoot(path);
-      const prompt = promptFor(path, root);
-      try {
-        await requireApproval(
-          this.options,
-          {
-            sessionId: ctx.sessionId,
-            tool,
-            category: "fs_read_outside",
-            reason: prompt.reason,
-            ...(prompt.preview !== undefined ? { preview: prompt.preview } : {}),
-            affectedResources: [root],
-          },
-          ctx.signal,
-        );
-      } catch (err) {
-        if (err instanceof ApprovalDeniedError) {
-          // A repeat the gate refused because the user already said no
-          // keeps the gate's words: the scope sentence would invite the
-          // model to ask for the very path the user just declined.
-          return err.byUser || err.declinedEarlier
-            ? sessionReadDeclined(tool, path, roots, err.message)
-            : sessionReadRefusal(tool, path, ctx, roots);
+      // A call can name several paths outside the scope (`os.fs.diff`'s
+      // two sides, every `os.fs.move` source): re-check after each yes
+      // and ask about the next one, so a yes for one path never lets
+      // another through unasked. Paths approved during this call count
+      // as roots, so none is asked about twice.
+      const approved: string[] = [];
+      for (;;) {
+        const roots = [...this.roots(ctx), ...approved];
+        const path = outsideOf(roots);
+        if (path === null) return null;
+        const root = widenedReadRoot(path);
+        const prompt = promptFor(path, root);
+        try {
+          await requireApproval(
+            this.options,
+            {
+              sessionId: ctx.sessionId,
+              tool,
+              category: "fs_read_outside",
+              reason: prompt.reason,
+              ...(prompt.preview !== undefined ? { preview: prompt.preview } : {}),
+              affectedResources: [root],
+            },
+            ctx.signal,
+          );
+        } catch (err) {
+          if (err instanceof ApprovalDeniedError) {
+            // A repeat the gate refused because the user already said no
+            // keeps the gate's words: the scope sentence would invite the
+            // model to ask for the very path the user just declined.
+            return err.byUser || err.declinedEarlier
+              ? sessionReadDeclined(tool, path, roots, err.message)
+              : sessionReadRefusal(tool, path, ctx, roots);
+          }
+          throw err;
         }
-        throw err;
+        this.options.approvals.readScopeGrants.widen(ctx.sessionId, root);
+        approved.push(path);
       }
-      this.options.approvals.readScopeGrants.widen(ctx.sessionId, root);
-      return null;
     });
   }
 

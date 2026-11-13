@@ -905,3 +905,56 @@ describe("os.http.request", () => {
     expect(result.summary).toContain("not followed");
   });
 });
+
+describe("os.http.request host allowlist on redirects", () => {
+  function redirectingRun(
+    calls: string[][],
+    status: number,
+    location: string,
+  ) {
+    return async (
+      _cmd: string,
+      args: string[],
+      _opts: CommandOptions,
+    ): Promise<CommandResult> => {
+      calls.push(args);
+      const first = calls.length === 1;
+      return makeCommandResult({
+        stdout: first
+          ? "\n" + meta(status, "text/plain", 0, 0.01, location)
+          : "ok\n" + meta(200, "text/plain", 2),
+      });
+    };
+  }
+
+  function tool(calls: string[][], status: number, location: string) {
+    return buildOsHttpRequestTool({
+      lookup: publicLookup,
+      approvals: approveAll(),
+      approvalRequired: true,
+      config: makeHttpConfig({ hostAllowlist: ["api.example.com"] }),
+      runCommand: redirectingRun(calls, status, location),
+    });
+  }
+
+  it("does not follow a redirect to a host outside the allowlist", async () => {
+    const calls: string[][] = [];
+    await expect(
+      tool(calls, 302, "https://evil.example/collect").run(
+        { url: "https://api.example.com/data" },
+        makeCtx(),
+      ),
+    ).rejects.toThrow(/evil\.example.*hostAllowlist/);
+    expect(calls).toHaveLength(1);
+  });
+
+  it("still follows a redirect within the allowlist", async () => {
+    const calls: string[][] = [];
+    const result = await tool(calls, 302, "https://api.example.com/v2/data").run(
+      { url: "https://api.example.com/data" },
+      makeCtx(),
+    );
+    expect(calls).toHaveLength(2);
+    expect(result.status).toBe("ok");
+  });
+});

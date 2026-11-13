@@ -3,7 +3,7 @@ import { listingResultCaps } from "../../compressor/listing-caps.js";
 import type { ToolDefinition } from "../tool-registry.js";
 import { BROWSER_PAGE_SOURCE } from "../untrusted-tool-output.js";
 import type { BrowserBackend, TabsInput } from "./browser-backend.js";
-import { isSafeUrl, refuseScriptUrl } from "./navigate.js";
+import { isSafeUrl, nonWebGrantKey, refuseScriptUrl } from "./navigate.js";
 import {
   requireApproval,
   type DangerousToolOptions,
@@ -70,12 +70,14 @@ export function buildBrowserTabsTool(
         input.url !== undefined &&
         !isSafeUrl(input.url)
       ) {
+        const grantKey = nonWebGrantKey(input.url);
         await requireApproval(
           options,
           {
             sessionId: ctx.sessionId,
             tool: "browser.tabs",
             category: "browser_nonweb",
+            ...(grantKey !== undefined ? { grantKey } : {}),
             reason: "non-http(s) URL requested for new tab",
             preview: input.url,
             affectedResources: [input.url],
@@ -87,7 +89,10 @@ export function buildBrowserTabsTool(
       await backend.ensureReady();
       const result = await backend.tabs(input);
       if (action === "new" && input.url !== undefined) {
-        const landed = await recheckLandedPage(backend, policy, "browser.tabs");
+        const landed = await recheckLandedPage(backend, policy, "browser.tabs", undefined, {
+          reader: ctx,
+          allowUrl: input.url,
+        });
         if (landed) return landed;
       }
       const rendered = result.tabs

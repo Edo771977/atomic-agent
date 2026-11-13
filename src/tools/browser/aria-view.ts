@@ -5,7 +5,7 @@ import {
   EMPTY_DOMAIN_POLICY,
   type BrowserDomainPolicy,
 } from "./browser-domain-policy.js";
-import { gatePageRead, type PageReadAsk } from "./gate-page-read.js";
+import { gatePageRead, type LocalPageRead, type PageReadAsk } from "./gate-page-read.js";
 import {
   diffView,
   interactiveView,
@@ -37,6 +37,8 @@ export interface AriaViewContext {
   /** Context window of the model serving the step, when known. */
   contextWindowTokens?: number;
   sessionId?: string;
+  /** The reader for the local-file check (`gate-page-read.ts`); omitted, it is skipped. */
+  local?: LocalPageRead;
 }
 
 function knownWindow(tokens: number | undefined): number | null {
@@ -166,6 +168,7 @@ export function renderAriaView(input: {
 export type ReadAriaViewResult =
   | { kind: "blocked"; host: string }
   | { kind: "user_site_not_cleared"; host: string | null }
+  | { kind: "local_file_refused"; path: string; why: string }
   | { kind: "error"; message: string }
   | { kind: "ok"; snapshot: AriaSnapshot; view: RenderedAriaView };
 
@@ -203,7 +206,7 @@ export async function readAriaView(
     ...(wantsWholeTree ? { full: true } : {}),
   });
   // Frames too: the snapshot text includes iframe content.
-  const gate = await gatePageRead(snapshot, policy, view.sessionId, ask);
+  const gate = await gatePageRead(snapshot, policy, view.sessionId, ask, view.local);
   if (gate.kind !== "ok") return gate;
   const key = store && view.sessionId !== undefined ? await tabKey(backend, view.sessionId) : null;
   const rendered = renderAriaView({

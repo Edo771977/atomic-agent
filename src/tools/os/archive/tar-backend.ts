@@ -16,6 +16,9 @@ import type {
 import {
   ExtractBudget,
   describeSanitizationError,
+  entryDiskPath,
+  pruneIntoReport,
+  realDestRoot,
   sanitizeEntryPath,
 } from "./archive-safety.js";
 
@@ -91,7 +94,11 @@ export class TarBackend implements ArchiveBackend {
         : options.include.some(
             (prefix) => p === prefix || p.startsWith(prefix + "/"),
           );
+    const destReal = await realDestRoot(options.destDir);
+    const createdLinks: Array<{ normalised: string; absolute: string }> = [];
 
+    // Pruned in a `finally`: a walk that throws midway (a write that
+    // fails, a corrupt stream) must not leave an escaping link behind.
     await this.walk(data, async (header, stream) => {
       const rawName = normaliseTarName(header.name);
       const kind = mapTarType(header.type);
@@ -113,9 +120,26 @@ export class TarBackend implements ArchiveBackend {
         for await (const _chunk of stream) void _chunk;
         return;
       }
+      // Symlink entries are created at their leaf; every other kind must not
+      // land on an existing symlink either.
+      const onDisk = await entryDiskPath(
+        destReal,
+        options.destDir,
+        sanitized.value.absolute,
+        kind !== "symlink",
+      );
+      if (!onDisk.ok) {
+        report.skippedEntries.push({
+          path: sanitized.value.normalised,
+          reason: onDisk.reason,
+        });
+        for await (const _chunk of stream) void _chunk;
+        return;
+      }
+      const absolute = onDisk.absolute;
 
       if (kind === "directory") {
-        await mkdir(sanitized.value.absolute, { recursive: true });
+        await mkdir(absolute, { recursive: true });
         for await (const _chunk of stream) void _chunk;
         return;
       }
@@ -143,9 +167,10 @@ export class TarBackend implements ArchiveBackend {
           for await (const _chunk of stream) void _chunk;
           return;
         }
-        await mkdir(dirname(sanitized.value.absolute), { recursive: true });
+        await mkdir(dirname(absolute), { recursive: true });
         try {
-          await symlink(target, sanitized.value.absolute);
+          await symlink(target, absolute);
+          createdLinks.push({ normalised: sanitized.value.normalised, absolute });
           report.extractedEntries++;
         } catch (err) {
           report.warnings.push(
@@ -177,9 +202,23 @@ export class TarBackend implements ArchiveBackend {
           for await (const _chunk of stream) void _chunk;
           return;
         }
-        await mkdir(dirname(sanitized.value.absolute), { recursive: true });
+        const linkSource = await entryDiskPath(
+          destReal,
+          options.destDir,
+          resolved.value.absolute,
+          true,
+        );
+        if (!linkSource.ok) {
+          report.skippedEntries.push({
+            path: sanitized.value.normalised,
+            reason: `hard-link target ${target}: ${linkSource.reason}`,
+          });
+          for await (const _chunk of stream) void _chunk;
+          return;
+        }
+        await mkdir(dirname(absolute), { recursive: true });
         try {
-          await link(resolved.value.absolute, sanitized.value.absolute);
+          await link(linkSource.absolute, absolute);
           report.extractedEntries++;
         } catch (err) {
           report.warnings.push(
@@ -203,7 +242,7 @@ export class TarBackend implements ArchiveBackend {
         for await (const _chunk of stream) void _chunk;
         return;
       }
-      if (!options.overwrite && (await pathExists(sanitized.value.absolute))) {
+      if (!options.overwrite && (await pathExists(absolute))) {
         report.skippedEntries.push({
           path: sanitized.value.normalised,
           reason: "destination exists and overwrite=false",
@@ -215,12 +254,11 @@ export class TarBackend implements ArchiveBackend {
       const chunks: Buffer[] = [];
       for await (const chunk of stream) chunks.push(chunk as Buffer);
       const body = Buffer.concat(chunks);
-      await mkdir(dirname(sanitized.value.absolute), { recursive: true });
-      await writeFile(sanitized.value.absolute, body);
+      await mkdir(dirname(absolute), { recursive: true });
+      await writeFile(absolute, body);
       report.extractedEntries++;
       report.totalBytesWritten += body.length;
-    });
-
+    }).finally(() => pruneIntoReport(report, destReal, createdLinks));
     return report;
   }
 

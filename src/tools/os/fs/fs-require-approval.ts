@@ -1,3 +1,4 @@
+import { dirname, resolve } from "node:path";
 import {
   requireApproval,
   savedRuleOverridesScope,
@@ -113,6 +114,31 @@ export interface FsApprovalRequest {
    * directory and a git verb its repository.
    */
   targetPaths?: readonly string[];
+  /**
+   * The directories an "allow in this chat" for an `other` (outside home)
+   * request covers. Default: each path's parent, or the destination
+   * itself for `extract`. Set by the git verbs to their repository.
+   */
+  grantDirs?: readonly string[];
+}
+
+/**
+ * The session-grant key of an `other` filesystem request: the tool and
+ * the directories it touches, so "allow in this chat" for one trash
+ * outside home covers that directory, never every later path for the
+ * tool (the gate's key-less `other` fallback is per tool only).
+ */
+export function fsOtherGrantKey(
+  tool: string,
+  kind: FsMutationKind,
+  paths: readonly string[],
+  grantDirs?: readonly string[],
+): string {
+  const dirs =
+    grantDirs ??
+    paths.map((path) => (kind === "extract" ? resolve(path) : dirname(resolve(path))));
+  const unique = [...new Set(dirs.map((dir) => resolve(dir)))].sort();
+  return `${tool}@${unique.join(", ")}`;
 }
 
 /**
@@ -209,6 +235,16 @@ export async function requireFsApproval(
       sessionId: request.sessionId,
       tool: request.tool,
       category,
+      ...(category === "other"
+        ? {
+            grantKey: fsOtherGrantKey(
+              request.tool,
+              request.kind,
+              request.paths,
+              request.grantDirs,
+            ),
+          }
+        : {}),
       reason: request.reason,
       ...(request.preview !== undefined ? { preview: request.preview } : {}),
       ...(request.affectedResources !== undefined

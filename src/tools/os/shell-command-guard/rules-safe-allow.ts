@@ -31,7 +31,7 @@ const VERSION_SAFE_COMMANDS: ReadonlySet<string> = new Set([
 ]);
 
 const VERSION_FLAGS: ReadonlySet<string> = new Set(["--version", "-v", "-V"]);
-const SHELL_METACHARS = /[`$<>|&;()*?{}\[\]\\]/;
+const SHELL_METACHARS = /[`$<>|&;()*?{}\[\]\\\n\r]/;
 
 export const safeAllowRule: Rule = {
   id: "safe-allow",

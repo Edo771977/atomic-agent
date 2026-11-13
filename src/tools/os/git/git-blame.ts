@@ -1,6 +1,6 @@
 import { compressToolResult } from "../../../compressor/result-compressor.js";
 import type { ToolDefinition } from "../../tool-registry.js";
-import { requireGitSuccess, runGit } from "./git-runner.js";
+import { requireGitSuccess, revisionArg, runGit } from "./git-runner.js";
 
 /**
  * One entry per source line in the blamed file. We keep the structured
@@ -28,7 +28,7 @@ export const osGitBlameTool: ToolDefinition = {
     }
     const revision =
       typeof rawArgs.revision === "string" && rawArgs.revision.length > 0
-        ? rawArgs.revision
+        ? revisionArg("os.git.blame", "revision", rawArgs.revision)
         : "HEAD";
     const startLine = parseLine(rawArgs.startLine, "startLine");
     const endLine = parseLine(rawArgs.endLine, "endLine");

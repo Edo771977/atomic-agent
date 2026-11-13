@@ -1,7 +1,7 @@
 import { compressToolResult } from "../../../compressor/result-compressor.js";
 import { listingResultCaps } from "../../../compressor/listing-caps.js";
 import type { ToolDefinition } from "../../tool-registry.js";
-import { requireGitSuccess, runGit } from "./git-runner.js";
+import { requireGitSuccess, revisionArg, runGit } from "./git-runner.js";
 
 /**
  * Structured commit record. Fields mirror the common subset of
@@ -43,7 +43,11 @@ export const osGitLogTool: ToolDefinition = {
   async run(rawArgs, ctx) {
     const repo = typeof rawArgs.repo === "string" ? rawArgs.repo : undefined;
     const limit = parseLimit(rawArgs.limit, 20);
-    const revisionRange = parseOptionalString(rawArgs.revisionRange);
+    const rawRange = parseOptionalString(rawArgs.revisionRange);
+    const revisionRange =
+      rawRange === undefined
+        ? undefined
+        : revisionArg("os.git.log", "revisionRange", rawRange);
     const filterPath = parseOptionalString(rawArgs.path);
 
     const args: string[] = [

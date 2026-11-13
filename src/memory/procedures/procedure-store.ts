@@ -5,6 +5,7 @@ import { dirname } from "node:path";
 
 import type { AgentMetrics } from "../../tracing/agent-metrics.js";
 import { applyMigrations } from "../memory-schema.js";
+import { containsSecret, SECRET_REFUSAL } from "../memory-secret-guard.js";
 
 /**
  * Memory-v2 phase 7b (Path F, MemP-style). A procedure is a
@@ -679,6 +680,9 @@ function validateActivation(raw: unknown): string {
       `activation must be at most ${PROCEDURE_ACTIVATION_MAX_LENGTH} chars`,
     );
   }
+  if (containsSecret(trimmed)) {
+    throw new ProcedureValidationError("activation", `activation ${SECRET_REFUSAL}`);
+  }
   return trimmed;
 }
 
@@ -724,6 +728,12 @@ function validateSteps(raw: readonly ProcedureStep[]): ProcedureStep[] {
       throw new ProcedureValidationError(
         "steps",
         `step description must be at most ${PROCEDURE_DESCRIPTION_MAX_LENGTH} chars`,
+      );
+    }
+    if (containsSecret(trimmedDesc)) {
+      throw new ProcedureValidationError(
+        "steps",
+        `step description ${SECRET_REFUSAL}`,
       );
     }
     const rawHint = (entry as ProcedureStep).toolHint;

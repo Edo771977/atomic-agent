@@ -1,5 +1,13 @@
 import { describe, it, expect } from "vitest";
-import { mkdtempSync, rmSync, readFileSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  mkdtempSync,
+  rmSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
+import { pack } from "tar-stream";
 import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -103,6 +111,127 @@ describe("TarBackend", () => {
           /max_entries_exceeded/.test(s.reason),
         ),
       ).toBe(true);
+    });
+  });
+});
+
+type TarSpec = {
+  name: string;
+  type?: "directory" | "symlink" | "link";
+  linkname?: string;
+  body?: string;
+};
+
+async function buildTar(entries: TarSpec[]): Promise<Buffer> {
+  const p = pack();
+  for (const e of entries) {
+    if (e.type) p.entry({ name: e.name, type: e.type, linkname: e.linkname });
+    else p.entry({ name: e.name }, e.body ?? "");
+  }
+  p.finalize();
+  const chunks: Buffer[] = [];
+  for await (const c of p) chunks.push(c as Buffer);
+  return Buffer.concat(chunks);
+}
+
+function extractWithLinks(data: Buffer, destDir: string) {
+  return new TarBackend("tar").extract(data, {
+    destDir,
+    overwrite: true,
+    followSymlinks: true,
+    limits: DEFAULT_EXTRACT_LIMITS,
+  });
+}
+
+describe("TarBackend symlink containment", () => {
+  it("does not write through a chain of symlinks the archive created", async () => {
+    await withTmp(async (root) => {
+      const dest = join(root, "ws", "out");
+      const data = await buildTar([
+        { name: "x/", type: "directory" },
+        { name: "x/up", type: "symlink", linkname: ".." },
+        { name: "x/up/e", type: "symlink", linkname: ".." },
+        { name: "x/up/e/pwned.txt", body: "pwned" },
+      ]);
+      const report = await extractWithLinks(data, dest);
+      expect(existsSync(join(root, "ws", "pwned.txt"))).toBe(false);
+      expect(existsSync(join(dest, "pwned.txt"))).toBe(false);
+      expect(
+        report.skippedEntries.some((s) => s.path === "x/up/e/pwned.txt"),
+      ).toBe(true);
+    });
+  });
+
+  it("does not hard-link a file reached through an archive symlink", async () => {
+    await withTmp(async (root) => {
+      const dest = join(root, "out");
+      writeFileSync(join(root, "secret.txt"), "secret");
+      const data = await buildTar([
+        { name: "a/", type: "directory" },
+        { name: "a/up", type: "symlink", linkname: ".." },
+        { name: "a/up/b", type: "symlink", linkname: ".." },
+        { name: "copy.txt", type: "link", linkname: "a/up/b/secret.txt" },
+      ]);
+      await extractWithLinks(data, dest);
+      expect(existsSync(join(dest, "copy.txt"))).toBe(false);
+    });
+  });
+
+  it("does not write a file through a symlink at the entry path", async () => {
+    await withTmp(async (root) => {
+      const dest = join(root, "out");
+      const data = await buildTar([
+        { name: "target.txt", body: "inside" },
+        { name: "link", type: "symlink", linkname: "target.txt" },
+        { name: "link", body: "overwrite-through-link" },
+      ]);
+      const report = await extractWithLinks(data, dest);
+      expect(await readFile(join(dest, "target.txt"), "utf8")).toBe("inside");
+      expect(report.skippedEntries.some((s) => s.path === "link")).toBe(true);
+    });
+  });
+
+  it("removes a symlink whose real target leaves destDir via another link", async () => {
+    await withTmp(async (root) => {
+      const dest = join(root, "out");
+      const data = await buildTar([
+        { name: "d/", type: "directory" },
+        { name: "d/b", type: "symlink", linkname: ".." },
+        { name: "a", type: "symlink", linkname: "d/b/.." },
+      ]);
+      const report = await extractWithLinks(data, dest);
+      expect(existsSync(join(dest, "a"))).toBe(false);
+      expect(report.skippedEntries.some((s) => s.path === "a")).toBe(true);
+      expect(existsSync(join(dest, "d", "b"))).toBe(true);
+    });
+  });
+
+  it("removes an escaping chained link even when extraction fails later", async () => {
+    await withTmp(async (root) => {
+      const dest = join(root, "out");
+      const data = await buildTar([
+        { name: "d/", type: "directory" },
+        { name: "d/b", type: "symlink", linkname: ".." },
+        { name: "a", type: "symlink", linkname: "d/b/.." },
+        // A file over an existing directory: the write throws (EISDIR).
+        { name: "z/", type: "directory" },
+        { name: "z", body: "boom" },
+      ]);
+      await expect(extractWithLinks(data, dest)).rejects.toThrow();
+      expect(() => lstatSync(join(dest, "a"))).toThrow();
+      expect(existsSync(join(dest, "d", "b"))).toBe(true);
+    });
+  });
+
+  it("keeps a symlink that stays inside destDir", async () => {
+    await withTmp(async (root) => {
+      const dest = join(root, "out");
+      const data = await buildTar([
+        { name: "real.txt", body: "ok" },
+        { name: "alias", type: "symlink", linkname: "real.txt" },
+      ]);
+      await extractWithLinks(data, dest);
+      expect(await readFile(join(dest, "alias"), "utf8")).toBe("ok");
     });
   });
 });
