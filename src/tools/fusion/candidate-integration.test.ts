@@ -167,3 +167,31 @@ it("promotes inside a Git subdirectory while retaining dirty and untracked origi
     expect(await readFile(join(root, "api.json"), "utf8")).toBe('{"name":"checked"}');
   } finally { await candidate.cleanup(); }
 });
+
+async function ignoreRepo() {
+  const repo = await makeGitRepo("atag-candidate-ignore-"); roots.push(repo);
+  await writeRepoFile(repo, "scripts/build/pack.sh", "echo old\n");
+  await writeRepoFile(repo, ".gitignore", ".env\nnode_modules/\n");
+  await writeRepoFile(repo, "a.txt", "a\n");
+  await writeRepoFile(repo, ".atomic-agent/approval-rules.json", '{"rules":[]}');
+  await runGitRaw(repo, ["add", "-A"]); await runGitRaw(repo, ["commit", "-qm", "fixture"]);
+  await writeFile(join(repo, ".env"), "SECRET=1\n");
+  await mkdir(join(repo, "node_modules")); await writeFile(join(repo, "node_modules", "dep.js"), "dep\n");
+  return repo;
+}
+const pass = async () => ({ ok: true, results: [{ ok: true }] });
+
+it("promotes a tracked file under a directory named like a dependency/build folder", async () => {
+  const root = await ignoreRepo(); const candidate = await createCandidateIntegration(root);
+  try {
+    expect(await readFile(join(candidate.dir, "scripts", "build", "pack.sh"), "utf8")).toBe("echo old\n");
+    await writeFile(join(candidate.dir, "scripts", "build", "pack.sh"), "echo new\n");
+    await writeFile(join(candidate.dir, "node_modules", "dep.js"), "private rebuild\n");
+    const report = await candidate.finish({ rows, contract, signal, runChecks: pass });
+    expect(report.status).toBe("promoted");
+    expect(report.changes).toEqual(["scripts/build/pack.sh"]);
+    expect(await readFile(join(root, "scripts", "build", "pack.sh"), "utf8")).toBe("echo new\n");
+    expect(await readFile(join(root, "node_modules", "dep.js"), "utf8")).toBe("dep\n");
+  } finally { await candidate.cleanup(); }
+});
+

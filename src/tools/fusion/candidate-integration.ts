@@ -6,7 +6,7 @@ import { isInside } from "../../approval/fanout-scope.js";
 import { resolveUserPath } from "../os/expand-home.js";
 import { inputPathIdentity } from "../os/fs/fs-input-path-identity.js";
 import { VERIFY_COPY_EXCLUDED, VERIFY_COPY_MAX_BYTES } from "../verify/verify-workspace-copy.js";
-import { createBranchSet, BRANCH_MERGE_DIR, ensureMergeDir, type BranchWorkspace, type CreateBranchSetOptions } from "./branch-workspace.js";
+import { createBranchSet, defaultGitExec, BRANCH_MERGE_DIR, ensureMergeDir, type BranchSet, type BranchWorkspace, type CreateBranchSetOptions, type GitExec } from "./branch-workspace.js";
 import { workspaceChanges, writeTaskPatch, type SavedTaskPatch } from "./branch-diff.js";
 import { resolveContractInputs } from "./contract-inputs.js";
 import { inspectContractProvides, runContractChecks, type ContractCheckRunner, type ContractReport } from "./contract-checks.js";
@@ -46,7 +46,22 @@ async function fileHash(path: string, bounds: InventoryBounds): Promise<string> 
   }
   return hash.digest("hex");
 }
-async function inventory(root: string, workspace: BranchWorkspace, bounds: InventoryBounds): Promise<Inventory> {
+/**
+ * Tracked paths of the snapshot and every ancestor directory. Git ignore
+ * rules and the dependency/build folder names never apply to these: the
+ * candidate copy carries every tracked file, so promotion must too.
+ */
+async function trackedPaths(set: BranchSet, git: GitExec): Promise<ReadonlySet<string>> {
+  if (set.method !== "worktree") return new Set();
+  const listed = await git(["ls-files", "--cached", "-z"], set.baseDir);
+  if (listed === null || listed.exitCode !== 0 || listed.timedOut || listed.truncated) throw new Error("Git could not list the candidate's tracked paths");
+  const out = new Set<string>();
+  for (const path of listed.stdout.split("\0").filter(Boolean)) {
+    for (let entry = path.split("/").join(sep); entry !== "." && !out.has(entry); entry = dirname(entry)) out.add(entry);
+  }
+  return out;
+}
+async function inventory(root: string, workspace: BranchWorkspace, tracked: ReadonlySet<string>, bounds: InventoryBounds): Promise<Inventory> {
   const out: Inventory = new Map();
   const walk = async (dir: string): Promise<void> => {
     bounds.signal?.throwIfAborted();
@@ -60,7 +75,9 @@ async function inventory(root: string, workspace: BranchWorkspace, bounds: Inven
     const ignored = await workspace.directoryIgnorePolicy?.(dirs, bounds.signal);
     for (const item of entries) {
       const rel = join(dir, item.name);
-      if (VERIFY_COPY_EXCLUDED.has(item.name) || rel === BRANCH_MERGE_DIR || rel.startsWith(`${BRANCH_MERGE_DIR}${sep}`) || workspace.excludedDirectories?.has(rel) || ignored?.has(rel)) continue;
+      if (item.name === ".git" || rel === BRANCH_MERGE_DIR || rel.startsWith(`${BRANCH_MERGE_DIR}${sep}`)) continue;
+      // Disposable dependency/build/ignored folders, unless they hold tracked paths.
+      if ((VERIFY_COPY_EXCLUDED.has(item.name) || workspace.excludedDirectories?.has(rel) || ignored?.has(rel)) && !tracked.has(rel)) continue;
       bounds.signal?.throwIfAborted();
       if (--bounds.entries < 0) throw new Error("candidate inventory entry limit exceeded");
       const path = join(root, rel); const info = await lstat(path);
@@ -123,7 +140,9 @@ export async function createCandidateIntegration(
   const set = await createBranchSet(realDir, [id], { ...options, signal: setupSignal });
   if (set === null) throw new Error("candidate workspace unavailable: private copies exceed the copy limit");
   const workspace = set.workspaces.get(id)!;
-  const snapshot = (root: string, signal?: AbortSignal): Promise<Inventory> => inventory(root, workspace, { bytes: options.maxInventoryBytes ?? options.maxCopyBytes ?? VERIFY_COPY_MAX_BYTES, entries: options.maxInventoryEntries ?? 100_000, signal: signal === undefined ? AbortSignal.timeout(options.maxInventoryMs ?? 30_000) : AbortSignal.any([signal, AbortSignal.timeout(options.maxInventoryMs ?? 30_000)]) });
+  let tracked: ReadonlySet<string>;
+  try { tracked = await trackedPaths(set, options.git ?? defaultGitExec); } catch (err) { await set.cleanup(); throw err; }
+  const snapshot = (root: string, signal?: AbortSignal): Promise<Inventory> => inventory(root, workspace, tracked, { bytes: options.maxInventoryBytes ?? options.maxCopyBytes ?? VERIFY_COPY_MAX_BYTES, entries: options.maxInventoryEntries ?? 100_000, signal: signal === undefined ? AbortSignal.timeout(options.maxInventoryMs ?? 30_000) : AbortSignal.any([signal, AbortSignal.timeout(options.maxInventoryMs ?? 30_000)]) });
   let retain = false;
   let base: Inventory;
   try {
