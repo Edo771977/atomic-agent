@@ -94,6 +94,7 @@ export function projectFusionArtifactEvidence(result: CompressedToolResult, maxC
   omitted += Math.max(0, rows.length - TASKS);
   const report = record(result.details.candidateIntegration) ? result.details.candidateIntegration : undefined;
   const manifest = report?.artifactManifest === undefined ? undefined : parseArtifactManifest(report.artifactManifest);
+  if (report?.artifactManifest !== undefined && manifest === undefined) omitted += 1;
   const parsedReceipt = parseCandidateAcceptanceReceipt(report?.acceptanceReceipt);
   const receipt = parsedReceipt !== undefined && safeText(JSON.stringify(parsedReceipt), known) ? parsedReceipt : undefined;
   if (report?.acceptanceReceipt !== undefined && receipt === undefined) omitted += 1;

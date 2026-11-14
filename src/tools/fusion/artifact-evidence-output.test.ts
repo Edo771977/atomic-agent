@@ -166,4 +166,10 @@ describe("model-visible artifact evidence", () => {
     expect(result.summary).not.toContain("Synthetic");
   });
 
+  it.each([false, true])("counts a malformed candidate inventory explicitly (receipt=%s)", withReceipt => {
+    const receipt: CandidateAcceptanceReceipt = { version: 1, id: "d".repeat(24), disposition: "rejected", checkScope: "declared", checkStatus: "unverified", checks: { total: 0, passed: 0, failed: 0 }, inputs: { declared: 0, verified: 0 }, reason: "other" };
+    const result = projectFusionArtifactEvidence(compressToolResult({ tool: "fusion.delegate", status: "error", output: "candidate prose", details: { candidateIntegration: { artifactManifest: { invalid: true }, ...(withReceipt ? { acceptanceReceipt: receipt } : {}) } } }), 1200);
+    expect(evidence(result.summary).omitted).toBe(1);
+  });
+
 });
