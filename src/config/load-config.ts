@@ -485,6 +485,7 @@ export function loadConfig(): AtomicAgentConfig {
         envPassthrough: [...user.tools.shell.envPassthrough],
       },
       screen: { enabled: user.tools.screen.enabled, point: user.tools.screen.point },
+      verify: { maxCopyBytes: user.tools.verify.maxCopyBytes },
     },
     log: { level: logLevel },
     tasks: {

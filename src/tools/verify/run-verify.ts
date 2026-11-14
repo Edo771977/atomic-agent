@@ -30,7 +30,18 @@ export interface VerifyRunResult {
   /** A run that could not happen (no browser, bad cwd, spawn failure). */
   readonly error?: string;
   /** Setup/cancellation failures are distinct from a check that actually ran. */
-  readonly errorCode?: "workspace-unavailable" | "cancelled" | "workspace-cleanup-failed";
+  readonly errorCode?: "workspace-unavailable" | "cancelled";
+  /**
+   * The throwaway copy could not be removed afterwards (a file still
+   * busy on Windows, say). A warning only: the run's own outcome — pass
+   * or fail — stands.
+   */
+  readonly cleanupWarning?: string;
+  /**
+   * The call was cancelled while the executor ran. Its fields (command
+   * line, exit code, output) are kept as evidence; the run never passes.
+   */
+  readonly aborted?: boolean;
   readonly commandLine?: string;
   readonly exitCode?: number | null;
   readonly timedOut?: boolean;
@@ -51,11 +62,20 @@ export interface VerifyRunResult {
   readonly summary: string;
 }
 
+/**
+ * What `verify.run` reads from the config: browser settings for page
+ * runs and the workspace copy limit (`tools.verify.maxCopyBytes`, the
+ * built-in 2 GiB when absent). A full `AtomicAgentConfig` fits.
+ */
+export type VerifyRunConfig = Pick<AtomicAgentConfig, "browser"> & {
+  readonly tools?: { readonly verify?: { readonly maxCopyBytes?: number } };
+};
+
 export interface VerifyRunContext {
   readonly inputIntegrity?: VerificationInputIntegrity;
   readonly workingDir: string;
-  /** Browser settings for page runs; `getConfig().browser` when omitted. */
-  readonly config?: Pick<AtomicAgentConfig, "browser">;
+  /** Browser settings and copy limit; `getConfig().browser` for page runs when omitted. */
+  readonly config?: VerifyRunConfig;
   readonly signal?: AbortSignal;
   /** Test seams. */
   readonly launchBrowser?: BrowserLauncher;
@@ -185,7 +205,8 @@ export async function runVerify(
   let workspace: VerifyWorkspace | undefined;
   let result: VerifyRunResult;
   try {
-    workspace = await (ctx.workspace ?? createVerifyWorkspace)(ctx.workingDir);
+    const maxBytes = ctx.config?.tools?.verify?.maxCopyBytes;
+    workspace = await (ctx.workspace ?? ((dir: string) => createVerifyWorkspace(dir, maxBytes === undefined ? {} : { maxBytes })))(ctx.workingDir);
     if (ctx.signal?.aborted) {
       result = failed("verification cancelled before execution", "cancelled", workspace.isolated);
     } else if (!workspace.isolated || resolve(workspace.dir) === resolve(ctx.workingDir)) {
@@ -197,18 +218,24 @@ export async function runVerify(
       await completeIntegrity?.();
       // Executors may settle normally after an abort (a page can skip
       // remaining script steps). Such an incomplete run cannot pass.
-      if (ctx.signal?.aborted) result = failed("verification cancelled during execution", "cancelled", true);
+      // Keep what it did report: the command line, exit code and output
+      // are evidence of what ran before the cancellation landed.
+      if (ctx.signal?.aborted) {
+        const { ok: _ok, summary: _summary, checks: _checks, durationMs: _durationMs, ...fields } = result;
+        const error = `verification cancelled during execution${fields.error === undefined ? "" : ` (${fields.error})`}`;
+        result = finish({ ...fields, error, errorCode: "cancelled", aborted: true }, { kind: args.kind }, args.checks, false, started);
+      }
     }
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
     result = failed(error, ctx.signal?.aborted ? "cancelled" : workspace === undefined ? "workspace-unavailable" : undefined, workspace?.isolated ?? false);
-  } finally {
-    try {
-      await workspace?.cleanup();
-    } catch (err) {
-      const error = err instanceof Error ? err.message : String(err);
-      result = failed(`could not clean up verification workspace: ${error}`, "workspace-cleanup-failed", workspace?.isolated ?? false);
-    }
+  }
+  try {
+    await workspace?.cleanup();
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    const warned = { ...result, cleanupWarning: `could not remove the verification copy ${workspace?.dir ?? ""}: ${error}` };
+    result = { ...warned, summary: renderVerifyRunSummary(warned) };
   }
   return result;
 }

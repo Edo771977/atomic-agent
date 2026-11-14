@@ -83,9 +83,12 @@ The campaign config runs only `gaia.eval.ts`; its runner checks completion
 outside test hooks, so a title filter matching nothing fails too. The
 orchestrator independently validates its fresh completion report after Vitest
 closes. An absent agent filter selects defaults; an explicitly empty string
-or comma-only filter selects no agents and fails.
+or comma-only filter selects no agents and fails. `ATOMIC_AGENT_GAIA_TASK_IDS`
+follows the same rule: absent selects every row, an explicitly empty or
+comma-only list selects no rows and the campaign fails as empty.
 Set `ATOMIC_AGENT_GAIA_REPORT_DIR` to place a campaign's reports in a chosen
-directory (the default remains a timestamped directory under `reports/`).
+directory (the default remains a timestamped directory under `reports/`;
+an empty value counts as unset, in the launcher and in `gaia.eval.ts`).
 The launcher resolves a relative report directory against the test child's
 working directory (normally the repository root), then passes the same
 absolute path to the child and completion validator.
@@ -93,10 +96,28 @@ absolute path to the child and completion validator.
 Orchestrators launch the installed Vitest JavaScript entry with the current
 Node executable, including on Windows; forwarded arguments stay separate
 argv entries. Spawn errors fail the run, and cancellation waits for the
-test child to close before returning.
-Installed SIGINT/SIGTERM handlers request cancellation through the signal
-passed by smoke/level1; they do not exit or stop daemons inline. The caller
-awaits child close, then its managed-daemon teardown, before exiting 130.
+test child to close before returning. On POSIX the test child leads its own
+process group (stdin is not inherited): cancellation signals the whole group,
+so Vitest's forked workers and the agents they started stop too, and the
+launcher waits until the group is gone, escalating to SIGKILL after a timeout
+(10 s by default). A group left behind after a normal exit is stopped the
+same way. On Windows cancellation runs `taskkill /T /F` at once: without
+`/F` taskkill only sends a close request, which a console Node process
+ignores. `/T` walks the tree from the live Vitest process, so descendants
+are reached only while it is alive; workers it left behind after exiting
+on its own are not found (a known limitation, no process groups there).
+Installed SIGINT/SIGTERM/SIGHUP/SIGQUIT handlers (SIGQUIT on POSIX only)
+request cancellation through the signal passed by smoke/level1, so closing
+the terminal or dropping an SSH session cancels like Ctrl-C; they do not
+exit or stop daemons inline. The caller awaits child close, then its
+managed-daemon teardown, before exiting 129 (SIGHUP), 130 (SIGINT), 131
+(SIGQUIT) or 143 (SIGTERM). While a test tree runs, an exit listener kills
+it synchronously if the launcher exits any other way (an uncaught
+exception); a launcher killed with SIGKILL cannot clean up. A second signal does not wait: it SIGKILLs the
+running test process tree, runs the synchronous teardowns orchestrators
+registered with `registerSyncTeardown` (smoke/level1 stop the daemons they
+started), and exits at once with the second signal's code, skipping the
+callers' `finally` blocks.
 Health waits honor the same signal, and handlers are removed after teardown.
 
 ## Methodology

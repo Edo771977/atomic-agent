@@ -21,8 +21,10 @@
  * so a test run still finds them, except the shared dependency
  * directories (`node_modules`, `target`, `.venv`), which are normally symlinked
  * to the original's and cost no copy budget (with
- * `privateDependencyDirectories`, tasks copy them privately instead). Denied
- * or unsupported generated directory links become bounded private copies.
+ * `privateDependencyDirectories`, tasks copy them privately instead). A
+ * denied generated symlink becomes a junction; only with no link at all
+ * does it become a bounded private copy, made once in the base and
+ * linked from there by the tasks when they can.
  * Outside git, or when git cannot snapshot
  * (no commit yet, a merge in progress, no git binary), a workspace is
  * a private folder copy without the original's git metadata. Copying
@@ -53,7 +55,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, dirname, join, relative, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { runCommand, type CommandResult } from "../../sandbox/command-runner.js";
 import { buildCommandEnv } from "../../sandbox/command-env.js";
 import { VERIFY_COPY_EXCLUDED, VERIFY_COPY_MAX_BYTES } from "../verify/verify-workspace-copy.js";
@@ -216,6 +218,8 @@ export interface CreateBranchSetOptions {
    * original before promotion. The base, which nobody writes to, still links.
    */
   privateDependencyDirectories?: boolean;
+  /** Told why `createBranchSet` returned `null` (the copy limit), in words for the user. */
+  onRefusal?: (reason: string) => void;
 }
 
 const GIT_TIMEOUT_MS = 120_000;
@@ -364,7 +368,49 @@ async function copyFileKeepingMode(from: string, to: string): Promise<void> {
 }
 
 class PrivateCopyLimitError extends Error {
-  constructor() { super("the private workspace copies exceed the copy byte limit"); }
+  /** `pending`: bytes of the file that did not fit, not yet charged. */
+  constructor(readonly pending = 0) { super("the private workspace copies exceed the copy byte limit"); }
+}
+
+/** Why a dependency directory was copied: no link was possible, or a candidate must own it. */
+type DependencyCopyKind = "unlinked" | "private";
+
+/**
+ * Run a dependency directory's copy, charging its bytes (including a
+ * file that did not fit) to `kind`; a nested dependency directory is
+ * charged to the outermost copy only.
+ */
+async function chargeDependencyCopy(budget: PrivateCopyBudget, kind: DependencyCopyKind, copy: () => Promise<void>): Promise<void> {
+  if (budget.chargingDependency === true) return copy();
+  budget.chargingDependency = true;
+  const before = budget.left;
+  let pending = 0;
+  try {
+    await copy();
+  } catch (err) {
+    if (err instanceof PrivateCopyLimitError) pending = err.pending;
+    throw err;
+  } finally {
+    delete budget.chargingDependency;
+    budget.dependencyBytes[kind] += before - budget.left + pending;
+  }
+}
+
+/**
+ * The refusal for a copy that hit the limit: dependency copies are named
+ * only when the rest of what was copied, the file that did not fit
+ * included, would have fitted without them.
+ */
+function copyLimitReason(budget: PrivateCopyBudget, limit: number, err: PrivateCopyLimitError): string {
+  const needed = limit - budget.left + err.pending;
+  const blame = (bytes: number): boolean => bytes > 0 && needed - bytes <= limit;
+  if (blame(budget.dependencyBytes.unlinked)) {
+    return `dependency folders could not be linked on this system and copying them exceeds the copy limit (${limit} bytes)`;
+  }
+  if (blame(budget.dependencyBytes.private)) {
+    return `the candidate's private copy of the dependency folders exceeds the copy limit (${limit} bytes)`;
+  }
+  return "the folder is too large to copy";
 }
 
 interface PrivateCopyBudget {
@@ -377,6 +423,19 @@ interface PrivateCopyBudget {
    * the original they are copied from (the base only holds links to it).
    */
   privateDependenciesFrom?: string;
+  /**
+   * With `privateDependenciesFrom`: the git repository holding the
+   * original (`top`, and the working directory relative to it). `worktree`
+   * when every workspace is a worktree of the whole repository; otherwise
+   * only the working directory is copied.
+   */
+  privateDependencyRepository?: { top: string; rel: string; worktree: boolean };
+  /** Set while making a private-dependency set's base: unlinkable dependencies get an empty placeholder. */
+  dependencyPlaceholders?: boolean;
+  /** Bytes charged by dependency directory copies, by why they were copied. */
+  dependencyBytes: Record<DependencyCopyKind, number>;
+  /** Set while a dependency directory's copy is being charged. */
+  chargingDependency?: boolean;
 }
 
 /**
@@ -386,22 +445,60 @@ interface PrivateCopyBudget {
  * the base and every task both blew the copy limit and refused isolation
  * for ordinary repos. Never stamped or merged (`VERIFY_COPY_EXCLUDED`).
  * Writes through the link reach the original, as for `verify.run`;
- * `privateDependencyDirectories` copies them instead. Hosts that deny or do
- * not support generated directory links also use budgeted private copies.
+ * `privateDependencyDirectories` copies them instead. Hosts that deny
+ * symlinks get junctions; with no link at all, budgeted private copies.
  */
 export const SHARED_DEPENDENCY_DIRECTORIES: ReadonlySet<string> = new Set(["node_modules", "target", ".venv"]);
 
-/** Try sharing a real directory; denied/unsupported generated links copy privately. */
+/** Link errors that mean "this host cannot make that link", not a broken tree. */
+const LINK_UNAVAILABLE = ["EPERM", "EACCES", "ENOTSUP", "EOPNOTSUPP"];
+
+function linkUnavailable(err: unknown, codes: readonly string[] = LINK_UNAVAILABLE): boolean {
+  return codes.includes((err as NodeJS.ErrnoException).code ?? "");
+}
+
+/**
+ * A directory link to `target`: a symlink, else (Windows without the
+ * symlink privilege) a junction, which resolves the same way. `false`
+ * when the host allows neither; other errors throw.
+ */
+async function linkDirectory(target: string, to: string): Promise<boolean> {
+  try {
+    await symlink(target, to, "dir");
+    return true;
+  } catch (err) {
+    if (!linkUnavailable(err)) throw err;
+  }
+  try {
+    // Node ignores the type outside Windows; there it makes a junction.
+    await symlink(target, to, "junction");
+    return true;
+  } catch (err) {
+    // A junction cannot reach every volume (network shares: EINVAL).
+    if (!linkUnavailable(err, [...LINK_UNAVAILABLE, "EINVAL", "EXDEV"])) throw err;
+    return false;
+  }
+}
+
+/**
+ * Share a real directory by a link (symlink or junction). When no link
+ * is possible the directory is copied privately, counted against the
+ * budget, and remembered so a refusal can name the cause; the base of a
+ * private-dependency set, which nobody writes to or runs in, instead
+ * holds an empty placeholder (its tasks copy from the original).
+ */
 async function linkDirectoryOrCopy(from: string, to: string, budget: PrivateCopyBudget, rel: string): Promise<void> {
   await mkdir(dirname(to), { recursive: true });
-  try {
-    await symlink(from, to, "dir");
+  if (await linkDirectory(from, to)) {
     budget.generatedDirectoryLinks.set(to, from);
-  } catch (err) {
-    if (!["EPERM", "EACCES", "ENOTSUP", "EOPNOTSUPP"].includes((err as NodeJS.ErrnoException).code ?? "")) throw err;
-    budget.signal?.throwIfAborted();
-    await copyPrivateEntry(from, to, budget, rel, false);
+    return;
   }
+  budget.signal?.throwIfAborted();
+  if (budget.dependencyPlaceholders === true) {
+    await mkdir(to, { recursive: true });
+    return;
+  }
+  await chargeDependencyCopy(budget, "unlinked", () => copyPrivateEntry(from, to, budget, rel, false));
 }
 
 /** Whether any component of `rel` names a shared dependency directory. */
@@ -432,7 +529,7 @@ async function copyPrivateEntry(
     // A user's own link (or a path only the source has) keeps its normal copy.
     if (own !== null && !own.isSymbolicLink()) {
       // Nested shared names redirect to the same original path: copied too.
-      await copyPrivateEntry(origin, to, budget, rel, false);
+      await chargeDependencyCopy(budget, "private", () => copyPrivateEntry(origin, to, budget, rel, false));
       return;
     }
   }
@@ -449,9 +546,9 @@ async function copyPrivateEntry(
     }
   } else if (info.isSymbolicLink()) {
     await mkdir(dirname(to), { recursive: true });
-    await symlink(await readlink(from), to);
+    await recreateLink(from, to, budget, rel);
   } else if (info.isFile()) {
-    if (info.size > budget.left) throw new PrivateCopyLimitError();
+    if (info.size > budget.left) throw new PrivateCopyLimitError(info.size);
     budget.left -= info.size;
     await copyFileKeepingMode(from, to);
     budget.signal?.throwIfAborted();
@@ -461,6 +558,97 @@ async function copyPrivateEntry(
   } else {
     throw new Error(`cannot copy a special workspace entry: ${from}`);
   }
+}
+
+/** `target` relative to `root` when it lies inside it, lexically or through its parent's real path. */
+async function insideRoot(target: string, root: string): Promise<string | undefined> {
+  const within = (path: string): string | undefined => {
+    const rel = relative(root, path);
+    return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel)) ? rel : undefined;
+  };
+  const lexical = within(target);
+  if (lexical !== undefined) return lexical;
+  const parent = await realpath(dirname(target)).catch(() => null);
+  return parent === null ? undefined : within(join(parent, basename(target)));
+}
+
+/**
+ * Where a private dependency copy's link to the absolute `target` must
+ * point: the same place in this workspace when it lies inside the
+ * original (`workspaceDir`), or inside the repository a worktree holds
+ * whole; kept as it is when outside the repository. A target inside the
+ * repository but outside a folder copy cannot be made private: throws.
+ */
+async function privateDependencyTarget(target: string, workspaceDir: string, budget: PrivateCopyBudget, rel: string): Promise<string> {
+  const inside = await insideRoot(target, budget.privateDependenciesFrom!);
+  if (inside !== undefined) return join(workspaceDir, inside);
+  const repository = budget.privateDependencyRepository;
+  const inRepository = repository === undefined ? undefined : await insideRoot(target, repository.top);
+  if (repository === undefined || inRepository === undefined) return target;
+  const where = `the dependency link ${rel} points into the repository outside the working directory (${target})`;
+  if (!repository.worktree) {
+    throw new Error(`${where}; only the working directory is copied, so a write through it would reach the original`);
+  }
+  const worktreeRoot = repository.rel.length === 0 ? workspaceDir : workspaceDir.slice(0, workspaceDir.length - repository.rel.length - 1);
+  const mapped = join(worktreeRoot, inRepository);
+  const exists = (path: string): Promise<boolean> => lstat(path).then(() => true, () => false);
+  if (!await exists(mapped) && await exists(target)) {
+    throw new Error(`${where}, which the private worktree does not hold (an untracked or ignored path)`);
+  }
+  return mapped;
+}
+
+/**
+ * Copy a user's symlink with its target. Inside a private dependency
+ * copy (`budget.privateDependenciesFrom`), an absolute target inside the
+ * original (npm workspaces on Windows, pnpm: `node_modules/@s/pkg` →
+ * `<project>/packages/pkg`) is pointed at the same place in this
+ * workspace instead, so a write through it stays private; in a worktree
+ * the same holds for a target elsewhere in the repository (a monorepo's
+ * sibling package), and in a folder copy such a target refuses setup
+ * (`privateDependencyTarget`). A relative target under a dependency
+ * directory is kept when it resolves inside the source tree (from the
+ * source link's own folder); one leaving it becomes its absolute
+ * original target, then follows the same rules. Targets outside the
+ * repository (or, without one, the original) are kept. Where the host denies symlinks, a directory target
+ * under a dependency directory becomes a junction to the same resolved
+ * path; otherwise the copy fails, naming the link (it is never expanded
+ * into a copy).
+ */
+async function recreateLink(from: string, to: string, budget: PrivateCopyBudget, rel: string): Promise<void> {
+  let target = await readlink(from);
+  const dependency = rel.length > 0 && underSharedDependencyDirectory(rel) && from.endsWith(`${sep}${rel}`) && to.endsWith(`${sep}${rel}`);
+  if (dependency && !isAbsolute(target)) {
+    // Resolved where the source link lives: one leaving the source tree
+    // would dangle (or hit an unrelated folder) next to the copy.
+    const resolved = resolve(dirname(from), target);
+    if (await insideRoot(resolved, from.slice(0, from.length - rel.length - 1)) === undefined) target = resolved;
+  }
+  if (dependency && budget.privateDependenciesFrom !== undefined && isAbsolute(target)) {
+    target = await privateDependencyTarget(target, to.slice(0, to.length - rel.length - 1), budget, rel);
+  }
+  let denied: unknown;
+  try {
+    await symlink(target, to);
+    return;
+  } catch (err) {
+    if (!linkUnavailable(err)) throw err;
+    denied = err;
+  }
+  budget.signal?.throwIfAborted();
+  // Only under a dependency directory: never inventoried or merged, so a
+  // junction's absolute link text cannot be mistaken for a change.
+  if (underSharedDependencyDirectory(rel) && await stat(from).then((found) => found.isDirectory(), () => false)) {
+    try {
+      // A junction needs an absolute target; resolve it where the link lives.
+      await symlink(resolve(dirname(to), target), to, "junction");
+      return;
+    } catch (err) {
+      if (!linkUnavailable(err, [...LINK_UNAVAILABLE, "EINVAL", "EXDEV"])) throw err;
+    }
+  }
+  const why = denied instanceof Error ? denied.message : String(denied);
+  throw new Error(`cannot recreate the link ${rel || "."} in a private workspace: ${why}`);
 }
 
 /** What a git snapshot needs: the commit, and what lives outside it. */
@@ -510,6 +698,14 @@ async function gitSnapshot(
     untracked: zList(untracked.stdout),
     ignored: zList(ignored.stdout),
   };
+}
+
+/** The git repository's top holding `realDir`, even where it cannot be snapshotted. */
+async function repositoryTop(realDir: string, git: GitExec): Promise<string | undefined> {
+  const result = await git(["rev-parse", "--show-toplevel"], realDir);
+  if (!ok(result)) return undefined;
+  const top = await realpath(result.stdout.trim()).catch(() => null);
+  return top === null || relative(top, realDir).startsWith("..") ? undefined : top;
 }
 
 /** One worktree of the snapshot at `root`, with private copies of what git does not carry. */
@@ -634,7 +830,8 @@ export async function createBranchSet(
       await cleanupGit(["worktree", "prune"], snapshot.top).catch(() => null);
     }
   };
-  const budget: PrivateCopyBudget = { left: options.maxCopyBytes ?? VERIFY_COPY_MAX_BYTES, generatedDirectoryLinks: new Map(), ...(options.signal === undefined ? {} : { signal: options.signal }) };
+  const limit = options.maxCopyBytes ?? VERIFY_COPY_MAX_BYTES;
+  const budget: PrivateCopyBudget = { left: limit, generatedDirectoryLinks: new Map(), dependencyBytes: { unlinked: 0, private: 0 }, ...(options.signal === undefined ? {} : { signal: options.signal }) };
   try {
     const method: BranchMethod = snapshot === null ? "copy" : "worktree";
     const make = async (name: string, source: string): Promise<string> => {
@@ -644,9 +841,20 @@ export async function createBranchSet(
       await copyPrivateEntry(source, root, budget);
       return root;
     };
-    const baseDir = await make("base", real);
     // Tasks copy what the base only links; the base itself stays link-only.
-    if (options.privateDependencyDirectories === true) budget.privateDependenciesFrom = real;
+    // Without links its dependency directories are placeholders: the
+    // tasks' own copies come from the original, so they are copied once.
+    if (options.privateDependencyDirectories === true) budget.dependencyPlaceholders = true;
+    const baseDir = await make("base", real);
+    delete budget.dependencyPlaceholders;
+    if (options.privateDependencyDirectories === true) {
+      budget.privateDependenciesFrom = real;
+      // A folder copy still needs the repository's bounds to refuse links into it.
+      const top = snapshot?.top ?? await repositoryTop(real, git);
+      if (top !== undefined) {
+        budget.privateDependencyRepository = { top, rel: relative(top, real), worktree: snapshot !== null };
+      }
+    }
     const directoryIgnorePolicy = await createDirectoryIgnorePolicy({
       originalDir: real, baseDir, probeDir: join(runRoot, "ignore-policy"),
       ...(options.signal === undefined ? {} : { signal: options.signal }),
@@ -680,7 +888,10 @@ export async function createBranchSet(
     return { method, realDir: real, baseDir, workspaces, cleanup, remainingCopyBytes: () => budget.left, retainForRecovery: () => writeFile(join(runRoot, OWNER_FILE), JSON.stringify({ pid: process.pid, recovery: true, createdAt: new Date().toISOString() })) };
   } catch (err) {
     await cleanup();
-    if (err instanceof PrivateCopyLimitError) return null;
+    if (err instanceof PrivateCopyLimitError) {
+      options.onRefusal?.(copyLimitReason(budget, limit, err));
+      return null;
+    }
     throw err;
   }
 }

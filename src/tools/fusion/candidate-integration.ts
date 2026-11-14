@@ -28,9 +28,9 @@ const depth = (path: string): number => path.split(sep).length;
 
 /** A strict, byte-based inventory: never follow links or trust size/mtime cache hints. */
 interface InventoryBounds { bytes: number; entries: number; signal?: AbortSignal }
-async function lineCount(path: string, signal: AbortSignal): Promise<number> {
+async function lineCount(path: string, signal: AbortSignal, maxBytes: number): Promise<number> {
   let lines = 0, last: number | undefined;
-  let left = VERIFY_COPY_MAX_BYTES;
+  let left = maxBytes;
   for await (const chunk of createReadStream(path, { signal, highWaterMark: 64 * 1024 })) {
     signal.throwIfAborted(); const bytes = chunk as Buffer; left -= bytes.length;
     if (left < 0) throw new Error("declared input byte limit exceeded");
@@ -152,7 +152,7 @@ const atOrUnder = (path: string, root: string): boolean => path === root || path
  * ignored name such as `notes.md` → `notes.log`). Renames into an
  * existing ignored directory are not walked; they show in `ignoredChanges`.
  */
-async function lostToIgnoreRules(changed: readonly string[], base: Inventory, final: Inventory, dropped: Dropped, fresh: readonly string[], input: CandidateFinishInput, dir: string, baseDir: string): Promise<string | undefined> {
+async function lostToIgnoreRules(changed: readonly string[], base: Inventory, final: Inventory, dropped: Dropped, fresh: readonly string[], input: CandidateFinishInput, dir: string, baseDir: string, maxBytes: number): Promise<string | undefined> {
   const declared = (input.contract?.provides ?? []).flatMap(provide => [...(provide.kind === "file" ? [provide.name] : []), ...(provide.in === undefined ? [] : [provide.in])]).flatMap(path => {
     let absolute: string;
     try { absolute = resolveUserPath(path, dir); } catch { return []; }
@@ -170,7 +170,7 @@ async function lostToIgnoreRules(changed: readonly string[], base: Inventory, fi
   for (const path of fresh) {
     const entry = dropped.get(path);
     if (entry?.kind !== "file" || !sizes.has(entry.size)) continue;
-    const hash = await fileHash(join(dir, path), { bytes: VERIFY_COPY_MAX_BYTES, entries: 1, signal: input.signal });
+    const hash = await fileHash(join(dir, path), { bytes: maxBytes, entries: 1, signal: input.signal });
     const source = hashes.get(hash);
     if (source !== undefined) renamed.push(`${posixPath(source)} → ${posixPath(path)}`);
   }
@@ -309,16 +309,22 @@ export async function createCandidateIntegration(
     maxInventoryBytes?: number; maxInventoryEntries?: number; maxInventoryMs?: number } = {},
 ): Promise<CandidateIntegration> {
   const id = `candidate-${randomBytes(6).toString("hex")}`;
+  // `tools.verify.maxCopyBytes` when the caller passes it: copies, inventories and hashes share one bound.
+  const copyLimit = options.maxCopyBytes ?? VERIFY_COPY_MAX_BYTES;
   const setupSignal = options.signal === undefined ? AbortSignal.timeout(120_000) : AbortSignal.any([options.signal, AbortSignal.timeout(120_000)]);
   const protectedInputs = await freezeCheckInputs(realDir, options.checkInputs ?? [], setupSignal);
-  const set = await createBranchSet(realDir, [id], { ...options, signal: setupSignal, privateDependencyDirectories: true });
-  if (set === null) throw new Error("candidate workspace unavailable: private copies exceed the copy limit");
+  let refusal: string | undefined;
+  const set = await createBranchSet(realDir, [id], {
+    ...options, signal: setupSignal, privateDependencyDirectories: true,
+    onRefusal: (reason) => { refusal = reason; options.onRefusal?.(reason); },
+  });
+  if (set === null) throw new Error(`candidate workspace unavailable: ${refusal ?? "private copies exceed the copy limit"}`);
   const workspace = set.workspaces.get(id)!;
   let tracked: ReadonlySet<string>;
   try { tracked = await trackedPaths(set, options.git ?? defaultGitExec); } catch (err) { await set.cleanup(); throw err; }
-  const snapshot = (root: string, signal?: AbortSignal, dropped?: Dropped): Promise<Inventory> => inventory(root, workspace, tracked, { bytes: options.maxInventoryBytes ?? options.maxCopyBytes ?? VERIFY_COPY_MAX_BYTES, entries: options.maxInventoryEntries ?? 100_000, signal: signal === undefined ? AbortSignal.timeout(options.maxInventoryMs ?? 30_000) : AbortSignal.any([signal, AbortSignal.timeout(options.maxInventoryMs ?? 30_000)]) }, dropped);
+  const snapshot = (root: string, signal?: AbortSignal, dropped?: Dropped): Promise<Inventory> => inventory(root, workspace, tracked, { bytes: options.maxInventoryBytes ?? copyLimit, entries: options.maxInventoryEntries ?? 100_000, signal: signal === undefined ? AbortSignal.timeout(options.maxInventoryMs ?? 30_000) : AbortSignal.any([signal, AbortSignal.timeout(options.maxInventoryMs ?? 30_000)]) }, dropped);
   /** Bounds for re-verifying single live entries during delivery and rollback. */
-  const liveBounds = (signal: AbortSignal): InventoryBounds => ({ bytes: options.maxInventoryBytes ?? options.maxCopyBytes ?? VERIFY_COPY_MAX_BYTES, entries: 1, signal });
+  const liveBounds = (signal: AbortSignal): InventoryBounds => ({ bytes: options.maxInventoryBytes ?? copyLimit, entries: 1, signal });
   let retain = false;
   let verifiedInputs = 0;
   const verifyProtectedInputs = async (root: string, signal: AbortSignal): Promise<void> => {
@@ -368,7 +374,7 @@ export async function createCandidateIntegration(
     if (!info.isDirectory()) throw new Error("inner recovery artifact folder is not a directory");
     const destination = join(await ensureMergeDir(set.realDir), `${id}.held`);
     await mkdir(destination);
-    const bounds: InventoryBounds = { bytes: options.maxCopyBytes ?? VERIFY_COPY_MAX_BYTES, entries: 100_000, signal: signal ?? AbortSignal.timeout(30_000) };
+    const bounds: InventoryBounds = { bytes: copyLimit, entries: 100_000, signal: signal ?? AbortSignal.timeout(30_000) };
     const copy = async (from: string, to: string): Promise<void> => {
       bounds.signal?.throwIfAborted(); if (--bounds.entries < 0) throw new Error("held artifact entry limit exceeded");
       const entry = await lstat(from);
@@ -449,7 +455,7 @@ export async function createCandidateIntegration(
         await symlink(link, tmp);
       } else {
         await copyFile(join(root, rel), tmp);
-        if (await fileHash(tmp, { bytes: options.maxInventoryBytes ?? VERIFY_COPY_MAX_BYTES, entries: 1, signal: AbortSignal.timeout(30_000) }) !== expected.hash) throw new Error(`candidate changed before delivery: ${rel}`);
+        if (await fileHash(tmp, { bytes: options.maxInventoryBytes ?? copyLimit, entries: 1, signal: AbortSignal.timeout(30_000) }) !== expected.hash) throw new Error(`candidate changed before delivery: ${rel}`);
         // copyFile can preserve a read-only source mode. Make only the private
         // staging copy writable to open the flush handle.
         await chmod(tmp, 0o600);
@@ -588,7 +594,7 @@ export async function createCandidateIntegration(
         const changed = differences(base, final);
         // Ignore rules keep these private, so promotion would silently lose them.
         ignoredChanges = droppedChanges(baseDropped, finalDropped);
-        const lost = await lostToIgnoreRules(changed, base, final, finalDropped, ignoredChanges, { ...input, contract: rebaseChecked(input.contract) }, checkedDir, set.baseDir);
+        const lost = await lostToIgnoreRules(changed, base, final, finalDropped, ignoredChanges, { ...input, contract: rebaseChecked(input.contract) }, checkedDir, set.baseDir, copyLimit);
         if (lost !== undefined) return await rejectFinal(`candidate not promoted: ${lost}`, { contract: evidence, ignoredChanges: ignoredChanges.map(posixPath) });
         // Approval rules and other project agent state are operator-owned: a
         // worker cannot loosen or remove them by way of a promoted candidate.
@@ -627,7 +633,7 @@ export async function createCandidateIntegration(
             if (before !== undefined && after === undefined) throw new Error(`declared input ${path}: would remove the user's file`);
             if (before?.kind === "file") {
               if (after?.kind !== "file") throw new Error(`declared input ${path}: would remove the user's file`);
-              const beforeLines = await lineCount(join(set.baseDir, path), input.signal), afterLines = await lineCount(join(checkedDir, path), input.signal);
+              const beforeLines = await lineCount(join(set.baseDir, path), input.signal, copyLimit), afterLines = await lineCount(join(checkedDir, path), input.signal, copyLimit);
               if (beforeLines >= 4 && afterLines * 2 < beforeLines) throw new Error(`declared input ${path}: would replace the user's file (${beforeLines} → ${afterLines} lines)`);
             }
           }

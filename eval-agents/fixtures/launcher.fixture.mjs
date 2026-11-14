@@ -9,9 +9,10 @@ const running = runVitest({
   forwarded: JSON.parse(process.env.LAUNCHER_ARGS ?? "[]"),
   extraEnv: { LAUNCHER_EXTRA: "injected extra env" },
   signal: controller.signal,
+  ...(process.env.LAUNCHER_KILL_TIMEOUT_MS ? { killTimeoutMs: Number(process.env.LAUNCHER_KILL_TIMEOUT_MS) } : {}),
   ...(process.env.LAUNCHER_REQUIRE_CAMPAIGN === "1" ? { requireCampaign: true } : {}),
 });
-if (process.env.LAUNCHER_MODE === "cancel") {
+if (["cancel", "tree", "stubborn"].includes(process.env.LAUNCHER_MODE)) {
   const deadline = Date.now() + 3000;
   while (!existsSync(process.env.LAUNCHER_RESULT) && Date.now() < deadline) await delay(10);
   controller.abort();

@@ -14,16 +14,32 @@ childProcess.spawnSync = () => {
   return { status: 0, stdout: "", stderr: "" };
 };
 syncBuiltinESMExports();
-const { installSignalHandlers, runVitest } = await import("../scripts/_lib.mjs");
+const lib = await import("../scripts/_lib.mjs");
+const { installSignalHandlers, runVitest } = lib;
 const cancellation = installSignalHandlers(() => {});
+// A fake managed-daemon teardown: synchronous, like runCli(["models", "stop"]).
+if (process.env.LAUNCHER_TEARDOWN === "1") {
+  const unregister = lib.registerSyncTeardown(() => record("sync-teardown"));
+  if (process.env.LAUNCHER_UNREGISTER === "1") unregister();
+}
 const running = runVitest({ entryPath: process.env.LAUNCHER_ENTRY,
-  cwd: process.env.LAUNCHER_CWD, signal: cancellation?.signal });
+  cwd: process.env.LAUNCHER_CWD, signal: cancellation?.signal,
+  ...(process.env.LAUNCHER_KILL_TIMEOUT_MS ? { killTimeoutMs: Number(process.env.LAUNCHER_KILL_TIMEOUT_MS) } : {}) });
 const deadline = Date.now() + 3000;
 while (!exists(process.env.LAUNCHER_RESULT) && Date.now() < deadline) await delay(10);
 record("child-ready");
+if (process.env.LAUNCHER_CRASH === "1") {
+  // An uncaught exception while the test tree runs: the launcher dies.
+  setTimeout(() => { throw new Error("launcher crashed"); }, 0);
+  await new Promise(() => {});
+}
 // Node dispatches the same installed handlers on both operating systems;
 // no interactive Windows console or actual Ctrl-C injection is required.
-process.emit(process.env.LAUNCHER_SIGNAL ?? "SIGINT");
+// LAUNCHER_REAL_SIGNAL delivers an actual POSIX signal instead, so an
+// unhandled one takes its default action (the terminal closing: SIGHUP).
+if (process.env.LAUNCHER_REAL_SIGNAL === "1") process.kill(process.pid, process.env.LAUNCHER_SIGNAL ?? "SIGINT");
+else process.emit(process.env.LAUNCHER_SIGNAL ?? "SIGINT");
+if (process.env.LAUNCHER_SECOND_SIGNAL) process.emit(process.env.LAUNCHER_SECOND_SIGNAL);
 let code;
 try {
   code = await running;

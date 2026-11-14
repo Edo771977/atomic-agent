@@ -6,6 +6,7 @@ import {
   installSignalHandlers,
   loadEnv,
   makeLog,
+  registerSyncTeardown,
   runVitest,
   teardownDaemons,
 } from "./_lib.mjs";
@@ -15,12 +16,15 @@ const cancellation = installSignalHandlers(log);
 
 async function main() {
   let startedByUs = false;
+  let unregisterTeardown = () => {};
   try {
     loadEnv();
     const daemons = await bringUpDaemons(log, { signal: cancellation.signal });
     const { chatUrl, embedUrl } = daemons;
     startedByUs = daemons.startedByUs;
-    if (cancellation.signal.aborted) return 130;
+    // A second signal exits without reaching the finally below.
+    if (startedByUs) unregisterTeardown = registerSyncTeardown(() => teardownDaemons(log, true));
+    if (cancellation.signal.aborted) return cancellation.exitCode;
     if (!chatUrl) {
       log("no chat llama URL — set ATOMIC_AGENT_EVAL_LLAMA_URL or start managed models");
       return 2;
@@ -39,8 +43,9 @@ async function main() {
         forwarded: process.argv.slice(2),
         signal: cancellation.signal,
       });
-    return cancellation.signal.aborted ? 130 : code;
+    return cancellation.signal.aborted ? cancellation.exitCode : code;
   } finally {
+    unregisterTeardown();
     await teardownDaemons(log, startedByUs);
     cancellation.dispose();
   }
@@ -49,7 +54,7 @@ async function main() {
 main()
   .then((c) => process.exit(c))
   .catch((err) => {
-    if (cancellation.signal.aborted) process.exit(130);
+    if (cancellation.signal.aborted) process.exit(cancellation.exitCode);
     log(`fatal: ${err?.stack ?? err}`);
     process.exit(1);
   });

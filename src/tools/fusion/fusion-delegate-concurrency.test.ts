@@ -36,6 +36,9 @@ function harness(over: Partial<FusionDelegateDeps> = {}, resolved = mode()) {
   const started: string[] = [];
   const pending: Array<() => void> = [];
   const perProvider = new Map<string, number>();
+  // Running turns' providers, sampled at every start.
+  const snapshots: string[][] = [];
+  const running: string[] = [];
   const peaks = new Map<string, number>();
   const deps: FusionDelegateDeps = {
     createEphemeralSession: (meta) => createEmptySessionState({ id: `__fusion_worker__${++minted}`, workingDir: dir, metadata: { fusionWorker: meta } }),
@@ -43,6 +46,8 @@ function harness(over: Partial<FusionDelegateDeps> = {}, resolved = mode()) {
       const id = (session.metadata?.fusionWorker as { taskId: string }).taskId;
       const provider = options.providerId!;
       started.push(id);
+      running.push(provider);
+      snapshots.push([...running]);
       active++;
       peak = Math.max(peak, active);
       perProvider.set(provider, (perProvider.get(provider) ?? 0) + 1);
@@ -58,6 +63,7 @@ function harness(over: Partial<FusionDelegateDeps> = {}, resolved = mode()) {
         return { session, reason: "reply", stepCount: 1 } satisfies RunTurnResult;
       } finally {
         active--;
+        running.splice(running.indexOf(provider), 1);
         perProvider.set(provider, perProvider.get(provider)! - 1);
       }
     },
@@ -69,8 +75,11 @@ function harness(over: Partial<FusionDelegateDeps> = {}, resolved = mode()) {
   };
   const tool = buildFusionDelegateTool(deps);
   return {
-    start: (tasks: DelegateTask[], maxWorkers: number, signal = new AbortController().signal, sessionId = "parent") => tool.run({ tasks, maxWorkers }, { workingDir: dir, sessionId, stepIndex: 0, signal }),
+    start: (tasks: DelegateTask[], maxWorkers: number | undefined, signal = new AbortController().signal, sessionId = "parent") =>
+      tool.run(maxWorkers === undefined ? { tasks } : { tasks, maxWorkers }, { workingDir: dir, sessionId, stepIndex: 0, signal }),
     started, pending, peaks,
+    /** The most turns on `providers` that ever ran at once. */
+    localPeak: (providers: ReadonlySet<string>) => Math.max(0, ...snapshots.map((s) => s.filter((p) => providers.has(p)).length)),
     get active() { return active; }, get peak() { return peak; }, get minted() { return minted; },
     async drain(count: number) {
       for (let i = 0; i < count; i++) {
@@ -122,6 +131,95 @@ describe("fusion.delegate call-wide concurrency", () => {
     await h.drain(tasks.length);
     expect((await running).details.maxWorkers).toBe(4);
     expect(h.peak).toBe(4);
+  });
+
+  it("an unnamed width on an unpinned local main leg does not serialize cloud role tasks", async () => {
+    const h = harness({ workerSupportsSlotAffinity: (p) => p === "main", slotManager: { poolSize: () => 2 } }, mode({ workersPinned: false }));
+    const tasks = Array.from({ length: 4 }, (_, i) => ({ ...build, id: `b${i}` }));
+    const running = h.start(tasks, undefined);
+    await vi.waitFor(() => expect(h.active).toBe(4));
+    await h.drain(tasks.length);
+    expect((await running).details.maxWorkers).toBe(4);
+    expect(h.peak).toBe(4);
+  });
+
+  it("an unnamed width keeps the local main default of one beside cloud role width", async () => {
+    const h = harness({ workerSupportsSlotAffinity: (p) => p === "main", slotManager: { poolSize: () => 4 } }, mode({ workersPinned: false }));
+    const tasks = [main, { ...main, id: "main2" }, build, { ...build, id: "build2" }, review];
+    const running = h.start(tasks, undefined);
+    await vi.waitFor(() => expect(h.active).toBe(4));
+    await tick();
+    expect(h.active).toBe(4);
+    await h.drain(tasks.length);
+    expect((await running).details.maxWorkers).toBe(4);
+    expect(h.peaks.get("main")).toBe(1);
+    expect(h.peaks.get("builder")).toBe(2);
+    expect(h.peaks.get("reviewer")).toBe(1);
+  });
+
+  it("an unnamed width runs one local worker at a time across the main and local role legs", async () => {
+    const local = new Set(["main", "builder"]);
+    const h = harness({ workerSupportsSlotAffinity: (p) => local.has(p), slotManager: { poolSize: () => 4 } },
+      mode({ workersPinned: false, roles: { byRole: { build: { ...role("builder"), local: true }, review: role("reviewer") }, mixLocalModels: true, localLegProviderIds: ["builder"] } }));
+    const tasks = [main, { ...main, id: "main2" }, build, { ...build, id: "build2" }, review];
+    const running = h.start(tasks, undefined);
+    await vi.waitFor(() => expect(h.active).toBe(2));
+    await tick();
+    // The GPU's one worker plus the cloud reviewer.
+    expect(h.active).toBe(2);
+    expect(h.started).toContain("review");
+    await h.drain(tasks.length);
+    expect((await running).details.maxWorkers).toBe(2);
+    expect(h.localPeak(local)).toBe(1);
+  });
+
+  it("an unnamed width on a cloud main leg applies workers to that leg only", async () => {
+    const h = harness({}, mode({ workers: 1, workersPinned: false }));
+    const tasks = [main, { ...main, id: "main2" }, build, { ...build, id: "build2" }];
+    const running = h.start(tasks, undefined);
+    await vi.waitFor(() => expect(h.active).toBe(3));
+    await tick();
+    expect(h.active).toBe(3);
+    await h.drain(tasks.length);
+    expect((await running).details.maxWorkers).toBe(3);
+    expect(h.peaks.get("main")).toBe(1);
+    expect(h.peaks.get("builder")).toBe(2);
+  });
+
+  it("names a binding local main pool even when role legs are active", async () => {
+    const h = harness({ workerSupportsSlotAffinity: (p) => p === "main", slotManager: { poolSize: () => 1 } });
+    const tasks = [main, { ...main, id: "main2" }, { ...main, id: "main3" }, build];
+    const running = h.start(tasks, 4);
+    await h.drain(tasks.length);
+    const result = await running;
+    expect(result.details.maxWorkers).toBe(2);
+    expect(result.summary).toContain("3 workers' worth of work was sent");
+    expect(result.summary).toContain("1 request slot,");
+    expect(result.summary).toContain("only 1 ran at a time");
+  });
+
+  it("names a binding cloud cap on the main leg beside role legs, and stays quiet when it is not binding", async () => {
+    const h = harness({}, mode({ cloudWorkers: 2 }));
+    const tasks = [main, { ...main, id: "main2" }, { ...main, id: "main3" }, build];
+    const running = h.start(tasks, 4);
+    await h.drain(tasks.length);
+    expect((await running).summary).toContain("the cloud worker cap (`llm.runMode.fusion.cloudWorkers`)");
+    const quiet = harness({ workerSupportsSlotAffinity: (p) => p === "main", slotManager: { poolSize: () => 4 } }, mode({ workersPinned: false }));
+    const calm = quiet.start([main, { ...main, id: "main2" }, build], undefined);
+    await quiet.drain(3);
+    const calmResult = await calm;
+    expect(calmResult.summary).not.toContain("request slot");
+    expect(calmResult.summary).not.toContain("was clamped");
+  });
+
+  it("names the default width, not maxWorkers, when the cloud cap clamps a call that named none", async () => {
+    const h = harness({}, mode({ workers: 4, workersPinned: false, cloudWorkers: 2 }));
+    const tasks = [main, { ...main, id: "main2" }, { ...main, id: "main3" }];
+    const running = h.start(tasks, undefined);
+    await h.drain(tasks.length);
+    const summary = (await running).summary;
+    expect(summary).toContain("the default width of 3 (`llm.runMode.fusion.workers`; this call named no maxWorkers) was clamped to 2, the cloud worker cap (`llm.runMode.fusion.cloudWorkers`)");
+    expect(summary).not.toContain("maxWorkers 3");
   });
 
   it("keeps physical, cloud and strong leg caps within the call ceiling", async () => {
@@ -216,7 +314,29 @@ describe("fusion.delegate call-wide concurrency", () => {
     const result = await running;
     const rows = result.details.tasks as WorkerTaskResult[];
     expect(rows[1]).toMatchObject({ status: "ok", durationMs: 0, schedulerQueueWaitMs: 90_000 });
-    expect(rows[1]!.notes?.join(" ")).toContain("fan-out concurrency before execution");
     expect(rows[1]!.queueWaitMs).toBeNull();
+    // One call-wide line, not a note on every queued row.
+    expect(rows[1]!.notes?.join(" ") ?? "").not.toContain("worker slot");
+    expect(result.summary).toContain("1 task waited up to 2 min for a worker slot");
+  });
+
+  it("aggregates every queued task's wait into one call-wide note", async () => {
+    let now = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const h = harness();
+    const tasks = [main, build, review, strong];
+    const running = h.start(tasks, 1);
+    for (const wait of [10_000, 20_000, 30_000, 0]) {
+      await vi.waitFor(() => expect(h.pending.length).toBe(1));
+      now += wait;
+      h.pending.shift()!();
+      await tick();
+    }
+    const result = await running;
+    const rows = result.details.tasks as WorkerTaskResult[];
+    expect(rows.map((r) => r.schedulerQueueWaitMs ?? 0).sort((a, b) => a - b)).toEqual([0, 10_000, 30_000, 60_000]);
+    expect(rows.every((r) => !(r.notes ?? []).join(" ").includes("worker slot"))).toBe(true);
+    expect(result.summary.match(/waited up to/g)).toHaveLength(1);
+    expect(result.summary).toContain("3 tasks waited up to 1 min for a worker slot");
   });
 });

@@ -351,6 +351,44 @@ it.each([".ATOMIC-AGENT", ".Atomic-Agent", ".atomic-agent.", ".atomic-agent "])(
     // Rejection legitimately creates .atomic-agent/fusion-merge. On a
     // case-insensitive host the alias can name that same recovery folder.
     expect(await readFile(join(root, ".atomic-agent", "approval-rules.json"), "utf8")).toBe(protectedRules);
+    // Where the spelling names a folder of its own (case-sensitive, non-Win32
+    // filesystems), nothing may have been written there either.
+    const own = await stat(join(root, name)).catch(() => null);
+    const state = await stat(join(root, ".atomic-agent"));
+    if (own === null || own.ino !== state.ino || own.dev !== state.dev) {
+      await expect(readFile(join(root, name, "approval-rules.json"))).rejects.toThrow();
+    }
+  } finally { await candidate.cleanup(); }
+});
+
+it.each(["folder copy", "git worktree"] as const)("promotes through a symlinked alias of the project root without writing a separate tree there (%s)", async kind => {
+  let root: string;
+  if (kind === "git worktree") {
+    root = await realpath(await makeGitRepo("atag-candidate-alias-git-")); roots.push(root);
+    await writeRepoFile(root, "api.json", '{"name":"before"}');
+    await runGitRaw(root, ["add", "-A"]); await runGitRaw(root, ["commit", "-qm", "fixture"]);
+  } else root = await project();
+  // A macOS /var -> /private/var style alias: the caller names the project through a link.
+  const holder = await realpath(await mkdtemp(join(tmpdir(), "atag-candidate-alias-"))); roots.push(holder);
+  const alias = join(holder, "alias");
+  await symlink(root, alias, "dir");
+  const candidate = await createCandidateIntegration(alias);
+  try {
+    expect(candidate.dir.startsWith(root)).toBe(false);
+    await writeFile(join(candidate.dir, "api.json"), '{"name":"after"}');
+    await mkdir(join(candidate.dir, "new")); await writeFile(join(candidate.dir, "new", "out.txt"), "delivered");
+    const report = await candidate.finish({ rows, contract, signal, runChecks: pass });
+    expect(report.status).toBe("promoted");
+    expect(await readFile(join(root, "api.json"), "utf8")).toBe('{"name":"after"}');
+    expect(await readFile(join(root, "new", "out.txt"), "utf8")).toBe("delivered");
+    // The alias is still the same link and nothing else appeared beside it.
+    expect((await lstat(alias)).isSymbolicLink()).toBe(true);
+    expect(await realpath(alias)).toBe(root);
+    expect(await readdir(holder)).toEqual(["alias"]);
+    // Every promotion rename names the canonical root, never the alias path.
+    const renames = fsEvents.filter(([event]) => event === "rename").map(([, path]) => path);
+    expect(renames.length).toBeGreaterThan(0);
+    expect(renames.filter(path => path.startsWith(`${alias}${sep}`))).toEqual([]);
   } finally { await candidate.cleanup(); }
 });
 
