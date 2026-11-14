@@ -21,6 +21,7 @@ import {
 } from "./read-scope-shell.js";
 import {
   READ_TOOL_TARGETS,
+  invalidLocalFileUrlReason,
   SHELL_TOOL,
   VERIFY_TOOL,
   verifyRunShellCalls,
@@ -246,6 +247,8 @@ export function localPageCheck(
   options: ConfineReadsOptions,
 ): (url: string, ctx: Pick<ToolContext, "sessionId" | "workingDir" | "readRoots">) => string | null {
   return (url, ctx) => {
+    const invalid = invalidLocalFileUrlReason(url);
+    if (invalid !== null) return invalid;
     const args = { url };
     if (checkWorkerRead(LOCAL_PAGE_TOOL, args, ctx, options.grantedDirs(ctx.sessionId)) !== null) {
       return "is outside this worker's directories";

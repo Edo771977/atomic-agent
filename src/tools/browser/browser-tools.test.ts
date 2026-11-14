@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeEach } from "vitest";
+import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import type {
   AriaSnapshot,
   BrowserBackend,
@@ -26,6 +28,8 @@ import {
 import { ToolRegistry } from "../tool-registry.js";
 import { ApprovalGate } from "../../approval/approval-gate.js";
 import type { DangerousToolOptions } from "../../approval/dangerous-tool.js";
+
+const LOCAL_FILE_URL = pathToFileURL(resolve("browser-fixture", "local.txt")).href;
 
 function autoApprove(): DangerousToolOptions {
   const gate = new ApprovalGate({
@@ -219,7 +223,7 @@ describe("browser tools on a fake backend", () => {
       approvalRequired: true,
     });
     await expect(
-      tool.run({ url: "file:///etc/passwd" }, CTX),
+      tool.run({ url: LOCAL_FILE_URL }, CTX),
     ).rejects.toMatchObject({ name: "ApprovalDeniedError" });
   });
 
@@ -372,7 +376,7 @@ describe("browser tools on a fake backend", () => {
       approvalRequired: true,
     });
     await expect(
-      tool.run({ action: "new", url: "file:///etc/passwd" }, CTX),
+      tool.run({ action: "new", url: LOCAL_FILE_URL }, CTX),
     ).rejects.toMatchObject({ name: "ApprovalDeniedError" });
     expect(backend.lastTabs).toBeNull();
     expect(backend.readyCalls).toBe(0);
@@ -390,14 +394,14 @@ describe("browser tools on a fake backend", () => {
       approvalRequired: true,
     });
     const result = await tool.run(
-      { action: "new", url: "file:///etc/hosts" },
+      { action: "new", url: LOCAL_FILE_URL },
       CTX,
     );
     expect(result.status).toBe("ok");
     // url survives the await and reaches the backend intact
     expect(backend.lastTabs).toEqual({
       action: "new",
-      url: "file:///etc/hosts",
+      url: LOCAL_FILE_URL,
     });
     expect(backend.readyCalls).toBe(1);
   });

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, parse } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { ApprovalGate, type ApprovalLevel, type ApprovalRequest } from "../../approval/index.js";
@@ -14,6 +14,7 @@ import {
 } from "../read-scope/confine-reads.js";
 import { GateBackend } from "./browser-gate-test-helpers.js";
 import { buildBrowserTools } from "./index.js";
+import { gatePageRead, localPageRefusal } from "./gate-page-read.js";
 
 /**
  * A file:// page is a local read: it goes through the agent's secret-file
@@ -163,7 +164,7 @@ describe("browser file:// navigation", () => {
     readScope = "working-dir";
     backend.url = url(join(work, "index.html"));
     // A file:// directory listing's parent link, off the temp directory.
-    backend.landAfterAction = "file:///srv/elsewhere/";
+    backend.landAfterAction = `${url(join(parse(root).root, "srv", "elsewhere"))}/`;
     const result = await registry.invoke("browser.click", { ref: "e1" }, ctx());
     expect(result.status).toBe("error");
     expect(result.details.reason).toBe("local_file_refused");
@@ -204,9 +205,86 @@ describe("browser file:// navigation", () => {
     readScope = "working-dir";
     decide = (r) => ({ approved: r.category !== "fs_read_outside" });
     // Off the temp directory, which is scratch and never asked about.
-    const result = await navigate("file:///srv/elsewhere/page.html");
+    const result = await navigate(url(join(parse(root).root, "srv", "elsewhere", "page.html")));
     expect(result.status).toBe("error");
     expect(prompts.map((p) => p.category)).toEqual(["fs_read_outside"]);
+    expect(backend.navigations).toHaveLength(0);
+  });
+
+  const unmappableUrls = [
+    "file:///bad%00name.html",
+    "view-source:file:///bad%00name.html",
+    "file:///bad%ZZname.html",
+    "file:///bad%2Fname.html",
+    "file:///C:/bad%00name.html",
+    "file://%ZZ/",
+    ...(process.platform === "win32"
+      ? ["file:///srv/elsewhere/page.html", "view-source:file:///srv/elsewhere/page.html"]
+      : ["file://server/share/page.html"]),
+  ];
+
+  it.each(unmappableUrls)("refuses an unmappable local URL before navigating: %s", async (target) => {
+    const result = await navigate(target);
+    expect(result.status).toBe("error");
+    expect(result.details.reason).toBe("local_file_refused");
+    expect(backend.navigations).toHaveLength(0);
+    expect(prompts).toEqual([]);
+  });
+
+  it.each(unmappableUrls)("refuses an unmappable local URL before opening a tab: %s", async (target) => {
+    const result = await registry.invoke("browser.tabs", { action: "new", url: target }, ctx());
+    expect(result.status).toBe("error");
+    expect(result.details.reason).toBe("local_file_refused");
+    expect(backend.tabCalls).toBe(0);
+    expect(prompts).toEqual([]);
+  });
+
+  it.each(unmappableUrls)("clears a click landing on an unmappable local URL: %s", async (target) => {
+    backend.landAfterAction = target;
+    const result = await registry.invoke("browser.click", { ref: "e1" }, ctx());
+    expect(result.status).toBe("error");
+    expect(result.details.reason).toBe("local_file_refused");
+    expect(backend.url).toBe("about:blank");
+    expect(backend.snapshots).toBe(0);
+  });
+
+  it.each(unmappableUrls)("does not read or screenshot an unmappable local URL: %s", async (target) => {
+    backend.url = target;
+    for (const tool of ["browser.read_aria", "browser.screenshot"]) {
+      const result = await registry.invoke(tool, {}, ctx());
+      expect(result.status).toBe("error");
+      expect(result.details.reason).toBe("local_file_refused");
+      expect(result.details.worldSnapshot).toBeUndefined();
+      expect(result.summary).not.toContain("secret page text");
+    }
+    expect(backend.shots).toHaveLength(0);
+  });
+
+  it.each(unmappableUrls)("does not exempt an unmappable requested URL or frame: %s", async (target) => {
+    const policy = { blockedDomains: [], allowedDomains: [] };
+    expect(localPageRefusal([target], policy, { reader: ctx(), allowUrl: target })).not.toBeNull();
+    const verdict = await gatePageRead(
+      { url: "https://example.com", frameUrls: [target] }, policy, "s",
+    );
+    expect(verdict.kind).toBe("local_file_refused");
+  });
+
+  it.each(unmappableUrls)("refuses an unmappable URL without a read-scope wrapper: %s", async (target) => {
+    const bareRegistry = new ToolRegistry();
+    for (const tool of buildBrowserTools(backend, { approvals: gate, approvalRequired: true })) {
+      bareRegistry.register(tool);
+    }
+    expect((await bareRegistry.invoke("browser.navigate", { url: target }, ctx())).status).toBe("error");
+    expect(backend.navigations).toHaveLength(0);
+    expect(prompts).toEqual([]);
+  });
+
+  it("asks for a native absolute local path outside scratch and the read scope", async () => {
+    readScope = "working-dir";
+    decide = (request) => ({ approved: request.category !== "fs_read_outside" });
+    const outside = join(parse(root).root, "atomic-scope-outside", "page.html");
+    expect((await navigate(url(outside))).status).toBe("error");
+    expect(prompts.map((request) => request.category)).toEqual(["fs_read_outside"]);
     expect(backend.navigations).toHaveLength(0);
   });
 });

@@ -23,27 +23,43 @@ const pathArg: ReadTargetsOf = (args) => {
  * `view-source:`), or `null` for any other URL. A browser page on a
  * local file is a read like `os.fs.read`.
  */
-export function localFileOfUrl(url: string): string | null {
+type LocalFileUrl = { path: string } | { error: string } | null;
+
+function parseLocalFileUrl(url: string): LocalFileUrl {
   let rest = url.trim();
   while (/^view-source:/i.test(rest)) rest = rest.slice("view-source:".length).trim();
   let parsed: URL;
   try {
     parsed = new URL(rest);
   } catch {
-    return null;
+    return /^file:/i.test(rest) ? { error: "has an invalid local file URL" } : null;
   }
   if (parsed.protocol !== "file:") return null;
   try {
-    return fileURLToPath(parsed);
-  } catch {
-    // A host the platform cannot map (`file://server/…` on POSIX): the
-    // path part is still what a browser would try to open.
-    try {
-      return decodeURIComponent(parsed.pathname);
-    } catch {
-      return parsed.pathname;
+    const path = fileURLToPath(parsed);
+    // Node permits NUL in the decoded string, but no filesystem API can
+    // open it. Windows also forbids the remaining ASCII control bytes.
+    if ((process.platform === "win32" ? /[\x00-\x1f]/ : /\x00/).test(path)) {
+      return { error: "has an invalid local file path" };
     }
+    return { path };
+  } catch {
+    // A drive-less Windows URL, foreign file host, invalid escape or
+    // encoded separator cannot be checked as a native path. Never drop
+    // its host/drive semantics and let a browser resolve it differently.
+    return { error: "cannot be mapped to an absolute local path on this platform" };
   }
+}
+
+export function localFileOfUrl(url: string): string | null {
+  const local = parseLocalFileUrl(url);
+  return local !== null && "path" in local ? local.path : null;
+}
+
+/** A local URL the browser must refuse, rather than opening unchecked. */
+export function invalidLocalFileUrlReason(url: string): string | null {
+  const local = parseLocalFileUrl(url);
+  return local !== null && "error" in local ? local.error : null;
 }
 
 const browserUrlArg: ReadTargetsOf = (args) => {

@@ -7,6 +7,7 @@ import {
   type DangerousToolOptions,
 } from "../../approval/dangerous-tool.js";
 import type { ToolContext } from "../tool-registry.js";
+import { invalidLocalFileUrlReason } from "../read-scope/read-scope-targets.js";
 import { requireUserSite } from "./user-profile-sites.js";
 import {
   localPageMessage,
@@ -54,6 +55,15 @@ export async function gateBrowserUrl(
       status: "error",
       output: `${tool}: in your own Chrome the agent opens only http(s) pages. chrome://, file:// and other browser pages (saved passwords, settings, history, local files) are off limits.`,
       details: { url, reason: "user_profile_nonweb" },
+    });
+  }
+  const invalidLocal = invalidLocalFileUrlReason(url);
+  if (invalidLocal !== null) {
+    return compressToolResult({
+      tool,
+      status: "error",
+      output: localPageMessage(tool, url, invalidLocal),
+      details: { url, path: url, reason: "local_file_refused" },
     });
   }
   const verdict = checkBrowserUrl(url, policy);
@@ -104,8 +114,8 @@ export async function gateBrowserUrl(
  * about. Such a page is cleared and refused the same way (never asked
  * about mid-action; the question belongs to a navigation naming it).
  *
- * Skipped while `blockedDomains` is empty and no local check is wired,
- * so it costs nothing then.
+ * Even without a domain/read-scope policy, an unmappable local URL is
+ * refused: its filesystem target cannot be checked safely.
  */
 export async function recheckLandedPage(
   backend: Pick<BrowserBackend, "currentUrl" | "navigate">,
@@ -114,8 +124,6 @@ export async function recheckLandedPage(
   landedUrl?: string,
   local?: LocalPageRead,
 ): Promise<CompressedToolResult | null> {
-  const checkLocal = policy.localPages !== undefined && local !== undefined;
-  if (policy.blockedDomains.length === 0 && !checkLocal) return null;
   let url = landedUrl;
   if (url === undefined) {
     try {

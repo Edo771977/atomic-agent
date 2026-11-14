@@ -1,5 +1,5 @@
 import type { DangerousToolOptions } from "../../approval/dangerous-tool.js";
-import { localFileOfUrl } from "../read-scope/read-scope-targets.js";
+import { invalidLocalFileUrlReason, localFileOfUrl } from "../read-scope/read-scope-targets.js";
 import {
   blockedHostOfPage,
   webHostOf,
@@ -43,6 +43,12 @@ export function localPageRefusal(
   policy: BrowserDomainPolicy,
   local: LocalPageRead | undefined,
 ): { path: string; why: string } | null {
+  // Validate before allowUrl: an unchecked URL must never exempt itself,
+  // even in an embedder without a session read-scope policy.
+  for (const url of urls) {
+    const invalid = invalidLocalFileUrlReason(url);
+    if (invalid !== null) return { path: url, why: invalid };
+  }
   const check = policy.localPages;
   if (check === undefined || local === undefined) return null;
   const allowed =
