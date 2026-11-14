@@ -268,7 +268,8 @@ export interface AgentRuntime {
    * `pending` says whether `sessionId`'s last turn is one;
    * `resumeMessage` returns the message that continues it (a note
    * telling the model to check before repeating side effects, then the
-   * request) and marks it "resume queued", so it is offered once; the
+   * request; for a cut-off Fusion orchestrator turn with a resumable run,
+   * that run's `fusionRuns.resumeMessage` instead) and marks it "resume queued", so it is offered once; the
    * marker is replaced when the continuing turn starts. `release` gives
    * it back when the caller drops that message before it runs (a cleared
    * queue, a stop, a switch). The caller sends the message through

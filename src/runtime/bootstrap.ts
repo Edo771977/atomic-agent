@@ -864,6 +864,34 @@ export async function createAgentRuntime(
   });
   consolidatorJob?.start();
 
+  // ATO-617 / ATO-448: fusion runs a restart cut off, for `/fusion resume`
+  // and for `/resume` of a cut-off orchestrator turn.
+  const fusionRunsApi = {
+    listResumable: (sessionId?: string) =>
+      fusionRuns.listResumable(sessionId).map((run) => ({
+        runId: run.runId,
+        sessionId: run.sessionId,
+        updatedAt: run.updatedAt,
+        summary: describeResumableRun(run),
+      })),
+    resumeMessage: (sessionId: string, runId?: string) => {
+      const run =
+        runId === undefined
+          ? fusionRuns.listResumable(sessionId)[0]
+          : fusionRuns.listResumable(sessionId).find((r) => r.runId === runId);
+      return run === undefined ? null : renderResumeRequest(run);
+    },
+    discard: (sessionId: string, runId?: string) => {
+      const run =
+        runId === undefined
+          ? fusionRuns.listResumable(sessionId)[0]
+          : fusionRuns.listResumable(sessionId).find((r) => r.runId === runId);
+      return run !== undefined && fusionRuns.discard(run.runId)
+        ? run.runId
+        : null;
+    },
+  };
+
   const runtime = {
     getSessionWorkspace(input: SessionState | string) {
       const session = typeof input === "string" ? sessionStore.load(input) : input;
@@ -890,33 +918,9 @@ export async function createAgentRuntime(
       steer: (parentSessionId: string, taskId: string, text: string) =>
         fusionLiveWorkers.steer(parentSessionId, taskId, text),
     },
-    fusionRuns: {
-      listResumable: (sessionId?: string) =>
-        fusionRuns.listResumable(sessionId).map((run) => ({
-          runId: run.runId,
-          sessionId: run.sessionId,
-          updatedAt: run.updatedAt,
-          summary: describeResumableRun(run),
-        })),
-      resumeMessage: (sessionId: string, runId?: string) => {
-        const run =
-          runId === undefined
-            ? fusionRuns.listResumable(sessionId)[0]
-            : fusionRuns.listResumable(sessionId).find((r) => r.runId === runId);
-        return run === undefined ? null : renderResumeRequest(run);
-      },
-      discard: (sessionId: string, runId?: string) => {
-        const run =
-          runId === undefined
-            ? fusionRuns.listResumable(sessionId)[0]
-            : fusionRuns.listResumable(sessionId).find((r) => r.runId === runId);
-        return run !== undefined && fusionRuns.discard(run.runId)
-          ? run.runId
-          : null;
-      },
-    },
+    fusionRuns: fusionRunsApi,
     // A chat turn a restart cut off: offered, never continued on its own (ATO-448).
-    interruptedTurns: createInterruptedTurns(sessionStore),
+    interruptedTurns: createInterruptedTurns(sessionStore, fusionRunsApi),
     profileStore,
     notesStore,
     lessonStore,

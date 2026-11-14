@@ -144,4 +144,42 @@ describe("createInterruptedTurns", () => {
     expect(turns.resumeMessage("task-session")).toBeNull();
     expect(store.readTurnProgress("task-session")).not.toBeNull();
   });
+  describe("a cut-off Fusion orchestrator turn", () => {
+    /** A fusion run store stub: `runs` resumable for "fz". */
+    function fusionRunsOf(runs: { runId: string; updatedAt: number }[]) {
+      const asked: (string | undefined)[] = [];
+      return {
+        asked,
+        api: {
+          listResumable: (sessionId?: string) =>
+            sessionId === "fz" ? runs.map((r) => ({ ...r, sessionId: "fz", summary: "1 of 3 done" })) : [],
+          resumeMessage: (sessionId: string, runId?: string) => {
+            asked.push(runId);
+            return sessionId === "fz" ? `resume fusion run ${runId ?? "newest"}` : null;
+          },
+        },
+      };
+    }
+
+    it("hands back the fusion resume instead of re-sending the request", () => {
+      cutOffByRestart("fz");
+      const fusion = fusionRunsOf([{ runId: "run-7", updatedAt: 1_500 }]);
+      const turns = createInterruptedTurns(store, fusion.api);
+      const message = turns.resumeMessage("fz");
+      expect(message).toBe("resume fusion run run-7");
+      expect(message).not.toContain("push the release branch");
+      expect(fusion.asked).toEqual(["run-7"]);
+      // Queued like any resume: offered once.
+      expect(turns.resumeMessage("fz")).toBeNull();
+    });
+
+    it("re-sends the request when the session's resumable run predates the cut-off turn", () => {
+      cutOffByRestart("fz");
+      const fusion = fusionRunsOf([{ runId: "old", updatedAt: 500 }]);
+      const message = createInterruptedTurns(store, fusion.api).resumeMessage("fz");
+      expect(message).toContain(INTERRUPTED_TURN_RESUME_NOTE);
+      expect(message?.endsWith("push the release branch")).toBe(true);
+      expect(fusion.asked).toEqual([]);
+    });
+  });
 });

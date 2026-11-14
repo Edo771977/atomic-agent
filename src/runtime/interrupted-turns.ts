@@ -30,9 +30,39 @@ export interface InterruptedTurns {
   release(sessionId: string): void;
 }
 
+/**
+ * The slice of `AgentRuntime.fusionRuns` a resume needs (structural,
+ * so this module does not import the runtime contract).
+ */
+export interface ResumableFusionRuns {
+  listResumable(sessionId: string): readonly { runId: string; updatedAt: number }[];
+  resumeMessage(sessionId: string, runId?: string): string | null;
+}
+
+/**
+ * A cut-off Fusion orchestrator turn is continued from its run's
+ * checkpoints, not by re-sending its request: that would start a fresh
+ * fan-out, paying the workers again and ignoring what they finished.
+ * When the session has a resumable run written during the cut-off turn
+ * (`updatedAt` at or after the turn's start), `resumeMessage` returns
+ * that run's resume message — the same one `/fusion resume` sends.
+ */
 export function createInterruptedTurns(
   store: Pick<SessionStore, "load" | "readTurnProgress">,
+  fusionRuns?: ResumableFusionRuns,
 ): InterruptedTurns {
+  const fusionResumeFor = (sessionId: string, turn: InterruptedChatTurn): string | null => {
+    if (fusionRuns === undefined) return null;
+    try {
+      const run = fusionRuns
+        .listResumable(sessionId)
+        .find((r) => r.updatedAt >= turn.startedAt);
+      return run === undefined ? null : fusionRuns.resumeMessage(sessionId, run.runId);
+    } catch {
+      // Unreadable checkpoints: fall back to re-sending the request.
+      return null;
+    }
+  };
   /** Session id -> `startedAt` of the cut-off turn a resume is queued for. */
   const queued = new Map<string, number>();
   const read = (sessionId: string): InterruptedChatTurn | null => {
@@ -56,8 +86,9 @@ export function createInterruptedTurns(
     resumeMessage(sessionId) {
       const turn = pending(sessionId);
       if (turn === null) return null;
+      const message = fusionResumeFor(sessionId, turn) ?? interruptedTurnResumeMessage(turn);
       queued.set(sessionId, turn.startedAt);
-      return interruptedTurnResumeMessage(turn);
+      return message;
     },
     release(sessionId) {
       queued.delete(sessionId);
