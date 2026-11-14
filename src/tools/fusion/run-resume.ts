@@ -132,6 +132,7 @@ function carriedResult(task: CheckpointTask): WorkerTaskResult {
     ...(r.changes === undefined ? {} : { changes: r.changes }),
     ...(r.shellRan === true ? { shellRan: true } : {}),
     ...(r.artifactManifest === undefined ? {} : { artifactManifest: r.artifactManifest }),
+    ...(r.question === undefined ? {} : { question: r.question }),
     notes: [...(r.notes ?? []), CARRIED_NOTE],
   };
 }

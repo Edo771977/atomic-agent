@@ -25,6 +25,7 @@ import {
   type WorkerTaskStatus,
   type WorkerToolStats,
 } from "./worker-result.js";
+import { MAX_WORKER_QUESTION_CHARS } from "./worker-question.js";
 import { UNTRACKED_WRITE_TOOLS, type FileChange } from "./worker-changes.js";
 import { incompleteArtifactManifest, storedArtifactManifest } from "./artifact-manifest.js";
 import type { ArtifactManifest } from "./artifact-manifest-types.js";
@@ -142,6 +143,11 @@ export interface CheckpointTaskResult {
   /** Absent in older v1 files. Incomplete coverage must never resume green. */
   artifactMetadata?: "complete" | "incomplete";
   artifactManifest?: ArtifactManifest;
+  /**
+   * A `needs_input` task's question (ATO-945), kept apart from the
+   * clipped reply so a resume still shows it. Absent in older v1 files.
+   */
+  question?: string;
 }
 
 export interface CheckpointTask {
@@ -498,6 +504,7 @@ export class FusionRunRecorder {
       tools: result.tools,
       ...(result.error === undefined ? {} : { error: result.error.slice(0, CHECKPOINT_REPLY_CHARS) }),
       ...(result.notes === undefined ? {} : { notes: result.notes.slice(0, 64).map((n) => n.slice(0, CHECKPOINT_REPLY_CHARS)) }),
+      ...(result.question === undefined ? {} : { question: result.question.slice(0, MAX_WORKER_QUESTION_CHARS) }),
       costUsd: spend,
       changes: changes.filter(validChange).slice(0, CHECKPOINT_MAX_CHANGES),
       ...(shellRan ? { shellRan: true } : {}),
@@ -642,5 +649,6 @@ function validTask(value: unknown): value is CheckpointTask {
     (r.notes === undefined || stringList(r.notes, CHECKPOINT_MAX_BYTES, CHECKPOINT_MAX_BYTES)) &&
     (r.changes === undefined || (Array.isArray(r.changes) && r.changes.length <= CHECKPOINT_MAX_CHANGES && r.changes.every(validChange))) &&
     (r.shellRan === undefined || r.shellRan === true) &&
+    (r.question === undefined || boundedString(r.question, MAX_WORKER_QUESTION_CHARS)) &&
     (r.artifactMetadata === undefined || r.artifactMetadata === "complete" || r.artifactMetadata === "incomplete");
 }
