@@ -874,17 +874,20 @@ async function addWorktree(
   await materializePrivateGitWorkspace(root, snapshot.privateGit);
   const dir = snapshot.rel.length === 0 ? root : join(root, snapshot.rel);
   await mkdir(dir, { recursive: true });
-  for (const path of snapshot.tracked) {
+  // Checkout attributes (including ident/eol) apply throughout the repository.
+  // Sibling packages used through rebased dependency links need exact bytes too.
+  const sourceTop = resolve(realDir, ...snapshot.rel.split(/[\\/]/).filter(Boolean).map(() => ".."));
+  for (const path of snapshot.privateGit.trackedPaths) {
     budget.signal?.throwIfAborted();
     if (budget.measurement !== undefined && --budget.measurement.entriesLeft < 0) throw new Error("final copy measurement exceeds the 100000 entry limit");
-    const from = join(realDir, path);
+    const from = join(sourceTop, path);
     let info;
     try {
       info = await lstat(from);
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
     }
-    const to = join(dir, path);
+    const to = join(root, path);
     // The checkout already holds the source's bytes (the common case):
     // only its mode and times are made the source's, nothing is copied
     // or charged to the copy limit.

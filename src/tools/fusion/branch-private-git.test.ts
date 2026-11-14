@@ -94,16 +94,17 @@ it("preserves dirty tracked sibling-package bytes outside the selected monorepo 
   await mkdir(join(f.project, "packages", "lib"));
   await writeFile(join(f.project, "packages", "app", "app.txt"), "app\n");
   await writeFile(join(f.project, "packages", "lib", "lib.txt"), "committed library\n");
-  await runGitRaw(f.project, ["add", "packages"]); await runGitRaw(f.project, ["commit", "-qm", "packages"]);
+  await writeFile(join(f.project, ".gitattributes"), "packages/lib/lib.txt ident\n");
+  await runGitRaw(f.project, ["add", "packages", ".gitattributes"]); await runGitRaw(f.project, ["commit", "-qm", "packages"]);
   await writeFile(join(f.project, "packages", "lib", "lib.txt"), "staged library\n");
   await runGitRaw(f.project, ["add", "packages/lib/lib.txt"]);
-  await writeFile(join(f.project, "packages", "lib", "lib.txt"), "dirty library\r\n");
+  await writeFile(join(f.project, "packages", "lib", "lib.txt"), "dirty library $Id$\r\n");
   const before = await metadata(f.project);
   const set = await createBranchSet(join(f.project, "packages", "app"), ["one"], { tmpRoot: f.copies, maxCopyBytes: 1024 * 1024 });
   try {
     expect(set?.method).toBe("worktree");
     const dir = set!.workspaces.get("one")!.dir;
-    expect(await readFile(join(dir, "..", "lib", "lib.txt"), "utf8")).toBe("dirty library\r\n");
+    expect(await readFile(join(dir, "..", "lib", "lib.txt"), "utf8")).toBe("dirty library $Id$\r\n");
     expect(await common(dir)).not.toBe(before.dir);
   } finally { await set?.cleanup(); }
   expect(await metadata(f.project)).toEqual(before);

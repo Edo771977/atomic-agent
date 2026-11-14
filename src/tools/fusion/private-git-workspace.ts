@@ -17,7 +17,7 @@ const MAX_OBJECTS = 100_000, MAX_OUTPUT = 32 * 1024 * 1024;
 export const DEFAULT_GIT_OBJECT_BYTES = DEFAULT_VERIFY_MAX_GIT_OBJECT_BYTES;
 export interface GitObjectBudget { left: number; signal?: AbortSignal }
 interface Ref { name: string; oid: string; symbolic?: string }
-export interface PrivateGitSnapshot { seed: string; commit: string; refs: readonly Ref[]; shallow: string; format: string; emptyConfig: string; infoExclude: Buffer; globalExclude: Buffer; budget: GitObjectBudget }
+export interface PrivateGitSnapshot { seed: string; commit: string; refs: readonly Ref[]; shallow: string; format: string; emptyConfig: string; infoExclude: Buffer; globalExclude: Buffer; trackedPaths: string[]; budget: GitObjectBudget }
 function charge(budget: GitObjectBudget, bytes: number): void {
   budget.signal?.throwIfAborted(); budget.left -= bytes;
   if (budget.left < 0) throw new Error("Git object import exceeds tools.verify.maxGitObjectBytes limit");
@@ -151,7 +151,7 @@ async function writeBlob(path: string, snapshot: PrivateGitSnapshot, before: Sta
 export async function preparePrivateGitSnapshot(input: { source: string; head: string; seed: string; maxBytes?: number; signal?: AbortSignal }): Promise<PrivateGitSnapshot> {
   const emptyConfig = `${input.seed}.empty-config`; await writeFile(emptyConfig, "");
   const deadline = AbortSignal.timeout(120_000), signal = input.signal === undefined ? deadline : AbortSignal.any([input.signal, deadline]);
-  const snapshot: PrivateGitSnapshot = { seed: input.seed, commit: input.head, refs: [], shallow: "", format: "sha1", emptyConfig, infoExclude: Buffer.alloc(0), globalExclude: Buffer.alloc(0), budget: { left: input.maxBytes ?? DEFAULT_GIT_OBJECT_BYTES, signal } };
+  const snapshot: PrivateGitSnapshot = { seed: input.seed, commit: input.head, refs: [], shallow: "", format: "sha1", emptyConfig, infoExclude: Buffer.alloc(0), globalExclude: Buffer.alloc(0), trackedPaths: [], budget: { left: input.maxBytes ?? DEFAULT_GIT_OBJECT_BYTES, signal } };
   if (!Number.isSafeInteger(snapshot.budget.left) || snapshot.budget.left <= 0) throw new Error("invalid Git object import byte limit");
   snapshot.format = (await git(["rev-parse", "--show-object-format"], input.source, snapshot)).trim();
   if (!["sha1", "sha256"].includes(snapshot.format)) throw new Error("unsupported Git object format");
@@ -196,6 +196,7 @@ export async function preparePrivateGitSnapshot(input: { source: string; head: s
     const match = /^(\d{6}) ([a-f0-9]+) 0\t([\s\S]+)$/.exec(line);
     if (match === null) throw new Error("cannot privately snapshot an unmerged index");
     const path = match[3]!, source = join(input.source, path);
+    snapshot.trackedPaths.push(path);
     let info; try { info = await lstat(source); } catch (reason) { if ((reason as NodeJS.ErrnoException).code === "ENOENT") continue; throw reason; }
     if (info.isSymbolicLink()) {
       const link = await readlink(source); charge(snapshot.budget, Buffer.byteLength(link));
