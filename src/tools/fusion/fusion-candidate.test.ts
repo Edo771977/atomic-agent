@@ -216,3 +216,28 @@ it("never releases dependents of a no_changes provider in candidate mode", async
   expect(ran).toEqual([`${FUSION_WORKER_ID_PREFIX}core`]);
   expect((result.details.candidateIntegration as { status: string }).status).toBe("rejected");
 });
+
+it.each(["relative", "absolute"] as const)("freezes %s checkInputs from the original before dispatch", async spelling => {
+  const f = await fixture(); await writeFile(join(f.root, "check.mjs"), "expected=good\nline2\nline3\nline4\nline5\n");
+  f.deps.runChecks = async specs => ({ ok: true, results: specs.map(() => ({ ok: true })) });
+  f.deps.runTurn = async session => { await writeFile(join(session.workingDir, "api.json"), "bad"); await writeFile(join(session.workingDir, "check.mjs"), "expected=evil\nline2\nline3\nline4\nline5\n"); return { session, reason: "reply", stepCount: 1 }; };
+  const result = await buildFusionDelegateTool(f.deps).run({ tasks: [{ id: "api", instructions: "work", files: ["api.json"] }], contract: { ...contract, checkInputs: [spelling === "relative" ? "check.mjs" : join(f.root, "check.mjs")] } }, f.ctx);
+  expect(result.details.candidateIntegration).toMatchObject({ status: "rejected", acceptanceReceipt: { disposition: "rejected", checkScope: "protected-declared", reason: "check-inputs-changed" } });
+  expect(await readFile(join(f.root, "api.json"), "utf8")).toBe('{"name":"before"}');
+  expect(await readFile(join(f.root, "check.mjs"), "utf8")).toContain("expected=good");
+});
+
+it("refuses protected checkInputs in direct mode before starting a worker", async () => {
+  const runTurn = vi.fn(); const f = await fixture({ runTurn }, false);
+  const result = await buildFusionDelegateTool(f.deps).run({ tasks: [{ id: "api", instructions: "work" }], contract: { ...contract, checkInputs: ["check.mjs"] } }, f.ctx);
+  expect(result.details.reason).toBe("check-inputs-require-candidate"); expect(runTurn).not.toHaveBeenCalled();
+});
+
+it.each([true, false])("records executed candidate task telemetry after final promotion decision (pass=%s)", async passing => {
+  const append = vi.fn(); const f = await fixture({ outcomeLog: { append } });
+  f.deps.runChecks = async specs => ({ ok: passing, results: specs.map(() => ({ ok: passing })) });
+  f.deps.runTurn = async session => { await writeFile(join(session.workingDir, "api.json"), "candidate"); return { session, reason: "reply", stepCount: 1 }; };
+  await buildFusionDelegateTool(f.deps).run({ tasks: [{ id: "api", instructions: "work", files: ["api.json"] }], contract }, f.ctx);
+  expect(append).toHaveBeenCalledTimes(1);
+  expect(append.mock.calls[0]![0]).toEqual([expect.objectContaining({ type: "task", candidate: expect.objectContaining({ receipt: expect.objectContaining({ disposition: passing ? "promoted" : "rejected" }) }) })]);
+});
