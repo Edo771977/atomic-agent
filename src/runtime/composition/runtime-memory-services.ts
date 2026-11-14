@@ -22,6 +22,7 @@ import { abortableSubcall, type SubcallComplete } from "../abortable-subcall.js"
 import type { RuntimeMemoryStores } from "./runtime-memory-stores.js";
 import type { GroundingConversationSource } from "../../memory/name-grounding.js";
 import { startRecallNameGuard } from "./runtime-recall-name-guard.js";
+import { noteUserMessagesTo } from "../../memory/recall-name-guard.js";
 
 interface MemoryServiceDependencies extends Omit<RuntimeMemoryStores, "embeddingHealth" | "embeddingBackfill"> {
   config: Pick<AtomicAgentConfig, "memory">;
@@ -374,6 +375,11 @@ export function createRuntimeMemoryServices(args: MemoryServiceDependencies & {
       rewriter: rewriterRunner,
       historyTurns: config.memory.retrieve.rewriter.historyTurns,
     });
+  }
+  // ATO-321. Outermost, so the guard sees the user's own message, never
+  // the rewriter's query.
+  if (memoryContextProvider && nameGuard) {
+    memoryContextProvider = noteUserMessagesTo(nameGuard, memoryContextProvider);
   }
   return { reflectionRunner, memoryContextProvider };
 }
