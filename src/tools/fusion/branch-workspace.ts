@@ -625,9 +625,14 @@ async function recreateLink(from: string, to: string, budget: PrivateCopyBudget,
   if (dependency && budget.privateDependenciesFrom !== undefined && isAbsolute(target)) {
     target = await privateDependencyTarget(target, to.slice(0, to.length - rel.length - 1), budget, rel);
   }
+  // Windows picks a link's type from its target when none is given, and
+  // the target (rewritten into this workspace) may not be copied yet: an
+  // untyped link to a directory would then be a broken file link. Take
+  // the type from what the original link points at.
+  const type = await stat(from).then((found) => found.isDirectory() ? "dir" as const : "file" as const, () => undefined);
   let denied: unknown;
   try {
-    await symlink(target, to);
+    await symlink(target, to, type);
     return;
   } catch (err) {
     if (!linkUnavailable(err)) throw err;
@@ -636,7 +641,7 @@ async function recreateLink(from: string, to: string, budget: PrivateCopyBudget,
   budget.signal?.throwIfAborted();
   // Only under a dependency directory: never inventoried or merged, so a
   // junction's absolute link text cannot be mistaken for a change.
-  if (underSharedDependencyDirectory(rel) && await stat(from).then((found) => found.isDirectory(), () => false)) {
+  if (underSharedDependencyDirectory(rel) && type === "dir") {
     try {
       // A junction needs an absolute target; resolve it where the link lives.
       await symlink(resolve(dirname(to), target), to, "junction");

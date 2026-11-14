@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import { createReadStream, type Stats } from "node:fs";
-import { chmod, copyFile, lstat, mkdir, open, opendir, readlink, rename, rm, rmdir, symlink } from "node:fs/promises";
+import { chmod, copyFile, lstat, mkdir, open, opendir, readlink, rename, rm, rmdir, stat, symlink } from "node:fs/promises";
 import { dirname, join, relative, sep } from "node:path";
 import { isInside } from "../../approval/fanout-scope.js";
 import { renameWithRetrySync, syncDirectoryBestEffort, writeFileSyncedSync } from "../../config/durable-write.js";
@@ -341,7 +341,7 @@ export async function createCandidateIntegration(
       bounds.signal?.throwIfAborted(); if (--bounds.entries < 0) throw new Error("held artifact entry limit exceeded");
       const entry = await lstat(from);
       if (entry.isDirectory()) { await mkdir(to); for await (const child of await opendir(from)) await copy(join(from, child.name), join(to, child.name)); }
-      else if (entry.isSymbolicLink()) await symlink(await readlink(from), to);
+      else if (entry.isSymbolicLink()) await symlink(await readlink(from), to, await stat(from).then((found) => found.isDirectory() ? "dir" : "file", () => undefined));
       else if (entry.isFile()) { bounds.bytes -= entry.size; if (bounds.bytes < 0) throw new Error("held artifact byte limit exceeded"); await copyFile(from, to); await chmod(to, entry.mode & 0o777); }
       else throw new Error("unsupported held artifact kind");
     };
