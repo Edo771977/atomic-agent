@@ -119,7 +119,7 @@ export function rebaseVerifyWorkspaceValue<T>(value: T, from: string, to: string
   const scan = (text: string, wholeLiteral: boolean): string => {
     // Whole argv/quoted path literals retain their spaces. Path lists and
     // command bodies still need token scanning; a drive's ':' is not a list.
-    const wholeUri = wholeLiteral || !/[|&<>]/.test(text) ? uri(text) : undefined;
+    const wholeUri = wholeLiteral || !/[|&<>;]/.test(text) ? uri(text) : undefined;
     if (wholeUri !== undefined) return wholeUri;
     if (wholeLiteral && !/[;|<>]/.test(text) && !text.slice(drive(text) ? 2 : 0).includes(":")) {
       const whole = native(text);
@@ -164,7 +164,7 @@ export function rebaseVerifyWorkspaceValue<T>(value: T, from: string, to: string
       const scheme = /^[a-z][a-z\d+.-]*:/i.test(tail) && !drive(tail);
       let end = index;
       if (scheme) {
-        while (end < text.length && !/[\s"'`()<>|&]/.test(text[end]!)) end++;
+        while (end < text.length && !/[\s"'`()<>|&;]/.test(text[end]!)) end++;
         result += uri(text.slice(index, end)) ?? text.slice(index, end);
       } else {
         // A literal root may itself contain spaces/braces/brackets. Consume

@@ -110,3 +110,13 @@ it("lets named path-list semantics take precedence over URL-looking first entrie
 it("retains named list context in a PowerShell environment assignment", () => {
   expect(rebase({ cmd: String.raw`$env:NODE_PATH='C:\external;C:\project\lib'; & node check.cjs` }, String.raw`C:\project`, String.raw`E:\checked`, "win32")).toEqual({ cmd: String.raw`$env:NODE_PATH='C:\external;E:\checked\lib'; & node check.cjs` });
 });
+
+it.each(["echo file:///external/a;/project/tool", "echo https://example.org;/project/tool", "https://example.org;/project/tool"])("ends an unquoted command URL at a semicolon: %s", cmd => {
+  expect(rebase({ cmd }, "/project", "/checked", "linux")).toEqual({ cmd: cmd.replace(";/project/", ";/checked/") });
+});
+
+it("preserves literal semicolons in quoted URLs, argv URLs and non-list environment URLs", () => {
+  const file = "file:///external/a;/project/tool", http = "https://example.org/;/project/tool";
+  const value = { cmd: `echo '${file}' "${http}"`, args: [file, http], env: { LINK: http } };
+  expect(rebase(value, "/project", "/checked", "linux")).toEqual(value);
+});
