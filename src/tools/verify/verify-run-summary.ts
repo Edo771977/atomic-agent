@@ -24,7 +24,7 @@ function checkLine(c: CheckOutcome): string {
 function outcomeLine(r: VerifyRunResult): string {
   if (r.error !== undefined) return r.error;
   if (r.kind === "command") {
-    const exit = r.exitCode === null ? (r.timedOut ? "killed: timed out" : "killed by signal") : `exit ${r.exitCode}`;
+    const exit = r.timedOut ? "killed: timed out" : r.exitCode === null ? "killed by signal" : `exit ${r.exitCode}`;
     return `${exit} after ${r.durationMs} ms`;
   }
   if (r.kind === "service") {
