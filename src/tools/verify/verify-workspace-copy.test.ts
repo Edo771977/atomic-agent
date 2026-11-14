@@ -174,6 +174,23 @@ describe("createVerifyWorkspace", () => {
     expect(await readdir(tmpRoot)).toEqual([]);
   });
 
+  it("keeps the copy error when cleanup after a failed copy also throws", async () => {
+    const eperm = async (): Promise<void> => {
+      throw Object.assign(new Error("EPERM: operation not permitted, symlink"), { code: "EPERM" });
+    };
+    const ws = await createVerifyWorkspace(work, {
+      platform: "win32",
+      tmpRoot,
+      symlink: eperm,
+      remove: async () => {
+        throw Object.assign(new Error("EBUSY: resource busy"), { code: "EBUSY" });
+      },
+    });
+    expect(ws).toMatchObject({ isolated: false, method: "unavailable" });
+    expect(ws.error).toMatch(/^could not copy workspace: .*Developer Mode/);
+    expect(ws.error).toContain("EBUSY: resource busy");
+  });
+
   it("uses clonefile on macOS and falls back to the copy when the clone fails", async () => {
     let cloneCalls = 0;
     const cloned = await createVerifyWorkspace(work, {

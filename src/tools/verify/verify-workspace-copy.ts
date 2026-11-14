@@ -299,8 +299,15 @@ export async function createVerifyWorkspace(
   try {
     await copyTreeWithExclusions(workingDir, dest, { platform, maxBytes: limit, ...(options.symlink === undefined ? {} : { symlink: options.symlink }) });
   } catch (err) {
-    await cleanup();
     const reason = err instanceof Error ? err.message : String(err);
+    try {
+      await cleanup();
+    } catch (cleanupErr) {
+      // Keep the copy failure as the cause; the caller retries the cleanup
+      // and reports it if the partial copy is still in the way.
+      const cleanupReason = cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr);
+      return { dir: dest, isolated: false, method: "unavailable", error: `could not copy workspace: ${reason} (and could not remove the partial copy ${dest}: ${cleanupReason})`, cleanup };
+    }
     return { dir: dest, isolated: false, method: "unavailable", error: `could not copy workspace: ${reason}`, cleanup: async () => {} };
   }
   return { dir: dest, isolated: true, method: "copy", cleanup };
