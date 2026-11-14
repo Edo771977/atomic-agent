@@ -925,7 +925,9 @@ async function dispatchToRuntime(
           postSnapshotIfDue,
           cadence.pollMs,
         );
+  const budgetNotices = new Set<string>();
   const eventHook = (event: AgentLoopEvent): void => {
+    if (event.type === "budget_notice" && event.sessionId === session.id) budgetNotices.add(event.text);
     tracker.onEvent(event);
     if (event.type === "step_finished") postSnapshotIfDue();
     if (event.type === "llm_event") {
@@ -993,6 +995,7 @@ async function dispatchToRuntime(
   if (snapshotBubble !== null && snapshotBubble !== progress) {
     await snapshotBubble.remove();
   }
+  for (const notice of budgetNotices) await sendText(ctx, ref.target, notice);
 
   // Only the agent's natural-language reply gets parse-mode
   // formatting. Cancellation acks, the empty-reply marker, and

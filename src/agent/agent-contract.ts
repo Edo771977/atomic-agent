@@ -974,6 +974,13 @@ export type AgentLoopEvent =
    * JSON schema (ATO-1417). Once per tool per turn.
    */
   | ToolDisabledEvent
+  | {
+      type: "budget_notice";
+      sessionId: string;
+      providerId: string;
+      reason: "soft" | "meter" | "clamp";
+      text: string;
+    }
   | { type: "step_started"; stepIndex: number }
   | {
       type: "step_finished";

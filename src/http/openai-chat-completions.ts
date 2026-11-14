@@ -772,6 +772,13 @@ export function buildStreamEventHook(
        this turn. One plain sentence (`notice`) for the chat, once per
        tool per turn. Extensions-only: an older host never asked for named
        frames, and one that did ignores a frame name it does not know. */
+    if (event.type === "budget_notice") {
+      if (env.request.extensionsEnabled && event.sessionId === env.session.id) {
+        sse.writeEvent("budget_notice", { object: "atomic.budget_notice", session_id: event.sessionId,
+          provider_id: event.providerId, reason: event.reason, notice: event.text });
+      }
+      return;
+    }
     if (event.type === "tool_disabled") {
       if (env.request.extensionsEnabled) {
         sse.writeEvent("tool_disabled", {

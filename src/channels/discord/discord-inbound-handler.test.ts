@@ -169,6 +169,19 @@ describe("stripMention", () => {
 });
 
 describe("handleDiscordMessage", () => {
+  it("delivers budget advice once to its owning channel before the reply", async () => {
+    const ctx = makeCtx();
+    ctx.runTurn.mockImplementationOnce(async (_session, _prompt, opts) => {
+      const notice = { type: "budget_notice", sessionId: "s1", providerId: "cloud", reason: "soft", text: "Budget uses an assumed output bound." };
+      opts.eventHook?.(notice); opts.eventHook?.(notice);
+      opts.eventHook?.({ ...notice, sessionId: "other", text: "Private other chat" });
+      opts.eventHook?.({ type: "llm_event", event: { type: "assistant_reply", text: "done" } });
+      return {};
+    });
+    await handleDiscordMessage(msg(), ctx);
+    expect(ctx.sent).toEqual(["Budget uses an assumed output bound.", "done"]);
+    expect(ctx.sentTo).toEqual(["c1", "c1"]);
+  });
   it("runs an owner DM through the agent and posts the reply", async () => {
     const ctx = makeCtx();
     await handleDiscordMessage(msg(), ctx);

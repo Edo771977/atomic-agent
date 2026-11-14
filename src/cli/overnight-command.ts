@@ -298,6 +298,7 @@ async function runForeground(args: OvernightArgs, taskId: string): Promise<numbe
         if (sessionId === null || eventSessionId !== sessionId) return;
         const text = replyFromEvent(event);
         if (text !== undefined) reply = text;
+        if (event.type === "budget_notice") process.stderr.write(`» ${event.text}\n`);
         if (event.type !== "step_finished") return;
         const line = formatProgressLine({
           stepIndex: event.stepIndex,

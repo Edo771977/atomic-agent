@@ -25,6 +25,9 @@ import { linkSpendBilling } from "../link-spend-billing.js";
 import { resolveModelPricingFor } from "../resolve-model-pricing.js";
 import { createRequestBudgetScope } from "../request-budget.js";
 import { createDailySpendBudget } from "../daily-spend-budget.js";
+import type { RequestBudgetNotices } from "../request-budget-notices.js";
+import type { RequestBudgetScope } from "../request-budget.js";
+import type { CompletionRequest } from "../../llm/provider/completion-types.js";
 import type { FusionTurnBudget } from "../../tools/fusion/turn-budget.js";
 import { LearnedContextWindows } from "../learned-context-windows.js";
 import { isOllamaEntry, readOllamaContextWindow } from "../../llm/provider/ollama/ollama-context-window.js";
@@ -328,6 +331,7 @@ export function connectRuntimeFallback(
     resolveModelPricing: RuntimeModelContext["resolveModelPricing"];
     resolveCatalogContextWindow?: RuntimeModelContext["resolveCatalogContextWindow"];
     turnBudget?: FusionTurnBudget;
+    budgetNotices?: RequestBudgetNotices;
   },
 ) {
   const {
@@ -341,6 +345,8 @@ export function connectRuntimeFallback(
     sessionUsage,
     dailySpend,
   } = deps;
+  const observeScope = (providerId: string, request: CompletionRequest, scope: RequestBudgetScope | undefined) =>
+    deps.budgetNotices?.observeScope(providerId, request, scope) ?? scope;
   // How a link bills, for the session readout: a local server (any kind
   // pointed at this machine) bills nothing, a subscription CLI bills by
   // the plan, the rest per token.
@@ -543,9 +549,9 @@ export function connectRuntimeFallback(
         const turnLimited = owner !== undefined && deps.turnBudget?.requestLimits(owner) !== undefined;
         if (!turnLimited && dailyBudget === undefined) return undefined;
         const entry = resolveLlmConfig(getConfig()).providers.find(p => p.id === providerId);
-        return createRequestBudgetScope(deps.turnBudget, request, provider, entry,
+        return observeScope(providerId, request, createRequestBudgetScope(deps.turnBudget, request, provider, entry,
           resolveModelPricing(provider.chatModelId ?? entry?.defaultChatModel ?? entry?.model ?? null, providerId),
-          dailyBudget);
+          dailyBudget));
       },
     } satisfies Pick<FallbackSeamDeps, "requestBudget">),
     recordUnaryUsage,
@@ -603,6 +609,7 @@ export function connectRuntimeFallback(
       refuses: (providerId: string): boolean => dailyLimitRefusal(providerId) !== null,
       enforce: enforceDailySpendLimit,
       budget: dailyBudget,
+      observeScope,
     },
   };
 }

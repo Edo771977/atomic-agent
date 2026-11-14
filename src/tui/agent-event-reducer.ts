@@ -1096,6 +1096,10 @@ function reduceAgentEvent(state: TuiState, event: AgentLoopEvent): TuiState {
       // resent the request without it, so the model cannot call it. The
       // loop says so once per tool per turn.
       return appendChatMessage(state, { role: "system", text: toolDisabledNotice(event.tool) });
+    case "budget_notice":
+      return event.sessionId === state.session.sessionId
+        ? appendChatMessage(state, { role: "system", variant: "warn", text: event.text })
+        : state;
     case "profile_clipped": {
       // Issue #407: the clip used to show only as a `[truncated]` inside
       // a prompt nobody reads. The loop fires this once per session, and

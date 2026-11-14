@@ -166,12 +166,13 @@ export interface RequestBudgetScope extends CompletionRequestBudget {
   /** True once a send reserved an assumed reply instead of an explicit ceiling. */
   softBound: boolean;
   /**
-   * One-line advice when the cap is not hard-enforced (`soft` or `meter`).
-   * The scope does no logging; a caller that reports it should do so once
-   * per `hintKey` (session and provider).
+   * One-line advice for soft/meter enforcement or an output clamp.
+   * The scope does no logging; runtime observes changes once per
+   * provider/reason/owning turn, including changes at physical admission.
    */
   hint?: string;
   hintKey?: string;
+  hintReason?: "soft" | "meter" | "clamp";
   /**
    * Settle the scope. `streamed.outputBytes` is the reply text a stream
    * delivered before it ended without a result (a cancel): the day's
@@ -276,7 +277,7 @@ export function createRequestBudgetScope(
     signal,
     ...(mode === undefined ? {} : { mode }),
     softBound: false,
-    ...(hint === undefined ? {} : { hint, hintKey }),
+    ...(hint === undefined ? {} : { hint, hintKey, hintReason: "meter" as const }),
     beforeSend(body) {
       if (done) throw new Error("request budget scope is already closed");
       if (signal.aborted) throw signal.reason;
@@ -315,6 +316,7 @@ export function createRequestBudgetScope(
           }
           scope.hint = hint;
           scope.hintKey = hintKey;
+          scope.hintReason = "soft";
         }
       } else {
         ceiling = Math.floor(Math.min(...explicitCaps));
@@ -380,6 +382,7 @@ export function createRequestBudgetScope(
             : `turn budget: reply capped at ${fitting.output} tokens (from ${ceiling}) to fit the remaining ${capText} turn allowance`;
           scope.hint = hint;
           scope.hintKey = hintKey;
+          scope.hintReason = "clamp";
         }
       }
       tierMultiplier = multiplier;
