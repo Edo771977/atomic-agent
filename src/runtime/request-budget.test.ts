@@ -306,6 +306,20 @@ describe("request budget scope", () => {
       expect(spent(budget)).toBeCloseTo((1_000 * 3 + 1_000 * 15) / 1_000_000, 9);
     });
 
+    it("charges a metered turn's retried success after a released 429 or unsent failure", () => {
+      for (const reject of [(s: ReturnType<typeof createRequestBudgetScope>) => s!.onResponse(429), (s: ReturnType<typeof createRequestBudgetScope>) => s!.onSendFailed?.(refused("ECONNREFUSED"))]) {
+        const budget = new FusionTurnBudget();
+        budget.begin("p", 0, { usd: 1 });
+        const s = createRequestBudgetScope(budget, { sessionId: "p", prompt: "hi" } as CompletionRequest, { id: "c" } as LlmProvider, entry, undefined)!;
+        expect(s.mode).toBe("meter");
+        s.beforeSend({});
+        reject(s);
+        s.beforeSend({});
+        s.finish({ usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2, costUsd: 0.5 } } as never);
+        expect(spent(budget)).toBeCloseTo(0.5, 9);
+      }
+    });
+
     it("still refuses a metered request once the cap is reached", () => {
       const budget = new FusionTurnBudget();
       budget.begin("p", 0, { usd: 1 });

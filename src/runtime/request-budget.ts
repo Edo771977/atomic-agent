@@ -369,17 +369,16 @@ export function createRequestBudgetScope(
     onResponse(status) {
       // 408, other 5xx and network deaths remain ambiguous and retain their bound.
       if (RELEASED_STATUSES.has(status)) {
-        held?.release();
-        held = undefined;
-        // A metered day's zero hold stays: its reply may still come.
+        // A metered hold (turn or day) is the scope's zero hold, not this
+        // send's: it stays so a retried reply is still settled against it.
+        if (turnPriced) { held?.release(); held = undefined; }
         if (dayPriced) { dayHeld?.release(); dayHeld = undefined; }
       }
     },
     onSendFailed(error) {
       const code = readErrnoCode(error);
       if (code !== undefined && UNSENT_ERRNOS.has(code)) {
-        held?.release();
-        held = undefined;
+        if (turnPriced) { held?.release(); held = undefined; }
         if (dayPriced) { dayHeld?.release(); dayHeld = undefined; }
       }
     },
