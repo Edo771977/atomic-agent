@@ -1,5 +1,8 @@
 import { getConfig } from "../../config/index.js";
-import { resolveLlmProviderApiKey } from "../../config/resolve-llm-api-key.js";
+import {
+  maySendSharedOpenAiKey,
+  resolveLlmProviderApiKey,
+} from "../../config/resolve-llm-api-key.js";
 import { isAsciiOnly } from "../../llm/provider/openai/ascii-header-guard.js";
 import {
   setActiveTextProviderInConfig,
@@ -7,7 +10,14 @@ import {
   writeProviderApiKeyToDotenv,
 } from "../../config/llm-provider-commands.js";
 import { findProviderPreset } from "./provider-presets.js";
-import { wizardKeyIsOptional } from "./providers-wizard-target.js";
+import {
+  networkComputerKeyEnvVar,
+  wizardKeyIsOptional,
+} from "./providers-wizard-target.js";
+import {
+  storedEntryAtBaseUrl,
+  storedProviderFileEntry,
+} from "./stored-provider-entry.js";
 import {
   AIMLAPI_DEFAULT_CHAT_MODEL,
   GEMINI_DEFAULT_CHAT_MODEL,
@@ -39,6 +49,8 @@ function defaultChatModelForKind(kind: ProvidersWizardKind): string {
   return OPENROUTER_DEFAULT_CHAT_MODEL;
 }
 
+export { networkComputerKeyEnvVar };
+
 export function saveProviderWizardToConfig(
   wizard: ProvidersWizardState,
 ): BuiltWizardProvider {
@@ -67,7 +79,7 @@ export function saveProviderWizardToConfig(
   // subscription-cli entry can carry a hand-set binPath / extraArgs /
   // streaming flag / spend ceiling, and any entry a request timeout.
   // `upsertLlmProvider` preserves model policy but replaces other fields,
-  // so carry them over the same way the stored apiKey is carried below.
+  // so carry them over; the key is handled below, from config.json itself.
   if (existing?.subscriptionCli && entry.subscriptionCli) {
     entry = {
       ...entry,
@@ -91,6 +103,25 @@ export function saveProviderWizardToConfig(
   // an empty key is a valid state for both: nothing is written to .env
   // and requests go out without Authorization.
   const keyOptional = wizardKeyIsOptional(wizard);
+  // ATO-1066: an endpoint the shared compat variables are never sent to
+  // (a server on another computer on this network, or plain http:// to a
+  // host that is not this machine) cannot use a key saved there: the
+  // resolver refuses it, and saving it would overwrite the operator's
+  // cloud key. A key typed for it lives under a variable of its own.
+  // The entry as written in config.json, moved to its new address. Never
+  // `existing` for keys: getConfig() has already filled its apiKey from
+  // the environment, and copying that wrote a shared cloud key into
+  // config.json in clear (ATO-1066).
+  const storedFile = existing ? storedProviderFileEntry(existing.id) : undefined;
+  const stored = storedFile
+    ? storedEntryAtBaseUrl(storedFile, entry.baseUrl)
+    : undefined;
+  const networkKeyEnvVar =
+    !preset &&
+    entry.kind === "openai-compatible" &&
+    !maySendSharedOpenAiKey(entry.baseUrl)
+      ? (stored?.apiKeyEnvVar ?? networkComputerKeyEnvVar(entry.id))
+      : undefined;
   if (wizard.apiKeyBuffer.trim().length > 0) {
     // Validate the value that is actually persisted: the dotenv writer
     // trims, and `trim()` strips U+00A0/U+FEFF paste artifacts that are
@@ -104,13 +135,22 @@ export function saveProviderWizardToConfig(
         "API key contains non-ASCII characters. Use a plain ASCII key.",
       );
     }
-    writeProviderApiKeyToDotenv(kind, wizard.apiKeyBuffer, preset?.envVar);
-  } else if (existing?.apiKey) {
-    entry = { ...entry, apiKey: existing.apiKey };
+    writeProviderApiKeyToDotenv(
+      kind,
+      wizard.apiKeyBuffer,
+      preset?.envVar ?? networkKeyEnvVar,
+    );
+    if (networkKeyEnvVar) entry = { ...entry, apiKeyEnvVar: networkKeyEnvVar };
+  } else if (stored?.apiKey) {
+    entry = { ...entry, apiKey: stored.apiKey };
+  } else if (stored?.apiKeyEnvVar && !entry.apiKeyEnvVar) {
+    // Still a variable: the key stays in .env, under the name the
+    // operator gave it.
+    entry = { ...entry, apiKeyEnvVar: stored.apiKeyEnvVar };
   } else if (
     !keyOptional &&
     !resolveLlmProviderApiKey(entry) &&
-    !(existing && resolveLlmProviderApiKey(existing))
+    !(stored && resolveLlmProviderApiKey(stored))
   ) {
     throw new Error("API key is empty — paste a key or set it in .env first");
   }

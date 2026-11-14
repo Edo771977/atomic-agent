@@ -2,6 +2,8 @@ import {
   matchesModelPricingFilter,
   type ModelPricingFilter,
 } from "../../llm/provider/model-pricing-filter.js";
+import { withAssumedScheme } from "../../llm/provider/openai/network-server-address.js";
+import { baseUrlLineError } from "./base-url-line-error.js";
 import { findProviderPreset, PROVIDER_PRESETS } from "./provider-presets.js";
 import {
   filterWizardRows,
@@ -279,8 +281,16 @@ export function advanceWizardPhase(
   if (phase === "base_url" && kind === "openai-compatible") {
     // Adding walks URL → key; a reconfigure run opened on the key screen
     // and edits the URL after it, so from there it proceeds to the model.
+    // ATO-1066: an address with a password, a query or trailing words
+    // stays on this screen with the reason, instead of being saved.
+    const invalid = baseUrlLineError(wizard.baseUrlLine);
+    if (invalid) return { ...wizard, error: invalid };
     const next = wizard.mode === "configure" ? "chat_model_line" : "api_key";
-    return { ...wizard, ...PHASE_ENTRY, phase: next };
+    // ATO-1066: an address typed without a scheme (`192.168.1.20:8080`,
+    // `gpu-box.local:1234`) gets one here, so the key screen, the model
+    // list and the saved entry all read the host where it is.
+    const baseUrlLine = withAssumedScheme(wizard.baseUrlLine);
+    return { ...wizard, ...PHASE_ENTRY, baseUrlLine, phase: next };
   }
   // `chat_model_line` is the last step for the compat/preset path: the
   // embedding screen is gone from the flow, embeddings stay on the local

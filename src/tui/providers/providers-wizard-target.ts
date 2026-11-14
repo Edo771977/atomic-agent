@@ -9,8 +9,10 @@
  * wizard.
  */
 
-import { getConfig } from "../../config/index.js";
-import { resolveLlmProviderApiKey } from "../../config/resolve-llm-api-key.js";
+import {
+  maySendSharedOpenAiKey,
+  resolveLlmProviderApiKey,
+} from "../../config/resolve-llm-api-key.js";
 import type { UserLlmProviderEntry } from "../../config/llm-config.js";
 import { DEFAULT_AIMLAPI_BASE } from "../../llm/provider/aimlapi/aimlapi-provider.js";
 import {
@@ -20,6 +22,10 @@ import {
 import { getCachedOpenAiCompatModelsForBaseUrl } from "../../llm/provider/openai/fetch-openai-compat-models.js";
 import { isAsciiOnly } from "../../llm/provider/openai/ascii-header-guard.js";
 import { normalizeOpenAiBaseUrl } from "../../llm/provider/openai/normalize-openai-base-url.js";
+import {
+  isOtherComputerOnNetworkUrl,
+  withAssumedScheme,
+} from "../../llm/provider/openai/network-server-address.js";
 import { openAiChatPathPrefix } from "../../llm/provider/openai/openai-chat-path.js";
 import {
   DEFAULT_OPENROUTER_BASE,
@@ -32,6 +38,11 @@ import type { ProviderVerifyTarget } from "../../llm/provider/verify/index.js";
 import { isLoopbackBaseUrl } from "../persist-user-local-models-config.js";
 import { isLocalProviderUrl } from "./is-local-provider-url.js";
 import { findProviderPreset } from "./provider-presets.js";
+import {
+  storedEntryAtBaseUrl,
+  storedKeyMove,
+  storedProviderFileEntry,
+} from "./stored-provider-entry.js";
 import { subscriptionCliForWizardKind } from "./providers-wizard-state.js";
 import {
   AIMLAPI_DEFAULT_CHAT_MODEL,
@@ -47,8 +58,11 @@ import type {
 
 /** Normalized so the fetch, the cache key and the displayed URL always agree. */
 export function baseUrlForWizard(wizard: ProvidersWizardState): string {
+  // ATO-1066: with the scheme a typed address left out, so `192.168.1.20:8080`
+  // reads as the host it names everywhere, the key rules included.
   return (
-    normalizeOpenAiBaseUrl(wizard.baseUrlLine) || OPENAI_COMPAT_DEFAULT_BASE_URL
+    normalizeOpenAiBaseUrl(withAssumedScheme(wizard.baseUrlLine)) ||
+    OPENAI_COMPAT_DEFAULT_BASE_URL
   );
 }
 
@@ -70,13 +84,18 @@ function keyLookupEntryForWizard(
   return {
     id: wizard.providerId ?? preset?.id ?? kind,
     kind,
+    // ATO-1066: the address decides whether the shared compat variables
+    // may answer at all. Without it the resolver never saw a server on
+    // another computer and handed it the operator's cloud key.
+    ...(kind === "openai-compatible" ? { baseUrl: baseUrlForWizard(wizard) } : {}),
     ...(preset ? { apiKeyEnvVar: preset.envVar } : {}),
   };
 }
 
 /**
- * The `config.json` entry a `configure` run would overwrite, or
- * `undefined` while adding. `saveProviderWizardToConfig` keeps this
+ * The `config.json` entry a `configure` run would overwrite, as written
+ * in the file and moved to the address the wizard now names
+ * (`storedEntryAtBaseUrl`), or `undefined` while adding. `saveProviderWizardToConfig` keeps this
  * entry's `apiKey` when the key screen is left blank, so every question
  * about "does this wizard have a key" has to see it: a key the operator
  * typed once lives in `config.json` with nothing in `.env` to find.
@@ -86,9 +105,13 @@ function storedEntryForWizard(
 ): UserLlmProviderEntry | undefined {
   const { mode, providerId } = wizard;
   if (mode !== "configure" || !providerId) return undefined;
-  return getConfig().llm?.providers.find(
-    (provider) => provider.id === providerId,
-  );
+  const stored = storedProviderFileEntry(providerId);
+  return stored
+    ? storedEntryAtBaseUrl(
+        stored,
+        wizard.kind === "openai-compatible" ? baseUrlForWizard(wizard) : undefined,
+      )
+    : undefined;
 }
 
 /**
@@ -122,10 +145,86 @@ export function envHintForWizard(wizard: ProvidersWizardState): string {
     ? findProviderPreset(wizard.presetId)
     : undefined;
   if (preset) return preset.envVar;
+  // ATO-1066: a key for an endpoint the shared variables are never sent
+  // to (another computer on the network, plain http:// off this machine)
+  // gets a variable of its own (`saveProviderWizardToConfig`); naming the
+  // shared one here would promise the key a home it never uses.
+  if (getsOwnKeyVariable(wizard)) {
+    return wizard.providerId
+      ? networkComputerKeyEnvVar(wizard.providerId)
+      : "ATOMIC_AGENT_KEY_<connection id>";
+  }
   if (wizard.kind === "openrouter") return "OPENROUTER_API_KEY";
   if (wizard.kind === "aimlapi") return "AIMLAPI_API_KEY";
   if (wizard.kind === "gemini") return "GEMINI_API_KEY";
   return "OPENAI_COMPAT_API_KEY";
+}
+
+/** `.env` variable for the key of a server on another computer: `custom-192-168-1-20-8080` -> `ATOMIC_AGENT_KEY_CUSTOM_192_168_1_20_8080`. */
+export function networkComputerKeyEnvVar(providerId: string): string {
+  return `ATOMIC_AGENT_KEY_${providerId.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}`;
+}
+
+/** A hand-added compat endpoint the shared OPENAI_* key is not sent to. */
+function getsOwnKeyVariable(wizard: ProvidersWizardState): boolean {
+  return (
+    !wizard.presetId &&
+    wizard.kind === "openai-compatible" &&
+    !maySendSharedOpenAiKey(baseUrlForWizard(wizard))
+  );
+}
+
+function targetsOtherComputer(wizard: ProvidersWizardState): boolean {
+  return (
+    !wizard.presetId &&
+    wizard.kind === "openai-compatible" &&
+    isOtherComputerOnNetworkUrl(baseUrlForWizard(wizard))
+  );
+}
+
+/** The shared compat variables, in the order the resolver reads them. */
+const SHARED_COMPAT_KEY_VARS = [
+  "OPENAI_COMPAT_API_KEY",
+  "OPENAI_API_KEY",
+  "ATOMIC_AGENT_OPENAI_API_KEY",
+] as const;
+
+/**
+ * ATO-1066: why an endpoint gets no key although a shared compat
+ * variable is set (a server on another computer, or plain http:// off
+ * this machine), or `null` when there is nothing to
+ * explain. Earlier builds sent that variable to such a server, so an
+ * operator who kept a LAN server's key there would otherwise see it
+ * stop working with no word as to why.
+ */
+export function sharedKeyNotSentNote(wizard: ProvidersWizardState): string | null {
+  if (!getsOwnKeyVariable(wizard) || apiKeyForWizard(wizard)) return null;
+  const set = SHARED_COMPAT_KEY_VARS.find((name) => {
+    const value = process.env[name];
+    return value !== undefined && value.length > 0;
+  });
+  if (!set) return null;
+  const where = targetsOtherComputer(wizard)
+    ? "to other computers on your network"
+    : "over plain http:// to a server that is not this computer";
+  return (
+    `${set} is not sent ${where}. ` +
+    "If this server needs a key, type the server's key here, or name its variable with apiKeyEnvVar in config.json."
+  );
+}
+
+/**
+ * Why a reconfigure asks for a key again although `config.json` holds
+ * one, or `null`: the entry now names a different server, and the saved
+ * key stays behind (`storedEntryAtBaseUrl`).
+ */
+export function storedKeyLeftBehindNote(wizard: ProvidersWizardState): string | null {
+  if (wizard.mode !== "configure" || !wizard.providerId || wizard.kind !== "openai-compatible") return null;
+  if (wizard.apiKeyBuffer.trim()) return null;
+  const stored = storedProviderFileEntry(wizard.providerId);
+  const move = stored ? storedKeyMove(stored, baseUrlForWizard(wizard)) : null;
+  if (!move) return null;
+  return `The key saved for ${move.from} is not sent to ${move.to}: type this server's key.`;
 }
 
 /**
@@ -147,8 +246,13 @@ export function wizardKeyIsOptional(wizard: ProvidersWizardState): boolean {
   // `llama-server` on `http://127.0.0.1:9931` needs no key, so an empty
   // one is valid there. The wizard collects the base URL before the key
   // screen for this kind, so the URL is known by the time this runs.
+  // ATO-1066: so is a server on another computer on this network (a GPU
+  // box running llama-server, LM Studio or Ollama): usually keyless, and
+  // one started with a key still takes it from this screen.
   return (
-    wizard.kind === "openai-compatible" && isLoopbackBaseUrl(wizard.baseUrlLine)
+    wizard.kind === "openai-compatible" &&
+    (isLoopbackBaseUrl(wizard.baseUrlLine) ||
+      isOtherComputerOnNetworkUrl(withAssumedScheme(wizard.baseUrlLine)))
   );
 }
 

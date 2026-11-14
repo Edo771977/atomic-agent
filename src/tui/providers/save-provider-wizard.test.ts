@@ -1,12 +1,17 @@
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished } from "vitest";
 
 import { getConfig, resetConfigCache } from "../../config/index.js";
 import { setModelModeInConfig } from "../../config/model-mode-commands.js";
+import { upsertLlmProvider } from "../../config/llm-provider-commands.js";
 import { LOCAL_EMBEDDING_CHOICE_ID } from "./providers-model-options.js";
-import { saveProviderWizardToConfig } from "./save-provider-wizard.js";
+import { resolveLlmProviderApiKey } from "../../config/resolve-llm-api-key.js";
+import {
+  networkComputerKeyEnvVar,
+  saveProviderWizardToConfig,
+} from "./save-provider-wizard.js";
 import { createProvidersWizardState } from "./providers-wizard-state.js";
 
 const ENV_KEYS = [
@@ -132,6 +137,170 @@ describe("saveProviderWizardToConfig", () => {
       modelMode: "local",
       defaultChatModel: "venice-uncensored",
     });
+  });
+
+  function lanWizard(apiKey: string) {
+    return {
+      ...createProvidersWizardState("add"),
+      kind: "openai-compatible" as const,
+      phase: "chat_model_line" as const,
+      apiKeyBuffer: apiKey,
+      baseUrlLine: "http://192.168.1.20:8080",
+      chatModelLine: "qwen3.6-27b",
+    };
+  }
+
+  it("keeps a key for another computer out of the shared compat variable (ATO-1066)", () => {
+    process.env.OPENAI_COMPAT_API_KEY = "sk-real-cloud-key";
+    const built = saveProviderWizardToConfig(lanWizard("lan-key"));
+    const envVar = networkComputerKeyEnvVar(built.entry.id);
+    onTestFinished(() => {
+      delete process.env[envVar];
+    });
+
+    expect(envVar).toMatch(/^ATOMIC_AGENT_KEY_[A-Z0-9_]+$/);
+    expect(built.entry.apiKeyEnvVar).toBe(envVar);
+    expect(process.env[envVar]).toBe("lan-key");
+    expect(process.env.OPENAI_COMPAT_API_KEY).toBe("sk-real-cloud-key");
+    expect(resolveLlmProviderApiKey(built.entry)).toBe("lan-key");
+  });
+
+  it("saves another computer with a blank key and never hands it the shared key (ATO-1066)", () => {
+    process.env.OPENAI_COMPAT_API_KEY = "sk-real-cloud-key";
+    const built = saveProviderWizardToConfig(lanWizard(""));
+
+    expect(built.entry.apiKeyEnvVar).toBeUndefined();
+    expect(resolveLlmProviderApiKey(built.entry)).toBeUndefined();
+  });
+
+  it.each([
+    "http://203.0.113.5:8000",
+    "http://localhost.localdomain:8000",
+  ])(
+    "keeps a key for plain http:// off this machine out of the shared variable: %s",
+    (baseUrlLine) => {
+      // The resolver never sends the shared key over plain http:// to a
+      // host that is not this machine, so a key saved there was never
+      // used (401 forever) and overwrote the operator's cloud key.
+      process.env.OPENAI_COMPAT_API_KEY = "sk-real-cloud-key";
+      const built = saveProviderWizardToConfig({
+        ...lanWizard("vps-key"),
+        baseUrlLine,
+      });
+      const envVar = networkComputerKeyEnvVar(built.entry.id);
+      onTestFinished(() => {
+        delete process.env[envVar];
+      });
+
+      expect(built.entry.apiKeyEnvVar).toBe(envVar);
+      expect(process.env[envVar]).toBe("vps-key");
+      expect(process.env.OPENAI_COMPAT_API_KEY).toBe("sk-real-cloud-key");
+      expect(readFileSync(join(stateDir, ".env"), "utf8")).not.toMatch(
+        /OPENAI_COMPAT_API_KEY=.*vps-key/,
+      );
+      resetConfigCache();
+      const runtime = getConfig().llm?.providers.find(
+        (p) => p.id === built.entry.id,
+      );
+      expect(runtime && resolveLlmProviderApiKey(runtime)).toBe("vps-key");
+    },
+  );
+
+  function configureCompat(providerId: string, baseUrl: string) {
+    return {
+      ...createProvidersWizardState("configure", {
+        providerId,
+        kind: "openai-compatible",
+        baseUrl,
+      }),
+      phase: "chat_model_line" as const,
+      chatModelLine: "qwen3.6-27b",
+    };
+  }
+
+  function configJsonText(): string {
+    return readFileSync(getConfig().paths.userConfigFile, "utf8");
+  }
+
+  it("never writes an environment key into config.json on reconfigure (ATO-1066)", () => {
+    process.env.OPENAI_COMPAT_API_KEY = "sk-SHARED";
+    const cloud = saveProviderWizardToConfig({
+      ...lanWizard(""),
+      baseUrlLine: "https://api.example.com",
+    });
+    expect(configJsonText()).not.toContain("sk-SHARED");
+
+    // Same address: the shared variable keeps answering, from .env.
+    const same = saveProviderWizardToConfig(
+      configureCompat(cloud.entry.id, "https://api.example.com"),
+    );
+    expect(same.entry.apiKey).toBeUndefined();
+    expect(configJsonText()).not.toContain("sk-SHARED");
+
+    // Moved to another computer: nothing to carry, nothing written.
+    const moved = saveProviderWizardToConfig(
+      configureCompat(cloud.entry.id, "http://192.168.1.20:8080"),
+    );
+    expect(moved.entry.apiKey).toBeUndefined();
+    expect(resolveLlmProviderApiKey(moved.entry)).toBeUndefined();
+    expect(configJsonText()).not.toContain("sk-SHARED");
+  });
+
+  it("keeps an entry's own key variable a variable on reconfigure (ATO-1066)", () => {
+    process.env.VLLM_TEST_KEY = "vllm-from-env";
+    onTestFinished(() => {
+      delete process.env.VLLM_TEST_KEY;
+    });
+    upsertLlmProvider({
+      id: "my-vllm",
+      kind: "openai-compatible",
+      baseUrl: "https://vllm.example.com",
+      apiKeyEnvVar: "VLLM_TEST_KEY",
+    });
+    resetConfigCache();
+
+    const built = saveProviderWizardToConfig(
+      configureCompat("my-vllm", "https://vllm.example.com"),
+    );
+    expect(built.entry.apiKey).toBeUndefined();
+    expect(built.entry.apiKeyEnvVar).toBe("VLLM_TEST_KEY");
+    expect(configJsonText()).not.toContain("vllm-from-env");
+  });
+
+  it("still carries a key written in config.json over a reconfigure", () => {
+    upsertLlmProvider({
+      id: "my-compat",
+      kind: "openai-compatible",
+      baseUrl: "https://api.example.com",
+      apiKey: "sk-literal",
+    });
+    resetConfigCache();
+    const built = saveProviderWizardToConfig(
+      configureCompat("my-compat", "https://api.example.com"),
+    );
+    expect(built.entry.apiKey).toBe("sk-literal");
+  });
+
+  it("does not carry a key written in config.json to a different server", () => {
+    upsertLlmProvider({
+      id: "my-compat",
+      kind: "openai-compatible",
+      baseUrl: "https://api.openai.com",
+      apiKey: "sk-literal",
+    });
+    resetConfigCache();
+    for (const baseUrl of ["http://203.0.113.5:8000", "https://other.example.com"]) {
+      expect(() =>
+        saveProviderWizardToConfig(configureCompat("my-compat", baseUrl)),
+      ).toThrow(/API key is empty/);
+    }
+    expect(configJsonText()).toContain("sk-literal");
+    const built = saveProviderWizardToConfig({
+      ...configureCompat("my-compat", "https://other.example.com"),
+      apiKeyBuffer: "other-key",
+    });
+    expect(built.entry.apiKey).toBeUndefined();
+    expect(configJsonText()).not.toContain("sk-literal");
   });
 
   function groqWizard(apiKey: string) {

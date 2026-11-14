@@ -34,6 +34,7 @@ This area owns configuration and compatibility. Read [AGENTS.md](AGENTS.md) befo
 - [llm-config.ts](llm-config.ts)
 - [llm-set-aside-providers.ts](llm-set-aside-providers.ts)
 - [llm-provider-commands.ts](llm-provider-commands.ts)
+- [resolve-llm-api-key.ts](resolve-llm-api-key.ts): provider key resolution; the shared `OPENAI_*` fallback goes only to https:// or plain http:// on this machine, never to another computer on the network, judged from the address as written with no DNS lookup (classifier: [local-server-url.ts](../llm/provider/openai/local-server-url.ts); user rule in the root README, "Configuration and secrets")
 - [fusion-setup-commands.ts](fusion-setup-commands.ts): the one validated write behind `setup fusion`
 - [mcp-server-commands.ts](mcp-server-commands.ts)
 - [mcp-server-config.ts](mcp-server-config.ts)

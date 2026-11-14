@@ -864,6 +864,8 @@ export class OpenAiProvider implements LlmProvider {
         {
           method: "GET",
           headers: buildOpenAiHeaders(this.http, false),
+          // Carries the key: never follow a redirect (see openAiFetch).
+          redirect: "manual",
         },
       );
       return {

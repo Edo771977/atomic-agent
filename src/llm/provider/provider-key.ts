@@ -1,6 +1,7 @@
 import type { UserSubscriptionCliOptions } from "../../config/llm-config.js";
 import { usesExternalCliAuth } from "../../config/provider-auth-mode.js";
-import { resolveLlmProviderApiKey } from "../../config/resolve-llm-api-key.js";
+import { resolveLlmProviderApiKey, sharedOpenAiKeyNotSent } from "../../config/resolve-llm-api-key.js";
+import { isOtherComputerOnNetworkUrl } from "./openai/network-server-address.js";
 import { isLocalProviderUrl } from "./presets/is-local-provider-url.js";
 import { presetForEntryId } from "./presets/provider-presets.js";
 
@@ -17,12 +18,15 @@ import { presetForEntryId } from "./presets/provider-presets.js";
  * did not need. They all read this now.
  *
  * The rule, in order:
- *  1. `present`: a key resolves, or a header named like a credential is
- *     set by hand (`Authorization`, `x-api-key`, the entry's own
- *     `apiKeyHeader`).
+ *  1. `present`: a key resolves for the entry's endpoint (a shared
+ *     OPENAI_* key counts only where it is sent: https://, or http:// on
+ *     this machine), or a header named like a credential is set by hand
+ *     (`Authorization`, `x-api-key`, the entry's own `apiKeyHeader`).
  *  2. `not-needed`: the entry signs in through a vendor CLI, or it is a
  *     local server: made from a `local` preset (LM Studio, Ollama, even on
- *     a LAN address) or pointed at this machine.
+ *     a LAN address), pointed at this machine, or (ATO-1066) a hand-made
+ *     `openai-compatible` entry for a server on another computer on this
+ *     network that declares no key variable of its own.
  *  3. `missing`: it talks to a service that always wants a key and has
  *     none. That is a cloud kind (`openrouter`, `aimlapi`, `gemini`) on
  *     the vendor's own endpoint, an entry that declares its own
@@ -30,7 +34,7 @@ import { presetForEntryId } from "./presets/provider-presets.js";
  *     wizard saves declares one), or an entry made from a cloud preset
  *     that still points at that preset's host.
  *  4. `unverified`: no key, and nothing says whether one is needed. A
- *     hand-made entry for a server on the LAN, a cloud kind behind an
+ *     hand-made entry for a server on a public host, a cloud kind behind an
  *     overridden endpoint (a proxy may hold the key itself), a
  *     `llama-server` entry. Callers that act on a missing key leave these
  *     alone; a check for "ready to serve" does not count them.
@@ -40,13 +44,34 @@ import { presetForEntryId } from "./presets/provider-presets.js";
  */
 export type ProviderKeyStatus =
   | { readonly state: "present" }
-  | { readonly state: "not-needed" }
+  | ({ readonly state: "not-needed" } & SharedKeyNotSent)
   | {
       readonly state: "missing";
       /** The entry's declared env var, when it declares one. */
       readonly envVar: string | null;
     }
-  | { readonly state: "unverified" };
+  | ({ readonly state: "unverified" } & SharedKeyNotSent);
+
+/**
+ * Set (only) when a shared OpenAI variable holds a key that this entry
+ * does not get, because the shared key never goes over plain http:// off
+ * this machine or to another computer on the network: the variable's
+ * name. A caller that shows readiness can say so ("OPENAI_API_KEY is not
+ * sent to this server; set the provider's own key"); see
+ * `describeSharedKeyNotSent`.
+ */
+interface SharedKeyNotSent {
+  readonly sharedKeyNotSent?: string;
+}
+
+/** One line for a readiness hint, or `null` when nothing was withheld. */
+export function describeSharedKeyNotSent(status: ProviderKeyStatus): string | null {
+  if (!("sharedKeyNotSent" in status) || !status.sharedKeyNotSent) return null;
+  return (
+    `${status.sharedKeyNotSent} is not sent to this server (plain http:// off this machine, ` +
+    "or another computer on your network); if it needs a key, set the provider's own apiKey or apiKeyEnvVar"
+  );
+}
 
 /**
  * The fields the rule reads. Both a user-config entry and a resolved
@@ -105,14 +130,28 @@ export function providerKeyStatus(
   if (preset?.local || isLocalProviderUrl(entry.baseUrl)) {
     return { state: "not-needed" };
   }
+  const withheld = sharedOpenAiKeyNotSent(entry);
+  const note = withheld !== undefined ? { sharedKeyNotSent: withheld } : {};
   const envVar = declaredEnvVar(entry);
+  // ATO-1066: a home server (llama-server, LM Studio, Ollama on the GPU
+  // box) usually has no key. One started with a key answers 401 on the
+  // first request, which names the problem; counting it as unready kept
+  // a working keyless one out of every "ready to serve" check.
+  if (
+    entry.kind === "openai-compatible" &&
+    envVar === null &&
+    preset === undefined &&
+    isOtherComputerOnNetworkUrl(entry.baseUrl)
+  ) {
+    return { state: "not-needed", ...note };
+  }
   const needsKey =
     (KEYED_CLOUD_KINDS.has(entry.kind) && !entry.baseUrl) ||
     envVar !== null ||
     (preset !== undefined &&
       hostOf(entry.baseUrl) !== null &&
       hostOf(entry.baseUrl) === hostOf(preset.baseUrl));
-  return needsKey ? { state: "missing", envVar } : { state: "unverified" };
+  return needsKey ? { state: "missing", envVar } : { state: "unverified", ...note };
 }
 
 /** Shorthand: the entry needs a key and has none. */
@@ -133,6 +172,9 @@ function hasCredential(
       : resolveLlmProviderApiKey({
           id: entry.id,
           kind: entry.kind,
+          // The shared OpenAI key is sent or not by where it would go, so
+          // the endpoint is part of the question.
+          ...(entry.baseUrl !== undefined ? { baseUrl: entry.baseUrl } : {}),
           ...(entry.apiKey !== undefined ? { apiKey: entry.apiKey } : {}),
           ...(entry.apiKeyEnvVar !== undefined
             ? { apiKeyEnvVar: entry.apiKeyEnvVar }

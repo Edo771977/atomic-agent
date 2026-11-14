@@ -554,6 +554,12 @@ describe("ProvidersOrchestrator.completeWizard", () => {
         ],
       },
     };
+    // The wizard reads a saved key from `config.json` itself, not from
+    // the env-filled runtime config, so the fixture puts it there too.
+    const { upsertLlmProvider } = await import(
+      "../../config/llm-provider-commands.js"
+    );
+    upsertLlmProvider(currentConfig.llm!.providers[0]!);
     const bodies: string[] = [];
     vi.stubGlobal(
       "fetch",

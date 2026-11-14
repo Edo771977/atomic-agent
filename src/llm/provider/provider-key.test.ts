@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  describeSharedKeyNotSent,
   providerKeyMissing,
   providerKeyStatus,
   type ProviderKeySubject,
@@ -166,6 +167,39 @@ describe("providerKeyStatus", () => {
     expect(
       providerKeyStatus({ id: "remote-box", kind: "llama-server" }).state,
     ).toBe("unverified");
+  });
+
+  it("is not-needed for a hand-made entry for another computer on this network (ATO-1066)", () => {
+    for (const baseUrl of ["http://192.168.1.20:8080", "http://gpu-box.local:1234", "http://10.0.0.5:11434"]) {
+      expect(providerKeyStatus({ id: "custom-lan", kind: "openai-compatible", baseUrl }).state, baseUrl).toBe("not-needed");
+    }
+    // One that declares its own key variable said it needs a key.
+    expect(
+      providerKeyStatus({ id: "custom-lan", kind: "openai-compatible", baseUrl: "http://192.168.1.20:8080", apiKeyEnvVar: "MY_LLM_KEY" }).state,
+    ).toBe("missing");
+    // A public host is not the home network.
+    expect(
+      providerKeyStatus({ id: "custom-pub", kind: "openai-compatible", baseUrl: "http://8.8.8.8:8080" }).state,
+    ).toBe("unverified");
+  });
+
+  it("judges a shared OpenAI key by where it would be sent, and says when it is not sent", () => {
+    // The beforeEach empty OPENAI_COMPAT_API_KEY would win the `??` chain.
+    delete process.env.OPENAI_COMPAT_API_KEY;
+    vi.stubEnv("OPENAI_API_KEY", "sk-shared");
+    const lan = { id: "custom-lan", kind: "openai-compatible", baseUrl: "http://192.168.1.20:8080" };
+    expect(providerKeyStatus(lan)).toEqual({ state: "not-needed", sharedKeyNotSent: "OPENAI_API_KEY" });
+    expect(providerKeyStatus({ id: "custom-pub", kind: "openai-compatible", baseUrl: "http://8.8.8.8:8080" })).toEqual({
+      state: "unverified",
+      sharedKeyNotSent: "OPENAI_API_KEY",
+    });
+    expect(describeSharedKeyNotSent(providerKeyStatus(lan))).toContain("OPENAI_API_KEY is not sent");
+    expect(describeSharedKeyNotSent({ state: "not-needed" })).toBeNull();
+    // Where the shared key does go, it counts.
+    expect(providerKeyStatus({ id: "custom", kind: "openai-compatible", baseUrl: "https://vllm.example" })).toEqual({ state: "present" });
+    expect(providerKeyStatus({ id: "custom", kind: "openai-compatible", baseUrl: "http://localhost:8000" })).toEqual({ state: "present" });
+    // An entry with its own key variable is not about the shared key.
+    expect(providerKeyStatus({ ...lan, apiKeyEnvVar: "MY_LLM_KEY" })).toEqual({ state: "missing", envVar: "MY_LLM_KEY" });
   });
 
   it("providerKeyMissing is true only for missing", () => {

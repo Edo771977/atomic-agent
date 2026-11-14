@@ -11,10 +11,13 @@ import {
   apiKeyPhaseError,
   emptyKeyMeaningForWizard,
   envHintForWizard,
+  sharedKeyNotSentNote,
+  storedKeyLeftBehindNote,
   verifyTargetForWizard,
   wizardKeyIsOptional,
 } from "./providers-wizard-target.js";
 import { createProvidersWizardState } from "./providers-wizard-state.js";
+import { contractProbeTargetForWizard } from "./contract-probe-target.js";
 import type {
   ProvidersWizardKind,
   ProvidersWizardState,
@@ -96,6 +99,22 @@ describe("apiKeyPhaseError", () => {
       const wizard = { ...wizardFor("openai-compatible"), baseUrlLine };
       expect(wizardKeyIsOptional(wizard)).toBe(true);
       expect(apiKeyPhaseError(wizard)).toBeNull();
+    }
+  });
+
+  it("makes the key optional for a server on another computer on this network (ATO-1066)", () => {
+    for (const baseUrlLine of [
+      "http://192.168.1.20:8080",
+      "192.168.1.20:8080", // no scheme, as typed
+      "gpu-box.local:1234",
+      "http://10.0.0.5:11434",
+    ]) {
+      const wizard = { ...wizardFor("openai-compatible"), baseUrlLine };
+      expect(wizardKeyIsOptional(wizard), baseUrlLine).toBe(true);
+      expect(apiKeyPhaseError(wizard)).toBeNull();
+      expect(emptyKeyMeaningForWizard(wizard)).toContain("Optional");
+      // No credential check to run: the model list is the reachability check.
+      expect(verifyTargetForWizard(wizard)).toBeNull();
     }
   });
 
@@ -241,6 +260,30 @@ describe("apiKeyPhaseError in configure mode", () => {
     expect(apiKeyForWizard(wizardFor("openrouter"))).toBeUndefined();
   });
 
+  it("asks again, and says why, when the entry moves to another server", () => {
+    upsertLlmProvider({
+      id: "my-compat",
+      kind: "openai-compatible",
+      baseUrl: "https://api.openai.com",
+      apiKey: "sk-literal",
+    });
+    const moved = {
+      ...configureWizard("openai-compatible", "my-compat"),
+      baseUrlLine: "https://other.example.com",
+    };
+    expect(apiKeyForWizard(moved)).toBeUndefined();
+    expect(apiKeyPhaseError(moved)).toContain("API key required");
+    expect(storedKeyLeftBehindNote(moved)).toBe(
+      "The key saved for https://api.openai.com is not sent to https://other.example.com: type this server's key.",
+    );
+    const same = {
+      ...configureWizard("openai-compatible", "my-compat"),
+      baseUrlLine: "https://api.openai.com/v1",
+    };
+    expect(apiKeyForWizard(same)).toBe("sk-literal");
+    expect(storedKeyLeftBehindNote(same)).toBeNull();
+  });
+
   it("tells the operator the saved key is what an empty screen keeps", () => {
     upsertLlmProvider({
       id: "openrouter",
@@ -274,6 +317,47 @@ describe("envHintForWizard", () => {
     expect(envHintForWizard(wizardFor("openai-compatible"))).toBe(
       "OPENAI_COMPAT_API_KEY",
     );
+  });
+});
+
+describe("envHintForWizard where the shared key is not sent", () => {
+  it.each(["http://203.0.113.5:8000", "http://localhost.localdomain"])(
+    "names the entry's own variable for %s",
+    (baseUrlLine) => {
+      const wizard = {
+        ...wizardFor("openai-compatible"),
+        baseUrlLine,
+        providerId: "my-vps",
+      };
+      expect(envHintForWizard(wizard)).toBe("ATOMIC_AGENT_KEY_MY_VPS");
+      // `.localdomain` is the operator's own network: the key is optional there.
+      expect(apiKeyPhaseError(wizard) ?? "ATOMIC_AGENT_KEY_MY_VPS").toContain(
+        "ATOMIC_AGENT_KEY_MY_VPS",
+      );
+    },
+  );
+
+  it("explains why the shared key is not sent over plain http://", () => {
+    process.env.OPENAI_COMPAT_API_KEY = "sk-SHARED";
+    try {
+      const note = sharedKeyNotSentNote({
+        ...wizardFor("openai-compatible"),
+        baseUrlLine: "http://203.0.113.5:8000",
+      });
+      expect(note).toContain(
+        "OPENAI_COMPAT_API_KEY is not sent over plain http://",
+      );
+    } finally {
+      delete process.env.OPENAI_COMPAT_API_KEY;
+    }
+  });
+
+  it("still names the shared variable for https", () => {
+    const wizard = {
+      ...wizardFor("openai-compatible"),
+      baseUrlLine: "https://api.example.com",
+    };
+    expect(envHintForWizard(wizard)).toBe("OPENAI_COMPAT_API_KEY");
   });
 });
 
@@ -356,5 +440,164 @@ describe("verifyTargetForWizard", () => {
       "https://api.perplexity.ai/chat/completions",
     );
     expect(result.status).toBe("ok");
+  });
+});
+
+describe("the shared compat key and a server on another computer (ATO-1066)", () => {
+  // `OPENAI_COMPAT_API_KEY` / `OPENAI_API_KEY` usually hold the
+  // operator's real cloud key. The wizard lists models and runs the
+  // contract probe with `apiKeyForWizard`, so if that answers with the
+  // shared key the key goes out as a Bearer over plain http:// to the
+  // box on the LAN — the leak the resolver guard exists to prevent.
+  let stateDir: string;
+  let previousStateDir: string | undefined;
+
+  beforeEach(() => {
+    previousStateDir = process.env.ATOMIC_AGENT_STATE_DIR;
+    stateDir = mkdtempSync(join(tmpdir(), "wizard-lan-key-"));
+    process.env.ATOMIC_AGENT_STATE_DIR = stateDir;
+    for (const key of ENV_KEYS) delete process.env[key];
+    resetConfigCache();
+  });
+
+  afterEach(() => {
+    rmSync(stateDir, { recursive: true, force: true });
+    if (previousStateDir === undefined) {
+      delete process.env.ATOMIC_AGENT_STATE_DIR;
+    } else {
+      process.env.ATOMIC_AGENT_STATE_DIR = previousStateDir;
+    }
+    for (const key of ENV_KEYS) delete process.env[key];
+    resetConfigCache();
+  });
+
+  function lanAddWizard(baseUrlLine: string): ProvidersWizardState {
+    return {
+      ...wizardFor("openai-compatible"),
+      phase: "chat_model_line",
+      baseUrlLine,
+      chatModelLine: "qwen",
+      selectedChatModelId: "qwen",
+    };
+  }
+
+  it("does not hand the shared key to a new server on another computer", () => {
+    process.env.OPENAI_COMPAT_API_KEY = "sk-SHARED";
+    process.env.OPENAI_API_KEY = "sk-SHARED-2";
+    for (const line of ["http://192.168.1.20:8080", "192.168.1.20:8080"]) {
+      const wizard = lanAddWizard(line);
+      expect(apiKeyForWizard(wizard), line).toBeUndefined();
+      expect(contractProbeTargetForWizard(wizard), line).toEqual({
+        kind: "skipped",
+        reason: "no_api_key",
+      });
+    }
+  });
+
+  it("still sends a key typed for that server", () => {
+    process.env.OPENAI_COMPAT_API_KEY = "sk-SHARED";
+    const wizard = { ...lanAddWizard("http://192.168.1.20:8080"), apiKeyBuffer: "lan-key" };
+    expect(apiKeyForWizard(wizard)).toBe("lan-key");
+    const probe = contractProbeTargetForWizard(wizard);
+    expect(probe.kind === "target" && probe.target.apiKey).toBe("lan-key");
+  });
+
+  it("still resolves the shared key for a cloud compat endpoint", () => {
+    process.env.OPENAI_COMPAT_API_KEY = "sk-SHARED";
+    expect(apiKeyForWizard(lanAddWizard("https://api.example.com"))).toBe("sk-SHARED");
+  });
+
+  it("does not hand the shared key over when a cloud entry is moved to another computer", () => {
+    process.env.OPENAI_COMPAT_API_KEY = "sk-SHARED";
+    upsertLlmProvider({
+      id: "my-compat",
+      kind: "openai-compatible",
+      baseUrl: "https://api.example.com",
+    });
+    resetConfigCache();
+    const wizard: ProvidersWizardState = {
+      ...createProvidersWizardState("configure", {
+        providerId: "my-compat",
+        kind: "openai-compatible",
+        baseUrl: "http://192.168.1.20:8080",
+      }),
+      phase: "chat_model_line",
+      chatModelLine: "qwen",
+      selectedChatModelId: "qwen",
+    };
+    expect(apiKeyForWizard(wizard)).toBeUndefined();
+    expect(contractProbeTargetForWizard(wizard)).toEqual({
+      kind: "skipped",
+      reason: "no_api_key",
+    });
+  });
+
+  it("does not send a cloud entry's saved key to another computer it is moved to", () => {
+    upsertLlmProvider({
+      id: "my-compat",
+      kind: "openai-compatible",
+      baseUrl: "https://api.example.com",
+      apiKey: "sk-cloud-literal",
+    });
+    resetConfigCache();
+    const wizard = createProvidersWizardState("configure", {
+      providerId: "my-compat",
+      kind: "openai-compatible",
+      baseUrl: "http://192.168.1.20:8080",
+    });
+    expect(apiKeyForWizard(wizard)).toBeUndefined();
+  });
+
+  it("keeps the saved key of a server on another computer that stays put", () => {
+    upsertLlmProvider({
+      id: "gpu-box",
+      kind: "openai-compatible",
+      baseUrl: "http://192.168.1.20:8080",
+      apiKey: "lan-literal",
+    });
+    resetConfigCache();
+    const wizard = createProvidersWizardState("configure", {
+      providerId: "gpu-box",
+      kind: "openai-compatible",
+      baseUrl: "http://192.168.1.20:8080",
+    });
+    expect(apiKeyForWizard(wizard)).toBe("lan-literal");
+  });
+});
+
+describe("sharedKeyNotSentNote (ATO-1066)", () => {
+  // A LAN server's key used to live in OPENAI_COMPAT_API_KEY. It is no
+  // longer sent there, so an operator upgrading must be told why the
+  // server suddenly sees no key.
+  beforeEach(() => {
+    for (const key of ENV_KEYS) delete process.env[key];
+  });
+  afterEach(() => {
+    for (const key of ENV_KEYS) delete process.env[key];
+  });
+
+  function lan(apiKeyBuffer = "", baseUrlLine = "http://192.168.1.20:8080") {
+    return { ...wizardFor("openai-compatible"), baseUrlLine, apiKeyBuffer };
+  }
+
+  it("names the shared variable that is set and what to do instead", () => {
+    process.env.OPENAI_API_KEY = "sk-SHARED";
+    const note = sharedKeyNotSentNote(lan());
+    expect(note).toContain("OPENAI_API_KEY is not sent to other computers on your network");
+    expect(note).toContain("type the server's key");
+    expect(note).toContain("apiKeyEnvVar");
+  });
+
+  it("stays quiet when it has nothing to explain", () => {
+    expect(sharedKeyNotSentNote(lan())).toBeNull();
+    process.env.OPENAI_COMPAT_API_KEY = "sk-SHARED";
+    expect(sharedKeyNotSentNote(lan("lan-key"))).toBeNull();
+    expect(sharedKeyNotSentNote(lan("", "https://api.example.com"))).toBeNull();
+    expect(sharedKeyNotSentNote(lan("", "http://127.0.0.1:8080"))).toBeNull();
+  });
+
+  it("does not promise the shared variable as the key's home", () => {
+    expect(envHintForWizard(lan())).not.toBe("OPENAI_COMPAT_API_KEY");
+    expect(envHintForWizard(lan())).toContain("ATOMIC_AGENT_KEY_");
   });
 });
