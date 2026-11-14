@@ -357,6 +357,13 @@ describe("fusion escalation calls in the session readout (ATO-1388)", () => {
 });
 
 describe("runtimeKnownSecrets (ATO-1077)", () => {
+  it("resolves a provider's custom key environment name without treating unrelated environment values as secrets", () => {
+    const config = { llm: { providers: [{ id: "lab", kind: "openai-compatible", apiKeyEnvVar: "LAB_BOX" }] } } as Parameters<typeof runtimeKnownSecrets>[0];
+    const secrets = runtimeKnownSecrets(config, { LAB_BOX: "SyntheticCustomCredential493825", ATOMIC_AGENT_KEY_LAB: "SyntheticAtomicCredential837251", UNRELATED_BOX: "ordinary public value" });
+    expect(secrets).toContainEqual({ label: "lab-key", value: "SyntheticCustomCredential493825" });
+    expect(secrets.some(secret => secret.value === "SyntheticAtomicCredential837251")).toBe(true);
+    expect(secrets.some(secret => secret.value === "ordinary public value")).toBe(false);
+  });
   it("lists the env's secret variables and the credentials stored in config", () => {
     const config = {
       llm: {
