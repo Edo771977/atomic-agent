@@ -281,3 +281,19 @@ it.each([true, false])("masks configured known secrets before bounding public ar
   expect(result.summary.length).toBeLessThanOrEqual(f.deps.outputCharCap); expect((result.fullOutput ?? "").length).toBeLessThanOrEqual(f.deps.outputCharCap);
   expect(result.summary.startsWith("artifact-evidence: ")).toBe(true);
 });
+
+it("reports one candidate task run with two completed worker invocations after a judge retry", async () => {
+  const append = vi.fn(); const f = await fixture({ outcomeLog: { append } });
+  const base = f.deps.resolveRunMode(); f.deps.resolveRunMode = () => ({ ...base, judge: { providerId: "cloud", model: "strong" } });
+  let turns = 0, judged = 0;
+  f.deps.runTurn = async session => { turns += 1; await writeFile(join(session.workingDir, "api.json"), `attempt ${turns}`); return { session, reason: "reply", stepCount: 1 }; };
+  f.deps.runChecks = async specs => ({ ok: true, results: specs.map(() => ({ ok: true })) });
+  f.deps.escalationComplete = async () => ({ content: JSON.stringify({ items: [{ id: "a2", pass: ++judged > 1, why: "verdict" }] }) });
+  await buildFusionDelegateTool(f.deps).run({ tasks: [{ id: "api", instructions: "work", files: ["api.json"] }], contract }, f.ctx);
+  expect(turns).toBe(2); expect(append).toHaveBeenCalledTimes(1);
+  const records = append.mock.calls[0]![0];
+  expect(records).toEqual([expect.objectContaining({ judgeRetried: true, candidate: expect.objectContaining({ workerRuns: 2 }) })]);
+  const { aggregateOutcomes } = await import("./outcome-report.js");
+  const report = aggregateOutcomes(records);
+  expect(report.workers[0]).toMatchObject({ checksPassed: 0, candidate: { taskRuns: 1, knownWorkerRuns: 2, workerRunsUnverified: 0 } });
+});

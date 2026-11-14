@@ -847,6 +847,7 @@ export function buildFusionDelegateTool(
       const candidateOriginalDir = ctx.workingDir;
       let candidate: CandidateIntegration | undefined;
       const completedCandidateRows = new Map<string, WorkerTaskResult>();
+      const candidateWorkerRuns = new Map<string, number>();
       let candidateOutcomesRecorded = false;
       let recordCandidateInterruption: ((report: CandidateIntegrationReport) => void) | undefined;
       if (mode.integration === "candidate") {
@@ -1149,7 +1150,10 @@ export function buildFusionDelegateTool(
           // still governs escalations and cuts (ATO-1406).
           shouldStartTask: () => breaker.stopReason(),
           onTaskFinished: (result: WorkerTaskResult): void => {
-            if (candidate !== undefined) completedCandidateRows.set(result.id, result);
+            if (candidate !== undefined) {
+              completedCandidateRows.set(result.id, result);
+              if (!(result.error ?? "").startsWith("not started:")) candidateWorkerRuns.set(result.id, Math.min(1_000_000, (candidateWorkerRuns.get(result.id) ?? 0) + 1));
+            }
             breaker.observe(result);
             // A finished worker that ran tools answers the format check.
             if (
@@ -1612,7 +1616,7 @@ export function buildFusionDelegateTool(
         candidateOutcomesRecorded = true;
         const ran = [...completedCandidateRows.values()].filter(row => !(row.error ?? "").startsWith("not started:"));
         deps.outcomeLog?.append(outcomeRowsFor(ran, new Date()).map(({ record, row }) =>
-          withCandidateOutcome(record, report.acceptanceReceipt!, report.contract?.checks ?? [], row.id)));
+          withCandidateOutcome(record, report.acceptanceReceipt!, report.contract?.checks ?? [], row.id, candidateWorkerRuns.get(row.id))));
       };
       const fanoutStartedAt = Date.now();
       const endLiveFanout = formatCheck.beginFanout(checkedServers);
@@ -2256,7 +2260,7 @@ export function buildFusionDelegateTool(
           // Final candidate disposition is telemetry, never individual task quality credit.
           candidateOutcomesRecorded = candidate !== undefined;
           deps.outcomeLog?.append(outcomeRows.map(({ record, row }) => candidateReport === undefined ? record
-            : withCandidateOutcome(record, candidateReport.acceptanceReceipt!, candidateReport.contract?.checks ?? [], row.id)));
+            : withCandidateOutcome(record, candidateReport.acceptanceReceipt!, candidateReport.contract?.checks ?? [], row.id, candidateWorkerRuns.get(row.id))));
           deps.turnLedger?.noteFanout(ctx.sessionId, {
             tasks: outcomeRows.map(({ row, record, pricing }) => ({
               ok: row.status === "ok",
