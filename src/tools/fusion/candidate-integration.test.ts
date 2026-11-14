@@ -260,7 +260,7 @@ it("promotes a tracked file under a directory named like a dependency/build fold
   } finally { await candidate.cleanup(); }
 });
 
-it("never promotes deletion or modification of ignored standalone files", async () => {
+it("never promotes deletion of ignored standalone files", async () => {
   const root = await ignoreRepo(); const candidate = await createCandidateIntegration(root);
   try {
     expect(await readFile(join(candidate.dir, ".env"), "utf8")).toBe("SECRET=1\n");
@@ -270,6 +270,10 @@ it("never promotes deletion or modification of ignored standalone files", async 
     expect(report.status).toBe("promoted"); expect(report.changes).toEqual(["a.txt"]);
     expect(await readFile(join(root, ".env"), "utf8")).toBe("SECRET=1\n");
   } finally { await candidate.cleanup(); }
+});
+
+it("never promotes modification of ignored standalone files", async () => {
+  const root = await ignoreRepo();
   const next = await createCandidateIntegration(root);
   try {
     await writeFile(join(next.dir, ".env"), "SECRET=worker\n");
