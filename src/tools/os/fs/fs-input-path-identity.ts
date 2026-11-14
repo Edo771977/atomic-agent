@@ -12,8 +12,15 @@ export function windowsComponentIdentity(component: string): string {
   return name.length === 0 ? component : name;
 }
 
-/** Lexical identity for resolved input paths; display spelling and link targets stay untouched. */
+/**
+ * Lexical identity for resolved input paths; display spelling and link
+ * targets stay untouched. macOS folds case and Unicode normalization as
+ * its default case-insensitive APFS volumes open names; on a
+ * case-sensitive APFS volume this over-protects (two distinct files that
+ * differ only in case are treated as one), which is the safe direction.
+ */
 export function inputPathIdentity(path: string, platform: NodeJS.Platform = process.platform): string {
+  if (platform === "darwin") return posix.resolve(path).normalize("NFC").toLowerCase();
   if (platform !== "win32") return posix.resolve(path);
   const normalized = win32.resolve(path);
   const { root } = win32.parse(normalized);

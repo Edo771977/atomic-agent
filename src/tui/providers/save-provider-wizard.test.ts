@@ -267,6 +267,64 @@ describe("saveProviderWizardToConfig", () => {
     expect(configJsonText()).not.toContain("vllm-from-env");
   });
 
+  it.each(["OPENAI_API_KEY", "OPENAI_COMPAT_API_KEY", "ATOMIC_AGENT_OPENAI_API_KEY"])(
+    "writes a key typed for another computer under its own variable, not a stored shared %s",
+    (shared) => {
+      const before = process.env[shared];
+      process.env[shared] = "sk-real-cloud-key";
+      onTestFinished(() => {
+        if (before === undefined) delete process.env[shared];
+        else process.env[shared] = before;
+      });
+      upsertLlmProvider({
+        id: "my-cloud",
+        kind: "openai-compatible",
+        baseUrl: "https://api.example.com",
+        apiKeyEnvVar: shared,
+      });
+      resetConfigCache();
+
+      const built = saveProviderWizardToConfig({
+        ...configureCompat("my-cloud", "http://192.168.1.20:8080"),
+        apiKeyBuffer: "lan-key",
+      });
+      const envVar = networkComputerKeyEnvVar(built.entry.id);
+      onTestFinished(() => {
+        delete process.env[envVar];
+      });
+
+      expect(built.entry.apiKeyEnvVar).toBe(envVar);
+      expect(process.env[envVar]).toBe("lan-key");
+      expect(process.env[shared]).toBe("sk-real-cloud-key");
+      expect(readFileSync(join(stateDir, ".env"), "utf8")).not.toMatch(
+        new RegExp(`^${shared}=.*lan-key`, "m"),
+      );
+    },
+  );
+
+  it("does not carry a stored shared OPENAI_* variable to another computer when no key is typed", () => {
+    const before = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = "sk-real-cloud-key";
+    onTestFinished(() => {
+      if (before === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = before;
+    });
+    upsertLlmProvider({
+      id: "my-cloud",
+      kind: "openai-compatible",
+      baseUrl: "https://api.example.com",
+      apiKeyEnvVar: "OPENAI_API_KEY",
+    });
+    resetConfigCache();
+
+    const built = saveProviderWizardToConfig(configureCompat("my-cloud", "http://192.168.1.20:8080"));
+
+    // Carrying the name over would make the resolver honour it as an
+    // explicit choice and send the cloud key to the LAN box in clear.
+    expect(built.entry.apiKeyEnvVar).toBeUndefined();
+    expect(resolveLlmProviderApiKey(built.entry)).toBeUndefined();
+  });
+
   it("still carries a key written in config.json over a reconfigure", () => {
     upsertLlmProvider({
       id: "my-compat",

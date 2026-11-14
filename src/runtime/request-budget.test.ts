@@ -35,17 +35,19 @@ describe("request budget scope", () => {
     expect(outcomes).toEqual(["ok", "ok", "ok"]);
   });
 
-  it("reserves at least one input token per character of a multi-byte prompt", () => {
-    // Independent bound: even a tokenizer emitting one token per character
-    // of N characters needs N input tokens at the highest ($3.75) rate.
+  it("estimates about one input token per character of a 3-byte CJK prompt", () => {
+    // The estimate is a third of a token per UTF-8 byte: N three-byte
+    // characters count as at least N input tokens at the $3 input rate.
+    // Below that cap even the smallest (1024-token) clamped reply cannot fit.
     const n = 20_000;
-    const body = () => ({ model: "m", messages: [{ role: "user", content: "é".repeat(n) }] });
-    const perCharacterUsd = (n * 3.75 + 4096 * 15) / 1_000_000;
+    const body = () => ({ model: "m", messages: [{ role: "user", content: "中".repeat(n) }] });
+    const perCharacterUsd = (n * 3 + 1024 * 15) / 1_000_000;
     expect(() => setup(perCharacterUsd).scope().beforeSend(body())).toThrow(/budget|cap/i);
     expect(() => setup(perCharacterUsd * 4).scope().beforeSend(body())).not.toThrow();
   });
 
-  // A 200k window at the $3.75 cache-write rate alone holds $0.75.
+  // A 200k window at the $3 input rate alone holds $0.60; the smallest
+  // clamped reply adds 1024 x $15, the full 4096-token ceiling $0.061.
   it.each<[string, Record<string, unknown>]>([
     ["OpenRouter plugins", { plugins: [{ id: "web" }] }],
     ["an :online model id", { model: "m:online" }],
@@ -53,8 +55,10 @@ describe("request budget scope", () => {
     ["a non-function tool", { tools: [{ type: "web_search_preview" }] }],
   ])("reserves the context window for provider-side input added by %s", (_label, extra) => {
     const body = () => ({ model: "m", messages: [{ role: "user", content: "hi" }], ...extra });
-    expect(() => setup(0.75).scope().beforeSend(body())).toThrow(/budget|cap/i);
-    expect(() => setup(0.82).scope().beforeSend(body())).not.toThrow();
+    expect(() => setup(0.61).scope().beforeSend(body())).toThrow(/budget|cap/i);
+    const admitted: Record<string, unknown> = body();
+    setup(0.67).scope().beforeSend(admitted);
+    expect(admitted.max_tokens).toBe(4096);
   });
 
   it("refuses provider-side input when the context window is not verified", () => {
@@ -129,12 +133,19 @@ describe("request budget scope", () => {
     expect(body).not.toHaveProperty("max_tokens");
   });
 
-  it("refuses a paid send without any explicit output ceiling instead of reserving the context window", () => {
+  it("admits a paid send without any explicit output ceiling on a soft bound, leaving the body unchanged", () => {
     const { budget, scope } = setup(10, { maxOutputTokens: undefined });
     const body: Record<string, unknown> = { model: "openai/gpt-5.1", messages: [] };
-    expect(() => scope().beforeSend(body)).toThrow(/set `maxOutputTokens` on provider entry cloud/);
-    expect(body).not.toHaveProperty("max_completion_tokens");
-    expect(spent(budget)).toBe(0);
+    const s = scope();
+    s.beforeSend(body);
+    expect(body).toEqual({ model: "openai/gpt-5.1", messages: [] });
+    expect(s.softBound).toBe(true);
+    expect(s.hint).toMatch(/maxOutputTokens/);
+    // The hold covers the assumed 8192-token reply at the output rate.
+    expect(() => budget.reserveRequest("p", 10 - 8192 * 15 / 1_000_000 + 0.001).release()).toThrow(/cannot cover/);
+    s.finish({ usage: { promptTokens: 1_000, completionTokens: 20_000, totalTokens: 21_000 } } as never);
+    // Settlement charges the real usage even beyond the assumed output.
+    expect(spent(budget)).toBeCloseTo((1_000 * 3 + 20_000 * 15) / 1_000_000, 9);
   });
 
   it("accepts a cap field already in the body as the explicit ceiling", () => {
@@ -158,12 +169,144 @@ describe("request budget scope", () => {
     expect(body).toEqual({ model: "claude-sonnet-4.5", messages: [], max_tokens: 4096 });
   });
 
-  it("refuses a paid request with no verified output ceiling", () => {
+  it("assumes no more output than a known context window on a soft bound", () => {
     const budget = new FusionTurnBudget();
     budget.begin("p", 0, { usd: 10 });
     const req = { sessionId: "p", prompt: "hi" } as CompletionRequest;
-    const s = createRequestBudgetScope(budget, req, provider, entry, { ...model, source: "default" })!;
-    expect(() => s.beforeSend({ model: "m", messages: [] })).toThrow(/output ceiling/);
+    const s = createRequestBudgetScope(budget, req, provider, entry, { ...model, contextWindow: 2_000 })!;
+    s.beforeSend({ model: "m", messages: [] });
+    expect(s.softBound).toBe(true);
+    s.finish(undefined);
+    // Lost usage settles the whole soft hold: body bytes + framing + 2000 output tokens.
+    expect(spent(budget)).toBeLessThan(((2_000 + 1_200) * 3.75 + 2_000 * 15) / 1_000_000);
+    expect(spent(budget)).toBeGreaterThan(2_000 * 15 / 1_000_000);
+  });
+
+  it("keeps the hard bound and no hint when an explicit ceiling exists", () => {
+    const { scope } = setup(10);
+    const s = scope();
+    s.beforeSend({ model: "m", messages: [] });
+    expect(s.softBound).toBe(false);
+    expect(s.hint).toBeUndefined();
+  });
+
+  describe("ordinary bodies and parallel workers under a $1 cap", () => {
+    // Reviewer probe p2: an OpenRouter Sonnet entry with maxOutputTokens 8192.
+    const orProvider = { id: "or", supportsRequestBudget: true } as LlmProvider;
+    const orEntry = { id: "or", kind: "openrouter", maxOutputTokens: 8192 } as LlmProviderConfigEntry;
+    const sonnet = { pricing: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 }, contextWindow: 200_000, source: "catalog" } as ResolvedModel;
+    const text = (kb: number) => ({ model: "anthropic/claude-sonnet-4.5", messages: [{ role: "user", content: "x".repeat(kb * 1024) }] });
+
+    it("admits a 250 KB orchestrator body after earlier settled requests (p2)", () => {
+      const budget = new FusionTurnBudget();
+      budget.begin("s1", 0, { usd: 1 });
+      for (const kb of [60, 150, 250]) {
+        const s = createRequestBudgetScope(budget, { sessionId: "s1" } as CompletionRequest, orProvider, orEntry, sonnet)!;
+        const body: Record<string, unknown> = text(kb);
+        expect(() => s.beforeSend(body)).not.toThrow();
+        expect(body.max_tokens).toBe(8192);
+        s.finish({ usage: { promptTokens: kb * 256, completionTokens: 500, totalTokens: kb * 256 + 500 } } as never);
+      }
+    });
+
+    it("admits four parallel 100 KB worker requests", () => {
+      const budget = new FusionTurnBudget();
+      budget.begin("s1", 0, { usd: 1 });
+      const outcomes = [1, 2, 3, 4].map(() => {
+        const s = createRequestBudgetScope(budget, { sessionId: "s1" } as CompletionRequest, orProvider, orEntry, sonnet)!;
+        try { s.beforeSend(text(100)); return "ok"; } catch (error) { return (error as Error).message; }
+      });
+      expect(outcomes).toEqual(["ok", "ok", "ok", "ok"]);
+    });
+
+    it("prices the cache-write premium only for bodies with explicit cache_control breakpoints", () => {
+      const cached = () => ({ model: "m", messages: [{ role: "user", content: [{ type: "text", text: "x".repeat(300_000), cache_control: { type: "ephemeral" } }] }] });
+      const plain = () => ({ model: "m", messages: [{ role: "user", content: "x".repeat(300_000) }] });
+      // ~101k input tokens: $0.303 at $3, $0.379 at $3.75, plus 4096 x $15 = $0.061.
+      const admitted: Record<string, unknown> = plain();
+      setup(0.4).scope().beforeSend(admitted);
+      expect(admitted.max_tokens).toBe(4096);
+      const s = setup(0.4).scope();
+      const body: Record<string, unknown> = cached();
+      s.beforeSend(body);
+      // The full bound no longer fits: the written ceiling is clamped instead.
+      expect(body.max_tokens).toBeLessThan(4096);
+      expect(body.max_tokens).toBeGreaterThanOrEqual(1024);
+    });
+
+    it("clamps an explicit ceiling to the remaining allowance, but not below 1024 tokens", () => {
+      // ~1.03k input tokens at $3 ~= $0.0031; 4096 output at $15 = $0.061; 1024 at $15 = $0.0154.
+      const s = setup(0.04).scope();
+      const body: Record<string, unknown> = { model: "m", messages: [] };
+      s.beforeSend(body);
+      const written = body.max_tokens as number;
+      expect(written).toBeGreaterThanOrEqual(1024);
+      expect(written).toBeLessThan(4096);
+      expect(((1_030 * 3) + written * 15) / 1_000_000).toBeLessThanOrEqual(0.04);
+      expect(() => setup(0.015).scope().beforeSend({ model: "m", messages: [] })).toThrow(/cannot cover/);
+    });
+
+    it("shrinks the assumed reply of a soft bound instead of refusing, leaving the body unchanged", () => {
+      const { budget, scope } = setup(0.04, { maxOutputTokens: undefined });
+      const s = scope();
+      const body: Record<string, unknown> = { model: "m", messages: [] };
+      s.beforeSend(body);
+      expect(body).toEqual({ model: "m", messages: [] });
+      expect(s.softBound).toBe(true);
+      s.finish(undefined);
+      expect(spent(budget)).toBeLessThanOrEqual(0.04 + 1e-9);
+      expect(() => setup(0.015, { maxOutputTokens: undefined }).scope().beforeSend({ model: "m", messages: [] })).toThrow(/cannot cover/);
+    });
+  });
+
+  describe("meter-only fallback when the cap cannot be enforced before sending", () => {
+    // Reviewer probe p1: an `openai` entry from presets, no maxOutputTokens, catalog pricing, $1 cap.
+    it("admits a default fusion setup request (p1) with the body unchanged", () => {
+      const budget = new FusionTurnBudget();
+      budget.begin("s1", 0, { usd: 1 });
+      const p = { id: "openai", supportsRequestBudget: true } as LlmProvider;
+      const e = { id: "openai", kind: "openai" } as LlmProviderConfigEntry;
+      const m = { pricing: { input: 2.5, output: 10 }, contextWindow: 128_000, source: "catalog" } as ResolvedModel;
+      const s = createRequestBudgetScope(budget, { sessionId: "s1" } as CompletionRequest, p, e, m)!;
+      const body = { model: "gpt-4o", messages: [{ role: "user", content: "hi" }] };
+      expect(() => s.beforeSend(body)).not.toThrow();
+      expect(body).toEqual({ model: "gpt-4o", messages: [{ role: "user", content: "hi" }] });
+    });
+
+    it("admits a paid provider without verified pricing and charges only reported cost", () => {
+      const budget = new FusionTurnBudget();
+      budget.begin("p", 0, { usd: 1 });
+      const s = createRequestBudgetScope(budget, { sessionId: "p", prompt: "hi" } as CompletionRequest, provider, entry, { ...model, pricing: undefined })!;
+      const body = { model: "m", messages: [] };
+      expect(() => s.beforeSend(body)).not.toThrow();
+      expect(body).toEqual({ model: "m", messages: [] });
+      expect(s.hint).toMatch(/pricing/);
+      s.finish({ usage: { promptTokens: 10, completionTokens: 10, totalTokens: 20, costUsd: 0.4 } } as never);
+      expect(spent(budget)).toBeCloseTo(0.4, 9);
+      // Without a reported cost or pricing nothing can be charged.
+      const t = createRequestBudgetScope(budget, { sessionId: "p", prompt: "hi" } as CompletionRequest, provider, entry, { ...model, pricing: undefined })!;
+      t.beforeSend({ model: "m", messages: [] });
+      t.finish({ usage: { promptTokens: 10, completionTokens: 10, totalTokens: 20 } } as never);
+      expect(spent(budget)).toBeCloseTo(0.4, 9);
+    });
+
+    it("meters a priced provider that cannot authorize physical sends with its usage estimate", () => {
+      const budget = new FusionTurnBudget();
+      budget.begin("p", 0, { usd: 1 });
+      const unsupported = { id: "cloud" } as LlmProvider;
+      const s = createRequestBudgetScope(budget, { sessionId: "p", prompt: "hi", maxOutputTokens: 4096 } as CompletionRequest, unsupported, entry, model)!;
+      expect(s.hint).toMatch(/physical send/);
+      s.finish({ usage: { promptTokens: 1_000, completionTokens: 1_000, totalTokens: 2_000 } } as never);
+      expect(spent(budget)).toBeCloseTo((1_000 * 3 + 1_000 * 15) / 1_000_000, 9);
+    });
+
+    it("still refuses a metered request once the cap is reached", () => {
+      const budget = new FusionTurnBudget();
+      budget.begin("p", 0, { usd: 1 });
+      const make = () => createRequestBudgetScope(budget, { sessionId: "p", prompt: "hi" } as CompletionRequest, provider, entry, { ...model, pricing: undefined });
+      make()!.finish({ usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2, costUsd: 1.5 } } as never);
+      expect(make).toThrow(/budget|cap/i);
+    });
   });
 
   describe("price modifiers carried by the request", () => {
@@ -206,8 +349,9 @@ describe("request budget scope", () => {
 
     it("reserves and settles a configured service-tier multiplier", () => {
       const priced = { ...model, pricing: { ...model.pricing!, serviceTierMultipliers: { priority: 2 } } } as ResolvedModel;
-      // Base bound: ~1.1k body tokens at $3.75 + 4096 output at $15 ~= $0.066.
-      expect(() => scoped(0.1, priced).scope().beforeSend({ model: "m", messages: [], service_tier: "priority" })).toThrow(/budget|cap/i);
+      // Base bound: ~1.05k body tokens at $3 + 4096 output at $15 ~= $0.065;
+      // even a 1024-token clamped reply at 2x is ~$0.037.
+      expect(() => scoped(0.02, priced).scope().beforeSend({ model: "m", messages: [], service_tier: "priority" })).toThrow(/budget|cap/i);
       const { budget, scope } = scoped(0.2, priced);
       const s = scope();
       s.beforeSend({ model: "m", messages: [], service_tier: "priority" });
@@ -256,20 +400,23 @@ describe("request budget scope", () => {
     });
 
     it("reserves a long-context cache-write rate derived from the base ratio", () => {
-      // No long cacheWrite: 6 x (3.75 / 3) = $7.50, above the long input rate.
+      // No long cacheWrite: 6 x (3.75 / 3) = $7.50, above the long input
+      // rate; it applies because the body places a cache breakpoint.
       const priced = { ...model, pricing: { ...model.pricing!, longContext: { thresholdTokens: 100_000, input: 6, output: 22.5 } } } as ResolvedModel;
-      const body = () => ({ model: "m", messages: [{ role: "user", content: "a".repeat(120_000) }] });
-      // At $6 the bound is ~$0.83; at $7.50 ~$1.01.
+      const body = () => ({ model: "m", messages: [{ role: "user", content: [{ type: "text", text: "a".repeat(360_000), cache_control: { type: "ephemeral" } }] }] });
+      // ~121k input tokens: at $6 the bound is ~$0.82; at $7.50 ~$1.0, and
+      // ~$0.93 with the smallest clamped reply.
       expect(() => scoped(0.9, priced).scope().beforeSend(body())).toThrow(/budget|cap/i);
       expect(() => scoped(1.1, priced).scope().beforeSend(body())).not.toThrow();
     });
 
     it("reserves long-context rates when the bound input can exceed the threshold", () => {
       const priced = { ...model, pricing: { ...model.pricing!, longContext: { thresholdTokens: 100_000, input: 6, output: 22.5, cacheWrite: 7.5, cacheRead: 0.6 } } } as ResolvedModel;
-      const body = () => ({ model: "m", messages: [{ role: "user", content: "a".repeat(120_000) }] });
-      // Base rates hold ~$0.52; long-context rates ~$1.00.
-      expect(() => scoped(0.8, priced).scope().beforeSend(body())).toThrow(/budget|cap/i);
-      expect(() => scoped(1.2, priced).scope().beforeSend(body())).not.toThrow();
+      const body = () => ({ model: "m", messages: [{ role: "user", content: "a".repeat(360_000) }] });
+      // ~121k input tokens: base rates hold ~$0.43; long-context rates ~$0.82,
+      // ~$0.75 with the smallest clamped reply.
+      expect(() => scoped(0.7, priced).scope().beforeSend(body())).toThrow(/budget|cap/i);
+      expect(() => scoped(0.9, priced).scope().beforeSend(body())).not.toThrow();
       // Below the threshold the base rates still apply.
       expect(() => scoped(0.1, priced).scope().beforeSend({ model: "m", messages: [] })).not.toThrow();
     });

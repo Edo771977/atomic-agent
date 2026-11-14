@@ -14,14 +14,17 @@
  * snapshot commit: `git stash create` captures the tracked files'
  * uncommitted state without touching the working tree or the stash
  * list (HEAD when there is nothing uncommitted). The commit supplies
- * Git metadata only: tracked paths are overlaid from the original's
- * actual bytes into the base, then from that frozen base into each
- * task, bypassing clean/smudge filters and Git's stat cache. Untracked files are
- * copied in; ignored directories and ignored files are copied privately
- * so a test run still finds them, except the shared dependency
- * directories (`node_modules`, `target`, `.venv`), which are normally symlinked
- * to the original's and cost no copy budget (with
- * `privateDependencyDirectories`, tasks copy them privately instead). A
+ * Git metadata only: a tracked path whose checkout differs from the
+ * original's actual bytes is overlaid from them into the base, then from
+ * that frozen base into each task, bypassing clean/smudge filters and
+ * Git's stat cache; an identical checkout is kept (only its mode and
+ * times are the source's) and costs no copy budget. Untracked files and
+ * ignored files are copied in. Ignored directories (a virtualenv, `dist/`,
+ * a cache) are normally symlinked to the original's like the shared
+ * dependency directories (`node_modules`, `target`, `.venv`) and cost no
+ * copy budget; with `privateDependencyDirectories` (a candidate) ignored
+ * directories are copied privately and tasks copy the dependency
+ * directories privately too. A
  * denied generated symlink becomes a junction; only with no link at all
  * does it become a bounded private copy, made once in the base and
  * linked from there by the tasks when they can.
@@ -44,6 +47,7 @@ import {
   lstat,
   mkdir,
   mkdtemp,
+  open,
   readdir,
   readFile,
   readlink,
@@ -54,6 +58,7 @@ import {
   utimes,
   writeFile,
 } from "node:fs/promises";
+import type { Stats } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { runCommand, type CommandResult } from "../../sandbox/command-runner.js";
@@ -104,11 +109,72 @@ async function staleRoot(root: string): Promise<boolean> {
 }
 
 /**
+ * Make git forget the worktrees at or under `removed`, whose folders
+ * Node's `rm` already deleted: `git worktree prune`, then, only for a
+ * registration prune left (a locked one) whose folder is really gone,
+ * `git worktree remove --force`. Git never walks a live workspace
+ * tree: one that holds a generated junction could lead a Git for
+ * Windows recursive delete into the original's dependency directory,
+ * while Node's `rm` removes a link (symlink or junction) without
+ * following it. Never throws.
+ */
+async function forgetRemovedWorktrees(git: GitExec, top: string, removed: readonly string[]): Promise<void> {
+  if (removed.length === 0) return;
+  try {
+    await git(["worktree", "prune"], top);
+    const listed = await git(["worktree", "list", "--porcelain", "-z"], top);
+    if (!ok(listed)) return;
+    let left = false;
+    for (const line of zList(listed.stdout)) {
+      if (!line.startsWith("worktree ")) continue;
+      const path = line.slice("worktree ".length);
+      if (!removed.some((root) => path === root || path.startsWith(`${root}${sep}`))) continue;
+      if (await lstat(path).then(() => true, () => false)) continue;
+      await git(["worktree", "remove", "--force", "--force", path], top);
+      left = true;
+    }
+    if (left) await git(["worktree", "prune"], top);
+  } catch {
+    // Housekeeping: a leftover registration is pruned by a later run.
+  }
+}
+
+/**
+ * `rm -r` of a workspace tree. Workspace directories carry the original's
+ * modes, so a read-only directory in the project is read-only here too
+ * and, for a non-root user, refuses deleting its entries. On EACCES/EPERM
+ * every directory in the tree (links never followed) gets owner rwx and
+ * the removal is retried once. `remove` is a test seam.
+ */
+export async function removeWorkspaceTree(
+  path: string,
+  remove: (target: string) => Promise<void> = (target) => rm(target, { recursive: true, force: true }),
+): Promise<void> {
+  try {
+    await remove(path);
+    return;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException | undefined)?.code;
+    if (code !== "EACCES" && code !== "EPERM") throw err;
+  }
+  const unlock = async (dir: string): Promise<void> => {
+    const info = await lstat(dir).catch(() => undefined);
+    if (!info?.isDirectory()) return;
+    await chmod(dir, (info.mode & 0o777) | 0o700).catch(() => undefined);
+    for (const entry of await readdir(dir, { withFileTypes: true }).catch(() => [])) {
+      if (entry.isDirectory()) await unlock(join(dir, entry.name));
+    }
+  };
+  await unlock(path);
+  await remove(path);
+}
+
+/**
  * Remove what a fusion run that died (a crash, a kill, a throw nobody
  * cleaned up after) left behind: its run roots under `tmpRoot` whose
  * owner process is gone, and the git worktrees `repoTop` still records
- * inside them. A root another live process owns is never touched.
- * Never throws.
+ * inside them (folders first, with Node; see `forgetRemovedWorktrees`).
+ * A root another live process owns is never touched. Never throws.
  */
 export async function sweepStaleBranchSets(
   tmpRoot: string,
@@ -122,22 +188,8 @@ export async function sweepStaleBranchSets(
       const root = join(tmpRoot, entry.name);
       if (await staleRoot(root)) stale.push(await realpath(root).catch(() => root));
     }
-    if (repoTop !== undefined) {
-      const listed = await git(["worktree", "list", "--porcelain", "-z"], repoTop);
-      if (ok(listed)) {
-        for (const line of zList(listed.stdout)) {
-          if (!line.startsWith("worktree ")) continue;
-          const path = line.slice("worktree ".length);
-          if (stale.some((root) => path === root || path.startsWith(`${root}${sep}`))) {
-            await git(["worktree", "remove", "--force", path], repoTop).catch(() => null);
-          }
-        }
-      }
-    }
-    for (const root of stale) await rm(root, { recursive: true, force: true }).catch(() => undefined);
-    if (repoTop !== undefined && stale.length > 0) {
-      await git(["worktree", "prune"], repoTop).catch(() => null);
-    }
+    for (const root of stale) await removeWorkspaceTree(root).catch(() => undefined);
+    if (repoTop !== undefined) await forgetRemovedWorktrees(git, repoTop, stale);
   } catch {
     // Housekeeping; never a reason to fail a fan-out.
   }
@@ -172,6 +224,12 @@ export interface BranchWorkspace {
   readonly directoryIgnorePolicy?: DirectoryIgnorePolicy;
   /** Tracked files and their ancestor directories: never excluded by name or ignore rule. */
   readonly trackedPaths?: ReadonlySet<string>;
+  /**
+   * Files under directories the frozen ignore rules classify as ignored
+   * (not linked, not excluded by name) at creation: what a merge leaves
+   * out, so a new or changed one can be reported instead of dropped silently.
+   */
+  readonly ignoredManifest?: ReadonlyMap<string, FileStamp>;
 }
 
 export interface BranchSet {
@@ -214,8 +272,10 @@ export interface CreateBranchSetOptions {
   /**
    * Give each task workspace a private copy of the shared dependency
    * directories (charged to the copy budget) instead of a link to the
-   * original's. Candidate integration sets this: nothing may reach the
-   * original before promotion. The base, which nobody writes to, still links.
+   * original's, and copy every ignored directory privately (into the base
+   * too) instead of linking it. Candidate integration sets this: nothing
+   * may reach the original before promotion. The base, which nobody writes
+   * to, still links the dependency directories.
    */
   privateDependencyDirectories?: boolean;
   /** Told why `createBranchSet` returned `null` (the copy limit), in words for the user. */
@@ -284,7 +344,8 @@ function isUnderMergeDir(rel: string): boolean {
  * `node_modules`, …) and the merge folder are skipped: none of it is
  * merged back. A path in `trackedPaths` (a tracked file or one of its
  * ancestors, e.g. `scripts/build`) is kept despite its name or an ignore
- * rule: a tracked change there is a deliverable.
+ * rule: a tracked change there is a deliverable. Files left out because
+ * an ignore rule classifies one of their directories go to `dropped`.
  */
 export async function stampTree(
   root: string,
@@ -292,6 +353,7 @@ export async function stampTree(
   directoryIgnorePolicy?: DirectoryIgnorePolicy,
   signal?: AbortSignal,
   trackedPaths: ReadonlySet<string> = new Set(),
+  dropped?: Map<string, FileStamp>,
 ): Promise<Map<string, FileStamp>> {
   signal?.throwIfAborted();
   const out = new Map<string, FileStamp>();
@@ -343,7 +405,7 @@ export async function stampTree(
       signal?.throwIfAborted();
       if (trackedPaths.has(rel)) continue;
       for (let dir = dirname(rel); dir !== "."; dir = dirname(dir)) {
-        if (ignored.has(dir)) { out.delete(rel); break; }
+        if (ignored.has(dir)) { dropped?.set(rel, out.get(rel)!); out.delete(rel); break; }
       }
     }
   }
@@ -436,6 +498,8 @@ interface PrivateCopyBudget {
   dependencyBytes: Record<DependencyCopyKind, number>;
   /** Set while a dependency directory's copy is being charged. */
   chargingDependency?: boolean;
+  /** A candidate's set: ignored directories are copied privately, not linked to the original. */
+  privateIgnoredDirectories?: boolean;
 }
 
 /**
@@ -656,6 +720,70 @@ async function recreateLink(from: string, to: string, budget: PrivateCopyBudget,
   throw new Error(`cannot recreate the link ${rel || "."} in a private workspace: ${why}`);
 }
 
+/**
+ * Give every real directory under `dir` that `source` also has the
+ * source directory's permission bits. `mkdir` and `git worktree add`
+ * apply the umask, so a `chmod 775 src` (or `700`) in the original would
+ * otherwise read as a change: the candidate compares directory modes.
+ * Deepest first, so a read-only directory is restricted only once its
+ * children exist. Links (generated or the user's) are never followed.
+ */
+async function matchDirectoryModes(source: string, dir: string, signal?: AbortSignal): Promise<void> {
+  const changes: { path: string; mode: number }[] = [];
+  const walk = async (rel: string): Promise<void> => {
+    signal?.throwIfAborted();
+    for (const entry of await readdir(join(dir, rel), { withFileTypes: true })) {
+      if (!entry.isDirectory() || entry.name === ".git") continue;
+      const child = join(rel, entry.name);
+      if (isUnderMergeDir(child)) continue;
+      const from = await lstat(join(source, child)).catch(() => null);
+      if (from?.isDirectory() === true) {
+        const to = await lstat(join(dir, child));
+        if ((to.mode & 0o7777) !== (from.mode & 0o7777)) changes.push({ path: join(dir, child), mode: from.mode & 0o7777 });
+      }
+      await walk(child);
+    }
+  };
+  await walk("");
+  for (const change of changes.reverse()) await chmod(change.path, change.mode);
+}
+
+/** Whether two regular files of the same size hold the same bytes. */
+async function sameBytes(a: string, b: string): Promise<boolean> {
+  const [left, right] = await Promise.all([open(a, "r"), open(b, "r")]);
+  try {
+    const one = Buffer.alloc(64 * 1024);
+    const two = Buffer.alloc(64 * 1024);
+    for (;;) {
+      const [x, y] = await Promise.all([left.read(one, 0, one.length, null), right.read(two, 0, two.length, null)]);
+      if (x.bytesRead !== y.bytesRead) return false;
+      if (x.bytesRead === 0) return true;
+      if (!one.subarray(0, x.bytesRead).equals(two.subarray(0, y.bytesRead))) return false;
+    }
+  } finally {
+    await Promise.all([left.close(), right.close()]);
+  }
+}
+
+/**
+ * Keep a checked-out tracked entry that already holds the source's
+ * bytes (or a symlink's target), giving a file the source's permission
+ * bits and times; `false` when it differs and must be replaced.
+ */
+async function adoptCheckoutEntry(from: string, info: Stats, to: string): Promise<boolean> {
+  const there = await lstat(to).catch(() => null);
+  if (there === null) return false;
+  if (info.isSymbolicLink()) {
+    return there.isSymbolicLink() && await readlink(from) === await readlink(to);
+  }
+  if (!info.isFile() || !there.isFile() || there.size !== info.size) return false;
+  if (!await sameBytes(from, to)) return false;
+  if ((there.mode & 0o777) !== (info.mode & 0o777)) await chmod(to, info.mode & 0o777);
+  // Source times, as for a copy (`copyFileKeepingMode`).
+  await utimes(to, info.atime, info.mtime);
+  return true;
+}
+
 /** What a git snapshot needs: the commit, and what lives outside it. */
 interface GitSnapshot {
   top: string;
@@ -741,6 +869,10 @@ async function addWorktree(
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
     }
     const to = join(dir, path);
+    // The checkout already holds the source's bytes (the common case):
+    // only its mode and times are made the source's, nothing is copied
+    // or charged to the copy limit.
+    if (info !== undefined && await adoptCheckoutEntry(from, info, to)) continue;
     // Checkout filters and a cached-clean index may disagree with the
     // working tree. Replace, never normalize, the actual source entry.
     await rm(to, { recursive: true, force: true });
@@ -758,9 +890,15 @@ async function addWorktree(
   for (const entry of snapshot.ignored) {
     const isDir = entry.endsWith("/");
     const path = (isDir ? entry.slice(0, -1) : entry).split("/").join(sep);
-    // Git lists ignored children (`node_modules/big/`) when a tracked
-    // placeholder keeps the dependency directory itself unignored.
-    await copyPrivateEntry(join(realDir, path), join(dir, path), budget, path, isDir && underSharedDependencyDirectory(path));
+    // Outside a candidate an ignored directory (a virtualenv, `.next/`,
+    // `dist/`, a cache) is linked to the original's, as a dependency
+    // directory is: direct mode is not a sandbox, and copying them into
+    // the base and every task refused isolation for ordinary repos. A
+    // candidate keeps private copies (dependency names aside). Git lists
+    // ignored children (`node_modules/big/`) when a tracked placeholder
+    // keeps the dependency directory itself unignored.
+    const shared = isDir && (budget.privateIgnoredDirectories !== true || underSharedDependencyDirectory(path));
+    await copyPrivateEntry(join(realDir, path), join(dir, path), budget, path, shared);
   }
   return dir;
 }
@@ -796,17 +934,12 @@ export async function createBranchSet(
   ).catch(() => undefined);
   let snapshot: GitSnapshot | null;
   try { snapshot = await gitSnapshot(real, git); }
-  catch (err) { await rm(runRoot, { recursive: true, force: true }); throw err; }
+  catch (err) { await removeWorkspaceTree(runRoot); throw err; }
   await sweepStaleBranchSets(dirname(runRoot), snapshot?.top, git);
   const roots: string[] = [];
-  const removeRoot = async (root: string): Promise<void> => {
-    if (snapshot !== null) {
-      await cleanupGit(["worktree", "remove", "--force", root], snapshot.top).catch(
-        () => null,
-      );
-    }
-  };
   const workspaceRoots = new Map<string, string>();
+  // Node's `rm` first (it removes a link, symlink or junction, without
+  // following it), then git forgets the worktrees (`forgetRemovedWorktrees`).
   const cleanup = async (keep: readonly string[] = []): Promise<void> => {
     if (keep.length > 0) {
       const kept = new Set(
@@ -816,35 +949,32 @@ export async function createBranchSet(
         }),
       );
       const base = roots[0];
+      const removed: string[] = [];
       for (const root of roots.splice(0)) {
         if (kept.has(root) || root === base) {
           roots.push(root);
           continue;
         }
-        await removeRoot(root);
-        await rm(root, { recursive: true, force: true }).catch(() => undefined);
+        await removeWorkspaceTree(root).catch(() => undefined);
+        removed.push(root);
       }
-      if (snapshot !== null) {
-        await cleanupGit(["worktree", "prune"], snapshot.top).catch(() => null);
-      }
+      if (snapshot !== null) await forgetRemovedWorktrees(cleanupGit, snapshot.top, removed);
       return;
     }
-    for (const root of roots) await removeRoot(root);
-    await rm(runRoot, { recursive: true, force: true }).catch(() => undefined);
-    if (snapshot !== null) {
-      await cleanupGit(["worktree", "prune"], snapshot.top).catch(() => null);
-    }
+    await removeWorkspaceTree(runRoot).catch(() => undefined);
+    if (snapshot !== null) await forgetRemovedWorktrees(cleanupGit, snapshot.top, [runRoot]);
   };
   const limit = options.maxCopyBytes ?? VERIFY_COPY_MAX_BYTES;
-  const budget: PrivateCopyBudget = { left: limit, generatedDirectoryLinks: new Map(), dependencyBytes: { unlinked: 0, private: 0 }, ...(options.signal === undefined ? {} : { signal: options.signal }) };
+  const budget: PrivateCopyBudget = { left: limit, generatedDirectoryLinks: new Map(), dependencyBytes: { unlinked: 0, private: 0 }, ...(options.privateDependencyDirectories === true ? { privateIgnoredDirectories: true } : {}), ...(options.signal === undefined ? {} : { signal: options.signal }) };
   try {
     const method: BranchMethod = snapshot === null ? "copy" : "worktree";
     const make = async (name: string, source: string): Promise<string> => {
       const root = join(runRoot, name);
       roots.push(root);
-      if (snapshot !== null) return addWorktree(snapshot, source, root, git, budget);
-      await copyPrivateEntry(source, root, budget);
-      return root;
+      const dir = snapshot !== null ? await addWorktree(snapshot, source, root, git, budget) : root;
+      if (snapshot === null) await copyPrivateEntry(source, root, budget);
+      await matchDirectoryModes(source, dir, options.signal);
+      return dir;
     };
     // Tasks copy what the base only links; the base itself stays link-only.
     // Without links its dependency directories are placeholders: the
@@ -880,13 +1010,15 @@ export async function createBranchSet(
       const name = workspaceName(index, taskId);
       workspaceRoots.set(taskId, join(runRoot, name));
       const dir = await make(name, baseDir);
+      const ignoredManifest = new Map<string, FileStamp>();
       workspaces.set(taskId, {
         taskId,
         name,
         dir,
-        manifest: await stampTree(dir, excludedDirectories, directoryIgnorePolicy, options.signal, trackedPaths),
+        manifest: await stampTree(dir, excludedDirectories, directoryIgnorePolicy, options.signal, trackedPaths, ignoredManifest),
         excludedDirectories,
         trackedPaths,
+        ignoredManifest,
         ...(directoryIgnorePolicy === undefined ? {} : { directoryIgnorePolicy }),
       });
     }
@@ -910,26 +1042,48 @@ export async function touchedPaths(
   workspace: BranchWorkspace,
   signal?: AbortSignal,
 ): Promise<string[]> {
-  const now = await stampTree(workspace.dir, workspace.excludedDirectories, workspace.directoryIgnorePolicy, signal, workspace.trackedPaths);
+  return (await workspaceTouches(workspace, signal)).touched;
+}
+
+function stampMoved(before: FileStamp | undefined, now: FileStamp): boolean {
+  return (
+    before === undefined ||
+    before.size !== now.size ||
+    before.mtimeMs !== now.mtimeMs ||
+    before.link !== now.link ||
+    before.mode !== now.mode
+  );
+}
+
+/** Paths added, changed or removed relative to `before`, sorted. */
+function movedPaths(before: ReadonlyMap<string, FileStamp>, now: ReadonlyMap<string, FileStamp>, signal?: AbortSignal): string[] {
   const out: string[] = [];
   for (const [rel, stamp] of now) {
     signal?.throwIfAborted();
-    const before = workspace.manifest.get(rel);
-    if (
-      before === undefined ||
-      before.size !== stamp.size ||
-      before.mtimeMs !== stamp.mtimeMs ||
-      before.link !== stamp.link ||
-      before.mode !== stamp.mode
-    ) {
-      out.push(rel);
-    }
+    if (stampMoved(before.get(rel), stamp)) out.push(rel);
   }
-  for (const rel of workspace.manifest.keys()) {
+  for (const rel of before.keys()) {
     signal?.throwIfAborted();
     if (!now.has(rel)) out.push(rel);
   }
   return out.sort();
+}
+
+/**
+ * `touchedPaths`, plus `ignored`: files the task added, changed or
+ * removed under a directory the frozen ignore rules classify as ignored
+ * (one it created, say `src/generated/`), which are never merged.
+ */
+export async function workspaceTouches(
+  workspace: BranchWorkspace,
+  signal?: AbortSignal,
+): Promise<{ touched: string[]; ignored: string[] }> {
+  const dropped = new Map<string, FileStamp>();
+  const now = await stampTree(workspace.dir, workspace.excludedDirectories, workspace.directoryIgnorePolicy, signal, workspace.trackedPaths, dropped);
+  return {
+    touched: movedPaths(workspace.manifest, now, signal),
+    ignored: movedPaths(workspace.ignoredManifest ?? new Map(), dropped, signal),
+  };
 }
 
 /**

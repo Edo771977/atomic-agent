@@ -25,7 +25,7 @@ async function fixture(git: boolean): Promise<{ repo: string; root: string }> {
 }
 
 describe("frozen disposable-directory policy", () => {
-  it.each(["worktree", "snapshot unavailable", "plain folder"] as const)("discards newly created ignored directories and existing caches in %s", async (method) => {
+  it.each(["worktree", "snapshot unavailable", "plain folder"] as const)("discards newly created ignored directories and never merges existing caches in %s", async (method) => {
     const { repo, root } = await fixture(method !== "plain folder");
     await writeRepoFile(repo, "nested/.gitignore", "cache*/\n!cache-keep/\n");
     await writeRepoFile(repo, "nested/cache-old/state.txt", "original cache\n");
@@ -45,7 +45,9 @@ describe("frozen disposable-directory policy", () => {
       },
     });
     expect(result.results[0]!.status).toBe("ok");
-    expect(await readFile(join(repo, "nested/cache-old/state.txt"), "utf8")).toBe("original cache\n");
+    // A worktree links an existing ignored directory to the original's
+    // (direct mode is not a sandbox); a folder copy keeps a private copy.
+    expect(await readFile(join(repo, "nested/cache-old/state.txt"), "utf8")).toBe(method === "worktree" ? "modified scratch\n" : "original cache\n");
     expect(await readdir(repo)).not.toContain("cache");
     expect(await readdir(repo)).not.toContain("cache space");
     expect(await readdir(join(repo, "nested"))).not.toContain("cache-new");
