@@ -101,8 +101,11 @@ process group (stdin is not inherited): cancellation signals the whole group,
 so Vitest's forked workers and the agents they started stop too, and the
 launcher waits until the group is gone, escalating to SIGKILL after a timeout
 (10 s by default). A group left behind after a normal exit is stopped the
-same way. On Windows cancellation runs `taskkill /T`, then `/T /F` after the
-timeout; it reaches descendants only while the Vitest process is alive.
+same way. On Windows cancellation runs `taskkill /T /F` at once: without
+`/F` taskkill only sends a close request, which a console Node process
+ignores. `/T` walks the tree from the live Vitest process, so descendants
+are reached only while it is alive; workers it left behind after exiting
+on its own are not found (a known limitation, no process groups there).
 Installed SIGINT/SIGTERM/SIGHUP/SIGQUIT handlers (SIGQUIT on POSIX only)
 request cancellation through the signal passed by smoke/level1, so closing
 the terminal or dropping an SSH session cancels like Ctrl-C; they do not

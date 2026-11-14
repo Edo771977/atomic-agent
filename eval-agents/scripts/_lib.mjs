@@ -288,16 +288,28 @@ function forceExit(name) {
   process.exit(signalExitCode(name));
 }
 
-function signalTree(child, name) {
+const defaultTreeDeps = {
+  platform: process.platform,
+  run: (command, args) => { spawnSync(command, args, { stdio: "ignore", windowsHide: true }); },
+  kill: (pid, name) => { process.kill(pid, name); },
+};
+
+/**
+ * Signal the test child's whole tree. POSIX: its process group. Windows:
+ * `taskkill /T /F` whatever the signal — without /F taskkill only asks
+ * windows to close, which a console Node process never receives, so a
+ * graceful request would be ignored. /T walks the tree from the live
+ * root; once the root has exited its orphaned descendants are not found.
+ * `deps` is a test seam.
+ */
+export function signalTree(child, name, deps = defaultTreeDeps) {
   if (!child.pid) return;
-  if (process.platform === "win32") {
-    // taskkill /T walks the tree from the live root; /F forces it.
-    spawnSync("taskkill", ["/pid", String(child.pid), "/T", ...(name === "SIGKILL" ? ["/F"] : [])],
-      { stdio: "ignore", windowsHide: true });
+  if (deps.platform === "win32") {
+    deps.run("taskkill", ["/pid", String(child.pid), "/T", "/F"]);
     return;
   }
   try {
-    process.kill(-child.pid, name);
+    deps.kill(-child.pid, name);
   } catch {
     // group already gone
   }
