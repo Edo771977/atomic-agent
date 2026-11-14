@@ -140,6 +140,7 @@ import { collectTaskArtifactManifests } from "./artifact-manifest-tasks.js";
 import { createCandidateIntegration, type CandidateIntegration, type CandidateIntegrationReport } from "./candidate-integration.js";
 import { readFusionWorkerMeta } from "../../session/fusion-worker-session.js";
 import { createTaskPermitPool, type TaskPermit } from "./task-permits.js";
+import { VERIFY_COPY_MAX_BYTES } from "../verify/verify-workspace-copy.js";
 
 export const FUSION_DELEGATE_TOOL = "fusion.delegate";
 
@@ -368,6 +369,10 @@ export function buildFusionDelegateTool(
         );
       }
       const mode = deps.resolveRunMode();
+      // The private-copy limit for worktree isolation and candidate
+      // staging: the same `tools.verify.maxCopyBytes` that bounds
+      // `verify.run`'s workspace copy.
+      const copyLimitBytes = getConfig().tools?.verify?.maxCopyBytes ?? VERIFY_COPY_MAX_BYTES;
       const workerProviderId = mode.workerProviderId;
       if (mode.effective !== "fusion" || workerProviderId === null) {
         return error(
@@ -885,7 +890,7 @@ export function buildFusionDelegateTool(
         try {
           const remaining = capped ? turnBudget.timeLeftMs(ctx.sessionId, limits) : undefined;
           const signal = remaining === undefined ? ctx.signal : AbortSignal.any([ctx.signal, AbortSignal.timeout(Math.max(0, remaining))]);
-          candidate = await createCandidateIntegration(candidateOriginalDir, { signal });
+          candidate = await createCandidateIntegration(candidateOriginalDir, { signal, maxCopyBytes: copyLimitBytes });
         } catch (err) {
           return error(`candidate integration could not stage a private workspace: ${err instanceof Error ? err.message : String(err)}`, { reason: "candidate-staging-failed", nonResumable: true });
         }
@@ -1303,6 +1308,7 @@ export function buildFusionDelegateTool(
           realDir: ctx.workingDir,
           tasks,
           writeScope,
+          options: { maxCopyBytes: copyLimitBytes },
           inputs: contract?.inputs ?? [],
           run: (rebased, taskWorkspace) =>
             runAcrossLegs(rebased, contract, briefSuffix, taskWorkspace, allowSplit),
