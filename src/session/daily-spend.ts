@@ -1,6 +1,12 @@
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, unlinkSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
+
+import {
+  renameWithRetrySync,
+  syncDirectoryBestEffort,
+  writeFileSyncedSync,
+} from "../config/durable-write.js";
 
 import type { CompletionPrice } from "./usage-meter.js";
 
@@ -13,9 +19,20 @@ import type { CompletionPrice } from "./usage-meter.js";
  * Kept in one small JSON file in the state directory, so the total
  * survives a restart and is shared by the terminal and the desktop app
  * (both run on `~/.atomic-agent`). Every write re-reads the file first,
- * so two processes add to one total rather than overwrite each other;
- * two writes in the same millisecond can still lose one call, which is
- * acceptable for a soft ceiling.
+ * so two processes add to one total rather than overwrite each other.
+ * There is no cross-process lock: two writes racing between the read and
+ * the rename can still lose one call, and another process's in-flight
+ * request-budget holds (`runtime/daily-spend-budget.ts`) are invisible
+ * here, so two processes can together overshoot the ceiling by what they
+ * have in flight. Each write is durable: the tmp file is flushed before
+ * the atomic rename and the directory after it, so a power loss cannot
+ * leave an empty file that would reset the day to zero.
+ *
+ * The day is the UTC calendar day starting at
+ * `llm.costTracking.dailyResetHourUtc` (0-23, default 0): with 6, spend
+ * at 05:59 UTC still belongs to the previous day and the total resets at
+ * 06:00 UTC. A file from an earlier day reads as zero; it is replaced on
+ * the next write.
  *
  * Same honesty rules as the session readout: only priced calls add to
  * `usd`; a cloud call with no known price is counted as unpriced, never
@@ -119,10 +136,22 @@ export class DailySpendStore {
 
   private write(reading: DailySpendReading): void {
     try {
-      mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
+      const dir = dirname(this.path);
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
       const tmp = `${this.path}.${randomUUID()}.tmp`;
-      writeFileSync(tmp, `${JSON.stringify(reading)}\n`, { mode: 0o600 });
-      renameSync(tmp, this.path);
+      // Flushed and unlinked on its own failure.
+      writeFileSyncedSync(tmp, `${JSON.stringify(reading)}\n`, { mode: 0o600, flag: "wx" });
+      try {
+        renameWithRetrySync(tmp, this.path);
+      } catch (err) {
+        try {
+          unlinkSync(tmp);
+        } catch {
+          // best effort: nothing more to do with a tmp file we cannot remove
+        }
+        throw err;
+      }
+      syncDirectoryBestEffort(dir);
     } catch {
       // A read-only state dir must not fail a completion. The total
       // still holds for this process (`cached`).

@@ -572,6 +572,11 @@ export interface AtomicAgentConfig {
        * is shown either way (ATO-569).
        */
       showInStatusBar: boolean;
+      /**
+       * UTC hour (0-23) the spend day starts at, for `dailyLimitUsd` and
+       * the day total: the day is the UTC calendar day shifted to start
+       * at this hour. Default 0 (UTC midnight).
+       */
       dailyResetHourUtc: number;
       /**
        * Daily spend ceiling in USD, all sessions together (ATO-649).

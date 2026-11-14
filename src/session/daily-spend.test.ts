@@ -1,7 +1,9 @@
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { dirname, join } from "node:path";
+import { describe, expect, it, vi } from "vitest";
+
+import * as durableWrite from "../config/durable-write.js";
 
 import {
   DailySpendStore,
@@ -21,7 +23,38 @@ function tempPath(): string {
 
 const NOON = Date.UTC(2026, 10, 12, 12, 0);
 
+vi.mock("../config/durable-write.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../config/durable-write.js")>();
+  return {
+    ...actual,
+    writeFileSyncedSync: vi.fn(actual.writeFileSyncedSync),
+    renameWithRetrySync: vi.fn(actual.renameWithRetrySync),
+    syncDirectoryBestEffort: vi.fn(actual.syncDirectoryBestEffort),
+  };
+});
+
 describe("DailySpendStore", () => {
+  it("writes the day durably: a flushed tmp file renamed into place, then the directory flushed", () => {
+    const path = tempPath();
+    const store = new DailySpendStore({ path, now: () => NOON });
+    store.record({ kind: "priced", usd: 0.4, source: "catalog" });
+    expect(durableWrite.writeFileSyncedSync).toHaveBeenCalledWith(expect.stringMatching(/daily-spend\.json\..*\.tmp$/), expect.any(String), expect.objectContaining({ mode: 0o600 }));
+    expect(durableWrite.renameWithRetrySync).toHaveBeenCalledWith(expect.stringMatching(/\.tmp$/), path);
+    expect(durableWrite.syncDirectoryBestEffort).toHaveBeenCalledWith(dirname(path));
+    expect(JSON.parse(readFileSync(path, "utf8"))).toMatchObject({ day: "2026-11-12", usd: 0.4 });
+  });
+
+  it("leaves no tmp file behind when the rename fails, and keeps the total in memory", () => {
+    const path = tempPath();
+    // A directory in the file's place: the rename onto it fails.
+    mkdirSync(path);
+    writeFileSync(join(path, "keep"), "x");
+    const store = new DailySpendStore({ path, now: () => NOON });
+    store.record({ kind: "priced", usd: 0.4, source: "catalog" });
+    expect(readdirSync(dirname(path)).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+    expect(store.peek().usd).toBeCloseTo(0.4);
+  });
+
   it("starts at zero and adds priced calls only", () => {
     const store = new DailySpendStore({ path: tempPath(), now: () => NOON });
     expect(store.today()).toEqual({ day: "2026-11-12", usd: 0, pricedCalls: 0, unpricedCalls: 0 });
