@@ -671,6 +671,34 @@ async function recreateLink(from: string, to: string, budget: PrivateCopyBudget,
   throw new Error(`cannot recreate the link ${rel || "."} in a private workspace: ${why}`);
 }
 
+/**
+ * Give every real directory under `dir` that `source` also has the
+ * source directory's permission bits. `mkdir` and `git worktree add`
+ * apply the umask, so a `chmod 775 src` (or `700`) in the original would
+ * otherwise read as a change: the candidate compares directory modes.
+ * Deepest first, so a read-only directory is restricted only once its
+ * children exist. Links (generated or the user's) are never followed.
+ */
+async function matchDirectoryModes(source: string, dir: string, signal?: AbortSignal): Promise<void> {
+  const changes: { path: string; mode: number }[] = [];
+  const walk = async (rel: string): Promise<void> => {
+    signal?.throwIfAborted();
+    for (const entry of await readdir(join(dir, rel), { withFileTypes: true })) {
+      if (!entry.isDirectory() || entry.name === ".git") continue;
+      const child = join(rel, entry.name);
+      if (isUnderMergeDir(child)) continue;
+      const from = await lstat(join(source, child)).catch(() => null);
+      if (from?.isDirectory() === true) {
+        const to = await lstat(join(dir, child));
+        if ((to.mode & 0o7777) !== (from.mode & 0o7777)) changes.push({ path: join(dir, child), mode: from.mode & 0o7777 });
+      }
+      await walk(child);
+    }
+  };
+  await walk("");
+  for (const change of changes.reverse()) await chmod(change.path, change.mode);
+}
+
 /** Whether two regular files of the same size hold the same bytes. */
 async function sameBytes(a: string, b: string): Promise<boolean> {
   const [left, right] = await Promise.all([open(a, "r"), open(b, "r")]);
@@ -903,9 +931,10 @@ export async function createBranchSet(
     const make = async (name: string, source: string): Promise<string> => {
       const root = join(runRoot, name);
       roots.push(root);
-      if (snapshot !== null) return addWorktree(snapshot, source, root, git, budget);
-      await copyPrivateEntry(source, root, budget);
-      return root;
+      const dir = snapshot !== null ? await addWorktree(snapshot, source, root, git, budget) : root;
+      if (snapshot === null) await copyPrivateEntry(source, root, budget);
+      await matchDirectoryModes(source, dir, options.signal);
+      return dir;
     };
     // Tasks copy what the base only links; the base itself stays link-only.
     // Without links its dependency directories are placeholders: the
