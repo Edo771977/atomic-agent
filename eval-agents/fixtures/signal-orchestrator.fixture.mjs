@@ -14,8 +14,14 @@ childProcess.spawnSync = () => {
   return { status: 0, stdout: "", stderr: "" };
 };
 syncBuiltinESMExports();
-const { installSignalHandlers, runVitest } = await import("../scripts/_lib.mjs");
+const lib = await import("../scripts/_lib.mjs");
+const { installSignalHandlers, runVitest } = lib;
 const cancellation = installSignalHandlers(() => {});
+// A fake managed-daemon teardown: synchronous, like runCli(["models", "stop"]).
+if (process.env.LAUNCHER_TEARDOWN === "1") {
+  const unregister = lib.registerSyncTeardown(() => record("sync-teardown"));
+  if (process.env.LAUNCHER_UNREGISTER === "1") unregister();
+}
 const running = runVitest({ entryPath: process.env.LAUNCHER_ENTRY,
   cwd: process.env.LAUNCHER_CWD, signal: cancellation?.signal,
   ...(process.env.LAUNCHER_KILL_TIMEOUT_MS ? { killTimeoutMs: Number(process.env.LAUNCHER_KILL_TIMEOUT_MS) } : {}) });

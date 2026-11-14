@@ -283,8 +283,30 @@ function untrackTree(tree) {
   if (activeTrees.size === 0) process.removeListener("exit", killTreesOnExit);
 }
 
+// Synchronous teardowns an orchestrator registered (stopping a daemon it
+// started, via spawnSync runCli); a forced exit skips its finally blocks.
+const syncTeardowns = new Set();
+
+/**
+ * Register `fn` to run synchronously when a second signal forces the
+ * launcher out, after the test trees are killed. Returns the unregister
+ * function: call it before the normal teardown so the work runs once.
+ */
+export function registerSyncTeardown(fn) {
+  syncTeardowns.add(fn);
+  return () => { syncTeardowns.delete(fn); };
+}
+
 function forceExit(name) {
   for (const { child } of activeTrees) signalTree(child, "SIGKILL");
+  for (const fn of [...syncTeardowns]) {
+    syncTeardowns.delete(fn);
+    try {
+      fn();
+    } catch (error) {
+      console.error(`[eval-agents] teardown failed during forced exit: ${error?.message ?? error}`);
+    }
+  }
   process.exit(signalExitCode(name));
 }
 

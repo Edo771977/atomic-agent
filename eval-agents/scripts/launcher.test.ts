@@ -195,6 +195,36 @@ describe.skipIf(process.platform === "win32")("eval launcher hang-up, quit and c
   });
 });
 
+describe.skipIf(process.platform === "win32")("eval launcher forced exit teardown", () => {
+  it("runs the orchestrator's synchronous teardown before a second signal exits", () => {
+    const result = launch("twice-teardown", { LAUNCHER_MODE: "stubborn", LAUNCHER_SIGNAL: "SIGINT",
+      LAUNCHER_SECOND_SIGNAL: "SIGINT", LAUNCHER_KILL_TIMEOUT_MS: "60000", LAUNCHER_TEARDOWN: "1" },
+      "signal-orchestrator.fixture.mjs");
+    const child = JSON.parse(readFileSync(result.output, "utf8")) as { pid: number; grandchildPid: number };
+    try {
+      expect(result.status, result.diagnostic).toBe(130);
+      const events = readFileSync(`${result.output}.events.jsonl`, "utf8").trim().split("\n").map((line) => JSON.parse(line).event);
+      expect(events).toEqual(["child-ready", "sync-teardown"]);
+    } finally {
+      for (const pid of [child.pid, child.grandchildPid]) try { process.kill(pid, "SIGKILL"); } catch { /* gone */ }
+    }
+  });
+
+  it("does not run an unregistered teardown", () => {
+    const result = launch("teardown-unregistered", { LAUNCHER_MODE: "stubborn", LAUNCHER_SIGNAL: "SIGINT",
+      LAUNCHER_SECOND_SIGNAL: "SIGINT", LAUNCHER_KILL_TIMEOUT_MS: "60000", LAUNCHER_TEARDOWN: "1", LAUNCHER_UNREGISTER: "1" },
+      "signal-orchestrator.fixture.mjs");
+    const child = JSON.parse(readFileSync(result.output, "utf8")) as { pid: number; grandchildPid: number };
+    try {
+      expect(result.status, result.diagnostic).toBe(130);
+      const events = readFileSync(`${result.output}.events.jsonl`, "utf8").trim().split("\n").map((line) => JSON.parse(line).event);
+      expect(events).toEqual(["child-ready"]);
+    } finally {
+      for (const pid of [child.pid, child.grandchildPid]) try { process.kill(pid, "SIGKILL"); } catch { /* gone */ }
+    }
+  });
+});
+
 describe("eval launcher without an installed Vitest", () => {
   it("still imports the shared helpers and fails runVitest with a clear diagnostic", () => {
     // A copy outside the repository cannot resolve the vitest package.

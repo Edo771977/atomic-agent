@@ -114,8 +114,10 @@ managed-daemon teardown, before exiting 129 (SIGHUP), 130 (SIGINT), 131
 (SIGQUIT) or 143 (SIGTERM). While a test tree runs, an exit listener kills
 it synchronously if the launcher exits any other way (an uncaught
 exception); a launcher killed with SIGKILL cannot clean up. A second signal does not wait: it SIGKILLs the
-running test process tree and exits at once with the second signal's code,
-skipping daemon teardown.
+running test process tree, runs the synchronous teardowns orchestrators
+registered with `registerSyncTeardown` (smoke/level1 stop the daemons they
+started), and exits at once with the second signal's code, skipping the
+callers' `finally` blocks.
 Health waits honor the same signal, and handlers are removed after teardown.
 
 ## Methodology
