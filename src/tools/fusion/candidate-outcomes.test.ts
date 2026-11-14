@@ -83,4 +83,29 @@ describe("candidate outcome telemetry", () => {
     expect(extra.candidate?.receipt).toEqual(receipt);
     expect(JSON.stringify(extra)).not.toContain("secret-path");
   });
+  it("treats nonstring JSON enums as unverified without crashing the report or leaking runtime extras", () => {
+    for (const field of ["disposition", "checkScope", "checkStatus"] as const) {
+      for (const value of [[receipt[field]], { toString: null }, {}]) {
+        const row = { ...record(), candidate: { receipt: { ...receipt, [field]: value }, taskChecks: { total: 0, passed: 0, failed: 0 } } };
+        const parsed = parseOutcomeLines(JSON.stringify(row));
+        expect(() => aggregateOutcomes(parsed)).not.toThrow();
+        expect(aggregateOutcomes(parsed).workers[0]).toMatchObject({ checksPassed: 0, candidate: { promoted: 0, unverified: 1 } });
+      }
+    }
+    const scope = { toString: () => "declared", privatePath: "C:/private/operator-project" };
+    const row = withCandidateOutcome(record(), { ...receipt, checkScope: scope } as unknown as CandidateAcceptanceReceipt, [], "private-task");
+    expect(JSON.stringify(row)).not.toContain("privatePath");
+    expect(row.candidate).not.toHaveProperty("receipt");
+  });
+  it("requires promotion digests and a nonempty fully verified protected scope", () => {
+    for (const invalid of [
+      { ...receipt, checkedPayloadDigest: undefined }, { ...receipt, checkPlanDigest: undefined },
+      { ...receipt, checkScope: "protected-declared" },
+      { ...receipt, disposition: "rejected", checkScope: "protected-declared", inputs: { declared: 1, verified: 0 } },
+    ]) {
+      const row = withCandidateOutcome(record(), invalid as CandidateAcceptanceReceipt, [], "private-task");
+      expect(row.candidate).not.toHaveProperty("receipt");
+      expect(aggregateOutcomes([row]).workers[0]!.candidate.unverified).toBe(1);
+    }
+  });
 });
