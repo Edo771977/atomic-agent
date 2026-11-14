@@ -19,6 +19,8 @@ The router runs once, before the turn starts (`executeTurn` in `runtime/composit
 
 It does nothing when it is off (the default), under the `local` run mode or Fusion, or for a turn that is already pinned (a Fusion worker, an explicit `providerId`). Under the `cloud` run mode it still routes, between cloud providers only: a rule that names a `llama-server` provider is passed over. A rule is also passed over when its provider is not configured, says `supportsTools: false` for a turn with tools, or says `supportsVision: false` for a message with an image. A matching rule that names the active provider keeps the turn where it was.
 
+Routing changes the prompt cache's key, not just the model: each provider keeps its own cache, so a turn routed to a different provider than the previous turn starts cold and pays the full prompt (stable prefix included) at uncached prices, and the next turn back pays it again. Rules that alternate providers turn by turn can cost more than they save; prefer rules that keep a session on one provider for runs of turns.
+
 A rule chooses a provider entry, and the entry's `defaultChatModel` is the model; to route to another model of the same service, configure a second entry. A per-rule `model` and step 2 (a small classifier model) are not built.
 
 Read [router](route-turn.ts), [tests](route-turn.test.ts), [config](../../config/llm-router-config.ts).
