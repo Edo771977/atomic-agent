@@ -18,9 +18,13 @@
  * Windows: a directory symlink needs Developer Mode or the symlink
  * privilege. Refused (EPERM/EACCES), the excluded directory is linked
  * with a junction instead — same write semantics (writes through it
- * reach the original). A symlink inside the tree falls back the same way
- * (junction for a directory, a copy of the target for a file). With
- * neither available the workspace is unavailable and says how to fix it.
+ * reach the original). A symlink inside the tree falls back the same way:
+ * a directory link becomes a junction to the matching directory in the
+ * copy when its target is inside the tree (writes stay in the copy), or
+ * to the real target when it points outside (writes reach that target,
+ * as with an excluded directory); a file link becomes a copy of the
+ * target. With neither available the workspace is unavailable and says
+ * how to fix it.
  */
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -36,7 +40,7 @@ import {
   chmod,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 export const VERIFY_COPY_EXCLUDED: ReadonlySet<string> = new Set([
   "node_modules",
@@ -162,8 +166,54 @@ export async function measureTree(root: string, limit: number): Promise<number> 
  * excluded directories — at any depth — back to their originals.
  */
 export async function copyTreeWithExclusions(src: string, dest: string, options: CopyTreeOptions = {}): Promise<void> {
-  const platform = options.platform ?? process.platform;
-  const link = options.symlink ?? symlink;
+  const context: CopyContext = {
+    platform: options.platform ?? process.platform,
+    link: options.symlink ?? symlink,
+    srcRoot: resolve(src),
+    destRoot: resolve(dest),
+  };
+  await copyDirectory(src, dest, context);
+}
+
+interface CopyContext {
+  readonly platform: NodeJS.Platform;
+  readonly link: SymlinkFn;
+  readonly srcRoot: string;
+  readonly destRoot: string;
+}
+
+/** `absolute` relative to `root` when it lies inside it, else `undefined`. */
+function insideTree(root: string, absolute: string): string | undefined {
+  const rel = relative(root, absolute);
+  if (rel === "") return rel;
+  if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return undefined;
+  return rel;
+}
+
+/**
+ * A symlink the host refused to recreate (Windows without the symlink
+ * privilege). A directory becomes a junction: to the matching path in
+ * the copy when the target is inside the tree (so writes stay in the
+ * copy), to the real target otherwise (like an excluded directory,
+ * writes through it reach that target). A file inside the tree becomes
+ * a copy of its target.
+ */
+async function recreateRefusedLink(from: string, to: string, target: string, context: CopyContext, cause: unknown): Promise<void> {
+  const { platform, link } = context;
+  const absolute = resolve(dirname(from), target);
+  const info = await stat(absolute).catch(() => undefined);
+  const rel = insideTree(context.srcRoot, absolute);
+  if (info?.isDirectory()) {
+    await linkDirectory(rel === undefined ? absolute : join(context.destRoot, rel), to, platform, link);
+  } else if (info?.isFile()) {
+    await copyFile(absolute, to);
+  } else {
+    throw linkUnavailableError(to, platform, cause);
+  }
+}
+
+async function copyDirectory(src: string, dest: string, context: CopyContext): Promise<void> {
+  const { platform, link } = context;
   await mkdir(dest, { recursive: true });
   const entries = await readdir(src, { withFileTypes: true });
   for (const entry of entries) {
@@ -175,17 +225,13 @@ export async function copyTreeWithExclusions(src: string, dest: string, options:
         await link(target, to);
       } catch (err) {
         if (!isLinkRefused(err) || platform !== "win32") throw err;
-        const absolute = resolve(dirname(from), target);
-        const info = await stat(absolute).catch(() => undefined);
-        if (info?.isDirectory()) await linkDirectory(absolute, to, platform, link);
-        else if (info?.isFile()) await copyFile(absolute, to);
-        else throw linkUnavailableError(to, platform, err);
+        await recreateRefusedLink(from, to, target, context, err);
       }
     } else if (entry.isDirectory()) {
       if (VERIFY_COPY_EXCLUDED.has(entry.name)) {
         await linkDirectory(from, to, platform, link);
       } else {
-        await copyTreeWithExclusions(from, to, options);
+        await copyDirectory(from, to, context);
       }
     } else if (entry.isFile()) {
       await copyFile(from, to);

@@ -108,6 +108,31 @@ describe("createVerifyWorkspace", () => {
     }
   });
 
+  it("junctions a refused in-tree directory symlink to the copy, never to the original", async () => {
+    await mkdir(join(work, "src", "a"));
+    await writeFile(join(work, "src", "a", "kept.txt"), "k");
+    await symlink("a", join(work, "src", "link"), "dir");
+    const junctions: { target: string; path: string }[] = [];
+    const ws = await createVerifyWorkspace(work, {
+      platform: "win32",
+      tmpRoot,
+      symlink: async (target, path, type) => {
+        if (type !== "junction") throw Object.assign(new Error("EPERM: operation not permitted, symlink"), { code: "EPERM" });
+        junctions.push({ target, path });
+        await symlink(target, path, "dir");
+      },
+    });
+    try {
+      expect(ws).toMatchObject({ isolated: true, method: "copy" });
+      expect(junctions.find((j) => j.path === join(ws.dir, "src", "link"))?.target).toBe(join(ws.dir, "src", "a"));
+      await writeFile(join(ws.dir, "src", "link", "written.txt"), "x");
+      expect(await readdir(join(work, "src", "a"))).toEqual(["kept.txt"]);
+      expect(await readFile(join(ws.dir, "src", "a", "written.txt"), "utf8")).toBe("x");
+    } finally {
+      await ws.cleanup();
+    }
+  });
+
   it("reports an actionable error when neither a symlink nor a junction can be made", async () => {
     const eperm = async (): Promise<void> => {
       throw Object.assign(new Error("EPERM: operation not permitted, symlink"), { code: "EPERM" });
