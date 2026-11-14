@@ -65,6 +65,19 @@ export type ContractCheckRunner = ((
   ctx: { workingDir: string; signal: AbortSignal; inputIntegrity?: VerificationInputIntegrity },
 ) => Promise<{ ok: boolean; results: readonly ContractCheckResult[] }>) & { readonly supportsInputIntegrity?: true };
 
+/** The note a held batch carries: on the contract line, rows, the candidate's rejection. */
+export const CONTRACT_CHECKS_HELD = "contract checks held after outside content: not run";
+
+/**
+ * Thrown by a check runner that was held back instead of run: the
+ * delegate's checks after outside content without a yes
+ * (`contract-check-hold.ts`). `runContractChecks` reports its message as
+ * the reason the checks did not run, never as a runner failure.
+ */
+export class ContractChecksHeldError extends Error {
+  override readonly name = "ContractChecksHeldError";
+}
+
 export interface ContractCheckOutcome {
   /** The task the check was attributed to; absent for a call-level check. */
   task?: string;
@@ -413,6 +426,14 @@ export async function runContractChecks(
       await runner(specs, { workingDir: ctx.workingDir, signal: ctx.signal, ...(ctx.inputIntegrity === undefined ? {} : { inputIntegrity: ctx.inputIntegrity }) })
     ).results;
   } catch (error) {
+    // Held after outside content (`contract-check-hold.ts`): its own note,
+    // not a runner failure. A turn cancelled while it waited says so.
+    if (error instanceof ContractChecksHeldError) {
+      return { outcomes: [], checksSkipped: maskSecrets(`${plural} not run — ${error.message}`, known) };
+    }
+    if (ctx.signal.aborted) {
+      return { outcomes: [], checksSkipped: `${plural} not run — the turn was cancelled` };
+    }
     return {
       outcomes: [],
       checksSkipped: maskSecrets(

@@ -514,6 +514,8 @@ export interface WorkerRunnerDeps {
         | "followDeclined"
         | "followTaint"
         | "holdsForOutsideContent"
+        | "outsideContentSources"
+        | "request"
         | "clearSessionGrants"
         | "hasDeclinedUnder"
         | "forgetDeclinedUnder"
