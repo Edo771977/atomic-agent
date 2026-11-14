@@ -218,6 +218,7 @@ describe("browser file:// navigation", () => {
     "file:///bad%2Fname.html",
     "file:///C:/bad%00name.html",
     "file://%ZZ/",
+    "view-\tsource:file:///C:/bad%00name.html",
     ...(process.platform === "win32"
       ? ["file:///srv/elsewhere/page.html", "view-source:file:///srv/elsewhere/page.html"]
       : ["file://server/share/page.html"]),
@@ -287,4 +288,14 @@ describe("browser file:// navigation", () => {
     expect(prompts.map((request) => request.category)).toEqual(["fs_read_outside"]);
     expect(backend.navigations).toHaveLength(0);
   });
+
+  it.each(["view-\tsource:", "view-\nsource: view-\rsource:", "view-source:view-source:"])(
+    "checks native secrets through a normalized wrapper %j", async (prefix) => {
+      decide = (request) => ({ approved: request.category !== "state_secret" });
+      await expect(navigate(`${prefix}${url(join(stateDir, "config.json"))}`))
+        .rejects.toMatchObject({ name: "ApprovalDeniedError" });
+      expect(prompts.map((request) => request.category)).toEqual(["state_secret"]);
+      expect(backend.navigations).toHaveLength(0);
+    },
+  );
 });

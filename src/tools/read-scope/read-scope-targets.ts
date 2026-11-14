@@ -26,13 +26,19 @@ const pathArg: ReadTargetsOf = (args) => {
 type LocalFileUrl = { path: string } | { error: string } | null;
 
 function parseLocalFileUrl(url: string): LocalFileUrl {
-  let rest = url.trim();
-  while (/^view-source:/i.test(rest)) rest = rest.slice("view-source:".length).trim();
+  // WHATWG URL parsing removes HT/LF/CR, including inside a scheme.
+  // Inspect the parsed protocol at every wrapper, rather than a raw
+  // prefix that misses `view-\tsource:` while the browser accepts it.
+  let rest = url.trim().replace(/[\t\r\n]/g, "");
   let parsed: URL;
-  try {
-    parsed = new URL(rest);
-  } catch {
-    return /^file:/i.test(rest) ? { error: "has an invalid local file URL" } : null;
+  for (;;) {
+    try {
+      parsed = new URL(rest);
+    } catch {
+      return /^file:/i.test(rest) ? { error: "has an invalid local file URL" } : null;
+    }
+    if (parsed.protocol !== "view-source:") break;
+    rest = parsed.pathname.trim();
   }
   if (parsed.protocol !== "file:") return null;
   try {
