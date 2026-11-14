@@ -1,4 +1,5 @@
 import { homedir } from "node:os";
+import { dirname, join, parse } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { collapseScope, resolveFanoutScope } from "./fanout-paths.js";
@@ -96,5 +97,16 @@ describe("collapseScope", () => {
     // the home directory are not scopes, they are the absence of one.
     expect(collapseScope(["/"])).toEqual([]);
     expect(collapseScope([homedir()])).toEqual([]);
+  });
+
+  it("refuses native root and home aliases without rejecting their siblings", () => {
+    const home = homedir();
+    expect(collapseScope([parse(home).root, join(home, ".."), join(home, ".")])).toEqual([]);
+    const sibling = `${dirname(home)}-review`;
+    expect(collapseScope([sibling])).toEqual([sibling]);
+    if (process.platform === "win32") {
+      expect(collapseScope(["C:\\", "c:/", "C:\\folder\\..", "\\\\server\\share\\", "//server/share/"])).toEqual([]);
+      expect(collapseScope([home.toUpperCase().replaceAll("\\", "/")])).toEqual([]);
+    }
   });
 });
