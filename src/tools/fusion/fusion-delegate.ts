@@ -2211,7 +2211,7 @@ export function buildFusionDelegateTool(
         const hint = poolIsBinding
           ? `\n\nNote: ${legTaskCount} workers' worth of work was sent but the local server has ${poolSize} request slot${poolSize === 1 ? "" : "s"}, so only ${workerLegMaxWorkers} ran at a time and the rest queued. That number comes from the machine — every slot draws on one shared llama-server context pool (\`localModels.managed.parallel\`, \`"auto"\` by default). Split into fewer, larger tasks if the queueing is costing more than the parallelism buys.`
           : cloudCapIsBinding
-            ? `\n\nNote: maxWorkers ${mainWanted} was clamped to ${workerLegMaxWorkers}, the cloud worker cap (\`llm.runMode.fusion.cloudWorkers\`)${roleLegs.size === 0 ? "" : " on the main worker leg"}; the rest queued behind them.`
+            ? `\n\nNote: ${parsed.maxWorkers === undefined ? `the default width of ${mainWanted} (\`llm.runMode.fusion.workers\`; this call named no maxWorkers)` : `maxWorkers ${mainWanted}`} was clamped to ${workerLegMaxWorkers}, the cloud worker cap (\`llm.runMode.fusion.cloudWorkers\`)${roleLegs.size === 0 ? "" : " on the main worker leg"}; the rest queued behind them.`
             : parsed.maxWorkers !== undefined && maxWorkers < wanted
               ? `\n\nNote: maxWorkers ${wanted} was clamped to ${maxWorkers} across the active provider pools by their slot, cloud-worker and strong-model limits; the rest queued behind them.`
               : "";

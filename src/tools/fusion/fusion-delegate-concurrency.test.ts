@@ -212,6 +212,16 @@ describe("fusion.delegate call-wide concurrency", () => {
     expect(calmResult.summary).not.toContain("was clamped");
   });
 
+  it("names the default width, not maxWorkers, when the cloud cap clamps a call that named none", async () => {
+    const h = harness({}, mode({ workers: 4, workersPinned: false, cloudWorkers: 2 }));
+    const tasks = [main, { ...main, id: "main2" }, { ...main, id: "main3" }];
+    const running = h.start(tasks, undefined);
+    await h.drain(tasks.length);
+    const summary = (await running).summary;
+    expect(summary).toContain("the default width of 3 (`llm.runMode.fusion.workers`; this call named no maxWorkers) was clamped to 2, the cloud worker cap (`llm.runMode.fusion.cloudWorkers`)");
+    expect(summary).not.toContain("maxWorkers 3");
+  });
+
   it("keeps physical, cloud and strong leg caps within the call ceiling", async () => {
     const h = harness({ workerSupportsSlotAffinity: (p) => p === "main", slotManager: { poolSize: () => 1 } }, mode({ cloudWorkers: 2 }));
     const tasks = [main, { ...main, id: "main2" }, build, { ...build, id: "build2" }, { ...build, id: "build3" }, strong, { ...strong, id: "strong2" }, { ...strong, id: "strong3" }];
