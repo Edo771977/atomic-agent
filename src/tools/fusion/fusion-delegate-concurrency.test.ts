@@ -162,6 +162,32 @@ describe("fusion.delegate call-wide concurrency", () => {
     expect(h.peaks.get("builder")).toBe(2);
   });
 
+  it("names a binding local main pool even when role legs are active", async () => {
+    const h = harness({ workerSupportsSlotAffinity: (p) => p === "main", slotManager: { poolSize: () => 1 } });
+    const tasks = [main, { ...main, id: "main2" }, { ...main, id: "main3" }, build];
+    const running = h.start(tasks, 4);
+    await h.drain(tasks.length);
+    const result = await running;
+    expect(result.details.maxWorkers).toBe(2);
+    expect(result.summary).toContain("3 workers' worth of work was sent");
+    expect(result.summary).toContain("1 request slot,");
+    expect(result.summary).toContain("only 1 ran at a time");
+  });
+
+  it("names a binding cloud cap on the main leg beside role legs, and stays quiet when it is not binding", async () => {
+    const h = harness({}, mode({ cloudWorkers: 2 }));
+    const tasks = [main, { ...main, id: "main2" }, { ...main, id: "main3" }, build];
+    const running = h.start(tasks, 4);
+    await h.drain(tasks.length);
+    expect((await running).summary).toContain("the cloud worker cap (`llm.runMode.fusion.cloudWorkers`)");
+    const quiet = harness({ workerSupportsSlotAffinity: (p) => p === "main", slotManager: { poolSize: () => 4 } }, mode({ workersPinned: false }));
+    const calm = quiet.start([main, { ...main, id: "main2" }, build], undefined);
+    await quiet.drain(3);
+    const calmResult = await calm;
+    expect(calmResult.summary).not.toContain("request slot");
+    expect(calmResult.summary).not.toContain("was clamped");
+  });
+
   it("keeps physical, cloud and strong leg caps within the call ceiling", async () => {
     const h = harness({ workerSupportsSlotAffinity: (p) => p === "main", slotManager: { poolSize: () => 1 } }, mode({ cloudWorkers: 2 }));
     const tasks = [main, { ...main, id: "main2" }, build, { ...build, id: "build2" }, { ...build, id: "build3" }, strong, { ...strong, id: "strong2" }, { ...strong, id: "strong3" }];

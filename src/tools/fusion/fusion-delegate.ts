@@ -676,13 +676,21 @@ export function buildFusionDelegateTool(
       // above, never a ceiling on role-model or orchestrator legs.
       const maxWorkers = Math.max(1, Math.min(parsed.maxWorkers === undefined ? capacity : wanted, capacity));
       const permits = createTaskPermitPool(maxWorkers);
-      const cloudCapIsBinding = roleLegs.size === 0 && maxWorkers < wanted && maxWorkers === cloudCap;
-      // The pool held this fan-out down when it ran fewer at a time than
-      // there was work for — whether the orchestrator asked for a wider
-      // number or simply had more tasks than the machine has slots.
+      // Binding is judged on the MAIN leg alone, whatever role legs run
+      // beside it: its own tasks against its own width. The cloud cap
+      // binds when it, not the requested width, cut that leg down…
+      const mainWanted = Math.max(1, Math.min(requested, legTaskCount));
+      const cloudCapIsBinding =
+        legTaskCount > 0 && !Number.isFinite(poolSize) &&
+        workerLegMaxWorkers < mainWanted && workerLegMaxWorkers === cloudCap;
+      // …and the pool held it down when it ran fewer at a time than the
+      // leg had work for and the slot count is what set that width —
+      // whether the orchestrator asked for a wider number or simply had
+      // more tasks than the machine has slots. A default of one worker
+      // on a larger pool is not the pool's doing.
       const poolIsBinding =
-        roleLegs.size === 0 && !cloudCapIsBinding &&
-        (maxWorkers < wanted || maxWorkers < legTaskCount);
+        legTaskCount > 0 && Number.isFinite(poolSize) &&
+        workerLegMaxWorkers < legTaskCount && workerLegMaxWorkers === poolSize;
 
       const orchestratorModel =
         mode.orchestratorModel ??
@@ -2175,10 +2183,10 @@ export function buildFusionDelegateTool(
         // all three things it needs: what was wanted, what actually ran
         // concurrently, and the config key that changes the second number.
         const hint = poolIsBinding
-          ? `\n\nNote: ${Math.max(wanted, legTaskCount)} workers' worth of work was sent but the local server has ${poolSize} request slot${poolSize === 1 ? "" : "s"}, so only ${maxWorkers} ran at a time and the rest queued. That number comes from the machine — every slot draws on one shared llama-server context pool (\`localModels.managed.parallel\`, \`"auto"\` by default). Split into fewer, larger tasks if the queueing is costing more than the parallelism buys.`
+          ? `\n\nNote: ${legTaskCount} workers' worth of work was sent but the local server has ${poolSize} request slot${poolSize === 1 ? "" : "s"}, so only ${workerLegMaxWorkers} ran at a time and the rest queued. That number comes from the machine — every slot draws on one shared llama-server context pool (\`localModels.managed.parallel\`, \`"auto"\` by default). Split into fewer, larger tasks if the queueing is costing more than the parallelism buys.`
           : cloudCapIsBinding
-            ? `\n\nNote: maxWorkers ${wanted} was clamped to ${maxWorkers}, the cloud worker cap (\`llm.runMode.fusion.cloudWorkers\`); the rest queued behind them.`
-            : maxWorkers < wanted
+            ? `\n\nNote: maxWorkers ${mainWanted} was clamped to ${workerLegMaxWorkers}, the cloud worker cap (\`llm.runMode.fusion.cloudWorkers\`)${roleLegs.size === 0 ? "" : " on the main worker leg"}; the rest queued behind them.`
+            : parsed.maxWorkers !== undefined && maxWorkers < wanted
               ? `\n\nNote: maxWorkers ${wanted} was clamped to ${maxWorkers} across the active provider pools by their slot, cloud-worker and strong-model limits; the rest queued behind them.`
               : "";
         // The call's own status is the tasks' summary: a fan-out where
