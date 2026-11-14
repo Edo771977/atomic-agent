@@ -670,7 +670,11 @@ export function buildFusionDelegateTool(
           }).length;
           return sum + (count === 0 ? 0 : roleLegWidth(leg, count));
         }, 0);
-      const maxWorkers = Math.max(1, Math.min(wanted, capacity));
+      // A named `maxWorkers` is the call's explicit ceiling. A call that
+      // named none is bounded by the active legs alone: the local default
+      // of one worker (or `runMode.workers`) is the MAIN leg's width
+      // above, never a ceiling on role-model or orchestrator legs.
+      const maxWorkers = Math.max(1, Math.min(parsed.maxWorkers === undefined ? capacity : wanted, capacity));
       const permits = createTaskPermitPool(maxWorkers);
       const cloudCapIsBinding = roleLegs.size === 0 && maxWorkers < wanted && maxWorkers === cloudCap;
       // The pool held this fan-out down when it ran fewer at a time than

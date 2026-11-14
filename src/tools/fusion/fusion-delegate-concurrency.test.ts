@@ -69,7 +69,8 @@ function harness(over: Partial<FusionDelegateDeps> = {}, resolved = mode()) {
   };
   const tool = buildFusionDelegateTool(deps);
   return {
-    start: (tasks: DelegateTask[], maxWorkers: number, signal = new AbortController().signal, sessionId = "parent") => tool.run({ tasks, maxWorkers }, { workingDir: dir, sessionId, stepIndex: 0, signal }),
+    start: (tasks: DelegateTask[], maxWorkers: number | undefined, signal = new AbortController().signal, sessionId = "parent") =>
+      tool.run(maxWorkers === undefined ? { tasks } : { tasks, maxWorkers }, { workingDir: dir, sessionId, stepIndex: 0, signal }),
     started, pending, peaks,
     get active() { return active; }, get peak() { return peak; }, get minted() { return minted; },
     async drain(count: number) {
@@ -122,6 +123,43 @@ describe("fusion.delegate call-wide concurrency", () => {
     await h.drain(tasks.length);
     expect((await running).details.maxWorkers).toBe(4);
     expect(h.peak).toBe(4);
+  });
+
+  it("an unnamed width on an unpinned local main leg does not serialize cloud role tasks", async () => {
+    const h = harness({ workerSupportsSlotAffinity: (p) => p === "main", slotManager: { poolSize: () => 2 } }, mode({ workersPinned: false }));
+    const tasks = Array.from({ length: 4 }, (_, i) => ({ ...build, id: `b${i}` }));
+    const running = h.start(tasks, undefined);
+    await vi.waitFor(() => expect(h.active).toBe(4));
+    await h.drain(tasks.length);
+    expect((await running).details.maxWorkers).toBe(4);
+    expect(h.peak).toBe(4);
+  });
+
+  it("an unnamed width keeps the local main default of one beside cloud role width", async () => {
+    const h = harness({ workerSupportsSlotAffinity: (p) => p === "main", slotManager: { poolSize: () => 4 } }, mode({ workersPinned: false }));
+    const tasks = [main, { ...main, id: "main2" }, build, { ...build, id: "build2" }, review];
+    const running = h.start(tasks, undefined);
+    await vi.waitFor(() => expect(h.active).toBe(4));
+    await tick();
+    expect(h.active).toBe(4);
+    await h.drain(tasks.length);
+    expect((await running).details.maxWorkers).toBe(4);
+    expect(h.peaks.get("main")).toBe(1);
+    expect(h.peaks.get("builder")).toBe(2);
+    expect(h.peaks.get("reviewer")).toBe(1);
+  });
+
+  it("an unnamed width on a cloud main leg applies workers to that leg only", async () => {
+    const h = harness({}, mode({ workers: 1, workersPinned: false }));
+    const tasks = [main, { ...main, id: "main2" }, build, { ...build, id: "build2" }];
+    const running = h.start(tasks, undefined);
+    await vi.waitFor(() => expect(h.active).toBe(3));
+    await tick();
+    expect(h.active).toBe(3);
+    await h.drain(tasks.length);
+    expect((await running).details.maxWorkers).toBe(3);
+    expect(h.peaks.get("main")).toBe(1);
+    expect(h.peaks.get("builder")).toBe(2);
   });
 
   it("keeps physical, cloud and strong leg caps within the call ceiling", async () => {
