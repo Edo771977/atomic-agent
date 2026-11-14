@@ -28,6 +28,13 @@ export interface InterruptedChatTurn {
   readonly startedAt: number;
 }
 
+/**
+ * Origins whose turns are the operator's own messages. A channel's
+ * (Telegram, Discord) or the scheduler's turn is never offered: `/resume`
+ * would replay someone else's words as the operator's message.
+ */
+const OPERATOR_ORIGINS: ReadonlySet<string> = new Set(["tui", "cli", "http", "sidecar"]);
+
 /** The note the continuing turn starts with. */
 export const INTERRUPTED_TURN_RESUME_NOTE =
   "The previous turn was cut off by a restart. Tools that were running may or may not have completed; " +
@@ -41,7 +48,7 @@ const REQUEST_HEADER = "\n\nThe interrupted request:\n";
  * continued: ended with `INTERRUPTED_TURN_ENDING` (not a person's stop,
  * not a failure), with its progress marker still there (not resumed
  * yet, not rolled back), and not a durable task's (the task runner owns
- * those). `null` otherwise.
+ * those), and the operator's own (`OPERATOR_ORIGINS`). `null` otherwise.
  */
 export function interruptedChatTurn(
   state: Pick<SessionState, "status" | "lastError">,
@@ -49,6 +56,9 @@ export function interruptedChatTurn(
 ): InterruptedChatTurn | null {
   if (progress === null) return null;
   if (progress.options.taskId !== undefined) return null;
+  const { origin, interactive } = progress.options;
+  // A marker written before origins were recorded: only an interactive turn.
+  if (origin === undefined ? interactive !== true : !OPERATOR_ORIGINS.has(origin)) return null;
   if (state.status !== INTERRUPTED_TURN_ENDING.status) return null;
   if (state.lastError !== INTERRUPTED_TURN_ENDING.lastError) return null;
   const request = originalRequest(progress.request);

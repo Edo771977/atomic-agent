@@ -60,6 +60,20 @@ describe("interruptedChatTurn", () => {
     ).toBeNull();
   });
 
+  it("offers only a turn the operator started, never a channel's or the scheduler's", () => {
+    // A message from Telegram or Discord, or a scheduled run, would be
+    // replayed as the operator's own message: never offered.
+    for (const origin of ["telegram", "discord", "scheduler", "fusion"]) {
+      expect(interruptedChatTurn(interrupted, marker({ options: { origin } }))).toBeNull();
+    }
+    for (const origin of ["tui", "http", "sidecar", "cli"]) {
+      expect(interruptedChatTurn(interrupted, marker({ options: { origin, interactive: true } }))).not.toBeNull();
+    }
+    // A marker written before origins were recorded: only an interactive one.
+    expect(interruptedChatTurn(interrupted, marker({ options: {} }))).toBeNull();
+    expect(interruptedChatTurn(interrupted, marker({ options: { interactive: true } }))).not.toBeNull();
+  });
+
   it("offers nothing for a blank request", () => {
     expect(interruptedChatTurn(interrupted, marker({ request: "  " }))).toBeNull();
   });
