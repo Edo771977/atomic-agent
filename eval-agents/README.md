@@ -85,7 +85,8 @@ orchestrator independently validates its fresh completion report after Vitest
 closes. An absent agent filter selects defaults; an explicitly empty string
 or comma-only filter selects no agents and fails.
 Set `ATOMIC_AGENT_GAIA_REPORT_DIR` to place a campaign's reports in a chosen
-directory (the default remains a timestamped directory under `reports/`).
+directory (the default remains a timestamped directory under `reports/`;
+an empty value counts as unset, in the launcher and in `gaia.eval.ts`).
 The launcher resolves a relative report directory against the test child's
 working directory (normally the repository root), then passes the same
 absolute path to the child and completion validator.

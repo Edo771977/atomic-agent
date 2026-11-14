@@ -153,7 +153,7 @@ export function runVitest({ extraEnv = {}, forwarded = [], signal,
   const env = { ...process.env, ...extraEnv };
   let campaignPath;
   if (requireCampaign) {
-    const reportDir = resolve(cwd, env.ATOMIC_AGENT_GAIA_REPORT_DIR ?? resolve(REPO_ROOT, "eval-agents", "reports",
+    const reportDir = resolve(cwd, env.ATOMIC_AGENT_GAIA_REPORT_DIR || resolve(REPO_ROOT, "eval-agents", "reports",
       `run-${new Date().toISOString().replace(/[:.]/g, "-")}-${randomUUID()}`));
     env.ATOMIC_AGENT_GAIA_REPORT_DIR = reportDir;
     campaignPath = resolve(reportDir, "campaign.json");

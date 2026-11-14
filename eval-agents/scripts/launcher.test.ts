@@ -65,6 +65,19 @@ describe("eval launcher actual Node children", () => {
     expect(JSON.parse(readFileSync(join(scratch, "relative-report", "campaign.json"), "utf8"))).toMatchObject({ executed: 1 });
   });
 
+  it("treats an empty report directory as unset instead of the working directory", () => {
+    const result = launch("empty-report", { LAUNCHER_MODE: "campaign", LAUNCHER_REQUIRE_CAMPAIGN: "1",
+      ATOMIC_AGENT_GAIA_REPORT_DIR: "" });
+    expect(result.status, result.diagnostic).toBe(0);
+    const child = JSON.parse(readFileSync(result.output, "utf8"));
+    try {
+      expect(child.reportDir).not.toBe(scratch);
+      expect(child.reportDir.startsWith(join(root, "eval-agents", "reports", "run-"))).toBe(true);
+    } finally {
+      if (child.reportDir !== scratch) rmSync(child.reportDir, { recursive: true, force: true });
+    }
+  });
+
   it("settles a spawn error with a diagnostic instead of an unhandled error", () => {
     const result = launch("spawn-error", { LAUNCHER_CWD: join(scratch, "nonexistent") });
     expect(result.status).toBe(1);
