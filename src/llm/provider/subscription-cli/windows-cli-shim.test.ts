@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { claudeCliAdapter } from "./claude-cli-adapter.js";
 import {
@@ -16,6 +16,8 @@ const WIN_ENV = {
   PATHEXT: ".COM;.EXE;.BAT;.CMD",
   ComSpec: "C:\\Windows\\System32\\cmd.exe",
 };
+
+afterEach(() => vi.unstubAllEnvs());
 
 /**
  * `present` lists the files as they sit on disk. The predicate matches
@@ -138,12 +140,23 @@ describe("resolveWindowsCliInvocation on win32", () => {
   });
 
   it("falls back to cmd.exe when ComSpec is unset", () => {
+    vi.stubEnv("SystemRoot", "D:\\Host Windows");
     const out = onWindows("claude", [], ["C:\\npm\\claude.cmd"], {
       PATH: "C:\\npm",
       PATHEXT: ".CMD",
     });
-    expect(out.command).toBe("cmd.exe");
+    expect(out.command).toBe("D:\\Host Windows\\System32\\cmd.exe");
   });
+
+  it.each(["cmd.exe", "tools\\cmd.exe", "\\tools\\cmd.exe", "C:cmd.exe"])(
+    "ignores non-qualified ComSpec %s and command-env SystemRoot", (ComSpec) => {
+      vi.stubEnv("SystemRoot", "D:\\Host Windows");
+      const out = onWindows("claude", [], ["C:\\npm\\claude.cmd"], {
+        ...WIN_ENV, ComSpec, SystemRoot: "C:\\project\\malicious-root",
+      });
+      expect(out.command).toBe("D:\\Host Windows\\System32\\cmd.exe");
+    },
+  );
 
   it("reads environment names case-insensitively, as Windows does", () => {
     const out = onWindows("claude", [], ["C:\\npm\\claude.cmd"], {

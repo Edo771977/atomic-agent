@@ -150,7 +150,7 @@ describe("merge only green tasks (isolation)", () => {
     expect(patch).toContain("+++ b/two.txt");
     expect(patch).toContain("+bad");
     expect(rows[1]!.notes?.join(" ")).toContain(
-      `not merged (its own checks failed: two.txt is bad): its changes to 1 file are kept as a patch at ${taskPatchPath("two")} (\`git apply\` in the folder); the folder is unchanged`,
+      `not merged (its own checks failed: two.txt is bad): its changes to 1 file are kept as a patch at ${taskPatchPath("two").replaceAll("\\", "/")} (\`git apply\` in the folder); the folder is unchanged`,
     );
     // The gate ran the checks in each task's workspace; nothing ran them again on the folder.
     const gateRuns = seen.filter((s) => s.dir !== repo);

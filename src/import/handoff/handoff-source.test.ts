@@ -59,8 +59,8 @@ describe("handoff source", () => {
   });
 
   it("defaults to the same dirs and env vars as atag import", () => {
-    expect(defaultHandoffSourceDir("claude-code", {}, "/h")).toBe("/h/.claude");
-    expect(defaultHandoffSourceDir("codex", {}, "/h")).toBe("/h/.codex");
+    expect(defaultHandoffSourceDir("claude-code", {}, "/h")).toBe(join("/h", ".claude"));
+    expect(defaultHandoffSourceDir("codex", {}, "/h")).toBe(join("/h", ".codex"));
     expect(
       defaultHandoffSourceDir("claude-code", { CLAUDE_CODE_STATE_DIR: "/x" }, "/h"),
     ).toBe("/x");

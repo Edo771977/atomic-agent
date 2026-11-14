@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { installPluginFromDir } from "./plugin-install.js";
 import { userKeyRefs } from "./plugin-keys.js";
 import { expandUserKeys, expandVars, loadPluginMcpServers, uniqueName } from "./plugin-mcp.js";
@@ -31,7 +31,7 @@ describe("plugin MCP servers", () => {
     const byName = Object.fromEntries(servers.map(s => [s.name, s]));
     expect(Object.keys(byName).sort()).toEqual(["demo-local", "demo-remote"]);
     const local = byName["demo-local"]!.transport as { command: string; args: string[] };
-    expect(local.command).toBe(join(installedPluginDir(stateDir, "demo"), "bin/server"));
+    expect(resolve(local.command)).toBe(join(installedPluginDir(stateDir, "demo"), "bin", "server"));
     expect(local.args[1]).toBe(join(stateDir, "plugins", "data", "demo"));
     expect(byName["demo-local"]!.trust).toBeUndefined();
     expect(byName["demo-remote"]!.trust).toBeUndefined();

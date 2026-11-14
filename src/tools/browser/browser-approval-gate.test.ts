@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { GATE_CTX, GateBackend, facts, recordingGate } from "./browser-gate-test-helpers.js";
 import {
   buildBrowserClickTool,
@@ -149,7 +151,7 @@ describe("script URLs", () => {
   it("file: still asks as browser_nonweb", async () => {
     const backend = new GateBackend();
     const { request, options } = gate(true);
-    await buildBrowserNavigateTool(backend, options).run({ url: "file:///tmp/page.html" }, CTX);
+    await buildBrowserNavigateTool(backend, options).run({ url: pathToFileURL(resolve("page.html")).href }, CTX);
     expect(promptOf(request)).toMatchObject({ category: "browser_nonweb" });
   });
 });

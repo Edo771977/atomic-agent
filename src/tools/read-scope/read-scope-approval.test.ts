@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, parse, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 
 import {
   ApprovalGate,
@@ -18,6 +19,93 @@ import { READ_REFUSAL_REASON, WORKER_READ_REFUSAL_REASON } from "./read-scope.js
 
 const WORKER = `${FUSION_WORKER_ID_PREFIX}1`;
 
+describe("local URL validation at read dispatch", () => {
+  let work: string;
+  let registry: ToolRegistry;
+  let gate: ApprovalGate;
+  let innerCalls: number;
+  let prompts: number;
+
+  const ctx = (sessionId: string): ToolContext => ({
+    sessionId, workingDir: work, stepIndex: 0, signal: new AbortController().signal,
+  });
+  const install = (readScope?: ReadScope) => confineReads(registry, {
+    grantedDirs: () => [],
+    ...(readScope === undefined ? {} : { readScope: () => readScope }),
+    approvals: { approvals: gate, approvalRequired: true },
+    stateSecrets: { stateDir: join(work, "state"), files: [join(work, "state", "config.json")] },
+  });
+
+  beforeEach(() => {
+    work = mkdtempSync(join(tmpdir(), "read-url-dispatch-"));
+    innerCalls = 0;
+    prompts = 0;
+    gate = new ApprovalGate({
+      level: 3,
+      emit: request => {
+        prompts += 1;
+        queueMicrotask(() => gate.resolve({ approvalId: request.approvalId, approved: false }));
+      },
+    });
+    registry = new ToolRegistry();
+    for (const name of ["browser.navigate", "browser.tabs"]) registry.register({
+      name, description: name, readonly: true,
+      run: async () => {
+        innerCalls += 1;
+        return compressToolResult({ tool: name, status: "ok", output: "inner body ran", details: {} });
+      },
+    });
+  });
+
+  afterEach(() => rmSync(work, { recursive: true, force: true }));
+
+  for (const sessionId of ["ordinary", WORKER]) {
+    for (const scope of ["unrestricted", "working-dir"] as const) {
+      for (const name of ["browser.navigate", "browser.tabs"]) {
+        it(`refuses invalid local URLs before ${name} for ${sessionId} under ${scope}`, async () => {
+          install(scope);
+          for (const url of [
+            "file:///bad%00name.html", "file:///bad%ZZname.html", "file:///bad%2Fname.html",
+            "view-\tsource:view-source:file:///bad%00name.html",
+            process.platform === "win32" ? "file:///srv/outside.html" : "file://server/share/outside.html",
+          ]) {
+            const result = await registry.invoke(name, { url, ...(name === "browser.tabs" ? { action: "new" } : {}) }, ctx(sessionId));
+            expect(result.status).toBe("error");
+            expect(result.details.reason).toBe("local_file_refused");
+            expect(innerCalls).toBe(0);
+            expect(prompts).toBe(0);
+          }
+        });
+      }
+    }
+  }
+
+  it("preserves valid native, network and non-file targets and ignores unused tab URLs", async () => {
+    install("unrestricted");
+    const urls = [pathToFileURL(join(work, "page.html")).href, "https://example.com", "about:blank", "data:text/plain,hello"];
+    if (process.platform === "win32") urls.push("file://server/share/page.html");
+    for (const url of urls) {
+      for (const name of ["browser.navigate", "browser.tabs"]) {
+        const before = innerCalls;
+        expect((await registry.invoke(name, { url, ...(name === "browser.tabs" ? { action: "new" } : {}) }, ctx("ordinary"))).status).toBe("ok");
+        expect(innerCalls).toBe(before + 1);
+      }
+    }
+    expect((await registry.invoke("browser.tabs", { action: "list", url: "file:///bad%00name" }, ctx(WORKER))).status).toBe("ok");
+    expect(prompts).toBe(0);
+  });
+
+  it("preserves confinement for a valid native file outside the scope", async () => {
+    install("working-dir");
+    const url = pathToFileURL(join(parse(work).root, "dispatch-outside-scratch", "page.html")).href;
+    const result = await registry.invoke("browser.navigate", { url }, ctx("ordinary"));
+    expect(result.status).toBe("error");
+    expect(result.details.reason).toBe(READ_REFUSAL_REASON);
+    expect(prompts).toBe(1);
+    expect(innerCalls).toBe(0);
+  });
+});
+
 describe("a read outside the scope asks through the ladder", () => {
   let work: string;
   let registry: ToolRegistry;
@@ -28,8 +116,8 @@ describe("a read outside the scope asks through the ladder", () => {
   let innerShells: number;
   let readScope: ReadScope;
   // Lexical and off the temp directory, which is scratch and never asked about.
-  const home = "/srv/homes/me";
-  const elsewhere = "/srv/homes/other-run/work";
+  const home = resolve("/srv/homes/me");
+  const elsewhere = resolve("/srv/homes/other-run/work");
   const solution = join(elsewhere, "solution.js");
 
   const ctx = (sessionId = "s-plain", readRoots?: readonly string[]): ToolContext => ({
@@ -79,7 +167,7 @@ describe("a read outside the scope asks through the ladder", () => {
         grantedDirs: () => [],
         readScope: () => readScope,
         approvals: { approvals: gate, approvalRequired: true },
-        shellEnv: { home, platform: "linux" },
+        shellEnv: { home, platform: process.platform },
       }),
     ).toEqual(["os.fs.read", "os.shell.run"]);
   });
@@ -299,7 +387,7 @@ describe("a read naming several outside paths asks about each", () => {
       grantedDirs: () => [],
       readScope: () => "working-dir",
       approvals: { approvals: gate, approvalRequired: true },
-      shellEnv: { home: "/srv/homes/me", platform: "linux" },
+      shellEnv: { home: resolve("/srv/homes/me"), platform: process.platform },
     });
   });
 
@@ -317,24 +405,24 @@ describe("a read naming several outside paths asks about each", () => {
   it("a yes for the first path does not let the second through unasked", async () => {
     const result = await registry.invoke(
       "os.fs.diff",
-      { aPath: "/srv/public/notes.txt", bPath: "/root/.ssh/id_rsa" },
+      { aPath: resolve("/srv/public/notes.txt"), bPath: resolve("/root/.ssh/id_rsa") },
       ctx(),
     );
     expect(result.status).toBe("ok");
     expect(prompts.map((p) => p.affectedResources)).toEqual([
-      ["/srv/public"],
-      ["/root/.ssh"],
+      [resolve("/srv/public")],
+      [resolve("/root/.ssh")],
     ]);
     expect(ran).toBe(1);
   });
 
   it("a no for a later path refuses the whole call", async () => {
     decide = (request) => ({
-      approved: !(request.affectedResources ?? []).includes("/root/.ssh"),
+      approved: !(request.affectedResources ?? []).includes(resolve("/root/.ssh")),
     });
     const result = await registry.invoke(
       "os.fs.diff",
-      { aPath: "/srv/public/notes.txt", bPath: "/root/.ssh/id_rsa" },
+      { aPath: resolve("/srv/public/notes.txt"), bPath: resolve("/root/.ssh/id_rsa") },
       ctx(),
     );
     expect(result.status).toBe("error");
@@ -345,15 +433,15 @@ describe("a read naming several outside paths asks about each", () => {
   it("checks every move source and every syntax-check file", async () => {
     await registry.invoke(
       "os.fs.move",
-      { moves: [{ from: "/srv/a/x", to: "x" }, { from: "/srv/b/y", to: "y" }] },
+      { moves: [{ from: resolve("/srv/a/x"), to: "x" }, { from: resolve("/srv/b/y"), to: "y" }] },
       ctx(),
     );
-    await registry.invoke("verify.syntax", { files: ["/srv/c/1.ts", "/srv/d/2.ts"] }, ctx());
+    await registry.invoke("verify.syntax", { files: [resolve("/srv/c/1.ts"), resolve("/srv/d/2.ts")] }, ctx());
     expect(prompts.map((p) => p.affectedResources)).toEqual([
-      ["/srv/a"],
-      ["/srv/b"],
-      ["/srv/c"],
-      ["/srv/d"],
+      [resolve("/srv/a")],
+      [resolve("/srv/b")],
+      [resolve("/srv/c")],
+      [resolve("/srv/d")],
     ]);
     expect(ran).toBe(2);
   });
@@ -361,7 +449,7 @@ describe("a read naming several outside paths asks about each", () => {
   it("paths under one approved directory are asked about once", async () => {
     await registry.invoke(
       "os.fs.diff",
-      { aPath: "/srv/public/a.txt", bPath: "/srv/public/b.txt" },
+      { aPath: resolve("/srv/public/a.txt"), bPath: resolve("/srv/public/b.txt") },
       ctx(),
     );
     expect(prompts).toHaveLength(1);

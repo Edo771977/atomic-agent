@@ -1,5 +1,4 @@
 import {
-  chmodSync,
   mkdtempSync,
   mkdirSync,
   rmSync,
@@ -7,7 +6,22 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const deniedStats = vi.hoisted(() => new Map<string, string>());
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...actual,
+    statSync: (...args: Parameters<typeof actual.statSync>) => {
+      const code = deniedStats.get(String(args[0]));
+      if (code !== undefined) {
+        throw Object.assign(new Error("fixture stat access denied"), { code });
+      }
+      return actual.statSync(...args);
+    },
+  };
+});
 
 import { hostFileStatus, readShimHead } from "./host-environment.js";
 
@@ -28,6 +42,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  deniedStats.clear();
   rmSync(dir, { recursive: true, force: true, maxRetries: 3 });
 });
 
@@ -130,16 +145,17 @@ describe("hostFileStatus", () => {
     // The bug `existsSync` cannot express: EACCES came back as `false`,
     // and a real install under a restricted directory was reported as
     // "was not found on PATH".
-    if (process.getuid?.() === 0) return; // root is not denied anything
     const locked = join(dir, "locked");
     mkdirSync(locked);
     const path = join(locked, "claude.cmd");
     writeFileSync(path, "@echo off");
-    chmodSync(locked, 0o000);
-    try {
+    // chmod cannot induce this errno on Windows or under root. Inject
+    // only this file's failed stat; all other probes still use real fs.
+    for (const code of ["EACCES", "EPERM"]) {
+      deniedStats.set(path, code);
       expect(hostFileStatus(path)).toBe("unknown");
-    } finally {
-      chmodSync(locked, 0o700);
     }
+    deniedStats.delete(path);
+    expect(hostFileStatus(path)).toBe("present");
   });
 });

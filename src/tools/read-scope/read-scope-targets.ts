@@ -23,34 +23,67 @@ const pathArg: ReadTargetsOf = (args) => {
  * `view-source:`), or `null` for any other URL. A browser page on a
  * local file is a read like `os.fs.read`.
  */
-export function localFileOfUrl(url: string): string | null {
-  let rest = url.trim();
-  while (/^view-source:/i.test(rest)) rest = rest.slice("view-source:".length).trim();
+type LocalFileUrl = { path: string } | { error: string } | null;
+
+function parseLocalFileUrl(url: string): LocalFileUrl {
+  // WHATWG URL parsing removes HT/LF/CR, including inside a scheme.
+  // Inspect the parsed protocol at every wrapper, rather than a raw
+  // prefix that misses `view-\tsource:` while the browser accepts it.
+  let rest = url.trim().replace(/[\t\r\n]/g, "");
   let parsed: URL;
-  try {
-    parsed = new URL(rest);
-  } catch {
-    return null;
+  for (;;) {
+    try {
+      parsed = new URL(rest);
+    } catch {
+      return /^file:/i.test(rest) ? { error: "has an invalid local file URL" } : null;
+    }
+    if (parsed.protocol !== "view-source:") break;
+    rest = parsed.pathname.trim();
   }
   if (parsed.protocol !== "file:") return null;
   try {
-    return fileURLToPath(parsed);
-  } catch {
-    // A host the platform cannot map (`file://server/…` on POSIX): the
-    // path part is still what a browser would try to open.
-    try {
-      return decodeURIComponent(parsed.pathname);
-    } catch {
-      return parsed.pathname;
+    const path = fileURLToPath(parsed);
+    // Node permits NUL in the decoded string, but no filesystem API can
+    // open it. Windows also forbids the remaining ASCII control bytes.
+    if ((process.platform === "win32" ? /[\x00-\x1f]/ : /\x00/).test(path)) {
+      return { error: "has an invalid local file path" };
     }
+    return { path };
+  } catch {
+    // A drive-less Windows URL, foreign file host, invalid escape or
+    // encoded separator cannot be checked as a native path. Never drop
+    // its host/drive semantics and let a browser resolve it differently.
+    return { error: "cannot be mapped to an absolute local path on this platform" };
   }
 }
 
-const browserUrlArg: ReadTargetsOf = (args) => {
-  const url = nonEmpty(args.url);
-  const file = url === undefined ? null : localFileOfUrl(url);
-  return file === null ? [] : [file];
-};
+export function localFileOfUrl(url: string): string | null {
+  const local = parseLocalFileUrl(url);
+  return local !== null && "path" in local ? local.path : null;
+}
+
+/** A local URL the browser must refuse, rather than opening unchecked. */
+export function invalidLocalFileUrlReason(url: string): string | null {
+  const local = parseLocalFileUrl(url);
+  return local !== null && "error" in local ? local.error : null;
+}
+
+/** URL reads share argument selection between validation and path extraction. */
+const URL_READ_TARGETS: ReadonlyMap<string, (args: Record<string, unknown>) => string | undefined> = new Map([
+  ["browser.navigate", (args) => nonEmpty(args.url)],
+  ["browser.tabs", (args) => args.action === "new" ? nonEmpty(args.url) : undefined],
+]);
+
+/** Invalid local URLs must not become an empty, implicitly allowed target set. */
+export function invalidReadUrlTarget(
+  tool: string,
+  args: Record<string, unknown>,
+): { url: string; why: string } | null {
+  const url = URL_READ_TARGETS.get(tool)?.(args);
+  if (url === undefined) return null;
+  const why = invalidLocalFileUrlReason(url);
+  return why === null ? null : { url, why };
+}
 
 function gitRepoArg(pathKey?: "path" | "paths"): ReadTargetsOf {
   return (args) => {
@@ -150,11 +183,11 @@ export const READ_TOOL_TARGETS: ReadonlyMap<string, ReadTargetsOf> = new Map<
   ["os.git.diff", gitRepoArg("paths")],
   // A file:// page (or its view-source:) reads that file into the
   // browser, and the page text comes back to the model.
-  ["browser.navigate", browserUrlArg],
-  [
-    "browser.tabs",
-    (args) => (args.action === "new" ? browserUrlArg(args) : []),
-  ],
+  ...Array.from(URL_READ_TARGETS, ([name, urlOf]): [string, ReadTargetsOf] => [name, (args) => {
+    const url = urlOf(args);
+    const file = url === undefined ? null : localFileOfUrl(url);
+    return file === null ? [] : [file];
+  }]),
   [
     // A syntax check reads every file it is handed.
     "verify.syntax",

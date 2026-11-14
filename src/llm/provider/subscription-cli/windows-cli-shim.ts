@@ -1,4 +1,5 @@
 import { win32 } from "node:path";
+import { windowsCommandInterpreter } from "../../../sandbox/windows-system-executable.js";
 
 import {
   hostEnv,
@@ -199,7 +200,7 @@ export function resolveWindowsCliInvocation(
   ].join(" ");
 
   const invocation: CliInvocation = {
-    command: lookupEnv(env, "ComSpec") ?? "cmd.exe",
+    command: windowsCommandInterpreter(env),
     args: ["/d", "/s", "/c", `"${commandLine}"`],
     windowsVerbatimArguments: true,
   };

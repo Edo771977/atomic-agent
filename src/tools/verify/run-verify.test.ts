@@ -160,7 +160,7 @@ describe("runVerify — command", () => {
     );
     expect(out.ok).toBe(false);
     expect(out.timedOut).toBe(true);
-    expect(out.exitCode).toBeNull();
+    expect(out.exitCode).toBe(process.platform === "win32" ? 1 : null);
     expect(out.checks?.[0]?.detail).toBe("killed (timed out)");
     expect(out.summary).toContain("killed: timed out");
   });

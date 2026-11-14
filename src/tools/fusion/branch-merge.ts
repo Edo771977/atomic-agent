@@ -34,7 +34,7 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
-import { dirname, isAbsolute, join, normalize, relative, sep } from "node:path";
+import { dirname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
 import { runCommand } from "../../sandbox/command-runner.js";
 import { buildCommandEnv } from "../../sandbox/command-env.js";
 import {
@@ -62,6 +62,7 @@ import { resolveContractInputs } from "./contract-inputs.js";
 import type { ContractProvide } from "./contract.js";
 import type { DelegateTask } from "./delegate-args.js";
 import type { WorkerTaskResult, WorkerTaskStatus } from "./worker-result.js";
+import { comparableScopePath } from "./scope-path.js";
 
 /** Statuses whose workspace is merged back; everything else is discarded. */
 export const MERGED_STATUSES: ReadonlySet<WorkerTaskStatus> = new Set([
@@ -424,15 +425,27 @@ export function rebaseScope(
   roots: readonly string[],
   dir: string,
 ): string[] {
+  const privateDir = comparableScopePath(dir);
+  if (privateDir === null) return [];
+  const comparableRoots = roots.map(comparableScopePath);
+  // An uncomparable original root must never leave its possible aliases
+  // authorized on the original project. Keep only the private workspace.
+  if (comparableRoots.some((root) => root === null)) return [privateDir];
+  const safeRoots = comparableRoots.filter((root): root is string => root !== null);
   const out: string[] = [];
-  for (const entry of scope) {
-    const root = [...roots]
+  for (const raw of scope) {
+    const entry = comparableScopePath(raw);
+    if (entry === null) continue;
+    const root = [...safeRoots]
       .sort((a, b) => b.length - a.length)
-      .find((r) => entry === r || entry.startsWith(`${r}${sep}`));
-    const mapped = root === undefined ? entry : join(dir, relative(root, entry));
+      .find((r) => {
+        const rel = relative(resolve(r), resolve(entry));
+        return rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+      });
+    const mapped = root === undefined ? entry : join(privateDir, relative(root, entry));
     if (!out.includes(mapped)) out.push(mapped);
   }
-  if (!out.includes(dir)) out.push(dir);
+  if (!out.includes(privateDir)) out.push(privateDir);
   return out;
 }
 
