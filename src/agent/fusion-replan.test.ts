@@ -26,6 +26,19 @@ describe("automatic replan hold (ATO-941)", () => {
     expect(takeReplanNotice(s).notice).toBeNull();
   });
 
+  it("does not hold the planner when every pending task is a question (needs_input)", () => {
+    const s = observeReplanStep(createReplanState(), [
+      delegate({ replan: { pending: [{ id: "a", status: "needs_input" }, { id: "b", status: "needs_input" }] } }),
+    ]);
+    expect(replanToolSet(s)).toBeNull();
+    expect(takeReplanNotice(s).notice).toBeNull();
+    // A failed task alongside a question still holds the step.
+    const mixed = observeReplanStep(createReplanState(), [
+      delegate({ replan: { pending: [{ id: "a", status: "needs_input" }, { id: "c", status: "failed" }] } }),
+    ]);
+    expect(replanToolSet(mixed)?.names).toEqual(["fusion.delegate"]);
+  });
+
   it("does not count an unparsed or refused delegate as the replan", () => {
     let s = observeReplanStep(createReplanState(), [
       delegate({ replan: { pending: [{ id: "a" }] } }),

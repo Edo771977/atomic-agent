@@ -277,6 +277,23 @@ describe("the fix each status calls for", () => {
     );
   });
 
+  it("a needs_input task: its question is the why, and no 'failed twice' fix", () => {
+    const question = "Which unit should the HUD use?";
+    const asked = { id: "ask", status: "needs_input", question } as never;
+    const report = describeReplan([asked], () => 2, 3);
+    expect(report.pending[0]!.why).toContain(question);
+    expect(report.pending[0]!.fix ?? "").not.toContain("failed twice");
+    expect(report.pending[0]!.fix).toContain("answer");
+    // Asked twice, once on the orchestrator's model: still a question to
+    // answer, not a failure to report.
+    const there = describeReplan([asked], () => 2, 3, () => true);
+    expect(there.failedOnOrchestrator).toEqual([]);
+    expect(there.pending.map((t) => t.id)).toEqual(["ask"]);
+    const block = renderReplanBlock(report);
+    expect(block).not.toContain("Your next step must be `fusion.delegate`");
+    expect(block).toContain(question);
+  });
+
   it("names no orchestrator fix while the target is off or its cap is used", () => {
     const report = describeReplan([row("twice", "failed")], () => 2, 3, () => false, false);
     expect(report.pending[0]!.fix).toBeUndefined();
