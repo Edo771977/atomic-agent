@@ -49,8 +49,8 @@ export interface ModelStats {
   checksFailed: number;
   /** Missing, legacy, or contradictory task-check evidence; never inferred from status ok. */
   checksUnverified: number;
-  /** Worker executions grouped by final candidate disposition; not candidate-call counts or quality samples. */
-  candidate: CandidateExecutionStats;
+  /** Aggregated task runs under their configured leg, not physical provider requests or quality samples. */
+  candidate: CandidateTaskRunStats;
   topFailures: Array<{ category: FailureCategory; count: number }>;
   escalated: number;
   escalationRate: number;
@@ -66,8 +66,12 @@ export interface ModelStats {
   costUsd: number | null;
 }
 
-export interface CandidateExecutionStats {
-  executed: number;
+export interface CandidateTaskRunStats {
+  taskRuns: number;
+  /** Sum of explicitly counted worker task invocations; not per-provider inference requests. */
+  knownWorkerRuns: number;
+  /** Task runs whose worker invocation count is absent or invalid. */
+  workerRunsUnverified: number;
   promoted: number;
   rejected: number;
   unchanged: number;
@@ -167,15 +171,17 @@ function median(values: number[]): number {
 
 const rate = (n: number, of: number): number => (of === 0 ? 0 : n / of);
 
-function candidateStats(rows: TaskOutcomeRecord[]): CandidateExecutionStats {
-  const stats: CandidateExecutionStats = { executed: 0, promoted: 0, rejected: 0, unchanged: 0, unverified: 0,
+function candidateStats(rows: TaskOutcomeRecord[]): CandidateTaskRunStats {
+  const stats: CandidateTaskRunStats = { taskRuns: 0, knownWorkerRuns: 0, workerRunsUnverified: 0, promoted: 0, rejected: 0, unchanged: 0, unverified: 0,
     taskChecksPassed: 0, taskChecksFailed: 0, taskChecksUnverified: 0, rejectionReasons: [] };
   const reasons = new Map<CandidateRejectionReason, number>();
   for (const row of rows) {
     if (!hasCandidateOutcome(row)) continue;
-    stats.executed += 1;
+    stats.taskRuns += 1;
     const evidence = candidateOutcomeEvidence(row);
-    if (evidence?.receipt === undefined) { stats.unverified += 1; stats.taskChecksUnverified += 1; continue; }
+    if (evidence?.receipt === undefined) { stats.unverified += 1; stats.taskChecksUnverified += 1; stats.workerRunsUnverified += 1; continue; }
+    if (evidence.workerRuns === undefined) stats.workerRunsUnverified += 1;
+    else stats.knownWorkerRuns += evidence.workerRuns;
     stats[evidence.receipt.disposition] += 1;
     if (evidence.receipt.reason !== undefined) reasons.set(evidence.receipt.reason, (reasons.get(evidence.receipt.reason) ?? 0) + 1);
     const checked = evidence.taskChecks;
@@ -411,8 +417,8 @@ function modelRows(stats: ModelStats[]): string[] {
 }
 
 function candidateRows(stats: ModelStats[]): string[] {
-  return table(["model", "leg", "executed", "promoted", "rejected", "unchanged", "unverified", "final own checks pass/fail/unverified", "rejection reasons"],
-    stats.map(s => [s.model === s.provider ? s.model : `${s.model} (${s.provider})`, s.leg, String(s.candidate.executed),
+  return table(["configured model", "configured leg", "task runs", "known worker runs", "unknown run counts", "promoted", "rejected", "unchanged", "unverified", "final own checks pass/fail/unverified", "rejection reasons"],
+    stats.map(s => [s.model === s.provider ? s.model : `${s.model} (${s.provider})`, s.leg, String(s.candidate.taskRuns), String(s.candidate.knownWorkerRuns), String(s.candidate.workerRunsUnverified),
       String(s.candidate.promoted), String(s.candidate.rejected), String(s.candidate.unchanged), String(s.candidate.unverified),
       `${s.candidate.taskChecksPassed}/${s.candidate.taskChecksFailed}/${s.candidate.taskChecksUnverified}`,
       s.candidate.rejectionReasons.length === 0 ? "-" : s.candidate.rejectionReasons.map(r => `${r.reason} ${r.count}`).join(", ")]));
@@ -432,8 +438,8 @@ export function formatFusionReport(report: FusionReport, options: ReportOptions 
   if (report.orchestratorTargets.length > 0) {
     lines.push("", "Tasks sent to the orchestrator's model", ...modelRows(report.orchestratorTargets));
   }
-  const candidates = [...report.workers, ...report.orchestratorTargets].filter(s => s.candidate.executed > 0);
-  if (candidates.length > 0) lines.push("", "Candidate worker executions (telemetry only)", ...candidateRows(candidates));
+  const candidates = [...report.workers, ...report.orchestratorTargets].filter(s => s.candidate.taskRuns > 0);
+  if (candidates.length > 0) lines.push("", "Candidate task runs (telemetry only)", ...candidateRows(candidates));
   if (report.orchestrator.length > 0) {
     lines.push(
       "",
@@ -463,7 +469,7 @@ export function formatFusionReport(report: FusionReport, options: ReportOptions 
     }`,
     "Reported green: status ok; reported 1st-pass: status ok on the first attempt with no judge retry or self-check notice. after retry: reported green after a replan or judge retry.",
     "Checks pass/fail/unverified: consistent task-checks acceptance records; missing or contradictory evidence is unverified. Replan attempts can have check evidence. The worker can modify the declared checks and their inputs; passing them does not establish semantic correctness or full integration acceptance.",
-    "Candidate executions count actual worker executions by final candidate disposition, not candidate calls. Final own checks count only task-attributed final reruns; call-level integration green gives no individual model credit. Candidate rows are telemetry only: promoted-only rates are conditioned on success and never train measured routing quality. Missing or malformed candidate metadata stays unverified.",
+    "Candidate task runs count aggregated task rows by final disposition, not candidate calls or individual worker invocations. Known worker runs count explicit task invocations, including judge retries; missing or invalid counts stay unknown. Rows are grouped under the configured leg even when retries or escalations used other providers; cost, usage and duration remain row-reported metrics, not complete billing or physical provider performance. Final own checks count only task-attributed final reruns; call-level integration green gives no individual model credit. Candidate rows are telemetry only: promoted-only rates are conditioned on success and never train measured routing quality. Missing or malformed candidate metadata stays unverified.",
   );
   return `${lines.join("\n")}\n`;
 }

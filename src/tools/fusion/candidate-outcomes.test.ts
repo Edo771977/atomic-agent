@@ -27,10 +27,10 @@ describe("candidate outcome telemetry", () => {
     expect(original).not.toHaveProperty("candidate");
     const stats = aggregateOutcomes(parseOutcomeLines(JSON.stringify(candidate))).workers[0]!;
     expect(stats).toMatchObject({ green: 1, checksPassed: 0, checksFailed: 0, checksUnverified: 1,
-      candidate: { executed: 1, promoted: 1, rejected: 0, unverified: 0,
+      candidate: { taskRuns: 1, promoted: 1, rejected: 0, unverified: 0,
         taskChecksPassed: 1, taskChecksFailed: 0, taskChecksUnverified: 0, rejectionReasons: [] } });
     const text = formatFusionReport(aggregateOutcomes([candidate]));
-    expect(text).toContain("Candidate worker executions (telemetry only)");
+    expect(text).toContain("Candidate task runs (telemetry only)");
     expect(text).toContain("telemetry only");
     const serialized = JSON.stringify(candidate);
     for (const secret of ["private-task", "private-title", "secret-reply", "command", "stdout"]) expect(serialized).not.toContain(secret);
@@ -39,7 +39,7 @@ describe("candidate outcome telemetry", () => {
     const rejected = withCandidateOutcome(record(), { ...receipt, disposition: "rejected", reason: "original-changed" }, [{ ok: true }], "private-task");
     const stats = aggregateOutcomes([rejected]).workers[0]!;
     expect(stats).toMatchObject({ green: 1, checksPassed: 0,
-      candidate: { executed: 1, promoted: 0, rejected: 1, taskChecksUnverified: 1,
+      candidate: { taskRuns: 1, promoted: 0, rejected: 1, taskChecksUnverified: 1,
         rejectionReasons: [{ reason: "original-changed", count: 1 }] } });
   });
   it("bounds metadata and strips prose while preserving an unverified candidate discriminator", () => {
@@ -51,7 +51,7 @@ describe("candidate outcome telemetry", () => {
       const row = { ...record(), candidate } as unknown as ReturnType<typeof record>;
       const stats = aggregateOutcomes(parseOutcomeLines(JSON.stringify(row))).workers[0]!;
       expect(stats.checksPassed).toBe(0);
-      expect(stats.candidate).toMatchObject({ executed: 1, unverified: 1 });
+      expect(stats.candidate).toMatchObject({ taskRuns: 1, unverified: 1 });
     }
   });
   it("roundtrips unchanged and failed final checks through the actual writer and history reader", () => {
@@ -66,7 +66,7 @@ describe("candidate outcome telemetry", () => {
       const rows = readRoutingHistory(path);
       expect(rows).toEqual([unchanged, rejected]);
       expect(aggregateOutcomes(rows).workers[0]).toMatchObject({ green: 2, checksPassed: 0, checksUnverified: 2,
-        candidate: { executed: 2, unchanged: 1, rejected: 1, taskChecksPassed: 1, taskChecksFailed: 1, taskChecksUnverified: 0,
+        candidate: { taskRuns: 2, unchanged: 1, rejected: 1, taskChecksPassed: 1, taskChecksFailed: 1, taskChecksUnverified: 0,
           rejectionReasons: [{ reason: "checks-failed", count: 1 }] } });
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
@@ -77,7 +77,7 @@ describe("candidate outcome telemetry", () => {
       { inputs: { declared: 0, verified: 1 } }, { checkStatus: "unverified" }]) {
       const row = withCandidateOutcome(record(), { ...receipt, ...over } as CandidateAcceptanceReceipt, [], "private-task");
       expect(row.candidate).not.toHaveProperty("receipt");
-      expect(aggregateOutcomes([row]).workers[0]).toMatchObject({ checksPassed: 0, candidate: { executed: 1, unverified: 1 } });
+      expect(aggregateOutcomes([row]).workers[0]).toMatchObject({ checksPassed: 0, candidate: { taskRuns: 1, unverified: 1 } });
     }
     const extra = withCandidateOutcome(record(), { ...receipt, extra: "secret-path" } as CandidateAcceptanceReceipt, [], "private-task");
     expect(extra.candidate?.receipt).toEqual(receipt);
@@ -107,5 +107,30 @@ describe("candidate outcome telemetry", () => {
       expect(row.candidate).not.toHaveProperty("receipt");
       expect(aggregateOutcomes([row]).workers[0]!.candidate.unverified).toBe(1);
     }
+  });
+  it("counts one retried task run separately from its two actual worker runs", () => {
+    const row = withCandidateOutcome({ ...record(), judgeRetried: true, costUsd: 0.25, tokensIn: 20, durationMs: 30 }, receipt,
+      [{ task: "private-task", ok: true }], "private-task", 2);
+    expect(row.candidate).toMatchObject({ workerRuns: 2 });
+    expect(row).toMatchObject({ attempt: 1, judgeRetried: true, costUsd: 0.25, tokensIn: 20, durationMs: 30 });
+    const stats = aggregateOutcomes(parseOutcomeLines(JSON.stringify(row))).workers[0]!;
+    expect(stats).toMatchObject({ checksPassed: 0, candidate: { taskRuns: 1, promoted: 1, knownWorkerRuns: 2, workerRunsUnverified: 0 } });
+    expect(stats.candidate).not.toHaveProperty("executed");
+    const text = formatFusionReport(aggregateOutcomes([row]));
+    expect(text).toContain("Candidate task runs (telemetry only)");
+    expect(text).toContain("configured leg");
+    expect(text).toContain("row-reported");
+  });
+  it("keeps absent, invalid or oversized worker-run counts unknown instead of inventing one", () => {
+    for (const workerRuns of [undefined, 0, -1, 1.5, NaN, 1_000_001, [2], { privatePath: "secret" }]) {
+      const row = withCandidateOutcome(record(), receipt, [], "private-task", workerRuns as number);
+      expect(row.candidate).not.toHaveProperty("workerRuns");
+      expect(JSON.stringify(row)).not.toContain("secret");
+      const raw = { ...row, candidate: { ...row.candidate, workerRuns } };
+      const stats = aggregateOutcomes(parseOutcomeLines(JSON.stringify(raw))).workers[0]!;
+      expect(stats).toMatchObject({ checksPassed: 0, candidate: { taskRuns: 1, promoted: 1, knownWorkerRuns: 0, workerRunsUnverified: 1 } });
+    }
+    const row = withCandidateOutcome(record(), receipt, [], "private-task", 1_000_000);
+    expect(row.candidate?.workerRuns).toBe(1_000_000);
   });
 });

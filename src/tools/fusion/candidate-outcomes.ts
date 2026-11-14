@@ -9,6 +9,8 @@ export interface CandidateOutcomeEvidence {
   receipt?: CandidateAcceptanceReceipt;
   /** Only final reruns explicitly attributed to this task, never call-level integration checks. */
   taskChecks: CandidateCheckCounts;
+  /** Actual worker task invocations, including judge retries; absent means unknown, never one. */
+  workerRuns?: number;
 }
 
 const object = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
@@ -27,13 +29,13 @@ export function candidateOutcomeEvidence(row: TaskOutcomeRecord): CandidateOutco
   const taskChecks = counts(row.candidate.taskChecks);
   if (receipt === undefined || taskChecks === undefined || taskChecks.total > receipt.checks.total ||
       taskChecks.passed > receipt.checks.passed || taskChecks.failed > receipt.checks.failed) return undefined;
-  return { receipt, taskChecks };
+  return { receipt, taskChecks, ...(count(row.candidate.workerRuns) && row.candidate.workerRuns > 0 ? { workerRuns: row.candidate.workerRuns } : {}) };
 }
 
 /** Final disposition is telemetry: even promoted candidates never train per-model quality rates. */
 export function withCandidateOutcome(
   record: TaskOutcomeRecord, receipt: CandidateAcceptanceReceipt,
-  finalTaskChecks: readonly Pick<ContractCheckOutcome, "task" | "ok">[], taskId: string,
+  finalTaskChecks: readonly Pick<ContractCheckOutcome, "task" | "ok">[], taskId: string, actualWorkerRuns?: number,
 ): TaskOutcomeRecord {
   const safe = parseCandidateAcceptanceReceipt(receipt);
   const taskChecks = { total: 0, passed: 0, failed: 0 };
@@ -44,5 +46,6 @@ export function withCandidateOutcome(
     if (check.ok) taskChecks.passed += 1;
     else taskChecks.failed += 1;
   }
-  return { ...record, candidate: { ...(safe === undefined ? {} : { receipt: safe }), taskChecks } };
+  return { ...record, candidate: { ...(safe === undefined ? {} : { receipt: safe }), taskChecks,
+    ...(count(actualWorkerRuns) && actualWorkerRuns > 0 ? { workerRuns: actualWorkerRuns } : {}) } };
 }

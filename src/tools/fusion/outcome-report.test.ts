@@ -95,7 +95,7 @@ describe("fusion report", () => {
       const row = { ...task({ acceptance: "checks-passed", acceptanceScope: "task-checks" }), candidate };
       const stats = aggregateOutcomes(parseOutcomeLines(JSON.stringify(row))).workers[0]!;
       expect(stats).toMatchObject({ green: 1, checksPassed: 0, checksUnverified: 1,
-        candidate: { executed: 1, promoted: 0, rejected: 0, unverified: 1 } });
+        candidate: { taskRuns: 1, promoted: 0, rejected: 0, unverified: 1 } });
     }
   });
   it("separates actual writer status-only success from declared check evidence", () => {
