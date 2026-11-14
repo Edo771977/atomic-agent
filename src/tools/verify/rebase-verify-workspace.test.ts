@@ -19,3 +19,9 @@ it("rebases a project root terminated by a shell or template delimiter", () => {
 it("refuses escaped Windows project references instead of reading the source outside the guarded copy", () => {
   expect(() => rebaseVerifyWorkspaceValue({ args: [String.raw`C:\\project\\check.mjs`] }, String.raw`C:\project`, String.raw`C:\actual`)).toThrow(/unsupported absolute project reference/);
 });
+it("preserves case-distinct external paths on Linux", () => {
+  expect(rebaseVerifyWorkspaceValue("/TMP/project/check.mjs", "/tmp/project", "/tmp/actual", "linux")).toBe("/TMP/project/check.mjs");
+});
+it.each(["win32", "darwin"] as const)("folds project case only on %s", platform => {
+  expect(rebaseVerifyWorkspaceValue("/TMP/project/check.mjs", "/tmp/project", "/tmp/actual", platform)).toBe("/tmp/actual/check.mjs");
+});
