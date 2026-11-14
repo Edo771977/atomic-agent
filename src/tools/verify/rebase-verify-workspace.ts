@@ -2,76 +2,148 @@ import { homedir } from "node:os";
 import { posix, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
 
-/** Rebase explicit project references into the workspace that actually executes a guarded check. */
+const unsupported = (): never => { throw new Error("verification check plan has an unsupported absolute project reference"); };
+
+/**
+ * Rebase finite, explicit literals, not evaluated shell/program expressions.
+ * URL spans precede filesystem tokens; quotes keep path spaces/metacharacters.
+ * Recognizable source aliases and unsupported attached options fail closed.
+ */
 export function rebaseVerifyWorkspaceValue<T>(value: T, from: string, to: string, platform: NodeJS.Platform = process.platform, home = homedir()): T {
+  const paths = platform === "win32" ? win32 : posix;
   const fold = (text: string): string => platform === "win32" || platform === "darwin" ? text.toLowerCase() : text;
-  if (typeof value === "string") {
-    const boundary = (next: string | undefined): boolean => next === undefined || /[\/\\\s"'`);,:}\]]/.test(next);
-    const before = (previous: string | undefined): boolean => previous === undefined || /[\s"'`(=;,{\[]/.test(previous);
-    let text: string = value;
-    for (const spelling of [...new Set([from, from.replace(/\\/g, "/")])]) {
-      let consumed = 0, rewritten = "";
-      const searchable = fold(text), needle = fold(spelling);
-      for (let index = searchable.indexOf(needle); index >= 0; index = searchable.indexOf(needle, index + spelling.length)) {
-        const end = index + spelling.length;
-        if (!before(text[index - 1]) || !boundary(text[end])) continue;
-        rewritten += text.slice(consumed, index) + to; consumed = end;
-      }
-      text = rewritten + text.slice(consumed);
-    }
-    // This is a restricted literal-path remapper, not a shell parser. Refuse
-    // recognizable home/escaped/normalized aliases rather than certify a
-    // check that still names its source. External paths and siblings stay put.
-    const paths = platform === "win32" ? win32 : posix;
-    const identity = (path: string): string => {
-      const resolved = paths.resolve(path).replace(/\\/g, "/");
-      return fold(platform === "darwin" ? resolved.normalize("NFC") : resolved);
-    };
-    const root = identity(from);
-    const namesSource = (path: string): boolean => {
-      const normalized = identity(path);
-      return normalized === root || normalized.startsWith(`${root}/`);
-    };
-    const tokens = [...text.matchAll(/[^\s"'`()=;,\[\]]+/g)].map(match => match[0]);
-    tokens.push(...[...text.matchAll(/["'`]([^"'`]+)["'`]/g)].map(match => match[1]!));
-    // A whole argv value may contain literal controls that WHATWG removes
-    // from a scheme; token splitting alone loses that explicit URI.
-    tokens.push(text);
-    for (let token of tokens) {
-      let fileUri: URL | undefined;
-      try { const uri = new URL(token); if (uri.protocol === "file:") fileUri = uri; } catch { /* Not a literal URL. */ }
-      if (fileUri !== undefined) {
-        // Use WHATWG protocol recognition, including its literal control
-        // normalization, instead of enumerating file scheme spellings.
-        try { token = fileURLToPath(fileUri, { windows: platform === "win32" }); }
-        catch (error) {
-          if (error instanceof URIError) {
-            // An invalid percent escape in a later component must not hide
-            // a recognizable source-root prefix. A logging label or an
-            // unrelated malformed URL is not evidence of that reference.
-            const prefix: string[] = [];
-            for (const component of fileUri.pathname.split("/")) {
-              try { decodeURIComponent(component); } catch { break; }
-              prefix.push(component);
-            }
-            const prefixUri = new URL(fileUri);
-            prefixUri.pathname = prefix.join("/") || "/";
-            let nativePrefix: string | undefined;
-            try { nativePrefix = fileURLToPath(prefixUri, { windows: platform === "win32" }); } catch { /* No native source prefix. */ }
-            if (nativePrefix !== undefined && namesSource(nativePrefix)) throw new Error("verification check plan has an unsupported absolute project reference");
-          }
-          // Non-native file URLs and labels (e.g. `file:`) cannot name a
-          // native source file; do not reject benign logging text.
-          continue;
+  const spelling = (text: string): string => platform === "win32" ? text.replace(/\\/g, "/") : text;
+  const identity = (text: string): string => {
+    const absolute = spelling(paths.resolve(text));
+    return fold(platform === "darwin" ? absolute.normalize("NFC") : absolute);
+  };
+  const root = identity(from);
+  const namesSource = (text: string): boolean => {
+    const absolute = identity(text);
+    return absolute === root || absolute.startsWith(root.endsWith("/") ? root : `${root}/`);
+  };
+  const source = spelling(from).replace(/\/$/, "") || "/";
+  const expandHome = (text: string): string => text.replace(/^(?:~|\$HOME|\$\{HOME\}|%USERPROFILE%|\$env:USERPROFILE)(?=[\/\\]|$)/i, home);
+  const drive = (text: string): boolean => platform === "win32" && /^[a-z]:[\/\\]/i.test(text);
+
+  // Return undefined only when this is not an absolute/home path literal.
+  const native = (text: string, allowRewrite = true): string | undefined => {
+    const expanded = expandHome(text);
+    if (!paths.isAbsolute(expanded)) return undefined;
+    if (!namesSource(expanded)) return text;
+    const comparable = spelling(text);
+    const prefix = fold(comparable.slice(0, source.length)) === fold(source) &&
+      (comparable.length === source.length || source === "/" || comparable[source.length] === "/");
+    // Do not silently reinterpret home expansions, dot segments or escaped
+    // separators. They can name the source despite a different literal prefix.
+    const suffix = comparable.slice(source.length);
+    if (!allowRewrite || !prefix || /[\u0000-\u001f\u007f]/.test(text) || /(?:^|\/)\.{1,2}(?:\/|$)/.test(suffix) || /\/\//.test(suffix)) unsupported();
+    return to + text.slice(source.length);
+  };
+
+  const uri = (text: string): string | undefined => {
+    if (drive(text)) return undefined;
+    let url: URL;
+    try { url = new URL(text); } catch { return undefined; }
+    if (url.protocol !== "file:") return text;
+    let filename: string;
+    try { filename = fileURLToPath(url, { windows: platform === "win32" }); }
+    catch (error) {
+      if (error instanceof URIError) {
+        const components: string[] = [];
+        for (const component of url.pathname.split("/")) {
+          try { decodeURIComponent(component); } catch { break; }
+          components.push(component);
         }
+        const prefix = new URL(url); prefix.pathname = components.join("/") || "/";
+        let filenamePrefix: string | undefined;
+        try { filenamePrefix = fileURLToPath(prefix, { windows: platform === "win32" }); } catch { /* No native source prefix. */ }
+        if (filenamePrefix !== undefined && namesSource(filenamePrefix)) unsupported();
       }
-      token = token.replace(/^(?:~|\$HOME|\$\{HOME\}|%USERPROFILE%|\$env:USERPROFILE)(?=[\/\\]|$)/i, home);
-      if (!paths.isAbsolute(token)) continue;
-      if (namesSource(token)) throw new Error("verification check plan has an unsupported absolute project reference");
+      // A benign file label, malformed external URL or non-native file URL
+      // must not become a filesystem substring search through its query.
+      return text;
     }
-    return text as T;
-  }
-  if (Array.isArray(value)) return value.map(item => rebaseVerifyWorkspaceValue(item, from, to, platform, home)) as T;
-  if (value !== null && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, rebaseVerifyWorkspaceValue(item, from, to, platform, home)])) as T;
-  return value;
+    if (namesSource(filename)) unsupported();
+    return text;
+  };
+
+  const literal = (text: string): string | undefined => uri(text) ?? native(text);
+  const delimiter = (char: string): boolean => /[\s"'`()=;,:<>|&@+]/.test(char);
+  const quote = (char: string): boolean => char === '"' || char === "'" || char === "`";
+
+  const scan = (text: string, wholeLiteral: boolean): string => {
+    // Whole argv/quoted path literals retain their spaces. Path lists and
+    // command bodies still need token scanning; a drive's ':' is not a list.
+    const wholeUri = uri(text);
+    if (wholeUri !== undefined) return wholeUri;
+    if (wholeLiteral && !/[;|<>]/.test(text) && !text.slice(drive(text) ? 2 : 0).includes(":")) {
+      const whole = native(text);
+      if (whole !== undefined) return whole;
+    }
+    let result = "";
+    for (let index = 0; index < text.length;) {
+      const char = text[index]!;
+      if (quote(char)) {
+        let end = index + 1;
+        for (; end < text.length; end++) {
+          if (text[end] !== char) continue;
+          let escapes = 0;
+          for (let previous = end - 1; previous > index && text[previous] === "\\"; previous--) escapes++;
+          if (escapes % 2 === 0) break;
+        }
+        if (end === text.length) {
+          // An unterminated quote is not safe to reinterpret as a literal.
+          const remainder = text.slice(index + 1);
+          if (scan(remainder, false) !== remainder) unsupported();
+          result += text.slice(index); break;
+        }
+        const body = text.slice(index + 1, end);
+        result += char + (literal(body) ?? scan(body, false)) + char;
+        index = end + 1; continue;
+      }
+      if (delimiter(char) || /[\[\]{}]/.test(char)) { result += char; index++; continue; }
+
+      const tail = text.slice(index);
+      // URI spans are recognized before '=' and ':' are treated as syntax.
+      const scheme = /^[a-z][a-z\d+.-]*:/i.test(tail) && !drive(tail);
+      let end = index;
+      if (scheme) {
+        while (end < text.length && !/[\s"'`()]/.test(text[end]!)) end++;
+        result += uri(text.slice(index, end)) ?? text.slice(index, end);
+      } else {
+        // A literal root may itself contain spaces/braces/brackets. Consume
+        // that known prefix before looking for surrounding syntax.
+        const attached = /^-[a-z]+(?=[\/\\]|[a-z]:[\/\\])/i.exec(tail)?.[0] ?? "";
+        const pathStart = index + attached.length;
+        const rootCandidate = spelling(text.slice(pathStart, pathStart + source.length));
+        if (fold(rootCandidate) === fold(source)) end = pathStart + source.length;
+        while (end < text.length) {
+          const next = text[end]!;
+          if (delimiter(next)) {
+            if (next === ":" && end === pathStart + 1 && drive(text.slice(pathStart))) { end++; continue; }
+            break;
+          }
+          end++;
+        }
+        if (end === index) { result += char; index++; continue; }
+        const token = text.slice(index, end);
+        if (attached !== "") {
+          const path = token.slice(attached.length);
+          const supported = attached === "-C" || attached === "-I";
+          result += attached + (native(path, supported) ?? path);
+        } else result += native(token) ?? token;
+      }
+      index = end;
+    }
+    return result;
+  };
+
+  const visit = (item: unknown, command = false): unknown => {
+    if (typeof item === "string") return scan(item, !command);
+    if (Array.isArray(item)) return item.map(child => visit(child));
+    if (item !== null && typeof item === "object") return Object.fromEntries(Object.entries(item).map(([key, child]) => [key, visit(child, key === "cmd" || key === "command")]));
+    return item;
+  };
+  return visit(value) as T;
 }
