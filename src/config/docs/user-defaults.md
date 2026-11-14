@@ -104,7 +104,7 @@ Checked snapshot of primitive USER_CONFIG_DEFAULTS values for config version 79.
 - `tools.shell.envPassthrough` (default `["GITHUB_TOKEN", "NOTION_API_KEY"]`).
 - `tools.screen.enabled` (default `false`): the macOS `os.screen.*` computer-use tools ([OS tools](../../tools/os/README.md)); read at start.
 - `tools.screen.point` (default `true`): `os.screen.point`, which only draws marks through the desktop app, plus `os.screen.capture`, on macOS, independent of `tools.screen.enabled`; read at start.
-- `tools.verify.maxCopyBytes` (default `2147483648`, 2 GiB): the largest tree `verify.run` copies into its throwaway workspace off macOS, not counting the linked `node_modules`, `.git`, `dist`, `build`, `target`, `.venv`; a bigger tree is refused, never run in place.
+- `tools.verify.maxCopyBytes` (default `2147483648`, 2 GiB): the largest tree `verify.run` copies into its throwaway workspace off macOS, not counting the linked `node_modules`, `.git`, `dist`, `build`, `target`, `.venv`; a bigger tree is refused, never run in place. It applies to `verify.run` only for now: fusion branch workspaces keep the 2 GiB default.
 
 ## browser
 

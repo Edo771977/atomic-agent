@@ -127,7 +127,7 @@ export interface UserToolsConfig {
   };
 }
 
-/** `tools.verify.maxCopyBytes` default; `verify-workspace-copy.ts` keeps the same value. */
+/** `tools.verify.maxCopyBytes` default; the one definition (`VERIFY_COPY_MAX_BYTES` re-exports it). */
 export const DEFAULT_VERIFY_MAX_COPY_BYTES = 2 * 1024 * 1024 * 1024;
 
 export function createToolsDefaults(): UserToolsConfig {

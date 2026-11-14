@@ -43,6 +43,8 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
+import { DEFAULT_VERIFY_MAX_COPY_BYTES } from "../../config/tool-config.js";
+
 export const VERIFY_COPY_EXCLUDED: ReadonlySet<string> = new Set([
   "node_modules",
   ".git",
@@ -52,7 +54,11 @@ export const VERIFY_COPY_EXCLUDED: ReadonlySet<string> = new Set([
   ".venv",
 ]);
 
-export const VERIFY_COPY_MAX_BYTES = 2 * 1024 * 1024 * 1024;
+/**
+ * The copy limit when the caller passes none: the `tools.verify.maxCopyBytes`
+ * default, owned by the config. Fusion's branch workspaces use it directly.
+ */
+export const VERIFY_COPY_MAX_BYTES: number = DEFAULT_VERIFY_MAX_COPY_BYTES;
 
 export interface VerifyWorkspace {
   /** The copy's path. An unavailable workspace must never be executed. */

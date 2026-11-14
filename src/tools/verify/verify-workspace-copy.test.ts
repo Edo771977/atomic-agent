@@ -3,11 +3,13 @@ import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
+import { DEFAULT_VERIFY_MAX_COPY_BYTES } from "../../config/tool-config.js";
 import {
   createVerifyWorkspace,
   measureTree,
   type SymlinkFn,
   VERIFY_COPY_EXCLUDED,
+  VERIFY_COPY_MAX_BYTES,
 } from "./verify-workspace-copy.js";
 
 let root: string;
@@ -43,6 +45,12 @@ describe("measureTree", () => {
     expect(size).toBe(13 + 10 + 18);
     expect(await measureTree(work, 5)).toBeGreaterThan(5);
     expect(await measureTree(work, 5)).toBeLessThan(13 + 10 + 18);
+  });
+});
+
+describe("VERIFY_COPY_MAX_BYTES", () => {
+  it("is the tools.verify.maxCopyBytes default", () => {
+    expect(VERIFY_COPY_MAX_BYTES).toBe(DEFAULT_VERIFY_MAX_COPY_BYTES);
   });
 });
 
