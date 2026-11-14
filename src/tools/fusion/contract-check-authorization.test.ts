@@ -188,3 +188,19 @@ describe("verification executor schema identity", () => {
     await run(hold, [spec]); expect(selected).toBe("node");
   });
 });
+
+describe("verification local page read policy", () => {
+  it.each(["path", "url", "service-url"] as const)("holds a protected state target on the %s surface before its runner", async surface => {
+    const { createReadTargetCheck } = await import("../read-scope/confine-reads.js");
+    const { pathToFileURL } = await import("node:url");
+    const path = resolve(cwd, "protected-state", "config.json");
+    const prompts: ApprovalRequest[] = [];
+    const gate: ApprovalGate = new ApprovalGate({ level: 4, emit: request => { prompts.push(request); queueMicrotask(() => gate.resolve({ approvalId: request.approvalId, approved: false })); } });
+    const runner = vi.fn<ContractCheckRunner>();
+    const checkReadTargets = createReadTargetCheck({ approvals: { approvals: gate, approvalRequired: true }, grantedDirs: () => [], stateSecrets: { stateDir: resolve(cwd, "protected-state"), files: [path] } });
+    const hold = createContractCheckHold({ runner, approvals: gate, approvalRequired: true, sessionId: "parent", workingDir: cwd, tool: "fusion.delegate", checks: [], signal, checkReadTargets });
+    const spec = surface === "path" ? { kind: "page", path, probes: [{ name: "state", expr: "document.body.innerText" }] } : surface === "url" ? { kind: "page", url: pathToFileURL(path).href } : { kind: "service", start: { cmd: "node", args: ["safe.js"] }, ready: { port: 3000 }, requests: [{ url: pathToFileURL(path).href }] };
+    await expect(run(hold, [spec])).rejects.toThrow();
+    expect(prompts.map(p => p.category)).toEqual(["state_secret"]); expect(runner).not.toHaveBeenCalled();
+  });
+});

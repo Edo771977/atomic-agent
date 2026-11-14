@@ -50,3 +50,6 @@ export { READ_TOOL_TARGETS as WORKER_READ_TOOL_TARGETS } from "./read-scope-targ
 
 export { createCommandReadCheck } from "./confine-reads.js";
 export type { CommandReadCheck } from "./confine-reads.js";
+
+export { createReadTargetCheck } from "./confine-reads.js";
+export type { ReadTargetCheck } from "./confine-reads.js";

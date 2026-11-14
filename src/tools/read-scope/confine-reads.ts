@@ -64,6 +64,56 @@ export interface ConfineReadsOptions {
   stateSecrets?: StateSecrets;
 }
 
+export type ReadTargetCheck = (tool: string, args: Record<string, unknown>, ctx: ToolContext, targetTool?: string) => Promise<CompressedToolResult | null>;
+
+/** Registry reads and programmatic local verification use one canonical boundary. */
+export function createReadTargetCheck(options: ConfineReadsOptions): ReadTargetCheck {
+  if (options.approvals === undefined && (options.readScope !== undefined || options.stateSecrets !== undefined)) throw new Error("read target checks require an approval gate");
+  const asker = options.approvals === undefined ? null : new ReadOutsideApprover(options.approvals);
+  const secrets = options.stateSecrets ?? null;
+  const scoped = () => options.readScope?.() === "working-dir";
+  return async (tool, args, ctx, targetTool = tool) => {
+    const invalid = invalidReadUrlTarget(targetTool, args);
+    if (invalid !== null) return compressToolResult({
+      tool,
+      status: "error",
+      output: `${tool}: ${invalid.url} ${invalid.why}, so the local file was not opened or read.`,
+      details: { url: invalid.url, path: invalid.url, reason: "local_file_refused" },
+    });
+    const worker = checkWorkerRead(
+      targetTool,
+      args,
+      ctx,
+      options.grantedDirs(ctx.sessionId),
+    );
+    if (worker !== null) return worker;
+    // Before the scope: a secret file asks even where reads are
+    // unrestricted. Once approved, that file needs no scope question
+    // on top for this call (and is not remembered for the next one).
+    const secretPaths =
+      asker === null || secrets === null
+        ? []
+        : findStateSecretReads(targetTool, args, ctx, secrets);
+    if (asker !== null && secretPaths.length > 0) {
+      await asker.confirmStateSecret(
+        tool,
+        ctx,
+        { reason: stateSecretReadPrompt(secretPaths) },
+        secretPaths,
+      );
+    }
+    if (asker === null || !scoped()) return null;
+    const refusal = await asker.admit(
+      tool,
+      ctx,
+      (roots) =>
+        findSessionReadOutside(targetTool, args, ctx, [...roots, ...secretPaths]),
+      (path, root) => readOutsidePrompt(path, ctx.workingDir, root),
+    );
+    return refusal;
+  };
+}
+
 export type CommandReadCheck = (tool: string, args: Record<string, unknown>, ctx: ToolContext) => Promise<CompressedToolResult | null>;
 
 /** The same pre-exec read/secret boundary for registry tools and programmatic checks. */
@@ -71,11 +121,11 @@ export function createCommandReadCheck(options: ConfineReadsOptions): CommandRea
   if (options.approvals === undefined) {
     if (options.readScope !== undefined || options.stateSecrets !== undefined) throw new Error("command read checks require an approval gate");
     return async () => null;
-}
-const asker = new ReadOutsideApprover(options.approvals);
-const secrets = options.stateSecrets ?? null;
-const scoped = () => options.readScope?.() === "working-dir";
-return async (
+  }
+  const asker = new ReadOutsideApprover(options.approvals);
+  const secrets = options.stateSecrets ?? null;
+  const scoped = () => options.readScope?.() === "working-dir";
+  return async (
     tool: string,
     args: Record<string, unknown>,
     ctx: Parameters<ToolDefinition["run"]>[1],
@@ -173,9 +223,8 @@ export function confineReads(
     options.approvals === undefined
       ? null
       : new ReadOutsideApprover(options.approvals);
-  const secrets = options.stateSecrets ?? null;
   const confined: string[] = [];
-  const scoped = () => options.readScope?.() === "working-dir";
+  const checkReadTarget = createReadTargetCheck(options);
   const install = (name: string, run: ToolDefinition["run"]): void => {
     const inner = registry.get(name);
     confined.push(name);
@@ -189,43 +238,7 @@ export function confineReads(
     if (!registry.has(name)) continue;
     const inner = registry.get(name);
     install(name, async (args, ctx) => {
-      const invalid = invalidReadUrlTarget(name, args);
-      if (invalid !== null) return compressToolResult({
-        tool: name,
-        status: "error",
-        output: `${name}: ${invalid.url} ${invalid.why}, so the local file was not opened or read.`,
-        details: { url: invalid.url, path: invalid.url, reason: "local_file_refused" },
-      });
-      const worker = checkWorkerRead(
-        name,
-        args,
-        ctx,
-        options.grantedDirs(ctx.sessionId),
-      );
-      if (worker !== null) return worker;
-      // Before the scope: a secret file asks even where reads are
-      // unrestricted. Once approved, that file needs no scope question
-      // on top for this call (and is not remembered for the next one).
-      const secretPaths =
-        asker === null || secrets === null
-          ? []
-          : findStateSecretReads(name, args, ctx, secrets);
-      if (asker !== null && secretPaths.length > 0) {
-        await asker.confirmStateSecret(
-          name,
-          ctx,
-          { reason: stateSecretReadPrompt(secretPaths) },
-          secretPaths,
-        );
-      }
-      if (asker === null || !scoped()) return inner.run(args, ctx);
-      const refusal = await asker.admit(
-        name,
-        ctx,
-        (roots) =>
-          findSessionReadOutside(name, args, ctx, [...roots, ...secretPaths]),
-        (path, root) => readOutsidePrompt(path, ctx.workingDir, root),
-      );
+      const refusal = await checkReadTarget(name, args, ctx);
       return refusal ?? inner.run(args, ctx);
     });
   }

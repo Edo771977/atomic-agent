@@ -1,6 +1,6 @@
 import type { ApprovalGate } from "../../approval/approval-gate.js";
 import { maskSecrets, type KnownSecret } from "../../error-reporting/secret-detector.js";
-import type { CommandReadCheck } from "../read-scope/confine-reads.js";
+import type { CommandReadCheck, ReadTargetCheck } from "../read-scope/confine-reads.js";
 import type { ShellGuardPolicy } from "../os/shell-command-guard/index.js";
 import { authorizeVerifyBatch } from "../verify/verify-authorization.js";
 import type { ContractCheck } from "./contract.js";
@@ -33,6 +33,7 @@ export function createContractCheckHold(options: {
   signal: AbortSignal;
   shellPolicy?: ShellGuardPolicy;
   checkCommandReads?: CommandReadCheck;
+  checkReadTargets?: ReadTargetCheck;
   knownSecrets?: readonly KnownSecret[];
   readRoots?: readonly string[];
   checkInputs?: readonly string[];
@@ -47,6 +48,7 @@ export function createContractCheckHold(options: {
         approvals: options.approvals as ApprovalGate, approvalRequired: options.approvalRequired,
         ...(options.shellPolicy === undefined ? {} : { shellPolicy: options.shellPolicy }),
         ...(options.checkCommandReads === undefined ? {} : { checkCommandReads: options.checkCommandReads }),
+        ...(options.checkReadTargets === undefined ? {} : { checkReadTargets: options.checkReadTargets }),
         ...(options.knownSecrets === undefined ? {} : { knownSecrets: options.knownSecrets }),
       }, {
         sessionId: options.sessionId, workingDir, ruleWorkdir: options.workingDir,

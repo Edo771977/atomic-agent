@@ -154,7 +154,7 @@ import { createTaskPermitPool, type TaskPermit } from "./task-permits.js";
 import { VERIFY_COPY_MAX_BYTES } from "../verify/verify-workspace-copy.js";
 import { createContractCheckHold } from "./contract-check-hold.js";
 import type { ShellGuardPolicy } from "../os/shell-command-guard/index.js";
-import type { CommandReadCheck } from "../read-scope/confine-reads.js";
+import type { CommandReadCheck, ReadTargetCheck } from "../read-scope/confine-reads.js";
 
 export const FUSION_DELEGATE_TOOL = "fusion.delegate";
 
@@ -174,6 +174,7 @@ export interface FusionDelegateDeps extends WorkerRunnerDeps {
   /** Shared pre-exec verification policy; installed by runtime composition. */
   shellPolicy?: ShellGuardPolicy;
   checkCommandReads?: CommandReadCheck;
+  checkReadTargets?: ReadTargetCheck;
   slotManager: Pick<SlotManager, "poolSize">;
   /** Live read — the operator can leave fusion mid-turn. */
   resolveRunMode: () => ResolvedRunMode;
@@ -1140,6 +1141,7 @@ export function buildFusionDelegateTool(
         signal: runSignal,
         ...(deps.shellPolicy === undefined ? {} : { shellPolicy: deps.shellPolicy }),
         ...(deps.checkCommandReads === undefined ? {} : { checkCommandReads: deps.checkCommandReads }),
+        ...(deps.checkReadTargets === undefined ? {} : { checkReadTargets: deps.checkReadTargets }),
         ...(deps.knownSecrets === undefined ? {} : { knownSecrets: collectKnownSecrets() }),
         ...(ctx.readRoots === undefined ? {} : { readRoots: ctx.readRoots }),
         checkInputs: parsed.contract?.checkInputs ?? [],

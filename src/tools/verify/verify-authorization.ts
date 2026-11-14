@@ -5,11 +5,12 @@ import { isSecretEnvName } from "../../sandbox/command-env.js";
 import { execWriteTargets, shellWriteTargets, type ShellGuardPolicy } from "../os/shell-command-guard/index.js";
 import { shellCommandArgv, shellRuleSegments, shellRunsUnreadableScript } from "../os/shell/shell-command-argv.js";
 import { formatShellPreview, needsShellInterpretation, shellGrantShape } from "../os/shell/shell-interpretation.js";
-import type { CommandReadCheck } from "../read-scope/confine-reads.js";
+import type { CommandReadCheck, ReadTargetCheck } from "../read-scope/confine-reads.js";
 import type { ToolContext } from "../tool-registry.js";
 import { rebaseVerifyWorkspaceValue } from "./rebase-verify-workspace.js";
 import { guardVerifyRun, verifyRunCommands } from "./verify-run-guard.js";
 import { parseVerifyRunArgs } from "./verify-run-args.js";
+import { localFileOfUrl, invalidLocalFileUrlReason } from "../read-scope/read-scope-targets.js";
 
 /** No partial consent: oversized plans are refused before prompting or executing. */
 const MAX_AUTHORIZATION_BYTES = 64 * 1024;
@@ -21,6 +22,7 @@ export class VerifyGuardRefusal extends Error {
 export interface VerifyAuthorizationOptions extends DangerousToolOptions {
   shellPolicy?: ShellGuardPolicy;
   checkCommandReads?: CommandReadCheck;
+  checkReadTargets?: ReadTargetCheck;
   knownSecrets?: readonly KnownSecret[];
   /** Interactive checks may use a worker's approved scope; contract checks have their own preflight. */
   allowFanoutScope?: boolean;
@@ -138,6 +140,21 @@ export async function authorizeVerifyBatch(
     }
   }
   for (const { logical, cwd } of plans) {
+    const readContext = { ...ctx, workingDir: cwd, readRoots: [project, ...(ctx.readRoots ?? [])] };
+    const paths = logical.kind === "page" && logical.path !== undefined ? [resolve(cwd, logical.path)] : [];
+    const urls = [logical.url, logical.ready?.url, ...(logical.requests ?? []).flatMap(request => [request.url, request.path])];
+    for (const url of urls) {
+      if (url === undefined) continue;
+      const invalid = invalidLocalFileUrlReason(url);
+      if (invalid !== null) throw new Error(`verification read target ${invalid}`);
+      const path = localFileOfUrl(url);
+      if (path !== null) paths.push(path);
+    }
+    for (const path of new Set(paths)) {
+      ctx.signal.throwIfAborted();
+      const refusal = await options.checkReadTargets?.("verify.run", { path }, readContext, "os.fs.read");
+      if (refusal !== undefined && refusal !== null) throw new Error(maskSecrets(refusal.summary, known));
+    }
     for (const command of verifyRunCommands(logical)) {
       ctx.signal.throwIfAborted();
       const refusal = await options.checkCommandReads?.("verify.run", { cmd: command.cmd, args: command.args, env: logical.env }, { ...ctx, workingDir: cwd, readRoots: [project, ...(ctx.readRoots ?? [])] });
