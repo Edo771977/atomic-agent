@@ -115,6 +115,22 @@ describe.skipIf(process.platform === "win32")(
       expect(asked).toEqual([]);
     });
 
+    it("goes to the gate inside the scope after outside content (agent.taintReview)", async () => {
+      gate.setTaintReview(() => true);
+      gate.noteUntrustedContent(WORKER, "a web page");
+      const err = await tool()
+        .run({ cmd: "ls", args: ["./"] }, ctx())
+        .then(
+          () => null,
+          (e: unknown) => e,
+        );
+      expect(err).toBeInstanceOf(ApprovalDeniedError);
+      expect((err as ApprovalDeniedError).message).toContain(FUSION_WORKER_APPROVAL_MARKER);
+      // Off: the scope covers it again.
+      gate.setTaintReview(() => false);
+      expect((await tool().run({ cmd: "ls", args: ["./"] }, ctx())).status).toBe("ok");
+    });
+
     it("keeps the general refusal for an ordinary command outside the scope", async () => {
       const outside = await mkdtemp(join(tmpdir(), "atomic-shell-outside-"));
       try {

@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -9,7 +9,9 @@ import {
   evictPromptCache,
   PROMPT_CACHE_MIN_TOKENS,
   promptCacheFingerprint,
+  promptCacheAtLaunch,
   promptCacheLaunchArgs,
+  purgePromptCache,
   restorePromptCaches,
   savePromptCaches,
 } from "./prompt-disk-cache.js";
@@ -144,5 +146,60 @@ describe("saving and restoring the slots' caches (ATO-456)", () => {
     expect(existsSync(join(dir, "slot-0-0.bin"))).toBe(false);
     expect(existsSync(join(dir, "slot-1-0.bin"))).toBe(false);
     expect(existsSync(join(dir, "slot-2-0.bin"))).toBe(true);
+  });
+});
+
+describe.skipIf(process.platform === "win32")("the prompt cache folder is the owner's only", () => {
+  let dataDir: string;
+  beforeEach(() => {
+    dataDir = mkdtempSync(join(tmpdir(), "prompt-cache-mode-"));
+  });
+  afterEach(() => rmSync(dataDir, { recursive: true, force: true }));
+  const mode = (path: string) => statSync(path).mode & 0o777;
+
+  it("tightens an existing folder and the saves in it on every launch", () => {
+    const dir = resolvePromptCacheDir(dataDir);
+    mkdirSync(dir, { mode: 0o755 });
+    chmodSync(dir, 0o755);
+    writeFileSync(join(dir, "slot-1-0.bin"), "state", { mode: 0o644 });
+    chmodSync(join(dir, "slot-1-0.bin"), 0o644);
+    promptCacheLaunchArgs(dataDir);
+    expect(mode(dir)).toBe(0o700);
+    expect(mode(join(dir, "slot-1-0.bin"))).toBe(0o600);
+  });
+
+  it("makes a save the server wrote with its umask readable by the owner only", async () => {
+    promptCacheLaunchArgs(dataDir);
+    const dir = resolvePromptCacheDir(dataDir);
+    const fetchImpl = (async (input: string | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/slots") return new Response(JSON.stringify([{ id: 0, is_processing: false }]));
+      const filename = (JSON.parse(String(init?.body)) as { filename: string }).filename;
+      writeFileSync(join(dir, filename), "state", { mode: 0o644 });
+      chmodSync(join(dir, filename), 0o644);
+      return new Response(JSON.stringify({ id_slot: 0, filename, n_saved: 5_000 }));
+    }) as typeof fetch;
+    expect(await savePromptCaches({ dataDir, port: 1, apiKey: null, fingerprint: "fp", fetchImpl })).toBe(1);
+    const saved = readdirSync(dir).filter((n) => n.endsWith(".bin"));
+    expect(saved).toHaveLength(1);
+    expect(mode(join(dir, saved[0]!))).toBe(0o600);
+  });
+
+  it("purgePromptCache removes the folder and what it held", () => {
+    promptCacheLaunchArgs(dataDir);
+    writeFileSync(join(resolvePromptCacheDir(dataDir), "slot-1-0.bin"), "state");
+    purgePromptCache(dataDir);
+    expect(existsSync(resolvePromptCacheDir(dataDir))).toBe(false);
+    expect(() => purgePromptCache(dataDir)).not.toThrow();
+  });
+
+  it("a launch with the cache off deletes what an earlier run saved; an unreadable setting keeps it", () => {
+    const dir = resolvePromptCacheDir(dataDir);
+    expect(promptCacheAtLaunch(dataDir, true)).toEqual(["--slot-save-path", dir]);
+    writeFileSync(join(dir, "slot-1-0.bin"), "state");
+    expect(promptCacheAtLaunch(dataDir, null)).toEqual([]);
+    expect(existsSync(join(dir, "slot-1-0.bin"))).toBe(true);
+    expect(promptCacheAtLaunch(dataDir, false)).toEqual([]);
+    expect(existsSync(dir)).toBe(false);
   });
 });

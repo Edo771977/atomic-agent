@@ -41,7 +41,9 @@ const TAINT_SENSITIVE: Record<ApprovalCategory, boolean> = {
   trust_config: true,
   publish: true,
   email: true,
-  fusion_fanout: false,
+  // Workers run commands and requests in its directories unasked: after
+  // outside content the fan-out is the way round every other hold.
+  fusion_fanout: true,
   fs_read_outside: false,
   state_secret: true,
   paid_generation: false,
@@ -97,6 +99,9 @@ function cleanSource(source: string): string {
     ? `${label.slice(0, TAINT_SOURCE_MAX_CHARS - 1)}…`
     : label;
 }
+
+/** Source an orchestrator is marked with when one of its Fusion workers read outside content. */
+export const FUSION_WORKER_TAINT_SOURCE = "a Fusion worker";
 
 /** Decision reason of a held request the reviewer let through. */
 export const TAINT_REVIEW_LOW_REASON = "auto-approved (risk review after outside content: low)";

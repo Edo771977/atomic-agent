@@ -17,7 +17,7 @@ import { currentRunLog } from "./server-fault.js";
 import { readLogTail } from "./log-tail.js";
 import {
   promptCacheFingerprint,
-  promptCacheLaunchArgs,
+  promptCacheAtLaunch,
   restorePromptCaches,
   savePromptCaches,
   statModelFile,
@@ -984,12 +984,12 @@ function readConfiguredCompletionMaxTokens(): number | undefined {
   }
 }
 
-/** `localModels.managed.promptDiskCache`; off when config cannot be read. */
-function readConfiguredPromptDiskCache(): boolean {
+/** `localModels.managed.promptDiskCache`; `null` (treated as off) when config cannot be read. */
+function readConfiguredPromptDiskCache(): boolean | null {
   try {
     return getConfig().localModels.managed.promptDiskCache === true;
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -1419,7 +1419,8 @@ export async function startDaemon(
   );
   // ATO-456: off by default. The fingerprint is taken before the save
   // path is added, which is not part of what a saved cache depends on.
-  const promptCacheFp = readConfiguredPromptDiskCache()
+  const promptDiskCache = readConfiguredPromptDiskCache();
+  const promptCacheFp = promptDiskCache === true
     ? promptCacheFingerprint({
         args,
         engineBuild: (() => {
@@ -1429,7 +1430,8 @@ export async function startDaemon(
         modelFile: statModelFile(modelPath),
       })
     : null;
-  if (promptCacheFp) args.push(...promptCacheLaunchArgs(opts.dataDir));
+  // Off: an earlier run's saves are deleted rather than left behind.
+  args.push(...promptCacheAtLaunch(opts.dataDir, promptDiskCache));
 
   // The launch decisions, in the daemon's own log where a reader looking
   // at the flags will look for them. Their first line is also the marker
@@ -1612,7 +1614,7 @@ export interface StopDaemonOptions {
  * `PROMPT_CACHE_SAVE_BUDGET_MS`; never throws.
  */
 async function savePromptCachesBeforeStop(dataDir: string, opts?: StopDaemonOptions): Promise<void> {
-  if (opts?.savePromptCache === false || !readConfiguredPromptDiskCache()) return;
+  if (opts?.savePromptCache === false || readConfiguredPromptDiskCache() !== true) return;
   try {
     let target: { pid: number; port: number; apiKey: string | null } | null = null;
     const core = (() => {

@@ -70,8 +70,10 @@ export function isTrustDirectoryEntry(entry: string): boolean {
  * config: the trust surface above, plus the bearer key the managed
  * llama-server is launched with (`resolveApiKeyFilePath`), the session
  * records Atomic Chat Core writes with their per-session key
- * (`coreSessionPath`) and the cached Atomic Mail session
- * (`resolveSessionPath`). Reading one of these through an agent tool,
+ * (`coreSessionPath`), the cached Atomic Mail session
+ * (`resolveSessionPath`) and the folder of saved prompt caches
+ * (`resolvePromptCacheDir`, a directory entry: a shell command naming
+ * anything under it asks). Reading one of these through an agent tool,
  * or naming one in a shell command, asks as `state_secret` (pinned at
  * level 5, never grantable; `src/tools/read-scope/state-secrets.ts`).
  *
@@ -91,6 +93,8 @@ export function getStateSecretPaths(paths: {
     join(paths.localModelsDataDir, "core", "chat.json"),
     join(paths.localModelsDataDir, "core", "embedding.json"),
     join(paths.stateDir, "atomic-mail", "session.json"),
+    // The saved prompt caches (`resolvePromptCacheDir`): whole prompts' token ids.
+    join(paths.localModelsDataDir, "prompt-cache") + sep,
   ];
 }
 

@@ -147,11 +147,94 @@ describe("ApprovalGate review after outside content (ATO-618)", () => {
   });
 
   it("refuses for a session under a refuse policy instead of parking a prompt", async () => {
-    const { gate, emitted, review } = setup({ answer: { risk: "low", reason: "x" } });
+    const { gate, emitted, review } = setup({ answer: { risk: "medium", reason: "x" } });
     gate.setSessionPolicy("s1", { onPrompt: "refuse", reason: "no surface" });
     gate.noteUntrustedContent("s1", "a web page");
     await expect(gate.request(curl)).resolves.toMatchObject({ approved: false, automatic: true, reason: "no surface" });
-    expect(review).not.toHaveBeenCalled();
+    expect(review).toHaveBeenCalledOnce();
     expect(emitted).toHaveLength(0);
+  });
+
+  it("lets the reviewer settle a held GET on a refuse-policy session (a worker after search results)", async () => {
+    const { gate, emitted, review } = setup({ answer: { risk: "low", reason: "docs lookup" } });
+    gate.setSessionPolicy("w1", { onPrompt: "refuse", reason: "refused-by-worker-policy" });
+    gate.noteUntrustedContent("w1", "web search results");
+    expect(gate.holdsForOutsideContent("w1", "http")).toBe(true);
+    await expect(
+      gate.request({ sessionId: "w1", tool: "os.web.fetch", category: "http", reason: "GET https://docs.example/x", preview: "p" }),
+    ).resolves.toMatchObject({ approved: true, reason: TAINT_REVIEW_LOW_REASON });
+    expect(review).toHaveBeenCalledOnce();
+    expect(emitted).toHaveLength(0);
+  });
+
+  it("still refuses on a refuse-policy session when the reviewer is off", async () => {
+    const { gate, review } = setup({ answer: { risk: "low", reason: "x" }, reviewerOn: false });
+    gate.setSessionPolicy("w1", { onPrompt: "refuse", reason: "refused-by-worker-policy" });
+    gate.noteUntrustedContent("w1", "web search results");
+    await expect(
+      gate.request({ sessionId: "w1", tool: "os.web.fetch", category: "http", reason: "GET https://docs.example/x" }),
+    ).resolves.toMatchObject({ approved: false, reason: "refused-by-worker-policy" });
+    expect(review).not.toHaveBeenCalled();
+  });
+
+  it("holds a fan-out after outside content instead of letting level 4 run it", async () => {
+    const { gate, emitted } = setup({ answer: { risk: "low", reason: "x" } });
+    expect(isTaintSensitive("fusion_fanout")).toBe(true);
+    gate.noteUntrustedContent("s1", "a web page");
+    const pending = gate.request({ ...curl, tool: "fusion.delegate", category: "fusion_fanout", reason: "fan out" });
+    await settle();
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0]!.category).toBe("fusion_fanout");
+    gate.reject(emitted[0]!.approvalId, "no");
+    await expect(pending).resolves.toMatchObject({ approved: false });
+  });
+
+  describe("Fusion workers (followTaint)", () => {
+    const worker = (gate: ApprovalGate) => {
+      gate.setSessionPolicy("w1", { onPrompt: "refuse", reason: "refused by the worker policy" });
+      gate.followTaint("w1", "s1");
+    };
+    const post = { ...curl, sessionId: "w1", tool: "os.http.request", category: "http_write" as const };
+
+    it("holds a worker's silent approvals while its orchestrator is tainted", async () => {
+      const { gate, emitted } = setup();
+      worker(gate);
+      gate.noteUntrustedContent("s1", "a web page");
+      expect(gate.holdsForOutsideContent("w1", "shell")).toBe(true);
+      await expect(gate.request(post)).resolves.toMatchObject({ approved: false, reason: "refused by the worker policy" });
+      await expect(gate.request({ ...curl, sessionId: "w1" })).resolves.toMatchObject({ approved: false });
+      expect(emitted).toHaveLength(0);
+    });
+
+    it("marks the orchestrator when a worker reads outside content", async () => {
+      const { gate } = setup();
+      worker(gate);
+      gate.noteUntrustedContent("w1", "a web page");
+      expect(gate.holdsForOutsideContent("s1", "http")).toBe(true);
+      // The worker's own turn start clears only its own taint, not the parent's.
+      gate.clearUntrustedContent("w1");
+      expect(gate.holdsForOutsideContent("w1", "http")).toBe(true);
+    });
+
+    it("drops the link with the worker's grants", async () => {
+      const { gate } = setup();
+      worker(gate);
+      gate.clearSessionGrants("w1");
+      gate.noteUntrustedContent("s1", "a web page");
+      expect(gate.holdsForOutsideContent("w1", "shell")).toBe(false);
+      gate.clearUntrustedContent("s1");
+      gate.noteUntrustedContent("w1", "a web page");
+      expect(gate.holdsForOutsideContent("s1", "shell")).toBe(false);
+    });
+
+    it("changes nothing while agent.taintReview is off", async () => {
+      const { gate } = setup({ taintReview: false });
+      worker(gate);
+      gate.noteUntrustedContent("s1", "a web page");
+      await expect(gate.request(post)).resolves.toMatchObject({ approved: true });
+      await expect(
+        gate.request({ ...curl, tool: "fusion.delegate", category: "fusion_fanout", reason: "fan out" }),
+      ).resolves.toMatchObject({ approved: true });
+    });
   });
 });

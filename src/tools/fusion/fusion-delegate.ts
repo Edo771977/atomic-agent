@@ -861,8 +861,11 @@ export function buildFusionDelegateTool(
       // so re-delegating a declined write is asked about again.
       const declinedInScope =
         deps.approvals.hasDeclinedUnder?.(ctx.sessionId, writeScope) ?? false;
+      // Nor after outside content (`agent.taintReview`): the standing yes
+      // was given before the text that may now be steering the fan-out.
       const alreadyApproved =
         !declinedInScope &&
+        !(deps.approvals.holdsForOutsideContent?.(ctx.sessionId, "fusion_fanout") ?? false) &&
         (deps.approvals.fanoutScopes?.turnGrantCovers(
           ctx.sessionId,
           writeScope,

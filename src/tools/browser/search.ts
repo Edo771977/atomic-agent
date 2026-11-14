@@ -10,6 +10,7 @@ import {
 } from "./browser-domain-policy.js";
 import { gateBrowserUrl, recheckLandedPage } from "./gate-browser-url.js";
 import { searchUrlFor } from "./search-engines.js";
+import { BROWSER_PAGE_SOURCE } from "../untrusted-tool-output.js";
 
 /** The engine's host goes through the same domain lists as a navigation. */
 export function buildBrowserSearchTool(
@@ -23,6 +24,8 @@ export function buildBrowserSearchTool(
     description:
       "Run a web search in the live browser: opens the engine's results page and refreshes the world snapshot. Engine defaults to google. Use only when the user explicitly asks to search via the browser, or when you then need to click/scroll/read the live results page.",
     readonly: false,
+    // The results page is someone else's text, and it reaches `### world`.
+    untrustedOutput: BROWSER_PAGE_SOURCE,
     async run(rawArgs, ctx) {
       const query = rawArgs.query;
       if (typeof query !== "string" || query.length === 0) {
