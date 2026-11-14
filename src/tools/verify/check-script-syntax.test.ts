@@ -1,7 +1,8 @@
 import { chmod, mkdtemp, rm, readdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { createRequire, syncBuiltinESMExports } from "node:module";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   type CheckerRun,
@@ -31,6 +32,25 @@ async function file(name: string, content: string): Promise<string> {
 }
 
 describe("runChecker", () => {
+  it("does not invoke spawn at all for an already-cancelled checker", async () => {
+    const childProcess = createRequire(import.meta.url)("node:child_process") as typeof import("node:child_process");
+    const spawn = vi.spyOn(childProcess, "spawn");
+    syncBuiltinESMExports();
+    try {
+      // The successful control proves this spy observes the imported
+      // binding runChecker actually calls, rather than an unused copy.
+      expect(await runChecker(process.execPath, ["-e", "0"], { cwd: dir })).toMatchObject({ exitCode: 0 });
+      expect(spawn).toHaveBeenCalledTimes(1);
+      spawn.mockClear();
+      expect(await runChecker(process.execPath, ["-e", "0"], { cwd: dir, signal: AbortSignal.abort() }))
+        .toMatchObject({ aborted: true, timedOut: true, missing: false, exitCode: null });
+      expect(spawn).not.toHaveBeenCalled();
+    } finally {
+      spawn.mockRestore();
+      syncBuiltinESMExports();
+    }
+  });
+
   it("preserves checker argv through a Windows batch shim", async () => {
     const script = await file("argv.cjs", "console.log(JSON.stringify(process.argv.slice(2)))");
     const cmd = process.platform === "win32"
