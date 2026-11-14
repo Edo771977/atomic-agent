@@ -37,7 +37,7 @@ describe("TaskStore failed initialization", () => {
   it("closes after statement initialization fails and preserves that error", () => {
     const failure = new Error("injected statement failure");
     const original = DatabaseCtor.prototype.prepare;
-    vi.spyOn(DatabaseCtor.prototype, "prepare").mockImplementation(function (sql, ...args) {
+    vi.spyOn(DatabaseCtor.prototype, "prepare").mockImplementation(function (this: InstanceType<typeof DatabaseCtor>, sql, ...args) {
       if (sql.startsWith("INSERT INTO tasks")) throw failure;
       return original.call(this, sql, ...args);
     });
