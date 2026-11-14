@@ -1,7 +1,7 @@
 import { describeReason } from "./describe-reason.js";
 import type { FailedAttempt } from "./failed-attempts.js";
 import type { ResolvedFallbackChain } from "./fallback-config.js";
-import { falloverCause } from "./link-failure-kind.js";
+import { falloverCause, isSpendLimitRefusal } from "./link-failure-kind.js";
 import { classifyFailureCause } from "../reliability/classify-failure-cause.js";
 import type { FailureCauseId } from "../reliability/failure-catalog.js";
 import {
@@ -30,7 +30,7 @@ export interface ProviderSwitchNotice {
    * (`falloverCause`), when it is a cloud provider's answer. The reason
    * text is cut short and can read a rate limit as billing; this cannot.
    */
-  cause?: "billing" | "auth" | "spend-limit" | "other";
+  cause?: "billing" | "auth" | "spend-limit" | "spend-allowance" | "other";
   /**
    * The failure-catalog cause of the error behind an "away"
    * (`classifyFailureCause`), for the plain "switched to" sentence
@@ -182,12 +182,9 @@ export class ProviderFallbackChain {
     const { timing } = this.resolve();
     const p = this.partition(partitionKey);
     const chain = this.chainFor(p);
-    registerBreakerFailure(
-      this.breaker(p, fromId),
-      this.now(),
-      decision.immediate,
-      timing,
-    );
+    if (!isSpendLimitRefusal(err)) {
+      registerBreakerFailure(this.breaker(p, fromId), this.now(), decision.immediate, timing);
+    }
 
     const idx = chain.indexOf(fromId);
     // Next healthy link after `fromId`: one whose cooldown has elapsed, so

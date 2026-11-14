@@ -152,8 +152,9 @@ function pickCause(err: unknown, category: LlmFailureCategory): FailureCauseId {
   }
 
   // ATO-649: our daily ceiling refused the paid link before sending.
-  if (chain.some((l) => l instanceof DailySpendLimitError)) {
-    return "daily_limit_reached";
+  const spendLimit = chain.find((l): l is DailySpendLimitError => l instanceof DailySpendLimitError);
+  if (spendLimit !== undefined) {
+    return spendLimit.wouldExceed ? "daily_allowance_insufficient" : "daily_limit_reached";
   }
 
   if (category === "transport") {

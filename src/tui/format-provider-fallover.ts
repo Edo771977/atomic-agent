@@ -38,11 +38,13 @@ export function formatProviderFalloverNotice(
         ? `${from} refused the credentials, which will not clear by itself — check the API key in <stateDir>/.env. Until then every answer comes from ${to}.`
         : cause === "spend-limit"
           ? `Cloud calls are paused until tomorrow (llm.costTracking.onDailyLimit is "local"). Until then every answer comes from ${to}.`
+          : cause === "spend-allowance"
+            ? `This request did not fit the remaining daily allowance on ${from}. Trying the configured fallback ${to}, which must fit the same allowance.`
           : `Answers come from ${to} until ${from} recovers.`,
   ].join("\n");
 }
 
-export type FalloverCause = "billing" | "auth" | "spend-limit" | "other";
+export type FalloverCause = "billing" | "auth" | "spend-limit" | "spend-allowance" | "other";
 
 /**
  * What kind of failure this was, from the reason text the chain carries.

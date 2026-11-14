@@ -21,6 +21,8 @@ It does nothing when it is off (the default), under the `local` run mode or Fusi
 
 Routing changes the prompt cache's key, not just the model: each provider keeps its own cache, so a turn routed to a different provider than the previous turn starts cold and pays the full prompt (stable prefix included) at uncached prices, and the next turn back pays it again. Rules that alternate providers turn by turn can cost more than they save; prefer rules that keep a session on one provider for runs of turns.
 
+The final request body can reveal that the routed link cannot fit even its smallest output allowance while today's remaining allowance is positive. That request-fit refusal tries the remaining configured fallback links even under `onDailyLimit: "stop"`; every candidate still reserves against both the daily and owning-turn budgets. Actual daily exhaustion still stops under `"stop"`, and an explicit provider pin still prevents fallback. Budget refusals do not mark a healthy provider as failed or arm its cooldown; switch notices distinguish request fit from exhaustion.
+
 A rule chooses a provider entry, and the entry's `defaultChatModel` is the model; to route to another model of the same service, configure a second entry. A per-rule `model` and step 2 (a small classifier model) are not built.
 
 Read [router](route-turn.ts), [tests](route-turn.test.ts), [config](../../config/llm-router-config.ts).

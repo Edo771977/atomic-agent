@@ -60,15 +60,13 @@ const NO: AdvanceDecision = { advance: false, immediate: false };
  * only counts toward the threshold).
  */
 export function shouldAdvance(err: unknown): AdvanceDecision {
-  // The day's spend ceiling refused this paid link before anything was
-  // sent (ATO-649). With `onDailyLimit: "stop"` (the default) no other
-  // link is tried: the turn ends saying the limit is reached. With
-  // `"local"` the next link (the local model, when the chain has one) is
-  // exactly where the turn should go. Not immediate: the breaker has
-  // nothing to learn about the provider from our own ceiling.
+  // A request bound that does not fit a positive daily allowance can
+  // still fit on a cheaper configured link. Actual exhaustion obeys
+  // onDailyLimit: stop; every candidate still runs its own admission.
+  // This administrative refusal says nothing about provider health.
   const spendLimit = findDailySpendLimitError(err);
   if (spendLimit !== null) {
-    return spendLimit.onLimit === "local" ? { advance: true, immediate: false } : NO;
+    return spendLimit.wouldExceed || spendLimit.onLimit === "local" ? { advance: true, immediate: false } : NO;
   }
   // A 400/413 that names the reply cap or the context length is the
   // request being too big for the model, not the link being down. It is

@@ -4,7 +4,7 @@
  *
  * Thrown from the fallback seam's per-attempt hook. What the chain does
  * with it follows `llm.costTracking.onDailyLimit`, carried on the error
- * as `onLimit`:
+ * as `onLimit`, once the allowance is actually exhausted:
  *  - `"stop"` (default): `shouldAdvance` does not move on, so no other
  *    link is tried, the turn ends on this sentence, and every later
  *    paid call that day is refused the same way.
@@ -15,6 +15,9 @@
  * instead of waiting out an outage. A leaf module on purpose: the
  * classifier, the chain and the turn recovery all read it, and none of
  * them may import the others.
+ * A request whose bound does not fit a positive allowance (`wouldExceed`)
+ * can advance to a cheaper configured link under either action. Each
+ * candidate still reserves against the same daily and owning-turn ledgers.
  */
 export type DailySpendLimitAction = "stop" | "local";
 

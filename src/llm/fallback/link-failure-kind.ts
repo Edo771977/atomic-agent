@@ -9,7 +9,7 @@ import { isSubscriptionCliSetupError } from "../provider/subscription-cli/subscr
 import { TransportError } from "../reliability/llm-failures.js";
 import { isNetworkError } from "../reliability/network-error.js";
 import { readProviderErrorVerdict } from "../reliability/provider-error-verdict.js";
-import { isDailySpendLimitError } from "../reliability/spend-limit-error.js";
+import { isDailySpendLimitError, findDailySpendLimitError } from "../reliability/spend-limit-error.js";
 
 /**
  * Three questions the chain asks about a link that failed, beyond
@@ -97,10 +97,11 @@ export function isSpendLimitRefusal(err: unknown): boolean {
  */
 export function falloverCause(
   err: unknown,
-): "billing" | "auth" | "spend-limit" | "other" | undefined {
+): "billing" | "auth" | "spend-limit" | "spend-allowance" | "other" | undefined {
   // Our own daily ceiling (ATO-649, `onDailyLimit: "local"`): cloud calls
   // are paused for the day, so the notice must not promise a recovery.
-  if (isSpendLimitRefusal(err)) return "spend-limit";
+  const spend = findDailySpendLimitError(err);
+  if (spend !== null) return spend.wouldExceed ? "spend-allowance" : "spend-limit";
   if (!(err instanceof OpenAiHttpError)) return undefined;
   if (isBillingRefusal(err)) return "billing";
   const { status } = err;

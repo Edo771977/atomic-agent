@@ -130,6 +130,10 @@ export const FAILURE_CATALOG = {
     phrase: "Today's cloud spending limit is reached, so cloud calls are paused.",
     action: "switch-model",
   },
+  daily_allowance_insufficient: {
+    phrase: "This request does not fit the remaining daily allowance.",
+    action: "switch-model",
+  },
 
   // No answer at all.
   connection_refused: {
