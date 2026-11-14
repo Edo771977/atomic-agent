@@ -35,3 +35,11 @@ it.each(["~/proj/check.mjs", "$HOME/proj/check.mjs", "${HOME}/proj/check.mjs", "
 it("preserves explicit external home and normalized sibling paths", () => {
   expect(rebaseVerifyWorkspaceValue("$HOME/elsewhere/check.mjs /home/u//proj-sibling/check.mjs", "/home/u/proj", "/tmp/actual", "linux", "/home/u")).toBe("$HOME/elsewhere/check.mjs /home/u//proj-sibling/check.mjs");
 });
+it("keeps original left boundaries across repeated embedded external matches", () => {
+  const value = "/backup/tmp/project/tmp/project/a.js";
+  expect(rebaseVerifyWorkspaceValue(value, "/tmp/project", "/private/checked", "linux")).toBe(value);
+});
+it("rebases multiple independent project arguments while preserving embedded occurrences", () => {
+  const value = "node /backup/tmp/project/tmp/project/a.js '/tmp/project/a.js' /tmp/project/b.js";
+  expect(rebaseVerifyWorkspaceValue(value, "/tmp/project", "/private/checked", "linux")).toBe("node /backup/tmp/project/tmp/project/a.js '/private/checked/a.js' /private/checked/b.js");
+});

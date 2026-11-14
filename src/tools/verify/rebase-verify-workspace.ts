@@ -9,16 +9,14 @@ export function rebaseVerifyWorkspaceValue<T>(value: T, from: string, to: string
     const before = (previous: string | undefined): boolean => previous === undefined || /[\s"'`(=;,{\[]/.test(previous);
     let text: string = value;
     for (const spelling of [...new Set([from, from.replace(/\\/g, "/")])]) {
-      let rest: string = text, rewritten = "";
-      const next = (): number => fold(rest).indexOf(fold(spelling));
-      for (let index = next(); index >= 0; index = next()) {
+      let consumed = 0, rewritten = "";
+      const searchable = fold(text), needle = fold(spelling);
+      for (let index = searchable.indexOf(needle); index >= 0; index = searchable.indexOf(needle, index + spelling.length)) {
         const end = index + spelling.length;
-        if (!before(rest[index - 1]) || !boundary(rest[end])) {
-          rewritten += rest.slice(0, end); rest = rest.slice(end); continue;
-        }
-        rewritten += rest.slice(0, index) + to; rest = rest.slice(end);
+        if (!before(text[index - 1]) || !boundary(text[end])) continue;
+        rewritten += text.slice(consumed, index) + to; consumed = end;
       }
-      text = rewritten + rest;
+      text = rewritten + text.slice(consumed);
     }
     // This is a restricted literal-path remapper, not a shell parser. Refuse
     // recognizable home/escaped/normalized aliases rather than certify a
