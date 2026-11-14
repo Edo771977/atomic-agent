@@ -68,6 +68,10 @@ it("promotes the final checked fanout and preserves original rules and dirty fil
   f.deps.runChecks = async (_, ctx) => { checked.push(ctx.workingDir); return { ok: (await readFile(join(ctx.workingDir, "api.json"), "utf8")).includes("after"), results: [{ ok: true }] }; };
   const result = await buildFusionDelegateTool(f.deps).run({ tasks: [tasks[0]], contract }, f.ctx);
   expect(result.details.candidateIntegration).toMatchObject({ status: "promoted", nonResumable: true });
+  expect(result.summary.startsWith("artifact-evidence: ")).toBe(true);
+  const evidence = JSON.parse(result.summary.split("\n")[0]!.slice("artifact-evidence: ".length));
+  expect(evidence.candidate).toMatchObject({ scope: "candidate-snapshot", disposition: "promoted", receipt: { disposition: "promoted", checkStatus: "passed" } });
+  expect(result.summary.length).toBeLessThanOrEqual(f.deps.outputCharCap);
   expect(checked.every(dir => dir !== f.root)).toBe(true);
   expect(await readFile(join(f.root, "api.json"), "utf8")).toBe('{"name":"after"}');
   expect(await readFile(join(f.root, "personal.txt"), "utf8")).toBe("untracked personal bytes\r\n");
@@ -222,7 +226,7 @@ it.each(["relative", "absolute"] as const)("freezes %s checkInputs from the orig
   f.deps.runChecks = async specs => ({ ok: true, results: specs.map(() => ({ ok: true })) });
   f.deps.runTurn = async session => { await writeFile(join(session.workingDir, "api.json"), "bad"); await writeFile(join(session.workingDir, "check.mjs"), "expected=evil\nline2\nline3\nline4\nline5\n"); return { session, reason: "reply", stepCount: 1 }; };
   const result = await buildFusionDelegateTool(f.deps).run({ tasks: [{ id: "api", instructions: "work", files: ["api.json"] }], contract: { ...contract, checkInputs: [spelling === "relative" ? "check.mjs" : join(f.root, "check.mjs")] } }, f.ctx);
-  expect(result.details.candidateIntegration).toMatchObject({ status: "rejected", acceptanceReceipt: { disposition: "rejected", checkScope: "protected-declared", reason: "check-inputs-changed" } });
+  expect(result.details.candidateIntegration, result.summary).toMatchObject({ status: "rejected", acceptanceReceipt: { disposition: "rejected", checkScope: "declared", inputs: { declared: 1, verified: 0 }, reason: "check-inputs-changed" } });
   expect(await readFile(join(f.root, "api.json"), "utf8")).toBe('{"name":"before"}');
   expect(await readFile(join(f.root, "check.mjs"), "utf8")).toContain("expected=good");
 });
@@ -240,4 +244,14 @@ it.each([true, false])("records executed candidate task telemetry after final pr
   await buildFusionDelegateTool(f.deps).run({ tasks: [{ id: "api", instructions: "work", files: ["api.json"] }], contract }, f.ctx);
   expect(append).toHaveBeenCalledTimes(1);
   expect(append.mock.calls[0]![0]).toEqual([expect.objectContaining({ type: "task", candidate: expect.objectContaining({ receipt: expect.objectContaining({ disposition: passing ? "promoted" : "rejected" }) }) })]);
+});
+
+it("retains recovery and executed task telemetry when post-worker completion handling throws", async () => {
+  const append = vi.fn(); const f = await fixture({ outcomeLog: { append }, emitEvent: (_, event) => { if (event.type === "fusion_worker" && event.taskId === "fusion.delegate" && event.phase === "finished") throw new Error("injected observer failure"); } });
+  f.deps.runTurn = async session => { await writeFile(join(session.workingDir, "api.json"), "candidate"); return { session, reason: "reply", stepCount: 1 }; };
+  f.deps.runChecks = async specs => ({ ok: true, results: specs.map(() => ({ ok: true })) });
+  const result = await buildFusionDelegateTool(f.deps).run({ tasks: [{ id: "api", instructions: "work", files: ["api.json"] }], contract }, f.ctx);
+  expect(result.details.candidateIntegration).toMatchObject({ status: "rejected", patch: { path: expect.any(String) } });
+  expect(append).toHaveBeenCalledTimes(1);
+  expect(append.mock.calls[0]![0]).toEqual([expect.objectContaining({ candidate: { receipt: expect.objectContaining({ disposition: "rejected", reason: "interrupted" }), taskChecks: { total: 0, passed: 0, failed: 0 } } })]);
 });

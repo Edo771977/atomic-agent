@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, it } from "vitest";
@@ -70,4 +70,40 @@ it("parses literal protected check inputs and rejects patterns and unbounded lis
   expect(parseDelegateArgs({ tasks, contract: { checkInputs: ["test/check.mjs"] } })).toMatchObject({ ok: true, contract: { checkInputs: ["test/check.mjs"] } });
   expect(parseDelegateArgs({ tasks, contract: { checkInputs: ["test/*.mjs"] } })).toMatchObject({ ok: false });
   expect(parseDelegateArgs({ tasks, contract: { checkInputs: Array.from({ length: 33 }, (_, i) => `check-${i}.mjs`) } })).toMatchObject({ ok: false });
+});
+
+it("charges the frozen final source to the candidate's remaining cumulative byte budget", async () => {
+  const root = await project(); const candidate = await createCandidateIntegration(root, { maxCopyBytes: 32 });
+  try {
+    await writeFile(join(candidate.dir, "a.txt"), "candidate");
+    const report = await candidate.finish({ rows, contract, signal, runChecks: pass });
+    expect(report.status).toBe("rejected"); expect(report.reason).toMatch(/remaining candidate copy budget/);
+    expect(await readFile(join(root, "a.txt"), "utf8")).toBe("original");
+  } finally { await candidate.cleanup(); }
+});
+
+it("binds promoted and zero-change receipts only after final delivery verification", async () => {
+  const root = await project(); await writeFile(join(root, "check.mjs"), "test");
+  for (const changed of [true, false]) {
+    const candidate = await createCandidateIntegration(root, { checkInputs: ["check.mjs"] });
+    try {
+      if (changed) await writeFile(join(candidate.dir, "a.txt"), "candidate");
+      const declared = { ...contract, checkInputs: ["check.mjs"] };
+      const report = await candidate.finish({ rows, contract: declared, signal, runChecks: pass });
+      expect(report.status).toBe("promoted");
+      expect(report.acceptanceReceipt).toMatchObject({ version: 1, disposition: changed ? "promoted" : "unchanged", checkScope: "protected-declared", checkStatus: "passed", inputs: { declared: 1, verified: 1 }, checks: { total: 1, passed: 1, failed: 0 } });
+      expect(report.acceptanceReceipt?.checkedPayloadDigest).toMatch(/^[a-f0-9]{64}$/);
+      expect(report.artifactManifest?.binding).toMatchObject({ scope: "candidate-snapshot", disposition: changed ? "promoted" : "unchanged", receiptId: report.acceptanceReceipt?.id });
+    } finally { await candidate.cleanup(); }
+  }
+});
+
+it("rejects mutation of otherwise unchanged project code during final checks", async () => {
+  const root = await project(); await writeFile(join(root, "unchanged.js"), "before");
+  const candidate = await createCandidateIntegration(root);
+  try {
+    await writeFile(join(candidate.dir, "a.txt"), "candidate");
+    const report = await candidate.finish({ rows, contract, signal, runChecks: async () => { await writeFile(join(candidate.dir, "unchanged.js"), "after"); return pass(); } });
+    expect(report.status).toBe("rejected"); expect(await readFile(join(root, "unchanged.js"), "utf8")).toBe("before");
+  } finally { await candidate.cleanup(); }
 });

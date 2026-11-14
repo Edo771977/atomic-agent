@@ -137,6 +137,8 @@ import { runSyntaxPass, syntaxPassFiles, type SyntaxCheckRunner } from "./syntax
 import { measuredTaskLegs, readRoutingHistory } from "./measured-routing.js";
 import { collectTaskArtifactManifests } from "./artifact-manifest-tasks.js";
 import { createCandidateIntegration, type CandidateIntegration, type CandidateIntegrationReport } from "./candidate-integration.js";
+import { withCandidateOutcome } from "./candidate-outcomes.js";
+import { projectFusionArtifactEvidence } from "./artifact-evidence-output.js";
 import { readFusionWorkerMeta } from "../../session/fusion-worker-session.js";
 import { createTaskPermitPool } from "./task-permits.js";
 
@@ -357,7 +359,7 @@ export function buildFusionDelegateTool(
   return {
     name: FUSION_DELEGATE_TOOL,
     description:
-      "Delegate independent parts of the work to worker agents that run concurrently. You choose how many run at once with `maxWorkers`. A task that needs more room than the default can say so with `maxSteps` / `timeoutMs`; both are clamped to a multiple of the configured default and the result tells you when that happened. An optional `contract` (owners, provides, requires, checks) is prepended to every brief and checked after the fan-out. Give each `provides` entry a one-line `shape` (a signature, a return shape, what a field means): it is pasted into the brief of every worker that relies on it, and matching names is not matching meaning. Args: { tasks: [{ id, instructions, title?, deliverable?, files?, etaSeconds?, maxSteps?, timeoutMs?, role?, model? }] (1..16), maxWorkers?, contract? }. To continue a run cut off by a restart: { resume: runId, confirm?: [taskId] } and nothing else.",
+      "Delegate independent parts of the work to worker agents that run concurrently. You choose how many run at once with `maxWorkers`. A task that needs more room than the default can say so with `maxSteps` / `timeoutMs`; both are clamped to a multiple of the configured default and the result tells you when that happened. An optional `contract` (owners, provides, requires, checks; candidate-only immutable checkInputs) is prepended to every brief and checked after the fan-out. Give each `provides` entry a one-line `shape` (a signature, a return shape, what a field means): it is pasted into the brief of every worker that relies on it, and matching names is not matching meaning. Args: { tasks: [{ id, instructions, title?, deliverable?, files?, etaSeconds?, maxSteps?, timeoutMs?, role?, model? }] (1..16), maxWorkers?, contract? }. To continue a run cut off by a restart: { resume: runId, confirm?: [taskId] } and nothing else.",
     readonly: false,
     async run(rawArgs, ctx): Promise<CompressedToolResult> {
       if (isFusionWorkerSessionId(ctx.sessionId)) {
@@ -404,6 +406,9 @@ export function buildFusionDelegateTool(
       const delegateArgs = resumedFrom?.args ?? rawArgs;
       const parsed = parseDelegateArgs(delegateArgs);
       if (!parsed.ok) return error(parsed.error, { field: "tasks" });
+      if ((parsed.contract?.checkInputs?.length ?? 0) > 0 && mode.integration !== "candidate") {
+        return error("contract.checkInputs requires candidate integration so the original check files can be frozen before workers", { reason: "check-inputs-require-candidate" });
+      }
       // What the run spent before the restart counts toward this turn's
       // cap: a resume is the same run, not a fresh allowance.
       if (resume !== undefined && resume.carriedSpendUsd > 0) {
@@ -840,6 +845,9 @@ export function buildFusionDelegateTool(
 
       const candidateOriginalDir = ctx.workingDir;
       let candidate: CandidateIntegration | undefined;
+      const completedCandidateRows = new Map<string, WorkerTaskResult>();
+      let candidateOutcomesRecorded = false;
+      let recordCandidateInterruption: ((report: CandidateIntegrationReport) => void) | undefined;
       if (mode.integration === "candidate") {
         if (writeScope.some(path => !isInside(resolvePath(candidateOriginalDir), resolvePath(path)))) {
           return error("candidate integration requires all declared write scopes inside the current project", { reason: "candidate-outside-project" });
@@ -847,7 +855,7 @@ export function buildFusionDelegateTool(
         try {
           const remaining = capped ? turnBudget.timeLeftMs(ctx.sessionId, limits) : undefined;
           const signal = remaining === undefined ? ctx.signal : AbortSignal.any([ctx.signal, AbortSignal.timeout(Math.max(0, remaining))]);
-          candidate = await createCandidateIntegration(candidateOriginalDir, { signal });
+          candidate = await createCandidateIntegration(candidateOriginalDir, { signal, checkInputs: parsed.contract?.checkInputs });
         } catch (err) {
           return error(`candidate integration could not stage a private workspace: ${err instanceof Error ? err.message : String(err)}`, { reason: "candidate-staging-failed", nonResumable: true });
         }
@@ -855,6 +863,7 @@ export function buildFusionDelegateTool(
         parsed.tasks = rebaseCandidateValue(parsed.tasks, roots, candidate.dir);
         if (parsed.contract !== undefined) {
           const originalInputs = parsed.contract.inputs;
+          const originalCheckInputs = parsed.contract.checkInputs;
           parsed.contract = rebaseCandidateValue(parsed.contract, roots, candidate.dir);
           // Resolve input identity independently of the prose rewriter: on
           // Windows the original root may use any case. Keep only the
@@ -864,6 +873,10 @@ export function buildFusionDelegateTool(
               const absolute = resolveUserPath(path, candidateOriginalDir);
               return isInside(candidateOriginalDir, absolute) ? relative(candidateOriginalDir, absolute) : path;
             } catch { return path; }
+          });
+          if (originalCheckInputs !== undefined) parsed.contract.checkInputs = originalCheckInputs.map(path => {
+            const absolute = resolveUserPath(path, candidateOriginalDir);
+            return relative(candidateOriginalDir, absolute);
           });
         }
         writeScope = rebaseScope(writeScope, roots, candidate.dir);
@@ -917,6 +930,7 @@ export function buildFusionDelegateTool(
       const waveWarnings: string[] =
         plan.cycle === undefined ? [] : [plan.cycle];
       const dependencyCheckOutcomes = new Map<number, ContractCheckOutcome>();
+      const verifiedNoChangesProviders = new Set<string>();
 
       // A cap reached mid-fan-out stops what is running and starts
       // nothing more; the rows say why.
@@ -1134,6 +1148,7 @@ export function buildFusionDelegateTool(
           // still governs escalations and cuts (ATO-1406).
           shouldStartTask: () => breaker.stopReason(),
           onTaskFinished: (result: WorkerTaskResult): void => {
+            if (candidate !== undefined) completedCandidateRows.set(result.id, result);
             breaker.observe(result);
             // A finished worker that ran tools answers the format check.
             if (
@@ -1555,6 +1570,49 @@ export function buildFusionDelegateTool(
         return expanded;
       };
 
+      const outcomeRowsFor = (ran: readonly WorkerTaskResult[], now: Date) => ran.map((r) => {
+            const leg = taskLegs.get(r.id);
+            const providerId = leg?.providerId ?? workerProviderId;
+            const legKind: OutcomeLeg =
+              leg?.orchestrator === true
+                ? "orchestrator"
+                : deps.workerSupportsSlotAffinity(providerId)
+                  ? "local"
+                  : "cloud";
+            const pricing =
+              leg === undefined || leg.isWorkerLeg
+                ? workerPricing
+                : rolePricing.get(leg.providerId);
+            return {
+              row: r,
+              record: taskOutcomeRecord(
+                r,
+                {
+                  provider: providerId,
+                  model: leg?.model ?? workerModel,
+                  leg: legKind,
+                  role: leg?.orchestrator === true ? "orchestrator" : (leg?.role ?? null),
+                  taskRole: parsed.tasks.find((task) => task.id === r.id)?.role ?? null,
+                  ...(executionIdentities.get(r.id) !== undefined && executionIdentities.get(r.id) === deps.resolveRoutingIdentity?.(providerId)
+                    ? { routingIdentity: executionIdentities.get(r.id) } : {}),
+                  attempt: turnBudget.attempts(ctx.sessionId, r.id),
+                  pricing,
+                  merge:
+                    mode.isolation === "worktree" ? (mergeOutcomes.get(r.id) ?? null) : null,
+                },
+                ctx.sessionId,
+                now,
+              ),
+              pricing,
+            };
+          });
+      recordCandidateInterruption = (report) => {
+        if (candidateOutcomesRecorded) return;
+        candidateOutcomesRecorded = true;
+        const ran = [...completedCandidateRows.values()].filter(row => !(row.error ?? "").startsWith("not started:"));
+        deps.outcomeLog?.append(outcomeRowsFor(ran, new Date()).map(({ record, row }) =>
+          withCandidateOutcome(record, report.acceptanceReceipt!, report.contract?.checks ?? [], row.id)));
+      };
       const fanoutStartedAt = Date.now();
       const endLiveFanout = formatCheck.beginFanout(checkedServers);
       try {
@@ -1592,6 +1650,7 @@ export function buildFusionDelegateTool(
           const verifyProvider = async (id: string): Promise<void> => {
             if (verifiedProviders.has(id)) return;
             verifiedProviders.add(id);
+            verifiedNoChangesProviders.delete(id);
             const rechecking = previouslyReleased.has(id);
             previouslyReleased.add(id);
             const original = finished.get(id);
@@ -1662,7 +1721,7 @@ export function buildFusionDelegateTool(
             if (noChanges) {
               // Artifact presence alone is no evidence: at least one own check
               // or syntax check must actually have run here and passed.
-              if (row!.status === "ok" && ranEvidence) releasedNoChanges.add(id);
+              if (row!.status === "ok" && ranEvidence) { releasedNoChanges.add(id); verifiedNoChangesProviders.add(id); }
               return;
             }
             if (row!.status !== "ok") gateState.verdicts.delete(id);
@@ -1736,6 +1795,7 @@ export function buildFusionDelegateTool(
           // The checkpoint stays: what finished can still be resumed.
           run?.finish("interrupted");
           await releaseKept();
+          if (candidate !== undefined) throw err;
           return error(
             `the fan-out failed: ${err instanceof Error ? err.message : String(err)}`,
             { reason: "fan-out-failed" },
@@ -2043,6 +2103,7 @@ export function buildFusionDelegateTool(
           workingDir: ctx.workingDir, roots: syntaxRoots, signal: runSignal,
           ...(parsed.contract === undefined ? {} : { contract: parsed.contract }),
           checkOutcomes, findings: contract?.findings ?? [],
+          verifiedNoChangesProviders,
         });
         for (const row of results) {
           if (row.artifactManifest !== undefined) run?.recordArtifactManifest(row.id, row.artifactManifest);
@@ -2190,45 +2251,11 @@ export function buildFusionDelegateTool(
         try {
           const ran = results.filter((r) => ranNow.has(r.id) && !(r.error ?? "").startsWith("not started:"));
           const now = new Date();
-          const outcomeRows = ran.map((r) => {
-            const leg = taskLegs.get(r.id);
-            const providerId = leg?.providerId ?? workerProviderId;
-            const legKind: OutcomeLeg =
-              leg?.orchestrator === true
-                ? "orchestrator"
-                : deps.workerSupportsSlotAffinity(providerId)
-                  ? "local"
-                  : "cloud";
-            const pricing =
-              leg === undefined || leg.isWorkerLeg
-                ? workerPricing
-                : rolePricing.get(leg.providerId);
-            return {
-              row: r,
-              record: taskOutcomeRecord(
-                r,
-                {
-                  provider: providerId,
-                  model: leg?.model ?? workerModel,
-                  leg: legKind,
-                  role: leg?.orchestrator === true ? "orchestrator" : (leg?.role ?? null),
-                  taskRole: parsed.tasks.find((task) => task.id === r.id)?.role ?? null,
-                  ...(executionIdentities.get(r.id) !== undefined && executionIdentities.get(r.id) === deps.resolveRoutingIdentity?.(providerId)
-                    ? { routingIdentity: executionIdentities.get(r.id) } : {}),
-                  attempt: turnBudget.attempts(ctx.sessionId, r.id),
-                  pricing,
-                  merge:
-                    mode.isolation === "worktree" ? (mergeOutcomes.get(r.id) ?? null) : null,
-                },
-                ctx.sessionId,
-                now,
-              ),
-              pricing,
-            };
-          });
-          // Inner task evidence is not acceptance of the final candidate.
-          // Candidate routing training stays off until promotion-aware records exist.
-          if (candidate === undefined) deps.outcomeLog?.append(outcomeRows.map((o) => o.record));
+          const outcomeRows = outcomeRowsFor(ran, now);
+          // Final candidate disposition is telemetry, never individual task quality credit.
+          candidateOutcomesRecorded = candidate !== undefined;
+          deps.outcomeLog?.append(outcomeRows.map(({ record, row }) => candidateReport === undefined ? record
+            : withCandidateOutcome(record, candidateReport.acceptanceReceipt!, candidateReport.contract?.checks ?? [], row.id)));
           deps.turnLedger?.noteFanout(ctx.sessionId, {
             tasks: outcomeRows.map(({ row, record, pricing }) => ({
               ok: row.status === "ok",
@@ -2367,7 +2394,7 @@ export function buildFusionDelegateTool(
           },
           { maxSummaryLength: deps.outputCharCap + 400, maxTailLines: 2000 },
         );
-        return candidateReport === undefined ? result : candidateToolResult(result, candidateReport, candidate!.dir, candidateOriginalDir, deps.outputCharCap);
+        return candidateReport === undefined ? projectFusionArtifactEvidence(result, deps.outputCharCap) : candidateToolResult(result, candidateReport, candidate!.dir, candidateOriginalDir, deps.outputCharCap);
       } finally {
         if (budgetTimer !== undefined) clearTimeout(budgetTimer);
         // Kept workspaces (a judged-red task's, for its retry) are removed
@@ -2379,6 +2406,9 @@ export function buildFusionDelegateTool(
       } catch (err) {
         if (candidate === undefined) throw err;
         const report = await candidate.reject(`candidate interrupted: ${err instanceof Error ? err.message : String(err)}`);
+        try { recordCandidateInterruption?.(report); } catch (recordError) {
+          deps.logger.warn("fusion: interrupted candidate outcomes were not recorded", { reason: recordError instanceof Error ? recordError.message : String(recordError) });
+        }
         return candidateToolResult(error("candidate fan-out interrupted", { reason: "candidate-interrupted" }), report, candidate.dir, candidateOriginalDir, deps.outputCharCap);
       } finally {
         await candidate?.cleanup();
@@ -2400,7 +2430,8 @@ function candidateToolResult(result: CompressedToolResult, report: CandidateInte
   const recovery = (report.patch === undefined ? "" : ` Changes retained at ${report.patch.path}${report.patch.filesDir === undefined ? "" : ` and ${report.patch.filesDir}`}.`) + (report.retainedWorkspace === undefined ? "" : ` Recovery workspace retained at ${report.retainedWorkspace}; remove it manually after recovery.`) + (report.heldArtifactsDir === undefined ? "" : ` Held task artifacts: ${report.heldArtifactsDir}.`) + (report.rollbackConflicts === undefined ? "" : ` Rollback left these concurrently changed or unwritable paths for review: ${report.rollbackConflicts.join(", ")}.`) + (report.ignoredChanges === undefined ? "" : ` Ignored or disposable paths kept private to the candidate, never promoted: ${report.ignoredChanges.join(", ")}.`);
   const details = rebaseCandidateValue(result.details, [candidateDir, candidateDir.replace(/\\/g, "/")], originalDir);
   delete details.runId;
-  return compressToolResult({ tool: result.tool, status: report.status === "rejected" ? "error" : result.status, output: `${note}${recovery} Candidate mode is non-resumable.\n\n${rebaseText(result.fullOutput ?? result.summary, [candidateDir, candidateDir.replace(/\\/g, "/")], originalDir)}`, details: { ...details, candidateIntegration: report } }, { maxSummaryLength: cap + 800, maxTailLines: 2000 });
+  const checkedRecovery = report.retainedCheckedWorkspace === undefined ? "" : ` Checked recovery workspace retained at ${report.retainedCheckedWorkspace}; remove it manually after recovery.`;
+  return projectFusionArtifactEvidence(compressToolResult({ tool: result.tool, status: report.status === "rejected" ? "error" : result.status, output: `${note}${recovery}${checkedRecovery} Candidate mode is non-resumable.\n\n${rebaseText(result.fullOutput ?? result.summary, [candidateDir, candidateDir.replace(/\\/g, "/")], originalDir)}`, details: { ...details, candidateIntegration: report } }, { maxSummaryLength: cap + 800, maxTailLines: 2000 }), cap);
 }
 
 /**

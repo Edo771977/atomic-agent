@@ -18,7 +18,9 @@ export function readCheckInputs(value: unknown, problems: string[]): string[] | 
   }
   const paths: string[] = [];
   for (const [index, item] of value.entries()) {
-    if (typeof item !== "string" || item.trim().length === 0 || item.length > 4096 || /[*?[\]{}\0]/.test(item)) {
+    // Braces/brackets may be literal ancestor names (including Windows sandbox temp roots).
+    // They are never expanded; '*' and '?' are refused rather than interpreted as globs.
+    if (typeof item !== "string" || item.trim().length === 0 || item.length > 4096 || /[*?\0]/.test(item)) {
       problems.push(`contract.checkInputs[${index}] must be a literal file path without patterns (at most 4096 characters)`);
     } else if (!paths.includes(item.trim())) paths.push(item.trim());
   }
@@ -44,6 +46,7 @@ export async function freezeCheckInputs(root: string, declarations: readonly str
     return rel;
   }))];
   const scan = async (dir: string, stop: AbortSignal): Promise<Map<string, Stamp>> => {
+    stop = AbortSignal.any([stop, AbortSignal.timeout(30_000)]);
     let left = MAX_BYTES;
     const entries = new Map<string, Stamp>();
     for (const path of paths) {
