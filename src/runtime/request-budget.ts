@@ -186,7 +186,12 @@ export interface RequestBudgetScope extends CompletionRequestBudget {
    */
   hint?: string;
   hintKey?: string;
-  finish(result?: CompletionResult): void;
+  /**
+   * Settle the scope. `streamed.outputBytes` is the reply text a stream
+   * delivered before it ended without a result (a cancel): the day's
+   * ledger prices it on top of the input bound.
+   */
+  finish(result?: CompletionResult, streamed?: { outputBytes: number }): void;
 }
 
 /**
@@ -263,6 +268,11 @@ export function createRequestBudgetScope(
   let done = false;
   // Multiplier of the most recent physical send; settlement prices usage with it.
   let tierMultiplier = 1;
+  // The latest priced send's input bound and per-output-token rate (USD),
+  // and its whole hold: what an abandoned send is charged on the day.
+  let sendInputUsd = 0;
+  let sendOutputUsdPerToken = 0;
+  let sendHoldUsd = 0;
   const hintKey = `${sessionId ?? ""}:${provider.id}`;
   const reserveBoth = (usd: number): SendHolds => {
     const turn = turnPriced ? budget!.reserveRequest(sessionId!, usd) : undefined;
@@ -357,6 +367,9 @@ export function createRequestBudgetScope(
       const outputCopies = Math.max(1, ...(copies as number[]));
       const upperUsd = (output: number) => ((inputTokens * inputRate + output * outputRate) * outputCopies * multiplier) / 1_000_000;
       const fitting = reserveFitting(reserveBoth, ceiling, upperUsd);
+      sendInputUsd = upperUsd(0);
+      sendOutputUsdPerToken = upperUsd(1) - sendInputUsd;
+      sendHoldUsd = upperUsd(fitting.output);
       if (turnPriced) held = fitting.holds.turn;
       if (dayPriced) dayHeld = fitting.holds.daily;
       if (fitting.output < ceiling) {
@@ -382,7 +395,7 @@ export function createRequestBudgetScope(
         if (dayPriced) { dayHeld?.release(); dayHeld = undefined; }
       }
     },
-    finish(result) {
+    finish(result, streamed) {
       // Reported cost has already won above; only the estimate takes the
       // tier, the one the response says served the request when it names
       // one (an `auto` request can be served at a project's priority tier).
@@ -403,10 +416,25 @@ export function createRequestBudgetScope(
       // A metered request holds nothing, so a missing estimate charges zero.
       held?.settle(usage === undefined ? (turnPriced ? undefined : 0) : settledUsd);
       held = undefined;
+      // A send abandoned after it left (a cancel or the turn deadline,
+      // or a reply with no usage block): the provider may bill the prompt
+      // and whatever it generated, but charging the whole output ceiling
+      // would put money never spent on today's total, and each Esc would
+      // eat into the day. The day counts it as a priced call at the input
+      // bound plus the output known to have arrived (streamed or returned
+      // text, at the bound's bytes-per-token), never more than the hold.
+      // The turn ledger keeps its conservative whole-hold charge.
+      const abandonedUsd = (outputBytes: number): number =>
+        Math.min(sendHoldUsd, sendInputUsd + Math.ceil(outputBytes / BODY_BYTES_PER_TOKEN) * sendOutputUsdPerToken);
+      const returnedBytes = (reply: CompletionResult): number =>
+        Buffer.byteLength(reply.content ?? "", "utf8") + Buffer.byteLength(reply.reasoningContent ?? "", "utf8") +
+        (reply.toolCalls === undefined ? 0 : Buffer.byteLength(JSON.stringify(reply.toolCalls), "utf8"));
       if (day !== undefined) {
         if (dayHeld !== undefined) {
           // No reply on a metered day: nothing is known to have been billed.
           if (usage === undefined && !dayPriced) dayHeld.release();
+          else if (dayPriced && usage === undefined && signal.aborted) dayHeld.settle(abandonedUsd(streamed?.outputBytes ?? 0));
+          else if (dayPriced && usage?.incomplete === true && reportedCostUsd(usage) === undefined) dayHeld.settle(abandonedUsd(returnedBytes(result!)));
           else dayHeld.settle(settledUsd);
         } else if (usage !== undefined) {
           // A reply whose send took no hold (released on a rejection the

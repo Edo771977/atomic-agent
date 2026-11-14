@@ -535,6 +535,49 @@ describe("request budget scope", () => {
         .toThrow(DailySpendLimitError);
     });
 
+    describe("an abandoned send counts its input bound and streamed output, not its whole hold", () => {
+      const bodyTokens = (sent: object) => Math.ceil(Buffer.byteLength(JSON.stringify(sent), "utf8") / 3) + 1024;
+      function aborted(streamedBytes?: number) {
+        const { store, daily } = day(5);
+        const caller = new AbortController();
+        const s = createRequestBudgetScope(undefined, { ...request(), signal: caller.signal }, provider, entry, model, daily)!;
+        const sent: Record<string, unknown> = body();
+        s.beforeSend(sent);
+        caller.abort();
+        s.finish(undefined, streamedBytes === undefined ? undefined : { outputBytes: streamedBytes });
+        return { store, input: bodyTokens(sent) * 3 / 1_000_000 };
+      }
+
+      it("charges a cancelled send at its input bound", () => {
+        const { store, input } = aborted();
+        expect(store.today().usd).toBeCloseTo(input, 9);
+        expect(store.today().usd).toBeLessThan(0.01);
+      });
+
+      it("adds the output streamed before the cancel", () => {
+        const { store, input } = aborted(3_000);
+        expect(store.today().usd).toBeCloseTo(input + 1_000 * 15 / 1_000_000, 9);
+      });
+
+      it("prices a reply without usage by its input bound and returned text", () => {
+        const { store, daily } = day(5);
+        const s = createRequestBudgetScope(undefined, request(), provider, entry, model, daily)!;
+        const sent: Record<string, unknown> = body();
+        s.beforeSend(sent);
+        s.finish({ content: "x".repeat(300), reasoningContent: "", usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0, incomplete: true } } as never);
+        expect(store.today().usd).toBeCloseTo((bodyTokens(sent) * 3 + 100 * 15) / 1_000_000, 9);
+      });
+
+      it("still charges the whole hold for a send that failed ambiguously without a cancel", () => {
+        const { store, daily } = day(5);
+        const s = createRequestBudgetScope(undefined, request(), provider, entry, model, daily)!;
+        s.beforeSend(body());
+        s.onResponse(502);
+        s.finish(undefined);
+        expect(store.today().usd).toBeGreaterThan(0.06);
+      });
+    });
+
     it.each(["llama-server", "subscription-cli"])("leaves a %s link out of the day", kind => {
       const { daily } = day(1);
       expect(createRequestBudgetScope(undefined, request(), provider, { id: "x", kind } as LlmProviderConfigEntry, model, daily)).toBeUndefined();
