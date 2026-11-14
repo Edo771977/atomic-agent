@@ -14,6 +14,7 @@ import type { ResolvedRunMode } from "../../llm/run-mode/index.js";
 import { visionCapableAlternatives } from "../../llm/provider/model-vision.js";
 import { resolveModelPricingFor } from "../resolve-model-pricing.js";
 import { createRequestBudgetScope } from "../request-budget.js";
+import type { DailySpendBudget } from "../daily-spend-budget.js";
 import type { ModelProfile } from "../../llm/model-profile.js";
 import type { SlotManager } from "../../llm/slot-manager.js";
 import { createFusionFormatProbeFor } from "./fusion-format-check.js";
@@ -736,6 +737,14 @@ export function registerRuntimeFusionAndReadScope(input: {
   sessionUsage?: Pick<SessionUsageLedger, "record">;
   /** `llm.costTracking`'s session and day totals: escalation and judge calls count here too (ATO-1497). */
   costAccumulator?: Pick<CostAccumulator, "recordTurn">;
+  /**
+   * Today's spend ceiling (ATO-649), for escalation and judge calls, which
+   * go straight to the provider past the fallback seam: `enforce` is the
+   * seam's early refusal, `budget` the daily ledger their request scope
+   * holds and settles on. The seam never sees these calls, so nothing
+   * counts them twice.
+   */
+  dailySpendLimit?: { enforce(providerId: string): void; budget: DailySpendBudget | undefined };
   liveWorkers?: FusionDelegateDeps["liveWorkers"];
   steerWorker?: FusionDelegateDeps["steerWorker"];
   orchestratorTurnSpendUsd?: FusionDelegateDeps["orchestratorTurnSpendUsd"];
@@ -758,7 +767,7 @@ export function registerRuntimeFusionAndReadScope(input: {
     prepareLocalLink, emitAgentLoopEventFor, resolveCurrentRunMode, providerRegistry,
     llama, approvals, dangerous, slotManager, workingDir, logger, turnBudget,
     orchestratorTurnSpendUsd, liveWorkers, steerWorker, runCheckpoints, sessionUsage,
-    outcomeLog, turnLedger, localFormatCheck, costAccumulator } = input;
+    outcomeLog, turnLedger, localFormatCheck, costAccumulator, dailySpendLimit } = input;
 
 
   // The orchestrator's fan-out. Registered UNCONDITIONALLY: the tool
@@ -889,11 +898,16 @@ export function registerRuntimeFusionAndReadScope(input: {
           maxOutputTokens,
           signal,
         };
-        const resolvedForBudget = sessionId !== undefined && turnBudget?.requestLimits(sessionId) !== undefined
-          ? resolveLlmConfig(getConfig()) : undefined;
+        // The daily ceiling refuses a paid link before anything is sent,
+        // as the fallback seam does for every other call (ATO-649).
+        dailySpendLimit?.enforce(providerId);
+        const dailyBudget = dailySpendLimit?.budget;
+        const turnLimited = sessionId !== undefined && turnBudget?.requestLimits(sessionId) !== undefined;
+        const resolvedForBudget = turnLimited || dailyBudget !== undefined ? resolveLlmConfig(getConfig()) : undefined;
         const entryForBudget = resolvedForBudget?.providers.find(p => p.id === providerId);
-        const scope = resolvedForBudget === undefined ? undefined : createRequestBudgetScope(turnBudget, { ...request, sessionId }, provider, entryForBudget,
-          resolveModelPricingFor(resolvedForBudget, provider.chatModelId ?? entryForBudget?.defaultChatModel ?? entryForBudget?.model ?? null, providerId));
+        const scope = resolvedForBudget === undefined ? undefined : createRequestBudgetScope(turnLimited ? turnBudget : undefined, { ...request, sessionId }, provider, entryForBudget,
+          resolveModelPricingFor(resolvedForBudget, provider.chatModelId ?? entryForBudget?.defaultChatModel ?? entryForBudget?.model ?? null, providerId),
+          dailyBudget);
         let result: Awaited<ReturnType<typeof provider.complete>> | undefined;
         try {
           result = await provider.complete({ ...request, ...(scope === undefined ? {} : { requestBudget: scope, signal: scope.signal ?? signal }) });

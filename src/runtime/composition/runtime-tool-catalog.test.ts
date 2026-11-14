@@ -24,6 +24,9 @@ import * as mcp from "../../mcp/index.js";
 import type { McpToolMeta, McpSamplingHandler } from "../../mcp/index.js";
 import * as composio from "../../composio/index.js";
 import { setDynamicResourceClassResolver } from "../../agent/tool-resource-class.js";
+import { DailySpendStore } from "../../session/daily-spend.js";
+import { createDailySpendBudget } from "../daily-spend-budget.js";
+import { DailySpendLimitError } from "../../llm/reliability/spend-limit-error.js";
 import { createRuntimeToolRegistry, registerRuntimeCoreTools, connectRuntimeMcpCatalog, mcpGrammarHookFor, registerRuntimeFusionAndReadScope, runtimeKnownSecrets } from "./runtime-tool-catalog.js";
 import { ModelProfileManager } from "../../llm/model-profile-manager.js";
 import { CostAccumulator } from "../../llm/provider/cost-accumulator.js";
@@ -370,6 +373,42 @@ describe("fusion escalation calls in llm.costTracking (ATO-1497)", () => {
       expect(costAccumulator.snapshot()).toEqual(expect.objectContaining({ sessionUsd: 0.25, dayUsd: 0.25, lastModelId: "big" }));
       await wired.escalationComplete({ providerId: "cloud", prompt: "p", maxOutputTokens: 100, signal });
       expect(costAccumulator.snapshot().sessionUsd).toBeCloseTo(0.5);
+    } finally {
+      vi.restoreAllMocks();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("fusion escalation calls against the daily spend limit (ATO-649)", () => {
+  it("counts an escalation or judge call on today's total once, and refuses it once the limit is reached", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "catalog-daily-"));
+    try {
+      const config = getConfig(); const toolRegistry = new ToolRegistry();
+      const approvals = new ApprovalGate({ emit: () => {}, level: 5 });
+      const builder = vi.spyOn(fusionTools, "buildFusionDelegateTool");
+      const store = new DailySpendStore({ path: join(directory, "daily-spend.json") });
+      const budget = createDailySpendBudget(store, () => ({ dailyLimitUsd: 0.3 }));
+      const enforce = vi.fn((providerId: string) => {
+        if (store.today().usd >= 0.3) throw new DailySpendLimitError({ spentUsd: store.today().usd, limitUsd: 0.3, providerId });
+      });
+      const usage = { promptTokens: 1_000, completionTokens: 200, totalTokens: 1_200, costUsd: 0.25 };
+      const provider = { complete: vi.fn(async () => ({ content: "advice", usage, modelId: "big" })) };
+      registerRuntimeFusionAndReadScope({ config, toolRegistry, approvals, dangerous: { approvals, approvalRequired: false }, declaredInputs: new osTools.DeclaredInputsRegistry(),
+        resolveOriginalRequest: () => undefined, runTurn: async () => externalOperation(), createEphemeralSession: () => createEmptySessionState({ id: "worker", workingDir: directory }),
+        prepareLocalLink: async () => {}, emitAgentLoopEventFor: () => {}, resolveCurrentRunMode: () => resolveRunMode(resolveLlmConfig(config)),
+        providerRegistry: { getProvider: () => provider as never }, llama: { measuredTokensPerSecond: () => null, fetchSlots: async () => ({ slots: [] }), probeHealth: async () => "answered" as const },
+        slotManager: { poolSize: () => 2 }, workingDir: directory, logger, dailySpendLimit: { enforce, budget } });
+      const wired = builder.mock.calls.at(-1)?.[0];
+      if (!wired?.escalationComplete) throw new Error("escalation seam missing");
+      const signal = new AbortController().signal;
+      await wired.escalationComplete({ providerId: "cloud", prompt: "p", maxOutputTokens: 100, signal, sessionId: "s-1" });
+      expect(store.today()).toMatchObject({ usd: 0.25, pricedCalls: 1 });
+      await wired.escalationComplete({ providerId: "cloud", prompt: "p", maxOutputTokens: 100, signal });
+      expect(store.today().usd).toBeCloseTo(0.5);
+      await expect(wired.escalationComplete({ providerId: "cloud", prompt: "p", maxOutputTokens: 100, signal })).rejects.toBeInstanceOf(DailySpendLimitError);
+      expect(provider.complete).toHaveBeenCalledTimes(2);
+      expect(enforce).toHaveBeenCalledWith("cloud");
     } finally {
       vi.restoreAllMocks();
       await rm(directory, { recursive: true, force: true });

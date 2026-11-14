@@ -837,6 +837,7 @@ export async function createAgentRuntime(
     turnBudget: fusionTurnBudget,
     sessionUsage,
     costAccumulator,
+    dailySpendLimit,
     liveWorkers: fusionLiveWorkers,
     runCheckpoints: fusionRuns,
     outcomeLog: fusionOutcomes.outcomeLog,

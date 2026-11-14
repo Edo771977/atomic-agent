@@ -595,10 +595,14 @@ export function connectRuntimeFallback(
     llmCompleteStream,
     /**
      * Today's ceiling for callers outside the fallback seam (ATO-649):
-     * `refuses` for the model router, which passes over a refused target.
+     * `refuses` for the model router, which passes over a refused target;
+     * `enforce` and the daily ledger (`budget`) for Fusion's escalation
+     * and judge calls, which go straight to their provider.
      */
     dailySpendLimit: {
       refuses: (providerId: string): boolean => dailyLimitRefusal(providerId) !== null,
+      enforce: enforceDailySpendLimit,
+      budget: dailyBudget,
     },
   };
 }
