@@ -139,6 +139,7 @@ import { runSyntaxPass, syntaxPassFiles, type SyntaxCheckRunner } from "./syntax
 import { measuredTaskLegs, readRoutingHistory } from "./measured-routing.js";
 import { collectTaskArtifactManifests } from "./artifact-manifest-tasks.js";
 import { createCandidateIntegration, type CandidateIntegration, type CandidateIntegrationReport } from "./candidate-integration.js";
+import { rebaseVerifyWorkspaceValue } from "../verify/rebase-verify-workspace.js";
 import { withCandidateOutcome } from "./candidate-outcomes.js";
 import { projectFusionArtifactEvidence } from "./artifact-evidence-output.js";
 import { readFusionWorkerMeta } from "../../session/fusion-worker-session.js";
@@ -901,6 +902,7 @@ export function buildFusionDelegateTool(
         catch { secretCollectionFailed = true; throw new Error("Secret metadata unavailable"); }
       };
       let recordCandidateInterruption: ((report: CandidateIntegrationReport) => void) | undefined;
+      try {
       if (mode.integration === "candidate") {
         if (writeScope.some(path => !isInside(resolvePath(candidateOriginalDir), resolvePath(path)))) {
           return error("candidate integration requires all declared write scopes inside the current project", { reason: "candidate-outside-project" });
@@ -917,7 +919,10 @@ export function buildFusionDelegateTool(
         if (parsed.contract !== undefined) {
           const originalInputs = parsed.contract.inputs;
           const originalCheckInputs = parsed.contract.checkInputs;
+          const originalChecks = parsed.contract.checks;
           parsed.contract = rebaseCandidateValue(parsed.contract, roots, candidate.dir);
+          // Check plans have stricter literal-path semantics than worker prose.
+          if (originalChecks !== undefined) parsed.contract.checks = rebaseVerifyWorkspaceValue(originalChecks, candidateOriginalDir, candidate.dir);
           // Resolve input identity independently of the prose rewriter: on
           // Windows the original root may use any case. Keep only the
           // declared suffix so generated temp prefixes cannot become globs.
@@ -935,7 +940,6 @@ export function buildFusionDelegateTool(
         writeScope = rebaseScope(writeScope, roots, candidate.dir);
         ctx = { ...ctx, workingDir: candidate.dir, ...(ctx.readRoots === undefined ? {} : { readRoots: ctx.readRoots.map(path => rebaseText(path, roots, candidate!.dir)) }) };
       }
-      try {
       // The orchestrator's brief is a summary, and summaries were thin
       // enough that workers built the wrong thing or scavenged the disk
       // for the missing spec. Every worker also gets what was asked.

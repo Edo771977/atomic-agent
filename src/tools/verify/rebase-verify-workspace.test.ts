@@ -25,3 +25,13 @@ it("preserves case-distinct external paths on Linux", () => {
 it.each(["win32", "darwin"] as const)("folds project case only on %s", platform => {
   expect(rebaseVerifyWorkspaceValue("/TMP/project/check.mjs", "/tmp/project", "/tmp/actual", platform)).toBe("/tmp/actual/check.mjs");
 });
+it("preserves an external path containing the project spelling as a suffix", () => {
+  expect(rebaseVerifyWorkspaceValue("/backup/home/u/proj/check.mjs", "/home/u/proj", "/tmp/actual", "linux")).toBe("/backup/home/u/proj/check.mjs");
+  expect(rebaseVerifyWorkspaceValue("/home/u/proj-sibling/check.mjs", "/home/u/proj", "/tmp/actual", "linux")).toBe("/home/u/proj-sibling/check.mjs");
+});
+it.each(["~/proj/check.mjs", "$HOME/proj/check.mjs", "${HOME}/proj/check.mjs", "/home/u//proj/check.mjs", "/home/u/./proj/check.mjs", "/home/u/other/../proj/check.mjs"])("refuses recognized project alias %s before executing an ambiguous plan", alias => {
+  expect(() => rebaseVerifyWorkspaceValue(`cd ${alias};`, "/home/u/proj", "/tmp/actual", "linux", "/home/u")).toThrow(/unsupported absolute project reference/);
+});
+it("preserves explicit external home and normalized sibling paths", () => {
+  expect(rebaseVerifyWorkspaceValue("$HOME/elsewhere/check.mjs /home/u//proj-sibling/check.mjs", "/home/u/proj", "/tmp/actual", "linux", "/home/u")).toBe("$HOME/elsewhere/check.mjs /home/u//proj-sibling/check.mjs");
+});

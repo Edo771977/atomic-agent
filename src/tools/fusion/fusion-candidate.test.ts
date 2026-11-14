@@ -310,6 +310,15 @@ it("keeps absolute check-generated snapshots inside the execution copy without c
   expect(await readFile(join(f.root, "api.json"), "utf8")).toBe("candidate");
   await expect(readFile(join(f.root, "snapshot.txt"))).rejects.toThrow();
 });
+it("refuses a normalized project alias in a check before dispatching workers", async () => {
+  const runTurn = vi.fn(async (session: SessionState): Promise<RunTurnResult> => ({ session, reason: "reply", stepCount: 1 }));
+  const f = await fixture({ runTurn, runChecks: async specs => ({ ok: true, results: specs.map(() => ({ ok: true })) }) });
+  const alias = f.root.replace(/\\/g, "/").replace(/\/([^/]+)$/, "/./$1") + "/check.mjs";
+  const result = await buildFusionDelegateTool(f.deps).run({ tasks: [{ id: "api", instructions: "work" }],
+    contract: { checks: [{ kind: "command", cmd: process.execPath, args: [alias] }] } }, f.ctx);
+  expect(result.details.candidateIntegration).toMatchObject({ status: "rejected", reason: expect.stringContaining("unsupported absolute project reference") });
+  expect(runTurn).not.toHaveBeenCalled();
+});
 
 it("binds an absolute protected check reference to the actual execution copy", async () => {
   const { runChecks } = await import("../verify/run-verify.js"); const f = await fixture({ runChecks });
