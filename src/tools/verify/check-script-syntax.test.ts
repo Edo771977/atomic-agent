@@ -1,4 +1,4 @@
-import { chmod, mkdtemp, rm, readdir, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, rm, readdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -51,14 +51,29 @@ describe("runChecker", () => {
 
   it("kills an owned checker process on cancellation and starts none after cancellation", async () => {
     const controller = new AbortController();
-    const script = await file("wait.cjs", "setInterval(()=>{},1000)");
+    const pidFile = join(dir, "owned-checker.pid");
+    const script = await file("wait.cjs", `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(()=>{},1000)`);
     const cmd = process.platform === "win32"
       ? await file("wait.cmd", `@"${process.execPath}" "${script}" %*\r\n`)
       : process.execPath;
     const args = process.platform === "win32" ? [] : [script];
     const pending = runChecker(cmd, args, { signal: controller.signal });
-    setTimeout(() => controller.abort(), 200);
-    expect(await pending).toMatchObject({ aborted: true, timedOut: true, missing: false });
+    try {
+      const deadline = Date.now() + 5_000;
+      let pidText: string | undefined;
+      while (Date.now() < deadline) {
+        pidText = await readFile(pidFile, "utf8").catch(() => undefined);
+        if (pidText !== undefined) break;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      expect(pidText).toMatch(/^\d+$/);
+      controller.abort();
+      expect(await pending).toMatchObject({ aborted: true, timedOut: true, missing: false });
+      expect(() => process.kill(Number(pidText), 0)).toThrow();
+    } finally {
+      controller.abort();
+      await pending;
+    }
     expect(await runChecker(cmd, args, { signal: controller.signal })).toMatchObject({ aborted: true, exitCode: null });
   });
 
