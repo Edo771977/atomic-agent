@@ -212,13 +212,23 @@ describe("models fit-test and the embedding daemon", () => {
   });
 });
 
+/** The restore record, beside the managed daemon it is about. */
+function markerFile(): string {
+  return join(getConfig().paths.localModelsDataDir, "fit-test-restore.json");
+}
+
+function writeMarker(marker: Record<string, unknown>): void {
+  mkdirSync(getConfig().paths.localModelsDataDir, { recursive: true });
+  writeFileSync(markerFile(), JSON.stringify(marker));
+}
+
 /** A pid that has already exited: a fit-test the desktop's Cancel killed. */
 function deadPid(): number {
   return spawnSync(process.execPath, ["-e", ""]).pid;
 }
 
 describe("models fit-test restore marker (killed without a signal handler, e.g. Windows Cancel)", () => {
-  const markerPath = (): string => join(stateDir, "fit-test-restore.json");
+  const markerPath = markerFile;
 
   it("records the user's models before switching and removes the record once they are back", async () => {
     Object.assign(fake, { chat: true, emb: true });
@@ -232,10 +242,7 @@ describe("models fit-test restore marker (killed without a signal handler, e.g. 
   });
 
   it("the next models command puts the user's model back, starts it again and clears the record", async () => {
-    writeFileSync(
-      markerPath(),
-      JSON.stringify({ pid: deadPid(), startedAt: Date.now(), previous: "qwen-3.5-4b", chatRunning: true, embeddingRunning: true }),
-    );
+    writeMarker({ pid: deadPid(), startedAt: Date.now(), previous: "qwen-3.5-4b", chatRunning: true, embeddingRunning: true });
     // The killed run left a test model serving, beside the embedding model.
     Object.assign(fake, { chat: true, emb: true });
     expect(await modelsCommand(["status"])).toBe(0);
@@ -247,10 +254,7 @@ describe("models fit-test restore marker (killed without a signal handler, e.g. 
   });
 
   it("`models stop` after a killed run puts the model back in config without starting it", async () => {
-    writeFileSync(
-      markerPath(),
-      JSON.stringify({ pid: deadPid(), startedAt: Date.now(), previous: "qwen-3.5-4b", chatRunning: true, embeddingRunning: false }),
-    );
+    writeMarker({ pid: deadPid(), startedAt: Date.now(), previous: "qwen-3.5-4b", chatRunning: true, embeddingRunning: false });
     Object.assign(fake, { chat: true, emb: false });
     await modelsCommand(["stop"]);
     expect(callsOf("use")).toEqual(["qwen-3.5-4b"]);
@@ -259,10 +263,7 @@ describe("models fit-test restore marker (killed without a signal handler, e.g. 
   });
 
   it("leaves the record of a fit-test that is still running alone", async () => {
-    writeFileSync(
-      markerPath(),
-      JSON.stringify({ pid: process.ppid, startedAt: Date.now(), previous: "qwen-3.5-4b", chatRunning: true, embeddingRunning: false }),
-    );
+    writeMarker({ pid: process.ppid, startedAt: Date.now(), previous: "qwen-3.5-4b", chatRunning: true, embeddingRunning: false });
     expect(await modelsCommand(["status"])).toBe(0);
     expect(fake.calls.map(([name]) => name)).toEqual(["status"]);
     expect(existsSync(markerPath())).toBe(true);
@@ -293,14 +294,11 @@ describe("models fit-test beside another client of the local model", () => {
   });
 
   it("refuses while another fit-test is running", async () => {
-    writeFileSync(
-      join(stateDir, "fit-test-restore.json"),
-      JSON.stringify({ pid: process.ppid, startedAt: Date.now(), previous: "qwen-3.5-4b", chatRunning: true, embeddingRunning: false }),
-    );
+    writeMarker({ pid: process.ppid, startedAt: Date.now(), previous: "qwen-3.5-4b", chatRunning: true, embeddingRunning: false });
     expect(await runModelsFitTest(fitArgs())).toBe(1);
     expect(stderr).toMatch(/another models fit-test is running/);
     expect(fake.calls).toEqual([]);
-    expect(existsSync(join(stateDir, "fit-test-restore.json"))).toBe(true);
+    expect(existsSync(markerFile())).toBe(true);
   });
 });
 
@@ -311,7 +309,7 @@ describe("models fit-test when putting the user's model back fails", () => {
     const run = JSON.parse(stdout) as { kind: string };
     expect(run.kind).toBe("atomic-agent.fit-test-run");
     expect(stderr).toMatch(/putting your model back failed: config is read-only/);
-    expect(existsSync(join(stateDir, "fit-test-restore.json"))).toBe(true);
+    expect(existsSync(markerFile())).toBe(true);
   });
 });
 
@@ -352,5 +350,47 @@ describe("a TUI starting beside a model fit-test put back with its cache suspend
     writeFileSync(join(sessions, String(process.ppid)), String(process.ppid));
     expect(await releaseSuspendedChatBeforeTui()).toBe(false);
     expect(callsOf("stop")).toEqual([]);
+  });
+});
+
+describe("the restore record lives beside the managed daemon", () => {
+  it("is written in the local models data dir, with the state dir whose config it restores", async () => {
+    const shared = mkdtempSync(join(tmpdir(), "atomic-fit-models-"));
+    try {
+      writeFileSync(
+        join(stateDir, "config.json"),
+        JSON.stringify({
+          version: USER_CONFIG_VERSION,
+          localModels: { mode: "managed", managed: { modelId: "qwen-3.5-4b", dataDirOverride: shared } },
+        }),
+      );
+      resetConfigCache();
+      let seen: unknown = null;
+      fake.duringTask = () => {
+        const at = join(shared, "fit-test-restore.json");
+        seen = existsSync(at) ? JSON.parse(readFileSync(at, "utf8")) : null;
+      };
+      expect(await runModelsFitTest(fitArgs())).toBe(0);
+      expect(seen).toMatchObject({ pid: process.pid, stateDir, previous: "qwen-3.5-4b" });
+      expect(existsSync(join(stateDir, "fit-test-restore.json"))).toBe(false);
+    } finally {
+      rmSync(shared, { recursive: true, force: true });
+    }
+  });
+
+  it("a command of another state dir sharing the daemon leaves that config alone", async () => {
+    writeMarker({
+      pid: deadPid(),
+      startedAt: Date.now(),
+      stateDir: join(tmpdir(), "another-state-dir"),
+      previous: "qwen-3.5-4b",
+      chatRunning: true,
+      embeddingRunning: false,
+      swapped: true,
+    });
+    expect(await modelsCommand(["status"])).toBe(0);
+    expect(callsOf("use")).toEqual([]);
+    expect(stderr).toMatch(/another-state-dir/);
+    expect(existsSync(markerFile())).toBe(true);
   });
 });

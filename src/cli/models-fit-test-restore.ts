@@ -3,17 +3,19 @@
  * and puts them back (ATO-1090, ATO-1498), including after a run that
  * was killed outright.
  *
- * The run writes a restore record (`<stateDir>/fit-test-restore.json`:
- * its pid, the active model, whether the chat and embedding daemons were
- * up) before it switches anything and removes it once the user's models
+ * The run writes a restore record (`<localModelsDataDir>/fit-test-restore.json`,
+ * beside the managed daemon it is about, which several state dirs can
+ * share through `dataDirOverride`: its pid, its state dir, the active
+ * model, whether the chat and embedding daemons were up) before it
+ * switches anything and removes it once the user's models
  * are back. A run killed without running a handler — the desktop's
  * Cancel on Windows is `TerminateProcess`, which no `process.on` hears —
  * leaves the record behind with a dead pid: the next `models` command or
  * TUI start (`recoverInterruptedFitTest`) puts the models back from it
  * and removes it.
  */
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { getConfig, resetConfigCache } from "../config/index.js";
 import type { LoadedFitModel } from "../fit-test/index.js";
 import { getDaemonStatus, getEmbeddingDaemonStatus, readLaunchRecord, stopEmbeddingDaemon } from "../local-llm/index.js";
@@ -153,26 +155,34 @@ const MARKER_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 export interface FitRestoreMarker extends FitModelSnapshot {
   pid: number;
   startedAt: number;
+  /** The state dir whose config `previous` is (absent: the reader's own). */
+  stateDir?: string;
 }
 
-export function fitRestoreMarkerPath(stateDir: string): string {
-  return join(stateDir, MARKER_FILE);
+/** `dataDir` is the local models data dir (`paths.localModelsDataDir`). */
+export function fitRestoreMarkerPath(dataDir: string): string {
+  return join(dataDir, MARKER_FILE);
 }
 
-export function writeFitRestoreMarker(stateDir: string, snapshot: FitModelSnapshot, pid = process.pid): void {
-  const marker: FitRestoreMarker = { pid, startedAt: Date.now(), ...snapshot };
-  writeFileSync(fitRestoreMarkerPath(stateDir), `${JSON.stringify(marker)}\n`, { encoding: "utf8", mode: 0o600 });
+export function writeFitRestoreMarker(
+  dataDir: string,
+  snapshot: FitModelSnapshot,
+  opts: { stateDir: string; pid?: number },
+): void {
+  const marker: FitRestoreMarker = { pid: opts.pid ?? process.pid, startedAt: Date.now(), stateDir: opts.stateDir, ...snapshot };
+  mkdirSync(dataDir, { recursive: true });
+  writeFileSync(fitRestoreMarkerPath(dataDir), `${JSON.stringify(marker)}\n`, { encoding: "utf8", mode: 0o600 });
 }
 
-export function clearFitRestoreMarker(stateDir: string): void {
-  rmSync(fitRestoreMarkerPath(stateDir), { force: true });
+export function clearFitRestoreMarker(dataDir: string): void {
+  rmSync(fitRestoreMarkerPath(dataDir), { force: true });
 }
 
 /** The record, or `null` when there is none or it cannot be read as one. */
-export function readFitRestoreMarker(stateDir: string): FitRestoreMarker | null {
+export function readFitRestoreMarker(dataDir: string): FitRestoreMarker | null {
   let raw: unknown;
   try {
-    raw = JSON.parse(readFileSync(fitRestoreMarkerPath(stateDir), "utf8"));
+    raw = JSON.parse(readFileSync(fitRestoreMarkerPath(dataDir), "utf8"));
   } catch {
     return null;
   }
@@ -184,7 +194,8 @@ export function readFitRestoreMarker(stateDir: string): FitRestoreMarker | null 
     typeof m.startedAt !== "number" ||
     !(m.previous === null || typeof m.previous === "string") ||
     typeof m.chatRunning !== "boolean" ||
-    typeof m.embeddingRunning !== "boolean"
+    typeof m.embeddingRunning !== "boolean" ||
+    !(m.stateDir === undefined || typeof m.stateDir === "string")
   ) {
     return null;
   }
@@ -215,18 +226,26 @@ export function fitRestoreMarkerLive(marker: FitRestoreMarker, now = Date.now())
  * record of a run still going is left alone; a failed restore keeps the
  * record for the next try.
  */
-export async function recoverInterruptedFitTest(opts: { stateDir?: string; restart?: boolean } = {}): Promise<boolean> {
-  const stateDir = opts.stateDir ?? getConfig().paths.stateDir;
-  const marker = readFitRestoreMarker(stateDir);
+export async function recoverInterruptedFitTest(opts: { restart?: boolean } = {}): Promise<boolean> {
+  const cfg = getConfig();
+  const dataDir = cfg.paths.localModelsDataDir;
+  const marker = readFitRestoreMarker(dataDir);
   if (marker === null) {
     // An unreadable record helps nobody: drop it.
-    clearFitRestoreMarker(stateDir);
+    clearFitRestoreMarker(dataDir);
     return false;
   }
   if (fitRestoreMarkerLive(marker)) return false;
+  if (marker.stateDir !== undefined && resolve(marker.stateDir) !== resolve(cfg.paths.stateDir)) {
+    // Its `previous` is another config's model: that config's next command puts it back.
+    process.stderr.write(
+      `an interrupted models fit-test of ${marker.stateDir} left a test model active; run an \`atomic-agent models\` command with that state dir to put its model back\n`,
+    );
+    return false;
+  }
   process.stderr.write("an interrupted models fit-test left a test model active; putting your model back\n");
   await createFitModelSwitcher(marker, { userCachesSaved: true }).restore(true, { restart: opts.restart !== false });
-  clearFitRestoreMarker(stateDir);
+  clearFitRestoreMarker(dataDir);
   return true;
 }
 

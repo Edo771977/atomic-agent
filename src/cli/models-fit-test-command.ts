@@ -197,7 +197,7 @@ export async function runModelsFitTest(args: string[]): Promise<number> {
   // fit-test stops and swaps the local model under every other client.
   // The TUI and the desktop register in the session registry; the
   // sidecar, `serve` and scheduled tasks do not, so they are not seen.
-  const other = readFitRestoreMarker(cfg.paths.stateDir);
+  const other = readFitRestoreMarker(cfg.paths.localModelsDataDir);
   if (other !== null && fitRestoreMarkerLive(other)) {
     process.stderr.write(`another models fit-test is running (pid ${other.pid}); wait for it to finish\n`);
     return 1;
@@ -235,7 +235,7 @@ export async function runModelsFitTest(args: string[]): Promise<number> {
   // A process killed with no chance to run a handler (the desktop's
   // Cancel on Windows is TerminateProcess) leaves this record behind; the
   // next `models` command or TUI start puts the models back from it.
-  writeFitRestoreMarker(cfg.paths.stateDir, snapshot);
+  writeFitRestoreMarker(cfg.paths.localModelsDataDir, snapshot, { stateDir: cfg.paths.stateDir });
   // A failed restore must not hide the finished report: it is reported,
   // the record stays for the next `models` command to retry, and the
   // command exits 1 after printing the run.
@@ -252,7 +252,7 @@ export async function runModelsFitTest(args: string[]): Promise<number> {
         );
         return;
       }
-      clearFitRestoreMarker(cfg.paths.stateDir);
+      clearFitRestoreMarker(cfg.paths.localModelsDataDir);
     },
   );
   if (outcome.stoppedBy !== null) return outcome.exitCode;
