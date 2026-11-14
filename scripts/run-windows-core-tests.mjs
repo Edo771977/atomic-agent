@@ -46,6 +46,7 @@ export const criticalFiles = [
   'src/tools/fusion/candidate-outcomes.test.ts',
   'src/tools/fusion/candidate-receipt.test.ts',
   'src/tools/fusion/candidate-durability.test.ts',
+  'src/tools/fusion/promotion-recovery.test.ts',
   'src/tools/fusion/branch-workspace-portability.test.ts',
   'src/tools/fusion/branch-workspace-dependency-links.test.ts',
   'src/tools/verify/verify-fail-closed.test.ts',
@@ -57,6 +58,7 @@ export const criticalFiles = [
 ];
 /** Additional whole-file regressions outside the exhaustively classified core directories. */
 export const supplementalFiles = [
+  'src/cli/fusion-recovery.test.ts',
   'src/agent/progress/test-command-key.test.ts',
   'src/import/handoff/handoff-source.test.ts',
   'scripts/run-windows-core-tests.test.ts',
