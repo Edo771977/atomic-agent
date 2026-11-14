@@ -161,6 +161,40 @@ describe.skipIf(process.platform === "win32")("eval launcher repeated signals", 
   }
 });
 
+describe.skipIf(process.platform === "win32")("eval launcher hang-up, quit and crash", () => {
+  for (const [signal, code] of [["SIGHUP", 129], ["SIGQUIT", 131]] as const) {
+    it(`a real ${signal} cancels the test tree like SIGINT and exits ${code}`, () => {
+      const result = launch(`real-${signal}`, { LAUNCHER_MODE: "tree", LAUNCHER_SIGNAL: signal, LAUNCHER_REAL_SIGNAL: "1" },
+        "signal-orchestrator.fixture.mjs");
+      const child = JSON.parse(readFileSync(result.output, "utf8")) as { pid: number; grandchildPid: number };
+      try {
+        expect(result.status, result.diagnostic).toBe(code);
+        const events = readFileSync(`${result.output}.events.jsonl`, "utf8").trim().split("\n").map((line) => JSON.parse(line).event);
+        expect(events).toEqual(["child-ready", "after-child-close", "teardown-finished", "returning"]);
+        expect(processAlive(child.pid)).toBe(false);
+        expect(processAlive(child.grandchildPid)).toBe(false);
+      } finally {
+        for (const pid of [child.pid, child.grandchildPid]) try { process.kill(pid, "SIGKILL"); } catch { /* gone */ }
+      }
+    });
+  }
+
+  it("kills the test tree when the launcher dies of an uncaught exception", () => {
+    const result = launch("crash", { LAUNCHER_MODE: "tree", LAUNCHER_CRASH: "1" }, "signal-orchestrator.fixture.mjs");
+    const child = JSON.parse(readFileSync(result.output, "utf8")) as { pid: number; grandchildPid: number };
+    try {
+      expect(result.status, result.diagnostic).toBe(1);
+      expect(result.diagnostic).toContain("launcher crashed");
+      const deadline = Date.now() + 2000;
+      while ((processAlive(child.pid) || processAlive(child.grandchildPid)) && Date.now() < deadline) { /* SIGKILL delivery */ }
+      expect(processAlive(child.pid)).toBe(false);
+      expect(processAlive(child.grandchildPid)).toBe(false);
+    } finally {
+      for (const pid of [child.pid, child.grandchildPid]) try { process.kill(pid, "SIGKILL"); } catch { /* gone */ }
+    }
+  });
+});
+
 describe("eval launcher without an installed Vitest", () => {
   it("still imports the shared helpers and fails runVitest with a clear diagnostic", () => {
     // A copy outside the repository cannot resolve the vitest package.

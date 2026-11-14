@@ -22,9 +22,17 @@ const running = runVitest({ entryPath: process.env.LAUNCHER_ENTRY,
 const deadline = Date.now() + 3000;
 while (!exists(process.env.LAUNCHER_RESULT) && Date.now() < deadline) await delay(10);
 record("child-ready");
+if (process.env.LAUNCHER_CRASH === "1") {
+  // An uncaught exception while the test tree runs: the launcher dies.
+  setTimeout(() => { throw new Error("launcher crashed"); }, 0);
+  await new Promise(() => {});
+}
 // Node dispatches the same installed handlers on both operating systems;
 // no interactive Windows console or actual Ctrl-C injection is required.
-process.emit(process.env.LAUNCHER_SIGNAL ?? "SIGINT");
+// LAUNCHER_REAL_SIGNAL delivers an actual POSIX signal instead, so an
+// unhandled one takes its default action (the terminal closing: SIGHUP).
+if (process.env.LAUNCHER_REAL_SIGNAL === "1") process.kill(process.pid, process.env.LAUNCHER_SIGNAL ?? "SIGINT");
+else process.emit(process.env.LAUNCHER_SIGNAL ?? "SIGINT");
 if (process.env.LAUNCHER_SECOND_SIGNAL) process.emit(process.env.LAUNCHER_SECOND_SIGNAL);
 let code;
 try {

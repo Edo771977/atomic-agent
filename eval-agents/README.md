@@ -103,10 +103,14 @@ launcher waits until the group is gone, escalating to SIGKILL after a timeout
 (10 s by default). A group left behind after a normal exit is stopped the
 same way. On Windows cancellation runs `taskkill /T`, then `/T /F` after the
 timeout; it reaches descendants only while the Vitest process is alive.
-Installed SIGINT/SIGTERM handlers request cancellation through the signal
-passed by smoke/level1; they do not exit or stop daemons inline. The caller
-awaits child close, then its managed-daemon teardown, before exiting 130
-(SIGINT) or 143 (SIGTERM). A second signal does not wait: it SIGKILLs the
+Installed SIGINT/SIGTERM/SIGHUP/SIGQUIT handlers (SIGQUIT on POSIX only)
+request cancellation through the signal passed by smoke/level1, so closing
+the terminal or dropping an SSH session cancels like Ctrl-C; they do not
+exit or stop daemons inline. The caller awaits child close, then its
+managed-daemon teardown, before exiting 129 (SIGHUP), 130 (SIGINT), 131
+(SIGQUIT) or 143 (SIGTERM). While a test tree runs, an exit listener kills
+it synchronously if the launcher exits any other way (an uncaught
+exception); a launcher killed with SIGKILL cannot clean up. A second signal does not wait: it SIGKILLs the
 running test process tree and exits at once with the second signal's code,
 skipping daemon teardown.
 Health waits honor the same signal, and handlers are removed after teardown.

@@ -201,7 +201,7 @@ export function runVitest({ extraEnv = {}, forwarded = [], signal,
     let interruptedBy = null;
     let killTimer;
     const tree = { child };
-    activeTrees.add(tree);
+    trackTree(tree);
     const interrupt = (name) => {
       if (interruptedBy) return;
       interruptedBy = name;
@@ -213,13 +213,10 @@ export function runVitest({ extraEnv = {}, forwarded = [], signal,
     const onAbort = () => interrupt(signal.reason?.signal ?? "SIGTERM");
     // Standalone callers forward process signals, without exiting before
     // close; a second signal kills the tree and exits immediately.
-    const onInt = () => (interruptedBy ? forceExit("SIGINT") : interrupt("SIGINT"));
-    const onTerm = () => (interruptedBy ? forceExit("SIGTERM") : interrupt("SIGTERM"));
+    const forwarders = new Map(CANCEL_SIGNALS.map((name) =>
+      [name, () => (interruptedBy ? forceExit(name) : interrupt(name))]));
     if (signal) signal.addEventListener("abort", onAbort, { once: true });
-    else {
-      process.prependListener("SIGINT", onInt);
-      process.prependListener("SIGTERM", onTerm);
-    }
+    else for (const [name, listener] of forwarders) process.prependListener(name, listener);
     child.once("error", (error) => {
       launchFailed = true;
       if (!signal?.aborted) console.error(`[eval-agents] could not launch vitest: ${error.message}`);
@@ -229,11 +226,10 @@ export function runVitest({ extraEnv = {}, forwarded = [], signal,
     // the caller tears down.
     child.once("close", async (code) => {
       signal?.removeEventListener("abort", onAbort);
-      process.removeListener("SIGINT", onInt);
-      process.removeListener("SIGTERM", onTerm);
+      for (const [name, listener] of forwarders) process.removeListener(name, listener);
       await reapTree(child, killTimeoutMs);
       clearTimeout(killTimer);
-      activeTrees.delete(tree);
+      untrackTree(tree);
       let exitCode = signal?.aborted ? signalExitCode(signal.reason?.signal)
         : interruptedBy ? signalExitCode(interruptedBy) : launchFailed ? 1 : code ?? 1;
       if (exitCode === 0 && campaignPath) {
@@ -250,13 +246,42 @@ export function runVitest({ extraEnv = {}, forwarded = [], signal,
   });
 }
 
-/** Conventional shell exit status for a cancellation signal. */
+/**
+ * Signals that cancel a campaign: Ctrl-C, termination, the terminal or SSH
+ * session closing (SIGHUP) and Ctrl-\ (SIGQUIT, POSIX only; Windows has no
+ * such signal and Node cannot listen for it there).
+ */
+const CANCEL_SIGNALS = process.platform === "win32"
+  ? ["SIGINT", "SIGTERM", "SIGHUP"]
+  : ["SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT"];
+
+const SIGNAL_EXIT_CODES = { SIGHUP: 129, SIGINT: 130, SIGQUIT: 131, SIGTERM: 143 };
+
+/** Conventional shell exit status (128 + number) for a cancellation signal. */
 export function signalExitCode(name) {
-  return name === "SIGTERM" ? 143 : 130;
+  return SIGNAL_EXIT_CODES[name] ?? 130;
 }
 
 // Test-child process trees still running; a second signal kills them all.
 const activeTrees = new Set();
+
+// While a tree runs, the launcher dying any other way — an uncaught
+// exception, process.exit from elsewhere — must not orphan it: an exit
+// listener kills it synchronously (only synchronous work runs on exit).
+// A launcher killed with SIGKILL runs nothing; that case still leaks.
+function killTreesOnExit() {
+  for (const { child } of activeTrees) signalTree(child, "SIGKILL");
+}
+
+function trackTree(tree) {
+  if (activeTrees.size === 0) process.on("exit", killTreesOnExit);
+  activeTrees.add(tree);
+}
+
+function untrackTree(tree) {
+  activeTrees.delete(tree);
+  if (activeTrees.size === 0) process.removeListener("exit", killTreesOnExit);
+}
 
 function forceExit(name) {
   for (const { child } of activeTrees) signalTree(child, "SIGKILL");
@@ -327,15 +352,12 @@ export function installSignalHandlers(log) {
     log(`received ${signal}, cancelling campaign`);
     controller.abort(Object.assign(new Error(`campaign cancelled by ${signal}`), { signal }));
   };
-  const onInt = () => onSignal("SIGINT");
-  const onTerm = () => onSignal("SIGTERM");
-  process.on("SIGINT", onInt);
-  process.on("SIGTERM", onTerm);
+  const listeners = new Map(CANCEL_SIGNALS.map((name) => [name, () => onSignal(name)]));
+  for (const [name, listener] of listeners) process.on(name, listener);
   return { signal: controller.signal,
-    /** 130 after SIGINT, 143 after SIGTERM; meaningful once aborted. */
+    /** 129 SIGHUP, 130 SIGINT, 131 SIGQUIT, 143 SIGTERM; meaningful once aborted. */
     get exitCode() { return signalExitCode(controller.signal.reason?.signal); },
     dispose() {
-    process.removeListener("SIGINT", onInt);
-    process.removeListener("SIGTERM", onTerm);
+    for (const [name, listener] of listeners) process.removeListener(name, listener);
   } };
 }
