@@ -214,211 +214,222 @@ export class TaskStore {
   constructor(options: TaskStoreOptions) {
     mkdirSync(dirname(options.dbFile), { recursive: true });
     this.db = new DatabaseCtor(options.dbFile);
-    this.db.pragma("journal_mode = WAL");
-    applyMigrations(this.db);
-    this.runOwnersUnavailable = ensureRunOwnerColumn(this.db);
-    const withOwners = this.runOwnersUnavailable === null;
-    this.budgetsUnavailable = ensureBudgetColumns(this.db);
-    const withBudgets = this.budgetsUnavailable === null;
-    const budgetColumns = withBudgets
-      ? ",\n         max_cost_usd, max_duration_ms, spent_usd, elapsed_ms, stop_cause"
-      : "";
-    const budgetValues = withBudgets
-      ? ",\n         @max_cost_usd, @max_duration_ms, @spent_usd, @elapsed_ms, @stop_cause"
-      : "";
-    this.approvalLevelUnavailable = ensureApprovalLevelColumn(this.db);
-    const withLevel = this.approvalLevelUnavailable === null;
-    const levelColumn = withLevel ? ", approval_level" : "";
-    const levelValue = withLevel ? ", @approval_level" : "";
-    this.ownerProbe = options.ownerProbe ?? currentTurnOwnerProbe();
-    this.dbIdentity = databaseIdentity(options.dbFile);
+    try {
+      this.db.pragma("journal_mode = WAL");
+      applyMigrations(this.db);
+      this.runOwnersUnavailable = ensureRunOwnerColumn(this.db);
+      const withOwners = this.runOwnersUnavailable === null;
+      this.budgetsUnavailable = ensureBudgetColumns(this.db);
+      const withBudgets = this.budgetsUnavailable === null;
+      const budgetColumns = withBudgets
+        ? ",\n         max_cost_usd, max_duration_ms, spent_usd, elapsed_ms, stop_cause"
+        : "";
+      const budgetValues = withBudgets
+        ? ",\n         @max_cost_usd, @max_duration_ms, @spent_usd, @elapsed_ms, @stop_cause"
+        : "";
+      this.approvalLevelUnavailable = ensureApprovalLevelColumn(this.db);
+      const withLevel = this.approvalLevelUnavailable === null;
+      const levelColumn = withLevel ? ", approval_level" : "";
+      const levelValue = withLevel ? ", @approval_level" : "";
+      this.ownerProbe = options.ownerProbe ?? currentTurnOwnerProbe();
+      this.dbIdentity = databaseIdentity(options.dbFile);
 
-    this.insertStmt = this.db.prepare(
-      `INSERT INTO tasks (
-         id, session_id, user_message, max_steps, status, origin,
-         attempts, max_attempts, last_error, last_error_cat,
-         created_at, updated_at, started_at, completed_at,
-         schedule_kind, schedule_value, scheduled_for, recurring,
-         last_scheduled_at, trigger_source, notify${budgetColumns}${levelColumn}
-       ) VALUES (
-         @id, @session_id, @user_message, @max_steps, @status, @origin,
-         @attempts, @max_attempts, @last_error, @last_error_cat,
-         @created_at, @updated_at, @started_at, @completed_at,
-         @schedule_kind, @schedule_value, @scheduled_for, @recurring,
-         @last_scheduled_at, @trigger_source, @notify${budgetValues}${levelValue}
-       )`,
-    );
-    // Names no `run_owner`: a copied row never carries a claim.
-    this.insertIfAbsentStmt = this.db.prepare(
-      `INSERT OR IGNORE INTO tasks (
-         id, session_id, user_message, max_steps, status, origin,
-         attempts, max_attempts, last_error, last_error_cat,
-         created_at, updated_at, started_at, completed_at,
-         schedule_kind, schedule_value, scheduled_for, recurring,
-         last_scheduled_at, trigger_source, notify${budgetColumns}${levelColumn}
-       ) VALUES (
-         @id, @session_id, @user_message, @max_steps, @status, @origin,
-         @attempts, @max_attempts, @last_error, @last_error_cat,
-         @created_at, @updated_at, @started_at, @completed_at,
-         @schedule_kind, @schedule_value, @scheduled_for, @recurring,
-         @last_scheduled_at, @trigger_source, @notify${budgetValues}${levelValue}
-       )`,
-    );
-    this.selectStmt = this.db.prepare(`SELECT * FROM tasks WHERE id = ?`);
-    this.listAllStmt = this.db.prepare(
-      `SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?`,
-    );
-    this.listBySessionStmt = this.db.prepare(
-      `SELECT * FROM tasks WHERE session_id = ? ORDER BY created_at DESC LIMIT ?`,
-    );
-    this.listPendingStmt = this.db.prepare(
-      `SELECT * FROM tasks WHERE status = 'pending' ORDER BY created_at ASC LIMIT ?`,
-    );
-    this.listPendingBySessionStmt = this.db.prepare(
-      `SELECT * FROM tasks
-         WHERE status = 'pending' AND session_id = ?
-         ORDER BY created_at ASC LIMIT ?`,
-    );
-    this.listDueStmt = this.db.prepare(
-      `SELECT * FROM tasks
-         WHERE status = 'pending'
-           AND (scheduled_for IS NULL OR scheduled_for <= ?)
-         ORDER BY scheduled_for ASC, created_at ASC
-         LIMIT ?`,
-    );
-    const claimOwner = withOwners ? ",\n              run_owner = @owner" : "";
-    // The claim names its owner in the same write, with the claim's own
-    // time as the owner's `at`: a row's owner speaks for the run only
-    // while `at` equals `started_at`. An older binary sharing the file
-    // claims without touching `run_owner`, so an owner left from an
-    // earlier claim never matches that run's `started_at`.
-    this.markRunningStmt = this.db.prepare(
-      `UPDATE tasks
-          SET status = 'running',
-              attempts = attempts + 1,
-              started_at = @now,
-              updated_at = @now,
-              last_error = NULL,
-              last_error_cat = NULL${claimOwner}
-        WHERE id = @id AND status = 'pending'`,
-    );
-    this.markCompletedStmt = this.db.prepare(
-      `UPDATE tasks
-          SET status = 'completed',
-              completed_at = @now,
-              updated_at = @now,
-              last_error = NULL,
-              last_error_cat = NULL
-        WHERE id = @id AND status = 'running'`,
-    );
-    this.markFailedStmt = this.db.prepare(
-      `UPDATE tasks
-          SET status = 'failed',
-              completed_at = @now,
-              updated_at = @now,
-              last_error = @last_error,
-              last_error_cat = @last_error_cat
-        WHERE id = @id AND status = 'running'`,
-    );
-    this.markRetryStmt = this.db.prepare(
-      `UPDATE tasks
-          SET status = 'pending',
-              updated_at = @now,
-              started_at = NULL,
-              scheduled_for = @scheduled_for,
-              last_error = @last_error,
-              last_error_cat = @last_error_cat
-        WHERE id = @id AND status = 'running'`,
-    );
-    this.markBlockedStmt = this.db.prepare(
-      `UPDATE tasks
-          SET status = 'blocked',
-              completed_at = @now,
-              updated_at = @now,
-              last_error = @last_error,
-              last_error_cat = @last_error_cat
-        WHERE id = @id AND status IN ('running', 'pending')`,
-    );
-    this.markCancelledStmt = this.db.prepare(
-      `UPDATE tasks
-          SET status = 'cancelled',
-              completed_at = @now,
-              updated_at = @now
-        WHERE id = @id AND status IN ('pending', 'running')`,
-    );
-    this.listRunningStmt = this.db.prepare(
-      `SELECT id, started_at, ${withOwners ? "run_owner" : "NULL AS run_owner"}
-         FROM tasks WHERE status = 'running'`,
-    );
-    // Keyed on the claim the sweep judged (`started_at`), so a row
-    // claimed again in between is never taken back on the old verdict.
-    this.recoverRunningStmt = this.db.prepare(
-      `UPDATE tasks
-          SET status = 'pending',
-              updated_at = @now,
-              started_at = NULL,
-              last_error = COALESCE(last_error, @last_error),
-              last_error_cat = COALESCE(last_error_cat, 'transport')
-        WHERE id = @id AND status = 'running' AND started_at IS @started_at`,
-    );
-    this.markInterruptedStmt = this.db.prepare(
-      `UPDATE tasks
-          SET status = 'pending',
-              attempts = CASE WHEN @scheduled_for IS NULL THEN attempts ELSE 0 END,
-              started_at = NULL,
-              scheduled_for = COALESCE(@scheduled_for, scheduled_for),
-              last_scheduled_at = CASE
-                WHEN @scheduled_for IS NULL THEN last_scheduled_at
-                ELSE @now
-              END,
-              updated_at = @now,
-              last_error = @last_error,
-              last_error_cat = 'cancelled'
-        WHERE id = @id AND status = 'running'`,
-    );
-    this.requeueRecurringStmt = this.db.prepare(
-      `UPDATE tasks
-          SET status = 'pending',
-              attempts = 0,
-              last_error = NULL,
-              last_error_cat = NULL,
-              started_at = NULL,
-              completed_at = NULL,
-              scheduled_for = @scheduled_for,
-              last_scheduled_at = @now,
-              updated_at = @now
-        WHERE id = @id AND recurring = 1`,
-    );
-    this.assignSessionStmt = this.db.prepare(
-      `UPDATE tasks
-          SET session_id = @session_id,
-              updated_at = @now
-        WHERE id = @id`,
-    );
-    this.recordSpendStmt = withBudgets
-      ? this.db.prepare(
-          `UPDATE tasks
-              SET spent_usd = @spent_usd,
-                  updated_at = @now
-            WHERE id = @id`,
-        )
-      : null;
-    this.recordElapsedStmt = withBudgets
-      ? this.db.prepare(
-          `UPDATE tasks
-              SET elapsed_ms = @elapsed_ms,
-                  updated_at = @now
-            WHERE id = @id`,
-        )
-      : null;
-    this.recordStopCauseStmt = withBudgets
-      ? this.db.prepare(`UPDATE tasks SET stop_cause = @stop_cause WHERE id = @id`)
-      : null;
-    this.resetSpendStmt = withBudgets
-      ? this.db.prepare(
-          `UPDATE tasks SET spent_usd = NULL, elapsed_ms = NULL, stop_cause = NULL WHERE id = @id`,
-        )
-      : null;
+      this.insertStmt = this.db.prepare(
+        `INSERT INTO tasks (
+           id, session_id, user_message, max_steps, status, origin,
+           attempts, max_attempts, last_error, last_error_cat,
+           created_at, updated_at, started_at, completed_at,
+           schedule_kind, schedule_value, scheduled_for, recurring,
+           last_scheduled_at, trigger_source, notify${budgetColumns}${levelColumn}
+         ) VALUES (
+           @id, @session_id, @user_message, @max_steps, @status, @origin,
+           @attempts, @max_attempts, @last_error, @last_error_cat,
+           @created_at, @updated_at, @started_at, @completed_at,
+           @schedule_kind, @schedule_value, @scheduled_for, @recurring,
+           @last_scheduled_at, @trigger_source, @notify${budgetValues}${levelValue}
+         )`,
+      );
+      // Names no `run_owner`: a copied row never carries a claim.
+      this.insertIfAbsentStmt = this.db.prepare(
+        `INSERT OR IGNORE INTO tasks (
+           id, session_id, user_message, max_steps, status, origin,
+           attempts, max_attempts, last_error, last_error_cat,
+           created_at, updated_at, started_at, completed_at,
+           schedule_kind, schedule_value, scheduled_for, recurring,
+           last_scheduled_at, trigger_source, notify${budgetColumns}${levelColumn}
+         ) VALUES (
+           @id, @session_id, @user_message, @max_steps, @status, @origin,
+           @attempts, @max_attempts, @last_error, @last_error_cat,
+           @created_at, @updated_at, @started_at, @completed_at,
+           @schedule_kind, @schedule_value, @scheduled_for, @recurring,
+           @last_scheduled_at, @trigger_source, @notify${budgetValues}${levelValue}
+         )`,
+      );
+      this.selectStmt = this.db.prepare(`SELECT * FROM tasks WHERE id = ?`);
+      this.listAllStmt = this.db.prepare(
+        `SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?`,
+      );
+      this.listBySessionStmt = this.db.prepare(
+        `SELECT * FROM tasks WHERE session_id = ? ORDER BY created_at DESC LIMIT ?`,
+      );
+      this.listPendingStmt = this.db.prepare(
+        `SELECT * FROM tasks WHERE status = 'pending' ORDER BY created_at ASC LIMIT ?`,
+      );
+      this.listPendingBySessionStmt = this.db.prepare(
+        `SELECT * FROM tasks
+           WHERE status = 'pending' AND session_id = ?
+           ORDER BY created_at ASC LIMIT ?`,
+      );
+      this.listDueStmt = this.db.prepare(
+        `SELECT * FROM tasks
+           WHERE status = 'pending'
+             AND (scheduled_for IS NULL OR scheduled_for <= ?)
+           ORDER BY scheduled_for ASC, created_at ASC
+           LIMIT ?`,
+      );
+      const claimOwner = withOwners ? ",\n              run_owner = @owner" : "";
+      // The claim names its owner in the same write, with the claim's own
+      // time as the owner's `at`: a row's owner speaks for the run only
+      // while `at` equals `started_at`. An older binary sharing the file
+      // claims without touching `run_owner`, so an owner left from an
+      // earlier claim never matches that run's `started_at`.
+      this.markRunningStmt = this.db.prepare(
+        `UPDATE tasks
+            SET status = 'running',
+                attempts = attempts + 1,
+                started_at = @now,
+                updated_at = @now,
+                last_error = NULL,
+                last_error_cat = NULL${claimOwner}
+          WHERE id = @id AND status = 'pending'`,
+      );
+      this.markCompletedStmt = this.db.prepare(
+        `UPDATE tasks
+            SET status = 'completed',
+                completed_at = @now,
+                updated_at = @now,
+                last_error = NULL,
+                last_error_cat = NULL
+          WHERE id = @id AND status = 'running'`,
+      );
+      this.markFailedStmt = this.db.prepare(
+        `UPDATE tasks
+            SET status = 'failed',
+                completed_at = @now,
+                updated_at = @now,
+                last_error = @last_error,
+                last_error_cat = @last_error_cat
+          WHERE id = @id AND status = 'running'`,
+      );
+      this.markRetryStmt = this.db.prepare(
+        `UPDATE tasks
+            SET status = 'pending',
+                updated_at = @now,
+                started_at = NULL,
+                scheduled_for = @scheduled_for,
+                last_error = @last_error,
+                last_error_cat = @last_error_cat
+          WHERE id = @id AND status = 'running'`,
+      );
+      this.markBlockedStmt = this.db.prepare(
+        `UPDATE tasks
+            SET status = 'blocked',
+                completed_at = @now,
+                updated_at = @now,
+                last_error = @last_error,
+                last_error_cat = @last_error_cat
+          WHERE id = @id AND status IN ('running', 'pending')`,
+      );
+      this.markCancelledStmt = this.db.prepare(
+        `UPDATE tasks
+            SET status = 'cancelled',
+                completed_at = @now,
+                updated_at = @now
+          WHERE id = @id AND status IN ('pending', 'running')`,
+      );
+      this.listRunningStmt = this.db.prepare(
+        `SELECT id, started_at, ${withOwners ? "run_owner" : "NULL AS run_owner"}
+           FROM tasks WHERE status = 'running'`,
+      );
+      // Keyed on the claim the sweep judged (`started_at`), so a row
+      // claimed again in between is never taken back on the old verdict.
+      this.recoverRunningStmt = this.db.prepare(
+        `UPDATE tasks
+            SET status = 'pending',
+                updated_at = @now,
+                started_at = NULL,
+                last_error = COALESCE(last_error, @last_error),
+                last_error_cat = COALESCE(last_error_cat, 'transport')
+          WHERE id = @id AND status = 'running' AND started_at IS @started_at`,
+      );
+      this.markInterruptedStmt = this.db.prepare(
+        `UPDATE tasks
+            SET status = 'pending',
+                attempts = CASE WHEN @scheduled_for IS NULL THEN attempts ELSE 0 END,
+                started_at = NULL,
+                scheduled_for = COALESCE(@scheduled_for, scheduled_for),
+                last_scheduled_at = CASE
+                  WHEN @scheduled_for IS NULL THEN last_scheduled_at
+                  ELSE @now
+                END,
+                updated_at = @now,
+                last_error = @last_error,
+                last_error_cat = 'cancelled'
+          WHERE id = @id AND status = 'running'`,
+      );
+      this.requeueRecurringStmt = this.db.prepare(
+        `UPDATE tasks
+            SET status = 'pending',
+                attempts = 0,
+                last_error = NULL,
+                last_error_cat = NULL,
+                started_at = NULL,
+                completed_at = NULL,
+                scheduled_for = @scheduled_for,
+                last_scheduled_at = @now,
+                updated_at = @now
+          WHERE id = @id AND recurring = 1`,
+      );
+      this.assignSessionStmt = this.db.prepare(
+        `UPDATE tasks
+            SET session_id = @session_id,
+                updated_at = @now
+          WHERE id = @id`,
+      );
+      this.recordSpendStmt = withBudgets
+        ? this.db.prepare(
+            `UPDATE tasks
+                SET spent_usd = @spent_usd,
+                    updated_at = @now
+              WHERE id = @id`,
+          )
+        : null;
+      this.recordElapsedStmt = withBudgets
+        ? this.db.prepare(
+            `UPDATE tasks
+                SET elapsed_ms = @elapsed_ms,
+                    updated_at = @now
+              WHERE id = @id`,
+          )
+        : null;
+      this.recordStopCauseStmt = withBudgets
+        ? this.db.prepare(`UPDATE tasks SET stop_cause = @stop_cause WHERE id = @id`)
+        : null;
+      this.resetSpendStmt = withBudgets
+        ? this.db.prepare(
+            `UPDATE tasks SET spent_usd = NULL, elapsed_ms = NULL, stop_cause = NULL WHERE id = @id`,
+          )
+        : null;
+    } catch (error) {
+      // No caller receives this instance when initialization throws.
+      // Release the handle even when migration or statement setup failed.
+      try {
+        this.db.close();
+      } catch {
+        // Keep the initialization error as the actionable failure.
+      }
+      throw error;
+    }
   }
 
   create(input: TaskCreateInput, now: number = Date.now()): TaskRecord {

@@ -1,8 +1,9 @@
-import { describe, expect, it, beforeEach, afterEach } from "vitest";
+import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import {
   chmodSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
   readdirSync,
   rmSync,
@@ -14,6 +15,11 @@ import { join } from "node:path";
 
 import { createNdjsonTraceSink, traceFilePath } from "./trace-sink.js";
 import type { TraceEvent } from "./trace-event.js";
+
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return { ...actual, openSync: vi.fn(actual.openSync) };
+});
 
 function baseEvent(sessionId: string, seq: number, ts: number): TraceEvent {
   return {
@@ -339,9 +345,14 @@ describe("createNdjsonTraceSink", () => {
     const sink = createNdjsonTraceSink({ dir, maxBytesPerSession: 600 });
     for (let i = 0; i < 8; i++) sink(paddedEvent("s-ro", i, 40));
     const before = readFileSync(traceFilePath(dir, "s-ro"), "utf8");
-    // A read-only directory fails the temp write; the sink must
-    // degrade to "stop writing", never lose the file and never throw.
-    chmodSync(dir, 0o500);
+    // Inject the exact temp-file failure: POSIX directory write bits do
+    // not deny a Windows write (and may not deny a root user's write).
+    // All prior appends, reads and successful trims use the real fs.
+    const tempWrite = vi.mocked(openSync);
+    tempWrite.mockClear();
+    tempWrite.mockImplementationOnce(() => {
+      throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+    });
     try {
       expect(() => {
         for (let i = 8; i < 40; i++) sink(paddedEvent("s-ro", i, 40));
@@ -357,8 +368,10 @@ describe("createNdjsonTraceSink", () => {
       }
       sink(paddedEvent("s-ro", 40, 40));
       expect(readFileSync(traceFilePath(dir, "s-ro"), "utf8")).toBe(after);
+      expect(tempWrite).toHaveBeenCalledTimes(1);
+      expect(tempWrite.mock.calls[0]![0]).toContain("s-ro.ndjson.trim-");
     } finally {
-      chmodSync(dir, 0o700);
+      tempWrite.mockRestore();
     }
   });
 

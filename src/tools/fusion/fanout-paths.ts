@@ -1,9 +1,10 @@
-import { dirname, isAbsolute, resolve, sep } from "node:path";
+import { dirname, isAbsolute, parse, relative, resolve } from "node:path";
 import { homedir } from "node:os";
 
 import { isInside } from "../../approval/fanout-scope.js";
 import { resolveUserPath } from "../os/expand-home.js";
 import type { DelegateTask } from "./delegate-args.js";
+import { comparableScopePath } from "./scope-path.js";
 
 /**
  * Where a fan-out is about to write — the directory the operator is
@@ -39,15 +40,31 @@ import type { DelegateTask } from "./delegate-args.js";
 const PATH_IN_PROSE =
   /(?:^|[\s"'`(])((?:\/|\.\/|~\/)[\w.@+-]+(?:\/[\w.@+-]+)*\.[A-Za-z0-9]{1,8})/g;
 
+// Keep the same conservative filename/extension rule on Windows. A drive
+// must be qualified (C:notes.ts is relative), and UNC names include a share.
+// URLs and version numbers must not silently widen an approval scope.
+const WINDOWS_PATH_IN_PROSE =
+  /(?:^|[\s"'`(])((?:[A-Za-z]:[\\/]|[\\/]{2}[\w.@+-]+[\\/][\w.@+-]+[\\/]|\.\\|~\\)[\w.@+-]+(?:[\\/][\w.@+-]+)*\.[A-Za-z0-9]{1,8})(?=$|[\s"'`),;])/g;
+
 /** Roots too broad to hand to a fan-out, however the brief was written. */
 function isTooBroad(dir: string): boolean {
-  const home = homedir();
-  return dir === sep || dir === home || dir === resolve(home, "..");
+  const home = comparableScopePath(homedir());
+  if (home === null) return true;
+  const absolute = resolve(dir);
+  // Native path equality also covers Windows drive/UNC roots, separator
+  // aliases and case differences. A textual comparison with `sep` only
+  // rejects "\\", leaving an entire drive or share available to workers.
+  return [parse(absolute).root, home, resolve(home, "..")].some(
+    (broad) => relative(broad, absolute) === "",
+  );
 }
 
 function collectFromText(text: string, workingDir: string): string[] {
   const out: string[] = [];
-  for (const match of text.matchAll(PATH_IN_PROSE)) {
+  const patterns = process.platform === "win32"
+    ? [PATH_IN_PROSE, WINDOWS_PATH_IN_PROSE]
+    : [PATH_IN_PROSE];
+  for (const match of patterns.flatMap((pattern) => [...text.matchAll(pattern)])) {
     const raw = match[1];
     if (raw === undefined) continue;
     try {
@@ -65,7 +82,8 @@ function collectFromText(text: string, workingDir: string): string[] {
  * anything too broad to authorise.
  */
 export function collapseScope(dirs: readonly string[]): string[] {
-  const unique = [...new Set(dirs)].filter((dir) => !isTooBroad(dir));
+  const comparable = dirs.map(comparableScopePath).filter((dir): dir is string => dir !== null);
+  const unique = [...new Set(comparable)].filter((dir) => !isTooBroad(dir));
   const roots: string[] = [];
   for (const dir of unique.sort((a, b) => a.length - b.length)) {
     if (!roots.some((root) => isInside(root, dir))) roots.push(dir);

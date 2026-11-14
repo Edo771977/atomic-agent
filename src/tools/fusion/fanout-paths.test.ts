@@ -1,4 +1,5 @@
 import { homedir } from "node:os";
+import { dirname, join, parse, toNamespacedPath } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { collapseScope, resolveFanoutScope } from "./fanout-paths.js";
@@ -13,15 +14,16 @@ function task(patch: Partial<DelegateTask> = {}): DelegateTask {
   };
 }
 
-const CWD = "/repo";
+const CWD = join(process.cwd(), "review-project");
+const OUTPUT = join(process.cwd(), "review-output");
 
 describe("resolveFanoutScope", () => {
   it("takes the directories a brief names in `files`", () => {
     const scope = resolveFanoutScope(
-      [task({ files: ["/tmp/rel-2/cart.js", "/tmp/rel-2/cart.test.js"] })],
+      [task({ files: [join(OUTPUT, "cart.js"), join(OUTPUT, "cart.test.js")] })],
       CWD,
     );
-    expect(scope).toContain("/tmp/rel-2");
+    expect(scope).toContain(OUTPUT);
   });
 
   it("reads paths out of the prose when `files` is empty", () => {
@@ -32,14 +34,14 @@ describe("resolveFanoutScope", () => {
       [
         task({
           instructions:
-            "Create directory /tmp/rel-2 if needed. Write two files:\n" +
-            "1. /tmp/rel-2/cart.js — export function addItem(cart, item).\n" +
-            "2. /tmp/rel-2/cart.test.js — use node:test.",
+            `Create directory ${OUTPUT} if needed. Write two files:\n` +
+            `1. ${join(OUTPUT, "cart.js")} — export function addItem(cart, item).\n` +
+            `2. ${join(OUTPUT, "cart.test.js")} — use node:test.`,
         }),
       ],
       CWD,
     );
-    expect(scope).toContain("/tmp/rel-2");
+    expect(scope).toContain(OUTPUT);
   });
 
   it("does not mistake prose for paths", () => {
@@ -58,13 +60,28 @@ describe("resolveFanoutScope", () => {
     expect(scope).toEqual([CWD]);
   });
 
+  it("reads native absolute paths from prose without treating versions or drive-relative words as paths", () => {
+    const cwd = join(process.cwd(), "review-project");
+    const outside = join(process.cwd(), "review-output");
+    const path = join(outside, "result.ts");
+    const scope = resolveFanoutScope([task({ instructions: `Write ${path}; then review.` })], cwd);
+    expect(scope).toContain(outside);
+    expect(resolveFanoutScope([task({ instructions: "Use v1.2.3, https://example.org/file.ts and C:notes.ts." })], cwd)).toEqual([cwd]);
+    if (process.platform === "win32") {
+      expect(resolveFanoutScope([task({ instructions: "Write C:/review-output/result.ts" })], cwd)).toContain("C:/review-output");
+      expect(resolveFanoutScope([task({ deliverable: "Save \\\\server\\share\\output\\result.ts" })], cwd)).toContain("\\\\server\\share\\output");
+      // File names at the drive/share root must never widen a fan-out to it.
+      expect(resolveFanoutScope([task({ instructions: "Write C:\\result.ts and \\\\server\\share\\result.ts" })], cwd)).toEqual([cwd]);
+    }
+  });
+
   it("always includes the working directory as the floor", () => {
     expect(resolveFanoutScope([task()], CWD)).toEqual([CWD]);
   });
 
   it("resolves a relative path against the working directory", () => {
     const scope = resolveFanoutScope([task({ files: ["./src/a.ts"] })], CWD);
-    expect(scope).toEqual(["/repo"]);
+    expect(scope).toEqual([CWD]);
   });
 });
 
@@ -96,5 +113,49 @@ describe("collapseScope", () => {
     // the home directory are not scopes, they are the absence of one.
     expect(collapseScope(["/"])).toEqual([]);
     expect(collapseScope([homedir()])).toEqual([]);
+  });
+
+  it("refuses native root and home aliases without rejecting their siblings", () => {
+    const home = homedir();
+    expect(collapseScope([parse(home).root, join(home, ".."), join(home, ".")])).toEqual([]);
+    const sibling = `${dirname(home)}-review`;
+    expect(collapseScope([sibling])).toEqual([sibling]);
+    if (process.platform === "win32") {
+      expect(collapseScope(["C:\\", "c:/", "C:\\folder\\..", "\\\\server\\share\\", "//server/share/"])).toEqual([]);
+      expect(collapseScope([home.toUpperCase().replaceAll("\\", "/")])).toEqual([]);
+    }
+  });
+
+  it("refuses namespaced broad roots and unsupported device scope spellings", () => {
+    expect(collapseScope([toNamespacedPath(homedir()), toNamespacedPath(dirname(homedir()))])).toEqual([]);
+    if (process.platform === "win32") {
+      for (const path of [
+        "\\\\?\\C:\\", "\\\\?\\UNC\\server\\share\\", "\\\\?\\unc\\SERVER\\SHARE\\",
+        "\\\\.\\C:\\project", "//?/C:/project", "//./C:/project", "\\\\?\\GLOBALROOT\\Device\\HarddiskVolume1\\project",
+        "\\\\?\\C:\\project\\.\\src", "\\\\?\\C:\\project\\..\\src", "\\\\?\\C:\\project.\\src", "\\\\?\\C:\\project \\src",
+        "\\\\?\\C:\\project\\NUL", "\\\\?\\UNC\\server\\share.\\project",
+        `${homedir()}.`, `${homedir()} `,
+      ]) expect(collapseScope([path]), path).toEqual([]);
+      expect(collapseScope([toNamespacedPath(join(homedir(), "review-safe"))])).toEqual([join(homedir(), "review-safe")]);
+    }
+  });
+
+  it("compares a namespaced home environment and refuses grants when home cannot be compared", () => {
+    const variable = process.platform === "win32" ? "USERPROFILE" : "HOME";
+    const previous = process.env[variable];
+    const normalHome = process.cwd();
+    try {
+      process.env[variable] = toNamespacedPath(normalHome);
+      expect(homedir()).toBe(toNamespacedPath(normalHome));
+      expect(collapseScope([normalHome, toNamespacedPath(normalHome), dirname(normalHome)])).toEqual([]);
+      expect(collapseScope([join(normalHome, "safe-child")])).toEqual([join(normalHome, "safe-child")]);
+      if (process.platform === "win32") {
+        process.env[variable] = "\\\\.\\C:\\profile";
+        expect(collapseScope([normalHome, join(normalHome, "safe-child")])).toEqual([]);
+      }
+    } finally {
+      if (previous === undefined) delete process.env[variable];
+      else process.env[variable] = previous;
+    }
   });
 });

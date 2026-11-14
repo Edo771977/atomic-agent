@@ -1,7 +1,7 @@
 import { mkdtemp, readFile, readdir, rm, writeFile, mkdir } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, toNamespacedPath } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { FanoutScopeRegistry } from "../../approval/fanout-scope.js";
 import type { RunTurnResult } from "../../agent/agent-loop.js";
@@ -277,7 +277,7 @@ describe("runIsolatedWave", () => {
     expect(await readFile(join(repo, "docs"), "utf8")).toBe("a file named docs\n");
     expect(await readFile(join(repo, "b.txt"), "utf8")).toBe("b from two\n");
     expect(wave.results.map((r) => r.status)).toEqual(["ok", "needs_orchestrator"]);
-    expect(wave.results[1]!.error).toContain("merge conflict in docs/a.md");
+    expect(wave.results[1]!.error).toContain(`merge conflict in ${join("docs", "a.md")}`);
     expect(wave.merges.map((m) => m.id)).toEqual(["merge-two"]);
     const saved = join(repo, BRANCH_MERGE_DIR, (await readdir(join(repo, BRANCH_MERGE_DIR))).filter((n) => n !== ".gitignore")[0]!);
     expect(await readFile(join(saved, "docs", "a.md.task"), "utf8")).toBe("under docs\n");
@@ -375,6 +375,44 @@ describe("inputReplacement / applyMergeOutcome", () => {
 });
 
 describe("rebaseTask / rebaseScope", () => {
+  it("rebases namespaced aliases of the real project without retaining write authority there", async () => {
+    const root = await plainDir({ "probe.txt": "same-file" });
+    const workspace = join(root, "private");
+    const namespaced = toNamespacedPath(root);
+    expect(await readFile(join(namespaced, "probe.txt"), "utf8")).toBe("same-file");
+    const sibling = `${root}-backup`;
+    for (const roots of [[root], [namespaced]]) {
+      const mapped = rebaseScope([namespaced, toNamespacedPath(join(root, "..hidden")), sibling], roots, workspace);
+      expect(mapped).toEqual([workspace, join(workspace, "..hidden"), sibling]);
+      const grants = new FanoutScopeRegistry();
+      grants.grant("namespace-test", mapped);
+      expect(grants.allows("namespace-test", [join(root, "probe.txt")])).toBe(false);
+      expect(grants.allows("namespace-test", [toNamespacedPath(join(root, "probe.txt"))])).toBe(false);
+      expect(grants.allows("namespace-test", [join(workspace, "out.txt")])).toBe(true);
+    }
+    if (process.platform === "win32") {
+      expect(rebaseScope([namespaced], [root], toNamespacedPath(workspace))).toEqual([workspace]);
+      expect(rebaseScope([root], [root], "\\\\.\\C:\\private")).toEqual([]);
+      const unc = "\\\\server\\share\\project";
+      expect(rebaseScope(["\\\\?\\unc\\SERVER\\SHARE\\PROJECT\\src"], [unc], workspace)).toEqual([join(workspace, "src"), workspace]);
+      expect(rebaseScope([join(unc, "src")], [toNamespacedPath(unc)], workspace)).toEqual([join(workspace, "src"), workspace]);
+      expect(rebaseScope(["\\\\.\\C:\\project", "\\\\?\\C:\\project.\\src", "//?/C:/project"], [root], workspace)).toEqual([workspace]);
+      expect(rebaseScope([root], ["\\\\.\\C:\\project"], workspace)).toEqual([workspace]);
+    }
+  });
+
+  it("rebases native scope aliases and keeps sibling scopes outside the workspace", () => {
+    const root = join(process.cwd(), "review-project");
+    const workspace = join(process.cwd(), "private-task");
+    const sibling = `${root}-backup`;
+    const alias = process.platform === "win32"
+      ? `${root.toUpperCase().replaceAll("\\", "/")}/src`
+      : join(root, "nested", "..", "src");
+    expect(rebaseScope([alias, sibling, join(root, "..hidden")], [root], workspace)).toEqual([
+      join(workspace, "src"), sibling, join(workspace, "..hidden"), workspace,
+    ]);
+  });
+
   it("points paths into the folder at the workspace, under either spelling", () => {
     const roots = ["/var/p", "/private/var/p"];
     const t = rebaseTask(
@@ -390,7 +428,7 @@ describe("rebaseTask / rebaseScope", () => {
     expect(t.instructions).toContain("edit /ws/t0/a.ts and /ws/t0/b.ts, not /var/plan.md");
     expect(t.files).toEqual(["/ws/t0/a.ts", "rel.ts", "/elsewhere/c.ts"]);
     expect(rebaseScope(["/var/p/src", "/other"], roots, "/ws/t0")).toEqual([
-      "/ws/t0/src",
+      join("/ws/t0", "src"),
       "/other",
       "/ws/t0",
     ]);

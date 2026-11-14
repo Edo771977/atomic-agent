@@ -77,8 +77,9 @@ function checkExit(check: string, tokens: string[], s: CheckSubject): CheckOutco
   const negated = a === "!=";
   const wanted = Number.parseInt((negated || a === "==" ? b : a) ?? "", 10);
   if (!Number.isInteger(wanted)) return outcome(check, false, "unknown check: expected `exit <code>`");
+  if (s.timedOut) return outcome(check, false, "killed (timed out)");
   if (s.exitCode === undefined) return outcome(check, false, `no exit code for a ${s.kind} run`);
-  const actual = s.exitCode === null ? (s.timedOut ? "killed (timed out)" : "killed by signal") : `exit ${s.exitCode}`;
+  const actual = s.exitCode === null ? "killed by signal" : `exit ${s.exitCode}`;
   const ok = negated ? s.exitCode !== wanted : s.exitCode === wanted;
   return outcome(check, ok, actual);
 }

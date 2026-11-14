@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, describe, expect, it } from "vitest";
 // @ts-expect-error -- plain .mjs script without declarations
-import { coreDirectories, criticalFiles, deferredFiles, externalCriticalFiles, scopeDrift } from "./run-windows-core-tests.mjs";
+import { coreDirectories, criticalFiles, deferredFiles, externalCriticalFiles, supplementalFiles, scopeDrift, supplementalDrift, quarantinedGateFiles } from "./run-windows-core-tests.mjs";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const scratch = mkdtempSync(join(tmpdir(), "windows-core-scope-"));
@@ -34,5 +34,25 @@ describe("Windows core gate scope", () => {
       missing: [(criticalFiles as string[])[0]],
       overlapping: [],
     });
+  });
+
+  it("validates the additional whole-file Windows regressions", () => {
+    expect(supplementalFiles).toContain("src/tasks/task-store-open-failure.test.ts");
+    expect(supplementalFiles).toContain("src/tools/os/shell/node-check-notice.test.ts");
+    expect(supplementalDrift(root)).toEqual({ missing: [], duplicated: [], insideCore: [] });
+    expect(supplementalDrift(root, ["src/missing.test.ts", "src/missing.test.ts", criticalFiles[0]])).toEqual({
+      missing: ["src/missing.test.ts"],
+      duplicated: ["src/missing.test.ts"],
+      insideCore: [criticalFiles[0]],
+    });
+  });
+
+  it("rejects quarantine of either a core or an additional regression", () => {
+    expect(quarantinedGateFiles([
+      { path: criticalFiles[0], status: "quarantined" },
+      { path: supplementalFiles[0], status: "quarantined" },
+      { path: supplementalFiles[1], status: "released" },
+      { path: "src/unrelated.test.ts", status: "quarantined" },
+    ])).toEqual([criticalFiles[0], supplementalFiles[0]]);
   });
 });

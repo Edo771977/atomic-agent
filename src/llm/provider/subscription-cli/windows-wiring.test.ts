@@ -45,7 +45,7 @@ vi.mock("node:child_process", async (importOriginal) => {
     ...actual,
     spawn: (file: string, args: readonly string[], options: unknown) => {
       state.spawns.push({ file, args, options });
-      if (file === "taskkill" && state.taskkillSpawnFails) {
+      if (file === "C:\\Windows\\System32\\taskkill.exe" && state.taskkillSpawnFails) {
         throw new Error("EPERM");
       }
       const child = Object.assign(new EventEmitter(), {
@@ -62,7 +62,7 @@ vi.mock("node:child_process", async (importOriginal) => {
       // `taskkill` is spawned by the tree-kill; it has no streams to
       // drive and must not be mistaken for the CLI child. Its exit code
       // is what decides whether the tree really died, so tests drive it.
-      if (file === "taskkill") {
+      if (file === "C:\\Windows\\System32\\taskkill.exe") {
         state.taskkills.push(child);
       } else {
         state.children.push(child);
@@ -100,12 +100,12 @@ function options(extra: Record<string, unknown> = {}) {
 }
 
 function cliSpawns() {
-  return state.spawns.filter((call) => call.file !== "taskkill");
+  return state.spawns.filter((call) => call.file !== "C:\\Windows\\System32\\taskkill.exe");
 }
 
 function taskkillArgs() {
   return state.spawns
-    .filter((call) => call.file === "taskkill")
+    .filter((call) => call.file === "C:\\Windows\\System32\\taskkill.exe")
     .map((call) => call.args);
 }
 
@@ -134,6 +134,7 @@ async function startAbortableTurn() {
 }
 
 beforeEach(() => {
+  vi.stubEnv("SystemRoot", "C:\\Windows");
   state.files = new Set([BIN_PATH.toLowerCase()]);
   state.spawns = [];
   state.children = [];
@@ -145,6 +146,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.unstubAllEnvs();
 });
 
 describe("the Windows shim as both CLI paths use it", () => {
@@ -181,9 +183,9 @@ describe("the Windows shim as both CLI paths use it", () => {
     const turn = await startAbortableTurn();
 
     turn.controller.abort();
-    expect(state.spawns.filter((call) => call.file === "taskkill")).toEqual([
+    expect(state.spawns.filter((call) => call.file === "C:\\Windows\\System32\\taskkill.exe")).toEqual([
       {
-        file: "taskkill",
+        file: "C:\\Windows\\System32\\taskkill.exe",
         args: ["/PID", "4242", "/T"],
         options: { stdio: "ignore", windowsHide: true },
       },

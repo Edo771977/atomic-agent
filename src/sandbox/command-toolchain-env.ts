@@ -1,6 +1,6 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { delimiter, join } from "node:path";
+import { join, posix } from "node:path";
 
 /**
  * What an `os.shell.run` command gets on top of the filtered environment
@@ -105,7 +105,7 @@ export function withToolchainEnv(
   const exists = options.exists ?? existsSync;
   const home = options.home ?? env.HOME ?? homedir();
   const pathKey = "PATH";
-  const current = (out[pathKey] ?? "").split(delimiter).filter(Boolean);
+  const current = (out[pathKey] ?? "").split(posix.delimiter).filter(Boolean);
   const seen = new Set(current);
   const extra: string[] = [];
   const add = (dir: string, mustExist: boolean) => {
@@ -119,11 +119,11 @@ export function withToolchainEnv(
   for (const dir of systemPaths) if (dir.startsWith("/")) add(dir, true);
   for (const dir of SYSTEM_TOOLCHAIN_DIRS[platform] ?? []) add(dir, true);
   if (home.length > 0) {
-    const nvmBin = nvmDefaultBin(env.NVM_DIR ?? join(home, ".nvm"), exists);
+    const nvmBin = nvmDefaultBin(env.NVM_DIR ?? posix.join(home, ".nvm"), exists);
     if (nvmBin !== null) add(nvmBin, true);
-    for (const rel of HOME_TOOLCHAIN_DIRS) add(join(home, rel), true);
+    for (const rel of HOME_TOOLCHAIN_DIRS) add(posix.join(home, rel), true);
   }
-  if (extra.length > 0) out[pathKey] = [...current, ...extra].join(delimiter);
+  if (extra.length > 0) out[pathKey] = [...current, ...extra].join(posix.delimiter);
   return out;
 }
 

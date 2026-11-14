@@ -1,9 +1,10 @@
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { verifySyntax } from "../verify/verify-syntax.js";
+import { installTestTypeScriptCompiler } from "../../../test/helpers/typescript-compiler.js";
 import {
   describeSyntax,
   runSyntaxPass,
@@ -27,9 +28,6 @@ function row(overrides: Partial<WorkerTaskResult> = {}): WorkerTaskResult {
 
 const realRunner: SyntaxCheckRunner = (files, dir, options) => verifySyntax(files, dir, options);
 
-/** This repository's own tsc, resolved through the `.bin` symlink. */
-const REAL_TSC = realpathSync(resolve(process.cwd(), "node_modules/.bin/tsc"));
-
 /** A strict TypeScript project in `dir` with its own `node_modules/.bin/tsc`. */
 function tsProject(dir: string): void {
   mkdirSync(dir, { recursive: true });
@@ -41,8 +39,7 @@ function tsProject(dir: string): void {
     }),
   );
   mkdirSync(join(dir, "src"));
-  mkdirSync(join(dir, "node_modules", ".bin"), { recursive: true });
-  symlinkSync(REAL_TSC, join(dir, "node_modules", ".bin", "tsc"));
+  installTestTypeScriptCompiler(dir);
 }
 
 describe("runSyntaxPass", () => {

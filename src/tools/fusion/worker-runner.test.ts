@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 import type { AgentLoopEvent, RunTurnResult } from "../../agent/agent-loop.js";
 import {
@@ -27,6 +27,8 @@ import {
   type WorkerRunnerDeps,
 } from "./worker-runner.js";
 import { createTaskPermitPool } from "./task-permits.js";
+
+const REPO = resolve("/repo");
 
 type RunTurnCall = {
   session: SessionState;
@@ -62,7 +64,7 @@ function harness(runTurn: (call: RunTurnCall) => Promise<RunTurnResult>): {
       minted += 1;
       return createEmptySessionState({
         id: `${FUSION_WORKER_ID_PREFIX}${minted}`,
-        workingDir: "/repo",
+        workingDir: REPO,
         metadata: { fusionWorker: { ...meta } },
       });
     },
@@ -72,14 +74,14 @@ function harness(runTurn: (call: RunTurnCall) => Promise<RunTurnResult>): {
         policies.push({ op: "clear", sessionId }),
     },
     emitEvent: (sessionId, event) => events.push({ sessionId, event }),
-    workingDir: "/repo",
+    workingDir: REPO,
   };
   return { deps, calls, policies, events };
 }
 
 function turnResult(over: Partial<RunTurnResult> = {}): RunTurnResult {
   return {
-    session: createEmptySessionState({ id: "s-x", workingDir: "/repo" }),
+    session: createEmptySessionState({ id: "s-x", workingDir: REPO }),
     reason: "reply",
     stepCount: 1,
     ...over,
@@ -1030,7 +1032,7 @@ describe("runWorkerTasks", () => {
         reason: "failed",
         stepCount: 0,
         session: {
-          ...createEmptySessionState({ id: "s-x", workingDir: "/repo" }),
+          ...createEmptySessionState({ id: "s-x", workingDir: REPO }),
           lastError,
         },
       }),
@@ -1122,7 +1124,7 @@ describe("a first request that died on the transport", () => {
         reason: "failed",
         stepCount: 3,
         session: {
-          ...createEmptySessionState({ id: "s-x", workingDir: "/repo" }),
+          ...createEmptySessionState({ id: "s-x", workingDir: REPO }),
           lastError: "fetch failed",
         },
       }),
@@ -1729,12 +1731,12 @@ describe("runWorkerTasks — declared inputs (F51)", () => {
         ...BASE,
         tasks: tasks(1),
         maxWorkers: 1,
-        contract: { inputs: ["sales.csv", "data/*.csv", "/abs/x.json"] },
+        contract: { inputs: ["sales.csv", "data/*.csv", resolve("/abs/x.json")] },
         signal: new AbortController().signal,
       },
     );
     expect(log).toEqual([
-      `declare s-w-1 ${join("/repo", "sales.csv")},/abs/x.json`,
+      `declare s-w-1 ${join(REPO, "sales.csv")},${resolve("/abs/x.json")}`,
       "turn s-w-1",
       "clear s-w-1",
     ]);

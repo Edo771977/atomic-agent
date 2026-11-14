@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type { ApprovalRequest } from "../../../approval/approval-gate.js";
 import type { ToolDefinition } from "../../tool-registry.js";
 import type { FsDangerousToolOptions } from "../fs/fs-require-approval.js";
@@ -102,9 +102,9 @@ describe("git write tools ride the fs approval ladder", () => {
       expect(prompt.tool).toBe(c.tool);
       expect(prompt.category).toBe("fs_write_workspace");
       expect(prompt.sessionId).toBe("test");
-      expect(prompt.reason).toContain(canonicalRepo);
+      expect(prompt.reason.replaceAll("\\", "/")).toContain(canonicalRepo.replaceAll("\\", "/"));
       expect(prompt.preview?.startsWith("git ")).toBe(true);
-      expect(prompt.affectedResources).toEqual([canonicalRepo]);
+      expect(prompt.affectedResources?.map(path => resolve(path))).toEqual([canonicalRepo]);
       expect(prompt.redirectablePath).toBeUndefined();
     });
 
@@ -138,9 +138,9 @@ describe("git write tools ride the fs approval ladder", () => {
     const workspace = await mkdtemp(join(tmpdir(), "atomic-git-ws-"));
     try {
       const prompts: ApprovalRequest[] = [];
-      const target = join(workspace, "fresh");
+      const target = join(workspace, "fresh repo");
       const result = await buildOsGitInitTool(recording(prompts)).run(
-        { path: "fresh" },
+        { path: "fresh repo" },
         makeCtx(workspace),
       );
       expect(result.status).toBe("ok");
@@ -149,10 +149,13 @@ describe("git write tools ride the fs approval ladder", () => {
       expect(prompts[0]).toMatchObject({
         tool: "os.git.init",
         category: "fs_write_workspace",
-        reason: `git init in ${target}`,
-        preview: `git init --initial-branch=main -- ${target}`,
-        affectedResources: [target],
       });
+      expect(prompts[0]!.reason).toBe(`git init in ${target}`);
+      // The space forces quoting on every platform. Keep the expected
+      // command independent of the formatter used by the producer.
+      const quotedTarget = `'${target.replaceAll("'", "'\\''")}'`;
+      expect(prompts[0]!.preview).toBe(`git init --initial-branch=main -- ${quotedTarget}`);
+      expect(prompts[0]!.affectedResources?.map(path => resolve(path))).toEqual([target]);
     } finally {
       await rm(workspace, { recursive: true, force: true });
     }

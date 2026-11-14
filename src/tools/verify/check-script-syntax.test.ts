@@ -1,7 +1,8 @@
-import { chmod, mkdtemp, rm, readdir, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, rm, readdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { createRequire, syncBuiltinESMExports } from "node:module";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   type CheckerRun,
@@ -31,10 +32,80 @@ async function file(name: string, content: string): Promise<string> {
 }
 
 describe("runChecker", () => {
+  it("does not invoke spawn at all for an already-cancelled checker", async () => {
+    const childProcess = createRequire(import.meta.url)("node:child_process") as typeof import("node:child_process");
+    const spawn = vi.spyOn(childProcess, "spawn");
+    syncBuiltinESMExports();
+    try {
+      // The successful control proves this spy observes the imported
+      // binding runChecker actually calls, rather than an unused copy.
+      expect(await runChecker(process.execPath, ["-e", "0"], { cwd: dir })).toMatchObject({ exitCode: 0 });
+      expect(spawn).toHaveBeenCalledTimes(1);
+      spawn.mockClear();
+      expect(await runChecker(process.execPath, ["-e", "0"], { cwd: dir, signal: AbortSignal.abort() }))
+        .toMatchObject({ aborted: true, timedOut: true, missing: false, exitCode: null });
+      expect(spawn).not.toHaveBeenCalled();
+    } finally {
+      spawn.mockRestore();
+      syncBuiltinESMExports();
+    }
+  });
+
+  it("preserves checker argv through a Windows batch shim", async () => {
+    const script = await file("argv.cjs", "console.log(JSON.stringify(process.argv.slice(2)))");
+    const cmd = process.platform === "win32"
+      ? await file("checker.cmd", `@"${process.execPath}" "${script}" %*\r\n`)
+      : process.execPath;
+    const values = ['a "quote" & echo injected', "spaces and unicode è", "%PATH%", "a^b", "", "trailing\\"];
+    const run = await runChecker(cmd, process.platform === "win32" ? values : [script, ...values]);
+    expect(run.exitCode).toBe(0);
+    expect(JSON.parse(run.stdout)).toEqual(values);
+    expect(run.stderr).toBe("");
+  });
+
+  it("reports synchronous spawn argument errors without rejecting", async () => {
+    const run = await runChecker(process.execPath, ["\u0000"]);
+    expect(run).toMatchObject({ exitCode: null, missing: false, timedOut: false });
+    expect(run.stderr.length).toBeGreaterThan(0);
+  });
+
+  it("kills an owned checker process on cancellation and starts none after cancellation", async () => {
+    const controller = new AbortController();
+    const pidFile = join(dir, "owned-checker.pid");
+    const script = await file("wait.cjs", `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(()=>{},1000)`);
+    const cmd = process.platform === "win32"
+      ? await file("wait.cmd", `@"${process.execPath}" "${script}" %*\r\n`)
+      : process.execPath;
+    const args = process.platform === "win32" ? [] : [script];
+    const pending = runChecker(cmd, args, { signal: controller.signal });
+    try {
+      const deadline = Date.now() + 5_000;
+      let pidText: string | undefined;
+      while (Date.now() < deadline) {
+        pidText = await readFile(pidFile, "utf8").catch(() => undefined);
+        if (pidText !== undefined) break;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      expect(pidText).toMatch(/^\d+$/);
+      controller.abort();
+      expect(await pending).toMatchObject({ aborted: true, timedOut: true, missing: false });
+      expect(() => process.kill(Number(pidText), 0)).toThrow();
+    } finally {
+      controller.abort();
+      await pending;
+    }
+    expect(await runChecker(cmd, args, { signal: controller.signal })).toMatchObject({ aborted: true, exitCode: null });
+  });
+
   it("reports a missing binary instead of throwing", async () => {
     const run = await runChecker("atag-no-such-binary-xyz", ["--version"]);
     expect(run.missing).toBe(true);
     expect(run.exitCode).toBeNull();
+  });
+
+  it("keeps an absent absolute checker classified as missing", async () => {
+    const run = await runChecker(join(dir, "absent-checker.cmd"), ["--version"]);
+    expect(run).toMatchObject({ missing: true, exitCode: null, timedOut: false });
   });
 
   it.skipIf(process.platform === "win32")("kills the child when the signal aborts", async () => {

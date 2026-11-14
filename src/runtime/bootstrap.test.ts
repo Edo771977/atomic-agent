@@ -10,6 +10,7 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { randomBytes } from "node:crypto";
 
 import {
@@ -350,18 +351,20 @@ describe("createAgentRuntime", () => {
         signal: new AbortController().signal,
       };
       // Level-5 boot: dangerous navigation runs without a prompt.
-      await runtime.toolRegistry.invoke(
+      const localUrl = pathToFileURL(join(workingDir, "hosts.html")).href;
+      const allowed = await runtime.toolRegistry.invoke(
         "browser.navigate",
-        { url: "file:///etc/hosts" },
+        { url: localUrl },
         ctx,
       );
+      expect(allowed.status).toBe("ok");
       expect(prompts).toHaveLength(0);
 
       runtime.setApprovalLevel(1);
       await expect(
         runtime.toolRegistry.invoke(
           "browser.navigate",
-          { url: "file:///etc/hosts" },
+          { url: localUrl },
           ctx,
         ),
       ).rejects.toThrow(/The user declined/);
@@ -609,7 +612,7 @@ describe("createAgentRuntime", () => {
       // 2. A different shell binary now runs silently under the grant.
       const second = await runtime.toolRegistry.invoke(
         "os.shell.run",
-        { cmd: "ls", args: [workingDir] },
+        { cmd: "node", args: ["-e", "0"] },
         ctx,
       );
       expect(second.status).toBe("ok");
@@ -684,11 +687,11 @@ describe("createAgentRuntime", () => {
       // 3. A different binary is not covered by the git shape; it asks.
       await runtime.toolRegistry.invoke(
         "os.shell.run",
-        { cmd: "ls", args: [workingDir] },
+        { cmd: "node", args: ["-e", "0"] },
         ctx,
       );
       expect(prompts).toHaveLength(2);
-      expect(prompts[1]?.commandShape).toBe("ls");
+      expect(prompts[1]?.commandShape).toBe("node");
     } finally {
       await runtime.shutdown();
     }

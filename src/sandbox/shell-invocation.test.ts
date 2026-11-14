@@ -60,8 +60,18 @@ describe("buildSubshellInvocation", () => {
     it("falls back to cmd.exe without a ComSpec", () => {
       asPlatform("win32");
       vi.stubEnv("ComSpec", "");
-      expect(buildSubshellInvocation("ver").command).toBe("cmd.exe");
+      vi.stubEnv("SystemRoot", "D:\\Operating System");
+      expect(buildSubshellInvocation("ver").command).toBe("D:\\Operating System\\System32\\cmd.exe");
     });
+
+    it.each(["cmd.exe", "tools\\cmd.exe", "\\tools\\cmd.exe", "C:cmd.exe"])(
+      "never treats relative ComSpec %s as a trusted interpreter", (comSpec) => {
+        asPlatform("win32");
+        vi.stubEnv("ComSpec", comSpec);
+        vi.stubEnv("SystemRoot", "C:\\Windows");
+        expect(buildSubshellInvocation("ver").command).toBe("C:\\Windows\\System32\\cmd.exe");
+      },
+    );
   });
 });
 

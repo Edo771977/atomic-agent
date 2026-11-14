@@ -1,7 +1,10 @@
 import { EventEmitter } from "node:events";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { killProcessTree, type KillableChild } from "./kill-process-tree.js";
+
+beforeEach(() => vi.stubEnv("SystemRoot", "C:\\Windows"));
+afterEach(() => vi.unstubAllEnvs());
 
 function fakeChild(pid?: number) {
   const signals: (NodeJS.Signals | number | undefined)[] = [];
@@ -63,7 +66,7 @@ describe("killProcessTree on win32", () => {
     const { child, signals } = fakeChild(4242);
     const { calls, impl } = fakeSpawn();
     killProcessTree(child, { platform: "win32", spawnImpl: impl });
-    expect(calls).toEqual([{ file: "taskkill", args: ["/PID", "4242", "/T"] }]);
+    expect(calls).toEqual([{ file: "C:\\Windows\\System32\\taskkill.exe", args: ["/PID", "4242", "/T"] }]);
     expect(signals).toEqual([]);
   });
 
@@ -72,6 +75,18 @@ describe("killProcessTree on win32", () => {
     const { calls, impl } = fakeSpawn();
     killProcessTree(child, { platform: "win32", force: true, spawnImpl: impl });
     expect(calls[0]?.args).toEqual(["/PID", "4242", "/T", "/F"]);
+  });
+
+  it("keeps both taskkill attempts on the host system path, never PATH or cwd", () => {
+    vi.stubEnv("SystemRoot", "D:\\Operating System");
+    const { child } = fakeChild(4242);
+    const { calls, impl, started } = fakeSpawn();
+    killProcessTree(child, { platform: "win32", spawnImpl: impl });
+    started[0]?.emit("close", 1);
+    expect(calls.map(call => call.file)).toEqual([
+      "D:\\Operating System\\System32\\taskkill.exe",
+      "D:\\Operating System\\System32\\taskkill.exe",
+    ]);
   });
 
   it("falls back to a direct signal when taskkill cannot be spawned", async () => {

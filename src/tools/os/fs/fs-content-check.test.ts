@@ -136,6 +136,7 @@ describe("newContentWarnings", () => {
 
 describe("checkChangedFile", () => {
   it("puts the parse warning first, then one line per content warning", () => {
+    const relative = join("js", "a.js");
     const out = checkChangedFile({
       absolute: "/w/js/a.js",
       workingDir: "/w",
@@ -143,8 +144,8 @@ describe("checkChangedFile", () => {
       after: "assistant_tool_call: {}\nconst o = {\n",
     });
     expect(out!.split("\n")).toEqual([
-      "⚠ js/a.js does not parse: SyntaxError: Unexpected end of input (line 3)",
-      "⚠ js/a.js: line 1 starts with `assistant_tool_call:` — that is agent transcript markup, not file content; remove it",
+      `⚠ ${relative} does not parse: SyntaxError: Unexpected end of input (line 3)`,
+      `⚠ ${relative}: line 1 starts with \`assistant_tool_call:\` — that is agent transcript markup, not file content; remove it`,
     ]);
   });
 
