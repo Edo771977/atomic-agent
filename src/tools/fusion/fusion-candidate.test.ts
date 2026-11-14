@@ -223,7 +223,7 @@ it("never releases dependents of a no_changes provider in candidate mode", async
 
 it.each(["relative", "absolute"] as const)("freezes %s checkInputs from the original before dispatch", async spelling => {
   const f = await fixture(); await writeFile(join(f.root, "check.mjs"), "expected=good\nline2\nline3\nline4\nline5\n");
-  f.deps.runChecks = async specs => ({ ok: true, results: specs.map(() => ({ ok: true })) });
+  f.deps.runChecks = (await import("../verify/run-verify.js")).runChecks;
   f.deps.runTurn = async session => { await writeFile(join(session.workingDir, "api.json"), "bad"); await writeFile(join(session.workingDir, "check.mjs"), "expected=evil\nline2\nline3\nline4\nline5\n"); return { session, reason: "reply", stepCount: 1 }; };
   const result = await buildFusionDelegateTool(f.deps).run({ tasks: [{ id: "api", instructions: "work", files: ["api.json"] }], contract: { ...contract, checkInputs: [spelling === "relative" ? "check.mjs" : join(f.root, "check.mjs")] } }, f.ctx);
   expect(result.details.candidateIntegration, result.summary).toMatchObject({ status: "rejected", acceptanceReceipt: { disposition: "rejected", checkScope: "declared", inputs: { declared: 1, verified: 0 }, reason: "check-inputs-changed" } });
@@ -254,4 +254,19 @@ it("retains recovery and executed task telemetry when post-worker completion han
   expect(result.details.candidateIntegration).toMatchObject({ status: "rejected", patch: { path: expect.any(String) } });
   expect(append).toHaveBeenCalledTimes(1);
   expect(append.mock.calls[0]![0]).toEqual([expect.objectContaining({ candidate: { receipt: expect.objectContaining({ disposition: "rejected", reason: "interrupted" }), taskChecks: { total: 0, passed: 0, failed: 0 } } })]);
+});
+
+it.each(["persistent", "restored"] as const)("rejects protected check input writes inside the actual verify execution copy (%s)", async mutation => {
+  const { runChecks } = await import("../verify/run-verify.js");
+  const f = await fixture({ runChecks });
+  const original = `import {readFileSync} from 'node:fs'; if (readFileSync('api.json','utf8') !== '{"name":"before"}') throw new Error('bad artifact');`;
+  await writeFile(join(f.root, "check.mjs"), original);
+  f.deps.runTurn = async session => {
+    await writeFile(join(session.workingDir, "api.json"), "bad");
+    await writeFile(join(session.workingDir, "runner.mjs"), `import {readFileSync,writeFileSync} from 'node:fs'; const original=readFileSync('check.mjs','utf8'); writeFileSync('check.mjs','export {};'); await import('./check.mjs'); ${mutation === "restored" ? "writeFileSync('check.mjs',original);" : ""}`);
+    return { session, reason: "reply", stepCount: 1 };
+  };
+  const result = await buildFusionDelegateTool(f.deps).run({ tasks: [{ id: "api", instructions: "work", files: ["api.json", "runner.mjs"] }], contract: { checkInputs: ["check.mjs"], checks: [{ kind: "command", cmd: process.execPath, args: ["runner.mjs"], network: true }] } }, f.ctx);
+  expect(result.details.candidateIntegration).toMatchObject({ status: "rejected", acceptanceReceipt: { disposition: "rejected", checkScope: "declared", inputs: { declared: 1, verified: 0 } } });
+  expect(await readFile(join(f.root, "api.json"), "utf8")).toBe('{"name":"before"}'); expect(await readFile(join(f.root, "check.mjs"), "utf8")).toBe(original);
 });

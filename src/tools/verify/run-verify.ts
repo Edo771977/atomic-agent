@@ -19,6 +19,7 @@ import { parseVerifyRunArgs, type VerifyRunArgs, type VerifyRunKind } from "./ve
 import { renderVerifyRunSummary } from "./verify-run-summary.js";
 import { terminalAppHint } from "./terminal-app-hint.js";
 import { createVerifyWorkspace, type VerifyWorkspace } from "./verify-workspace-copy.js";
+import type { VerificationInputIntegrity } from "./verify-input-integrity.js";
 
 export interface VerifyRunResult {
   readonly ok: boolean;
@@ -50,6 +51,7 @@ export interface VerifyRunResult {
 }
 
 export interface VerifyRunContext {
+  readonly inputIntegrity?: VerificationInputIntegrity;
   readonly workingDir: string;
   /** Browser settings for page runs; `getConfig().browser` when omitted. */
   readonly config?: Pick<AtomicAgentConfig, "browser">;
@@ -188,7 +190,9 @@ export async function runVerify(
     } else if (!workspace.isolated || resolve(workspace.dir) === resolve(ctx.workingDir)) {
       result = failed(`verification not started: ${workspace.error ?? "a private workspace copy is unavailable"}`, "workspace-unavailable");
     } else {
+      const completeIntegrity = await ctx.inputIntegrity?.begin(workspace.dir, ctx.signal ?? new AbortController().signal);
       result = await runInWorkspace(args, workspace.dir, true, ctx, started);
+      await completeIntegrity?.();
       // Executors may settle normally after an abort (a page can skip
       // remaining script steps). Such an incomplete run cannot pass.
       if (ctx.signal?.aborted) result = failed("verification cancelled during execution", "cancelled", true);
@@ -208,7 +212,7 @@ export async function runVerify(
 }
 
 /** The fan-out contract's checks: every spec in order, `ok` when all are. */
-export async function runChecks(
+export const runChecks = Object.assign(async function runChecks(
   specs: readonly (VerifyRunArgs | Record<string, unknown>)[],
   ctx: VerifyRunContext,
 ): Promise<{ ok: boolean; results: VerifyRunResult[] }> {
@@ -224,4 +228,4 @@ export async function runChecks(
     }
   }
   return { ok: results.length === specs.length && results.every((r) => r.ok), results };
-}
+}, { supportsInputIntegrity: true as const });

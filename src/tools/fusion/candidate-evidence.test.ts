@@ -50,7 +50,8 @@ it("rejects same-length edits to declared check inputs frozen before workers", a
   try {
     await writeFile(join(candidate.dir, "a.txt"), "bad"); await writeFile(join(candidate.dir, "check.mjs"), "expected=evil\nline2\nline3\nline4\nline5\n");
     const declared = { ...contract, checkInputs: ["check.mjs"], inputs: ["check.mjs"] };
-    const report = await candidate.finish({ rows, contract: declared, signal, runChecks: pass });
+    const { runChecks } = await import("../verify/run-verify.js");
+    const report = await candidate.finish({ rows, contract: declared, signal, runChecks });
     expect(report.status).toBe("rejected"); expect(report.reason).toMatch(/check input/);
     expect(await readFile(join(root, "check.mjs"), "utf8")).toContain("expected=good");
   } finally { await candidate.cleanup(); }
@@ -88,14 +89,26 @@ it("binds promoted and zero-change receipts only after final delivery verificati
     const candidate = await createCandidateIntegration(root, { checkInputs: ["check.mjs"] });
     try {
       if (changed) await writeFile(join(candidate.dir, "a.txt"), "candidate");
-      const declared = { ...contract, checkInputs: ["check.mjs"] };
-      const report = await candidate.finish({ rows, contract: declared, signal, runChecks: pass });
+      const declared = { checks: [{ kind: "command", cmd: process.execPath, args: ["-e", "process.exit(0)"] }], checkInputs: ["check.mjs"] };
+      const { runChecks } = await import("../verify/run-verify.js");
+      const report = await candidate.finish({ rows, contract: declared, signal, runChecks });
       expect(report.status).toBe("promoted");
       expect(report.acceptanceReceipt).toMatchObject({ version: 1, disposition: changed ? "promoted" : "unchanged", checkScope: "protected-declared", checkStatus: "passed", inputs: { declared: 1, verified: 1 }, checks: { total: 1, passed: 1, failed: 0 } });
       expect(report.acceptanceReceipt?.checkedPayloadDigest).toMatch(/^[a-f0-9]{64}$/);
       expect(report.artifactManifest?.binding).toMatchObject({ scope: "candidate-snapshot", disposition: changed ? "promoted" : "unchanged", receiptId: report.acceptanceReceipt?.id });
     } finally { await candidate.cleanup(); }
   }
+});
+
+it("refuses a custom runner that cannot attest each actual protected-input execution", async () => {
+  const root = await project(); await writeFile(join(root, "check.mjs"), "test");
+  const candidate = await createCandidateIntegration(root, { checkInputs: ["check.mjs"] });
+  try {
+    await writeFile(join(candidate.dir, "a.txt"), "candidate");
+    const report = await candidate.finish({ rows, contract: { ...contract, checkInputs: ["check.mjs"] }, signal, runChecks: pass });
+    expect(report.status).toBe("rejected"); expect(report.reason).toMatch(/custom check runner/);
+    expect(report.acceptanceReceipt).toMatchObject({ checkScope: "declared", checkStatus: "unverified", inputs: { declared: 1, verified: 0 } });
+  } finally { await candidate.cleanup(); }
 });
 
 it("rejects mutation of otherwise unchanged project code during final checks", async () => {

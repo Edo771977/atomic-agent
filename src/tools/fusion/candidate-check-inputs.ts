@@ -34,6 +34,8 @@ export interface CheckInputSnapshot {
   readonly paths: readonly string[];
   /** Verify every declared file against the pre-worker original bytes, type and mode. */
   verify(root: string, signal: AbortSignal): Promise<number>;
+  /** Bind integrity to one actual command/service/page execution copy, including ordinary write-and-restore activity. */
+  beginExecution(root: string, signal: AbortSignal): Promise<() => Promise<void>>;
 }
 
 export async function freezeCheckInputs(root: string, declarations: readonly string[], signal: AbortSignal): Promise<CheckInputSnapshot> {
@@ -80,7 +82,7 @@ export async function freezeCheckInputs(root: string, declarations: readonly str
     return entries;
   };
   const original = await scan(root, signal);
-  return { paths, async verify(dir, stop) {
+  const verify = async (dir: string, stop: AbortSignal): Promise<number> => {
     let current: Map<string, Stamp>;
     try { current = await scan(dir, stop); }
     catch (error) { throw new Error(`declared check input cannot be verified: ${error instanceof Error ? error.message : String(error)}`); }
@@ -89,5 +91,17 @@ export async function freezeCheckInputs(root: string, declarations: readonly str
       if (now?.sha256 !== stamp.sha256 || now.mode !== stamp.mode) throw new Error(`declared check input changed: ${path.split(sep).join("/")}`);
     }
     return current.size;
+  };
+  return { paths, verify, async beginExecution(dir, stop) {
+    await verify(dir, stop);
+    const stamps = await Promise.all(paths.map(path => lstat(join(dir, path), { bigint: true })));
+    return async () => {
+      await verify(dir, stop);
+      for (const [index, path] of paths.entries()) {
+        stop.throwIfAborted();
+        const before = stamps[index]!, after = await lstat(join(dir, path), { bigint: true });
+        if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size || before.mode !== after.mode || before.ctimeNs !== after.ctimeNs || before.mtimeNs !== after.mtimeNs) throw new Error("declared check input was written during actual verification");
+      }
+    };
   } };
 }

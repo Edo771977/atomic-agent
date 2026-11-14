@@ -10,6 +10,7 @@ import {
 } from "./contract.js";
 import type { DelegateTask } from "./delegate-args.js";
 import type { WorkerTaskResult } from "./worker-result.js";
+import type { VerificationInputIntegrity } from "../verify/verify-input-integrity.js";
 import {
   knownSecretsFromEnv,
   maskSecrets,
@@ -59,10 +60,10 @@ export interface ContractCheckResult {
  * another module family; absent, the checks are reported as not run —
  * never as passed.
  */
-export type ContractCheckRunner = (
+export type ContractCheckRunner = ((
   specs: readonly Record<string, unknown>[],
-  ctx: { workingDir: string; signal: AbortSignal },
-) => Promise<{ ok: boolean; results: readonly ContractCheckResult[] }>;
+  ctx: { workingDir: string; signal: AbortSignal; inputIntegrity?: VerificationInputIntegrity },
+) => Promise<{ ok: boolean; results: readonly ContractCheckResult[] }>) & { readonly supportsInputIntegrity?: true };
 
 export interface ContractCheckOutcome {
   /** The task the check was attributed to; absent for a call-level check. */
@@ -390,6 +391,7 @@ export async function runContractChecks(
     workingDir: string;
     signal: AbortSignal;
     knownSecrets?: readonly KnownSecret[];
+    inputIntegrity?: VerificationInputIntegrity;
   },
 ): Promise<{ outcomes: ContractCheckOutcome[]; checksSkipped?: string }> {
   if (checks.length === 0) return { outcomes: [] };
@@ -408,7 +410,7 @@ export async function runContractChecks(
   let results: readonly ContractCheckResult[];
   try {
     results = (
-      await runner(specs, { workingDir: ctx.workingDir, signal: ctx.signal })
+      await runner(specs, { workingDir: ctx.workingDir, signal: ctx.signal, ...(ctx.inputIntegrity === undefined ? {} : { inputIntegrity: ctx.inputIntegrity }) })
     ).results;
   } catch (error) {
     return {

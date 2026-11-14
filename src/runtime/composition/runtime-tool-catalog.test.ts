@@ -283,7 +283,7 @@ describe("runtime tool assembly phases and live MCP catalog", () => {
     } finally { await retained?.shutdown(); }
   });
 
-  it("registers fusion after existing tools, then decorates reads with live security callbacks", () => {
+  it("registers fusion after existing tools, then decorates reads with live security callbacks", async () => {
     const config = getConfig(); const toolRegistry = new ToolRegistry();
     toolRegistry.register({ name: "os.fs.read", description: "fixture", readonly: true, run: async () => externalOperation() });
     const approvals = new ApprovalGate({ emit: () => {}, level: 5 });
@@ -313,6 +313,16 @@ describe("runtime tool assembly phases and live MCP catalog", () => {
     config.agent.readScope = "working-dir"; expect(protectedReads.readScope?.()).toBe("working-dir");
     expect(toolRegistry.list().map(tool => tool.name)).toEqual(["os.fs.read", "fusion.delegate"]);
     expect(builder.mock.invocationCallOrder[0]).toBeLessThan(confinement.mock.invocationCallOrder[0] ?? 0);
+    expect(wired.runChecks?.supportsInputIntegrity).toBe(true);
+    const completed = vi.fn(async () => {});
+    const actualCopies: string[] = [];
+    const checks = await wired.runChecks!([{ kind: "command", cmd: process.execPath, args: ["-e", "process.exit(0)"], network: true }, { kind: "command", cmd: process.execPath, args: ["-e", "process.exit(0)"], network: true }], {
+      workingDir: directory, signal: new AbortController().signal,
+      inputIntegrity: { begin: async actualDir => { actualCopies.push(actualDir); return completed; } },
+    });
+    expect(checks.ok).toBe(true); expect(completed).toHaveBeenCalledTimes(2);
+    expect(actualCopies).toHaveLength(2); expect(new Set(actualCopies).size).toBe(2);
+    expect(actualCopies.every(path => path !== directory)).toBe(true);
   });
 });
 

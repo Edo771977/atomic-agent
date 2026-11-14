@@ -43,7 +43,7 @@ import { IMAGE_GENERATE_TOOL, openRouterImageKey, registerImageTools } from "../
 import { registerVideoTools, VIDEO_GENERATE_TOOL } from "../../tools/video/index.js";
 import { captureImageGenerated, captureVideoGenerated } from "../../analytics/analytics-events.js";
 import type { AnalyticsClient } from "../../analytics/analytics-client.js";
-import { buildFusionDelegateTool, readSlotOccupancy, type FusionDelegateDeps } from "../../tools/fusion/index.js";
+import { buildFusionDelegateTool, readSlotOccupancy, type ContractCheckRunner, type FusionDelegateDeps } from "../../tools/fusion/index.js";
 import {
   confineReads,
   localPageCheck,
@@ -924,12 +924,13 @@ export function registerRuntimeFusionAndReadScope(input: {
       // A contract's declared `checks` run through the verify family,
       // each on a throwaway copy of the workspace, so a fan-out is judged
       // by what its output does, never by what a worker's reply says.
-      runChecks: (specs, ctx) =>
+      runChecks: Object.assign((specs: Parameters<ContractCheckRunner>[0], ctx: Parameters<ContractCheckRunner>[1]) =>
         runChecks(specs, {
           workingDir: ctx.workingDir,
           signal: ctx.signal,
           config,
-        }),
+          ...(ctx.inputIntegrity === undefined ? {} : { inputIntegrity: ctx.inputIntegrity }),
+        }), { supportsInputIntegrity: true as const }),
       // `verify.syntax`'s own checker: the delegate syntax-checks every
       // green row's changed files itself, so the orchestrator does not
       // spend a step (and its context) on it after each fan-out.

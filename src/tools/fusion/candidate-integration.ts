@@ -530,6 +530,10 @@ export async function createCandidateIntegration(
         const checks = input.contract?.checks ?? [];
         if (checks.length === 0 || checks.length > 16) return await rejectFinal("candidate not promoted: one to sixteen explicit contract integration checks are required");
         if ((input.contract?.checkInputs?.length ?? 0) > 0 && protectedInputs.paths.length === 0) return await rejectFinal("candidate not promoted: declared check inputs were not frozen before workers");
+        if (protectedInputs.paths.length > 0 && input.runChecks?.supportsInputIntegrity !== true) {
+          verifiedInputs = 0;
+          return await rejectFinal("candidate not promoted: check input integrity cannot be attested by this custom check runner");
+        }
         await verifyProtectedInputs(workspace.dir, input.signal);
         // One private final source supplies every check and every delivered byte.
         // Its actual copies spend the original candidate's remaining budget.
@@ -577,9 +581,24 @@ export async function createCandidateIntegration(
           const result = await input.runChecks!(specs, ctx);
           return result.ok ? result : { ok: false, results: result.results.map(row => ({ ...row, ok: false })) };
         };
-        const checked = await runContractChecks(rebaseChecked(checks), runner, { workingDir: checkedDir, signal: input.signal });
+        let actualInputExecutions = 0;
+        const inputIntegrity = protectedInputs.paths.length === 0 ? undefined : {
+          async begin(dir: string, signal: AbortSignal): Promise<() => Promise<void>> {
+            const complete = await protectedInputs.beginExecution(dir, signal);
+            let completed = false;
+            return async () => {
+              if (completed) throw new Error("check input execution guard completed twice");
+              await complete(); completed = true; actualInputExecutions += 1;
+            };
+          },
+        };
+        const checked = await runContractChecks(rebaseChecked(checks), runner, { workingDir: checkedDir, signal: input.signal, ...(inputIntegrity === undefined ? {} : { inputIntegrity }) });
         receiptEvidence = { findings: [], checks: checked.outcomes, ...(checked.checksSkipped === undefined ? {} : { checksSkipped: checked.checksSkipped }) };
         input.signal.throwIfAborted();
+        if (inputIntegrity !== undefined && actualInputExecutions !== checks.length) {
+          verifiedInputs = 0;
+          return await rejectFinal("candidate not promoted: declared check inputs changed or could not be verified in each actual check execution", { contract: receiptEvidence });
+        }
         await verifyProtectedInputs(checkedDir, input.signal);
         await verifyProtectedInputs(workspace.dir, input.signal);
         if (differences(beforeChecks, await snapshot(checkedDir, input.signal)).length > 0) return await rejectFinal("checked source changed during final checks; generated deliverable changes are not allowed");
