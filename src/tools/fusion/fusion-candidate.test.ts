@@ -311,3 +311,29 @@ it("binds an absolute protected check reference to the actual execution copy", a
   expect(result.details.candidateIntegration).toMatchObject({ status: "rejected", acceptanceReceipt: { checkScope: "declared", inputs: { declared: 1, verified: 0 } } });
   expect(await readFile(join(f.root, "api.json"), "utf8")).toBe('{"name":"before"}');
 });
+
+it.each([true, false])("preserves terminal candidate disposition when post-decision secret metadata fails (pass=%s)", async passing => {
+  let decisionLogged = false, failedCollections = 0;
+  const append = vi.fn((_rows: readonly unknown[]) => { decisionLogged = true; });
+  const f = await fixture({ outcomeLog: { append }, knownSecrets: () => { if (decisionLogged) { failedCollections += 1; throw new Error("PRIVATE-METADATA-FAILURE"); } return []; } });
+  f.deps.runTurn = async session => { await writeFile(join(session.workingDir, "api.json"), "candidate"); return { session, reason: "reply", stepCount: 1 }; };
+  f.deps.runChecks = async specs => ({ ok: passing, results: specs.map(() => ({ ok: passing })) });
+  const result = await buildFusionDelegateTool(f.deps).run({ tasks: [{ id: "api", instructions: "work", files: ["api.json"] }], contract }, f.ctx);
+  expect(result.status).toBe(passing ? "ok" : "error");
+  expect(result.details).toMatchObject({ metadataUnavailable: true, candidateIntegration: { status: passing ? "promoted" : "rejected", nonResumable: true } });
+  expect(append).toHaveBeenCalledTimes(1); expect(failedCollections).toBe(1);
+  expect(append.mock.calls[0]![0]).toEqual([expect.objectContaining({ candidate: expect.objectContaining({ receipt: expect.objectContaining({ disposition: passing ? "promoted" : "rejected" }) }) })]);
+  expect(await readFile(join(f.root, "api.json"), "utf8")).toBe(passing ? "candidate" : '{"name":"before"}');
+  expect(JSON.stringify(result)).not.toContain("PRIVATE-METADATA-FAILURE"); expect(JSON.stringify(result)).not.toContain(f.root);
+});
+
+it("refuses unsafe metadata once when the secret collector fails before the candidate decision", async () => {
+  let calls = 0;
+  const f = await fixture({ knownSecrets: () => { calls += 1; throw new Error("PRIVATE-COLLECTOR-ERROR"); } });
+  f.deps.runTurn = async session => { await writeFile(join(session.workingDir, "api.json"), "candidate"); return { session, reason: "reply", stepCount: 1 }; };
+  f.deps.runChecks = async specs => ({ ok: true, results: specs.map(() => ({ ok: true })) });
+  const result = await buildFusionDelegateTool(f.deps).run({ tasks: [{ id: "api", instructions: "work", files: ["api.json"] }], contract }, f.ctx);
+  expect(result.status).toBe("error"); expect(result.details).toMatchObject({ metadataUnavailable: true, candidateIntegration: { status: "rejected" } });
+  expect(calls).toBe(1); expect(JSON.stringify(result)).not.toContain("PRIVATE-COLLECTOR-ERROR");
+  expect(await readFile(join(f.root, "api.json"), "utf8")).toBe('{"name":"before"}');
+});

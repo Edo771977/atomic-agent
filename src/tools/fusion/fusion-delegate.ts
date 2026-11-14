@@ -849,6 +849,14 @@ export function buildFusionDelegateTool(
       const completedCandidateRows = new Map<string, WorkerTaskResult>();
       const candidateWorkerRuns = new Map<string, number>();
       let candidateOutcomesRecorded = false;
+      let completedCandidateReport: CandidateIntegrationReport | undefined;
+      let terminalTaskCount = 0;
+      let secretCollectionFailed = false;
+      const collectKnownSecrets = (): readonly KnownSecret[] | undefined => {
+        if (secretCollectionFailed) throw new Error("Secret metadata unavailable");
+        try { return deps.knownSecrets?.(); }
+        catch { secretCollectionFailed = true; throw new Error("Secret metadata unavailable"); }
+      };
       let recordCandidateInterruption: ((report: CandidateIntegrationReport) => void) | undefined;
       if (mode.integration === "candidate") {
         if (writeScope.some(path => !isInside(resolvePath(candidateOriginalDir), resolvePath(path)))) {
@@ -1028,6 +1036,7 @@ export function buildFusionDelegateTool(
       const executionIdentities = new Map<string, string | undefined>();
       const workerDeps: FusionDelegateDeps = {
         ...deps,
+        ...(deps.knownSecrets === undefined ? {} : { knownSecrets: () => collectKnownSecrets() ?? [] }),
         ...(candidate === undefined ? {} : { ruleWorkdir: candidateOriginalDir }),
         ...(deps.resolveRoutingIdentity === undefined ? {} : { runTurn: (session, message, options) => {
           const taskId = readFusionWorkerMeta(session.metadata)?.taskId;
@@ -1225,7 +1234,7 @@ export function buildFusionDelegateTool(
           ...input,
           ...(deps.knownSecrets === undefined
             ? {}
-            : { knownSecrets: deps.knownSecrets() }),
+            : { knownSecrets: collectKnownSecrets() }),
           target: judgeTarget!,
           pricing: judgePricing,
           complete: sideComplete!,
@@ -1295,7 +1304,7 @@ export function buildFusionDelegateTool(
             runChecks: deps.runChecks,
             ...(deps.knownSecrets === undefined
               ? {}
-              : { knownSecrets: deps.knownSecrets() }),
+              : { knownSecrets: collectKnownSecrets() }),
             signal: runSignal,
             state: gateState,
             syntax: { runner: deps.syntaxCheck, roots: syntaxRoots },
@@ -1546,7 +1555,7 @@ export function buildFusionDelegateTool(
                     signal: runSignal,
                     ...(deps.knownSecrets === undefined
                       ? {}
-                      : { knownSecrets: deps.knownSecrets() }),
+                      : { knownSecrets: collectKnownSecrets() }),
                   },
                 );
                 const failedChecks = checks.outcomes
@@ -1694,7 +1703,7 @@ export function buildFusionDelegateTool(
               );
               const checks = await runContractChecks(own.map((c) => c.check), deps.runChecks, {
                 workingDir: ctx.workingDir, signal: runSignal,
-                ...(deps.knownSecrets === undefined ? {} : { knownSecrets: deps.knownSecrets() }),
+                ...(deps.knownSecrets === undefined ? {} : { knownSecrets: collectKnownSecrets() }),
               });
               const previous = own.flatMap((c) => {
                 const outcome = dependencyCheckOutcomes.get(c.index) ?? gateState.checkOutcomes.get(c.index);
@@ -1718,7 +1727,7 @@ export function buildFusionDelegateTool(
             if (row.status === "ok" && (rechecking || !gateState.syntaxGated.has(id) || gateState.isStale(id) || uncovered)) {
               [row] = await runSyntaxPass([row], [{ ...task, files }], {
                 runner: deps.syntaxCheck, workingDir: ctx.workingDir, roots: syntaxRoots, signal: runSignal,
-                ...(deps.knownSecrets === undefined ? {} : { knownSecrets: deps.knownSecrets() }),
+                ...(deps.knownSecrets === undefined ? {} : { knownSecrets: collectKnownSecrets() }),
               });
               const syntax = row!.syntax;
               ranEvidence ||= syntax !== undefined && syntax.error === undefined && syntax.checked > 0 && syntax.failedFiles.length === 0;
@@ -1903,7 +1912,7 @@ export function buildFusionDelegateTool(
               signal: runSignal,
               ...(deps.knownSecrets === undefined
                 ? {}
-                : { knownSecrets: deps.knownSecrets() }),
+                : { knownSecrets: collectKnownSecrets() }),
             },
           );
           const ran = checks.outcomes.length === pending.length;
@@ -1982,7 +1991,7 @@ export function buildFusionDelegateTool(
             signal: runSignal,
             ...(deps.knownSecrets === undefined
               ? {}
-              : { knownSecrets: deps.knownSecrets() }),
+              : { knownSecrets: collectKnownSecrets() }),
           });
           for (const row of checked) {
             if (row.status === "failed" && gateState.syntaxGated.has(row.id)) {
@@ -2249,6 +2258,8 @@ export function buildFusionDelegateTool(
         // Workers that were never served or timed out before a single step
         // count as nothing delivered too (ATO-234).
         const candidateReport = candidate === undefined ? undefined : await candidate.finish({ rows: results, tasks: parsed.tasks, ...(parsed.contract === undefined ? {} : { contract: parsed.contract }), ...(deps.runChecks === undefined ? {} : { runChecks: deps.runChecks }), signal: runSignal });
+        completedCandidateReport = candidateReport;
+        terminalTaskCount = results.length;
         const outcome = delegateOutcome(results);
         // The outcome log and the turn receipt (counts only, never the
         // brief, the reply or an error's words). A task kept from
@@ -2399,8 +2410,12 @@ export function buildFusionDelegateTool(
           },
           { maxSummaryLength: deps.outputCharCap + 400, maxTailLines: 2000 },
         );
-        const outputKnownSecrets = deps.knownSecrets?.();
-        return candidateReport === undefined ? projectFusionArtifactEvidence(result, deps.outputCharCap, { knownSecrets: outputKnownSecrets }) : candidateToolResult(result, candidateReport, candidate!.dir, candidateOriginalDir, deps.outputCharCap, outputKnownSecrets);
+        try {
+          const outputKnownSecrets = collectKnownSecrets();
+          return candidateReport === undefined ? projectFusionArtifactEvidence(result, deps.outputCharCap, { knownSecrets: outputKnownSecrets }) : candidateToolResult(result, candidateReport, candidate!.dir, candidateOriginalDir, deps.outputCharCap, outputKnownSecrets);
+        } catch {
+          return terminalMetadataUnavailable(candidateReport, terminalTaskCount, deps.outputCharCap, outcome === "all_failed" ? "error" : "ok");
+        }
       } finally {
         if (budgetTimer !== undefined) clearTimeout(budgetTimer);
         // Kept workspaces (a judged-red task's, for its retry) are removed
@@ -2411,11 +2426,16 @@ export function buildFusionDelegateTool(
       }
       } catch (err) {
         if (candidate === undefined) throw err;
+        if (completedCandidateReport !== undefined) return terminalMetadataUnavailable(completedCandidateReport, terminalTaskCount, deps.outputCharCap);
         const report = await candidate.reject(`candidate interrupted: ${err instanceof Error ? err.message : String(err)}`);
         try { recordCandidateInterruption?.(report); } catch (recordError) {
           deps.logger.warn("fusion: interrupted candidate outcomes were not recorded", { reason: recordError instanceof Error ? recordError.message : String(recordError) });
         }
-        return candidateToolResult(error("candidate fan-out interrupted", { reason: "candidate-interrupted" }), report, candidate.dir, candidateOriginalDir, deps.outputCharCap, deps.knownSecrets?.());
+        try {
+          return candidateToolResult(error("candidate fan-out interrupted", { reason: "candidate-interrupted" }), report, candidate.dir, candidateOriginalDir, deps.outputCharCap, collectKnownSecrets());
+        } catch {
+          return terminalMetadataUnavailable(report, completedCandidateRows.size, deps.outputCharCap);
+        }
       } finally {
         await candidate?.cleanup();
       }
@@ -2429,6 +2449,21 @@ function rebaseCandidateValue<T>(value: T, roots: readonly string[], to: string)
   if (Array.isArray(value)) return value.map(item => rebaseCandidateValue(item, roots, to)) as T;
   if (value !== null && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, item]) => [rebaseText(key, roots, to), rebaseCandidateValue(item, roots, to)])) as T;
   return value;
+}
+
+/** Rendering failures cannot revoke a completed file transaction or reveal unmasked source prose. */
+function terminalMetadataUnavailable(report: CandidateIntegrationReport | undefined, taskCount: number, cap: number, directStatus: "ok" | "error" = "error"): CompressedToolResult {
+  const status = report === undefined ? directStatus : report.status === "promoted" ? "ok" : "error";
+  const text = report === undefined ? "Fan-out completed; final metadata unavailable." : report.status === "promoted"
+    ? "Candidate promoted; final metadata unavailable." : "Candidate rejected; final metadata unavailable.";
+  const summary = text.slice(0, Number.isFinite(cap) ? Math.max(0, Math.floor(cap)) : text.length);
+  const result: CompressedToolResult = { tool: FUSION_DELEGATE_TOOL, status, summary, truncated: summary.length < text.length,
+    details: { metadataUnavailable: true, taskCount: Math.min(1_000_000, taskCount), ...(report === undefined ? {} : {
+      candidateIntegration: { status: report.status, nonResumable: true, metadataUnavailable: true, changesCount: Math.min(100_000, report.changes.length) },
+    }) } };
+  Object.defineProperty(result, "fullOutput", { value: summary, enumerable: false });
+  Object.defineProperty(result, "fullOutputTruncated", { value: result.truncated, enumerable: false });
+  return result;
 }
 
 function candidateToolResult(result: CompressedToolResult, report: CandidateIntegrationReport, candidateDir: string, originalDir: string, cap: number, knownSecrets?: readonly KnownSecret[]): CompressedToolResult {
