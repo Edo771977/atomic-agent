@@ -108,6 +108,38 @@ describe("validateSplitProposal", () => {
     expect(out.reason).toBe("two separate modules");
   });
 
+  it("hands the parent's subagent profile to every child, never a profile a child names (ATO-566)", () => {
+    // Children go through parseDelegateArgs, not applyTaskProfiles: a
+    // read-only `review` parent's children used to come back with no
+    // agentProfile, so they ran with the worker's full tools.
+    const agentProfile = { name: "review", prompt: "REVIEW RULES", tools: ["os.fs.read"] };
+    const parent: DelegateTask = { ...PARENT, profile: "review", agentProfile };
+    const out = validateSplitProposal(
+      { tasks: [{ ...TWO[0], profile: "explore" }, TWO[1]] },
+      parent,
+      LIMITS,
+    );
+    expect(out.ok).toBe(true);
+    if (!out.ok) return;
+    for (const child of out.tasks) {
+      expect(child.agentProfile).toEqual(agentProfile);
+      expect(child.profile).toBe("review");
+    }
+    // A parent with no profile: a child's own `profile` name is not
+    // applied (nothing resolves it here), so it is not carried either.
+    const plain = validateSplitProposal(
+      { tasks: [{ ...TWO[0], profile: "explore" }, TWO[1]] },
+      PARENT,
+      LIMITS,
+    );
+    expect(plain.ok).toBe(true);
+    if (!plain.ok) return;
+    for (const child of plain.tasks) {
+      expect(child).not.toHaveProperty("agentProfile");
+      expect(child).not.toHaveProperty("profile");
+    }
+  });
+
   it("holds the subtasks to the delegate's own validation", () => {
     const out = validateSplitProposal(
       { tasks: [{ id: "a" }, { id: "b", instructions: "x" }] },

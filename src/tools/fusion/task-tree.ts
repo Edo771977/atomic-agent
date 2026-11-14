@@ -384,7 +384,23 @@ export function validateSplitProposal(
       task.timeoutMs ?? limits.timeBudgetMs,
       limits.timeBudgetMs,
     );
-    return { ...task, id: rename(task.id), maxSteps, timeoutMs };
+    // A child works under its parent's subagent profile (ATO-566): the
+    // proposal went through parseDelegateArgs, which never applies one,
+    // so without this a read-only parent's children got full tools. A
+    // profile a child names itself is dropped, never resolved here.
+    const { profile: _ownProfile, agentProfile: _ownApplied, ...rest } = task;
+    return {
+      ...rest,
+      id: rename(task.id),
+      maxSteps,
+      timeoutMs,
+      ...(parent.agentProfile === undefined
+        ? {}
+        : {
+            ...(parent.profile === undefined ? {} : { profile: parent.profile }),
+            agentProfile: parent.agentProfile,
+          }),
+    };
   });
   const reason =
     typeof obj.reason === "string" && obj.reason.trim().length > 0
