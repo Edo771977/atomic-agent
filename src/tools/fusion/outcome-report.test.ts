@@ -90,6 +90,14 @@ const RECORDS = [
 ];
 
 describe("fusion report", () => {
+  it("never treats malformed or unknown candidate metadata as direct check evidence", () => {
+    for (const candidate of [null, false, {}, { disposition: "unknown" }]) {
+      const row = { ...task({ acceptance: "checks-passed", acceptanceScope: "task-checks" }), candidate };
+      const stats = aggregateOutcomes(parseOutcomeLines(JSON.stringify(row))).workers[0]!;
+      expect(stats).toMatchObject({ green: 1, checksPassed: 0, checksUnverified: 1,
+        candidate: { executed: 1, promoted: 0, rejected: 0, unverified: 1 } });
+    }
+  });
   it("separates actual writer status-only success from declared check evidence", () => {
     const row: WorkerTaskResult = {
       id: "task", title: "test", status: "ok", reply: "done", stepCount: 1,

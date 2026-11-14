@@ -14,6 +14,8 @@ import {
   formatUsdShort,
 } from "./turn-receipt.js";
 import { taskCheckEvidence } from "./outcome-evidence.js";
+import { candidateOutcomeEvidence, hasCandidateOutcome } from "./candidate-outcomes.js";
+import type { CandidateRejectionReason } from "./candidate-acceptance.js";
 
 /**
  * `atomic-agent fusion report` (and `/fusion report` in the TUI): the
@@ -47,6 +49,8 @@ export interface ModelStats {
   checksFailed: number;
   /** Missing, legacy, or contradictory task-check evidence; never inferred from status ok. */
   checksUnverified: number;
+  /** Worker executions grouped by final candidate disposition; not candidate-call counts or quality samples. */
+  candidate: CandidateExecutionStats;
   topFailures: Array<{ category: FailureCategory; count: number }>;
   escalated: number;
   escalationRate: number;
@@ -60,6 +64,18 @@ export interface ModelStats {
   tokensOut: number;
   /** Null when no task of this model was priced. */
   costUsd: number | null;
+}
+
+export interface CandidateExecutionStats {
+  executed: number;
+  promoted: number;
+  rejected: number;
+  unchanged: number;
+  unverified: number;
+  taskChecksPassed: number;
+  taskChecksFailed: number;
+  taskChecksUnverified: number;
+  rejectionReasons: Array<{ reason: CandidateRejectionReason; count: number }>;
 }
 
 export interface OrchestratorStats {
@@ -151,6 +167,26 @@ function median(values: number[]): number {
 
 const rate = (n: number, of: number): number => (of === 0 ? 0 : n / of);
 
+function candidateStats(rows: TaskOutcomeRecord[]): CandidateExecutionStats {
+  const stats: CandidateExecutionStats = { executed: 0, promoted: 0, rejected: 0, unchanged: 0, unverified: 0,
+    taskChecksPassed: 0, taskChecksFailed: 0, taskChecksUnverified: 0, rejectionReasons: [] };
+  const reasons = new Map<CandidateRejectionReason, number>();
+  for (const row of rows) {
+    if (!hasCandidateOutcome(row)) continue;
+    stats.executed += 1;
+    const evidence = candidateOutcomeEvidence(row);
+    if (evidence?.receipt === undefined) { stats.unverified += 1; stats.taskChecksUnverified += 1; continue; }
+    stats[evidence.receipt.disposition] += 1;
+    if (evidence.receipt.reason !== undefined) reasons.set(evidence.receipt.reason, (reasons.get(evidence.receipt.reason) ?? 0) + 1);
+    const checked = evidence.taskChecks;
+    if (checked.failed > 0) stats.taskChecksFailed += 1;
+    else if (checked.total > 0 && checked.passed === checked.total) stats.taskChecksPassed += 1;
+    else stats.taskChecksUnverified += 1;
+  }
+  stats.rejectionReasons = [...reasons].map(([reason, count]) => ({ reason, count })).sort((a, b) => b.count - a.count || a.reason.localeCompare(b.reason));
+  return stats;
+}
+
 function modelStats(rows: TaskOutcomeRecord[]): ModelStats {
   const first = rows[0]!;
   const green = rows.filter((r) => r.status === "ok");
@@ -179,6 +215,7 @@ function modelStats(rows: TaskOutcomeRecord[]): ModelStats {
     checksPassed: checks.filter((value) => value === "passed").length,
     checksFailed: checks.filter((value) => value === "failed").length,
     checksUnverified: checks.filter((value) => value === "unverified").length,
+    candidate: candidateStats(rows),
     topFailures: [...failures.entries()]
       .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
       .slice(0, 3)
@@ -373,6 +410,14 @@ function modelRows(stats: ModelStats[]): string[] {
   );
 }
 
+function candidateRows(stats: ModelStats[]): string[] {
+  return table(["model", "leg", "executed", "promoted", "rejected", "unchanged", "unverified", "final own checks pass/fail/unverified", "rejection reasons"],
+    stats.map(s => [s.model === s.provider ? s.model : `${s.model} (${s.provider})`, s.leg, String(s.candidate.executed),
+      String(s.candidate.promoted), String(s.candidate.rejected), String(s.candidate.unchanged), String(s.candidate.unverified),
+      `${s.candidate.taskChecksPassed}/${s.candidate.taskChecksFailed}/${s.candidate.taskChecksUnverified}`,
+      s.candidate.rejectionReasons.length === 0 ? "-" : s.candidate.rejectionReasons.map(r => `${r.reason} ${r.count}`).join(", ")]));
+}
+
 export function formatFusionReport(report: FusionReport, options: ReportOptions = {}): string {
   const window = options.days === undefined ? "all kept history" : `last ${options.days} day${options.days === 1 ? "" : "s"}`;
   const filter = options.model === undefined ? "" : `, model matching "${options.model}"`;
@@ -387,6 +432,8 @@ export function formatFusionReport(report: FusionReport, options: ReportOptions 
   if (report.orchestratorTargets.length > 0) {
     lines.push("", "Tasks sent to the orchestrator's model", ...modelRows(report.orchestratorTargets));
   }
+  const candidates = [...report.workers, ...report.orchestratorTargets].filter(s => s.candidate.executed > 0);
+  if (candidates.length > 0) lines.push("", "Candidate worker executions (telemetry only)", ...candidateRows(candidates));
   if (report.orchestrator.length > 0) {
     lines.push(
       "",
@@ -416,6 +463,7 @@ export function formatFusionReport(report: FusionReport, options: ReportOptions 
     }`,
     "Reported green: status ok; reported 1st-pass: status ok on the first attempt with no judge retry or self-check notice. after retry: reported green after a replan or judge retry.",
     "Checks pass/fail/unverified: consistent task-checks acceptance records; missing or contradictory evidence is unverified. Replan attempts can have check evidence. The worker can modify the declared checks and their inputs; passing them does not establish semantic correctness or full integration acceptance.",
+    "Candidate executions count actual worker executions by final candidate disposition, not candidate calls. Final own checks count only task-attributed final reruns; call-level integration green gives no individual model credit. Candidate rows are telemetry only: promoted-only rates are conditioned on success and never train measured routing quality. Missing or malformed candidate metadata stays unverified.",
   );
   return `${lines.join("\n")}\n`;
 }

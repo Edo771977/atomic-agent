@@ -5,7 +5,7 @@ import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import type { FusionRoleModels } from "../../llm/run-mode/index.js";
 import type { DelegateTask } from "./delegate-args.js";
-import { OUTCOME_LOG_MAX_BYTES, type TaskOutcomeRecord } from "./outcome-log.js";
+import { OUTCOME_LOG_MAX_BYTES, type OutcomeRecord, type TaskOutcomeRecord } from "./outcome-log.js";
 import { measuredTaskLegs, readRoutingHistory } from "./measured-routing.js";
 import { resolveTaskLegs } from "./role-models.js";
 
@@ -22,7 +22,7 @@ function record(provider: string, passed: boolean, over: Partial<TaskOutcomeReco
     acceptance: passed ? "checks-passed" : "checks-failed", acceptanceScope: "task-checks", routingIdentity: identity(provider), ...over };
 }
 const samples = (provider: string, passed: boolean, over: Partial<TaskOutcomeRecord> = {}) => Array.from({ length: 3 }, () => record(provider, passed, over));
-function select(records = [...samples("worker", false), ...samples("strong", true)], options: {
+function select(records: readonly OutcomeRecord[] = [...samples("worker", false), ...samples("strong", true)], options: {
   tasks?: DelegateTask[]; roles?: FusionRoleModels; remaining?: number; attempted?: boolean;
 } = {}) {
   const tasks = options.tasks ?? [{ id: "a", title: "Build", instructions: "build" }];
@@ -45,6 +45,17 @@ describe("measured routing evidence and admission", () => {
         expect(result.decisions[0]?.candidates.find(c => c.provider === "strong")?.verifiedSamples).toBe(0);
       }
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it("retains candidate provider blockers while excluding candidate executions from quality rates", () => {
+    const candidate = { receipt: { version: 1, id: "a".repeat(24), disposition: "rejected", checkScope: "declared", checkStatus: "unverified",
+      checks: { total: 0, passed: 0, failed: 0 }, inputs: { declared: 0, verified: 0 }, reason: "task-not-ok" },
+      taskChecks: { total: 0, passed: 0, failed: 0 } } as const;
+    const blocked = select([...samples("worker", false), ...samples("strong", true),
+      record("strong", false, { status: "failed", failure: "not-signed-in", candidate, ts: new Date(now).toISOString() })]);
+    expect(blocked.decisions[0]?.excluded).toContainEqual({ provider: "strong", reason: "blocking-history" });
+    const promoted = { ...candidate, receipt: { ...candidate.receipt, disposition: "promoted", checkStatus: "passed",
+      checks: { total: 1, passed: 1, failed: 0 }, reason: undefined } } as const;
+    expect(select([...samples("worker", false), ...samples("strong", true, { candidate: promoted })]).legs.get("a")?.providerId).toBe("worker");
   });
   it("chooses configured build targets and exact requested-role evidence", () => {
     const roles: FusionRoleModels = { byRole: { build: { providerId: "build", model: "builder", local: false } }, mixLocalModels: false, localLegProviderIds: [] };
