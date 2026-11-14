@@ -43,7 +43,9 @@ function isOwnSpelling(entry: string): boolean {
 function translate(entry: string): string[] | null {
   const claude = CLAUDE_TOOL_NAMES[entry.toLowerCase()];
   if (claude !== undefined) return [...claude];
-  const mcp = /^mcp__([A-Za-z0-9_-]+)(?:__([A-Za-z0-9_-]+))?$/.exec(entry);
+  // The server name stops at the first `__` (lazy), as Claude Code
+  // splits it; a greedy match swallowed the tool into the server.
+  const mcp = /^mcp__([A-Za-z0-9_-]+?)(?:__([A-Za-z0-9_-]+))?$/.exec(entry);
   if (mcp !== null) {
     return [mcp[2] === undefined ? `mcp.${mcp[1]}.*` : `mcp.${mcp[1]}.${mcp[2]}`];
   }
