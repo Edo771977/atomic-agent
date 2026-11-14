@@ -2254,21 +2254,30 @@ async function runOneTask(
   // parent once they ran.
   const proposedSplit = mayPropose && hasSplitProposal(result.reply);
   // A worker that ended its own turn on a question (ATO-945) stopped by
-  // design: it is `needs_input`, not `ok`, and its declared files are not
-  // checked, because it was told to stop before writing them.
+  // design: it is `needs_input`, not `ok`. One that wrote nothing is not
+  // checked, because it was told to stop before writing; one that did
+  // write has its declared files checked as if it had finished, and a
+  // contradiction fails it with the question still on the row.
   const question =
     !proposedSplit && result.status === "ok"
       ? readWorkerQuestion(result.reply)
       : undefined;
+  if (question !== undefined && task.files !== undefined && task.files.length > 0) {
+    const report = await inspectDeclaredFiles(task.files, workingDir, startedAt);
+    if (result.tools.writes > 0 || report.modified.length > 0) {
+      result = applyDeclaredFileReport(result, report);
+    }
+  }
   if (question !== undefined) {
     result = {
       ...result,
-      status: "needs_input",
+      ...(result.status === "ok" ? { status: "needs_input" as const } : {}),
       question,
       notes: [...(result.notes ?? []), WORKER_NEEDS_INPUT_NOTE],
     };
   }
   if (
+    question === undefined &&
     !proposedSplit &&
     task.files !== undefined &&
     task.files.length > 0 &&
