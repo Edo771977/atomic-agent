@@ -1,4 +1,4 @@
-import { lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative, sep } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
@@ -128,4 +128,54 @@ it("links a nested wave inside a candidate to the candidate's private copy, neve
       expect(await readlink(nested)).not.toContain(root);
     } finally { await set?.cleanup(); }
   } finally { await candidate.cleanup(); }
+});
+
+async function workspaceProject(): Promise<string> {
+  const root = await project();
+  await mkdir(join(root, "packages", "pkg"), { recursive: true });
+  await writeFile(join(root, "packages", "pkg", "index.js"), "original package\n");
+  await mkdir(join(root, "node_modules", "@s"), { recursive: true });
+  // npm workspaces on Windows and pnpm: absolute links into the project.
+  await symlink(join(root, "packages", "pkg"), join(root, "node_modules", "@s", "pkg"), "dir");
+  await symlink(join("..", "..", "packages", "pkg"), join(root, "node_modules", "@s", "rel"), "dir");
+  links.calls.length = 0;
+  return root;
+}
+
+it.each([
+  ["symlinks allowed", () => undefined],
+  ["only junctions allowed", (_target: string, type: string | undefined) => type === "junction" ? undefined : "EPERM"],
+] as const)("points a candidate's dependency links into the project at the candidate (%s)", async (_label, deny) => {
+  const root = await workspaceProject();
+  links.deny = deny;
+  const candidate = await createCandidateIntegration(root, { git: async () => null });
+  try {
+    for (const name of ["pkg", "rel"]) {
+      const link = join(candidate.dir, "node_modules", "@s", name);
+      expect((await lstat(link)).isSymbolicLink()).toBe(true);
+      expect(await realpath(link)).toBe(join(await realpath(candidate.dir), "packages", "pkg"));
+      await writeFile(join(link, "index.js"), `candidate wrote through ${name}\n`);
+      expect(await readFile(join(root, "packages", "pkg", "index.js"), "utf8")).toBe("original package\n");
+    }
+    expect((await candidate.reject("test")).status).toBe("rejected");
+  } finally { await candidate.cleanup(); }
+});
+
+it("keeps a candidate's dependency link outside the project pointing where it did", async () => {
+  const root = await project();
+  const outside = await realpath(await mkdtemp(join(tmpdir(), "atag-dep-outside-"))); roots.push(outside);
+  await symlink(outside, join(root, "node_modules", "global"), "dir");
+  const candidate = await createCandidateIntegration(root, { git: async () => null });
+  try {
+    expect(await readlink(join(candidate.dir, "node_modules", "global"))).toBe(outside);
+  } finally { await candidate.cleanup(); }
+});
+
+it("names the link a candidate cannot recreate when no link kind is available", async () => {
+  const root = await workspaceProject();
+  links.deny = () => "EPERM";
+  await expect(createCandidateIntegration(root, { git: async () => null })).rejects.toThrow(
+    `cannot recreate the link ${join("node_modules", "@s", "pkg")} in a private workspace`,
+  );
+  expect(await readFile(join(root, "packages", "pkg", "index.js"), "utf8")).toBe("original package\n");
 });

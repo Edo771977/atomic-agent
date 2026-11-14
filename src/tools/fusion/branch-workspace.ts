@@ -55,7 +55,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, dirname, join, relative, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { runCommand, type CommandResult } from "../../sandbox/command-runner.js";
 import { buildCommandEnv } from "../../sandbox/command-env.js";
 import { VERIFY_COPY_EXCLUDED, VERIFY_COPY_MAX_BYTES } from "../verify/verify-workspace-copy.js";
@@ -494,7 +494,7 @@ async function copyPrivateEntry(
     }
   } else if (info.isSymbolicLink()) {
     await mkdir(dirname(to), { recursive: true });
-    await symlink(await readlink(from), to);
+    await recreateLink(from, to, budget, rel);
   } else if (info.isFile()) {
     if (info.size > budget.left) throw new PrivateCopyLimitError();
     budget.left -= info.size;
@@ -506,6 +506,61 @@ async function copyPrivateEntry(
   } else {
     throw new Error(`cannot copy a special workspace entry: ${from}`);
   }
+}
+
+/** `target` relative to `root` when it lies inside it, lexically or through its parent's real path. */
+async function insideRoot(target: string, root: string): Promise<string | undefined> {
+  const within = (path: string): string | undefined => {
+    const rel = relative(root, path);
+    return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel)) ? rel : undefined;
+  };
+  const lexical = within(target);
+  if (lexical !== undefined) return lexical;
+  const parent = await realpath(dirname(target)).catch(() => null);
+  return parent === null ? undefined : within(join(parent, basename(target)));
+}
+
+/**
+ * Copy a user's symlink with its target. Inside a private dependency
+ * copy (`budget.privateDependenciesFrom`), an absolute target inside the
+ * original (npm workspaces on Windows, pnpm: `node_modules/@s/pkg` →
+ * `<project>/packages/pkg`) is pointed at the same place in this
+ * workspace instead, so a write through it stays private; relative
+ * targets already resolve inside the copy, and targets outside the
+ * original are kept. Where the host denies symlinks, a directory target
+ * under a dependency directory becomes a junction to the same resolved
+ * path; otherwise the copy fails, naming the link (it is never expanded
+ * into a copy).
+ */
+async function recreateLink(from: string, to: string, budget: PrivateCopyBudget, rel: string): Promise<void> {
+  let target = await readlink(from);
+  const origin = budget.privateDependenciesFrom;
+  if (origin !== undefined && isAbsolute(target) && underSharedDependencyDirectory(rel) && to.endsWith(`${sep}${rel}`)) {
+    const inside = await insideRoot(target, origin);
+    if (inside !== undefined) target = join(to.slice(0, to.length - rel.length - 1), inside);
+  }
+  let denied: unknown;
+  try {
+    await symlink(target, to);
+    return;
+  } catch (err) {
+    if (!linkUnavailable(err)) throw err;
+    denied = err;
+  }
+  budget.signal?.throwIfAborted();
+  // Only under a dependency directory: never inventoried or merged, so a
+  // junction's absolute link text cannot be mistaken for a change.
+  if (underSharedDependencyDirectory(rel) && await stat(from).then((found) => found.isDirectory(), () => false)) {
+    try {
+      // A junction needs an absolute target; resolve it where the link lives.
+      await symlink(resolve(dirname(to), target), to, "junction");
+      return;
+    } catch (err) {
+      if (!linkUnavailable(err, [...LINK_UNAVAILABLE, "EINVAL", "EXDEV"])) throw err;
+    }
+  }
+  const why = denied instanceof Error ? denied.message : String(denied);
+  throw new Error(`cannot recreate the link ${rel || "."} in a private workspace: ${why}`);
 }
 
 /** What a git snapshot needs: the commit, and what lives outside it. */
