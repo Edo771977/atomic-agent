@@ -31,7 +31,6 @@ beforeEach(async () => {
   await writeFile(join(work, "node_modules", "dep", "index.js"), "module.exports = 1;");
   await mkdir(join(work, ".git"));
   await writeFile(join(work, ".git", "HEAD"), "ref: refs/heads/main");
-  await symlink("src/app.js", join(work, "link.js"));
 });
 
 afterEach(async () => {
@@ -56,6 +55,7 @@ describe("VERIFY_COPY_MAX_BYTES", () => {
 
 describe("createVerifyWorkspace", () => {
   it("copies the tree, symlinks the excluded directories, keeps modes and symlinks", async () => {
+    await symlink("src/app.js", join(work, "link.js"));
     const ws = await createVerifyWorkspace(work, { platform: "linux", tmpRoot });
     try {
       expect(ws.isolated).toBe(true);
@@ -92,6 +92,7 @@ describe("createVerifyWorkspace", () => {
   });
 
   it("falls back to a junction on Windows when a directory symlink is refused (EPERM)", async () => {
+    await symlink("src/app.js", join(work, "link.js"));
     const calls: { target: string; path: string; type: string | undefined }[] = [];
     const ws = await createVerifyWorkspace(work, {
       platform: "win32",
@@ -223,6 +224,10 @@ describe("createVerifyWorkspace", () => {
   });
 
   it("uses clonefile on macOS and falls back to the copy when the clone fails", async () => {
+    // This is a clone/copy fallback test, independent of the host's
+    // directory-link privileges (covered by the dedicated link cases).
+    await rm(join(work, "node_modules"), { recursive: true });
+    await rm(join(work, ".git"), { recursive: true });
     let cloneCalls = 0;
     const cloned = await createVerifyWorkspace(work, {
       platform: "darwin",
