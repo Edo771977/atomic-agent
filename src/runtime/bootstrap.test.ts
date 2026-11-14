@@ -10,6 +10,7 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { randomBytes } from "node:crypto";
 
 import {
@@ -350,18 +351,20 @@ describe("createAgentRuntime", () => {
         signal: new AbortController().signal,
       };
       // Level-5 boot: dangerous navigation runs without a prompt.
-      await runtime.toolRegistry.invoke(
+      const localUrl = pathToFileURL(join(workingDir, "hosts.html")).href;
+      const allowed = await runtime.toolRegistry.invoke(
         "browser.navigate",
-        { url: "file:///etc/hosts" },
+        { url: localUrl },
         ctx,
       );
+      expect(allowed.status).toBe("ok");
       expect(prompts).toHaveLength(0);
 
       runtime.setApprovalLevel(1);
       await expect(
         runtime.toolRegistry.invoke(
           "browser.navigate",
-          { url: "file:///etc/hosts" },
+          { url: localUrl },
           ctx,
         ),
       ).rejects.toThrow(/The user declined/);
