@@ -83,6 +83,11 @@ describe("runChecker", () => {
     expect(run.exitCode).toBeNull();
   });
 
+  it("keeps an absent absolute checker classified as missing", async () => {
+    const run = await runChecker(join(dir, "absent-checker.cmd"), ["--version"]);
+    expect(run).toMatchObject({ missing: true, exitCode: null, timedOut: false });
+  });
+
   it.skipIf(process.platform === "win32")("kills the child when the signal aborts", async () => {
     const controller = new AbortController();
     const started = Date.now();

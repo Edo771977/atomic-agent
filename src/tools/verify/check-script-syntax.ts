@@ -26,6 +26,7 @@ import { basename, extname, join } from "node:path";
 
 import { isSeaBuild } from "../../runtime/self-invocation.js";
 import { resolveWindowsCliInvocation } from "../../llm/provider/subscription-cli/windows-cli-shim.js";
+import { SubscriptionCliNotInstalledError } from "../../llm/provider/subscription-cli/subscription-cli-errors.js";
 import { killProcessTree } from "../../sandbox/kill-process-tree.js";
 import { checkFileParses } from "../os/fs/fs-parse-check.js";
 import { type SyntaxFileResult, tailOfOutput } from "./syntax-check-types.js";
@@ -46,7 +47,8 @@ const CHECKER_TIMEOUT_MS = 60_000;
 const CHECKER_OUTPUT_CAP = 64 * 1024;
 
 function isMissingBinary(err: unknown): boolean {
-  return (err as NodeJS.ErrnoException | null)?.code === "ENOENT";
+  return err instanceof SubscriptionCliNotInstalledError ||
+    (err as NodeJS.ErrnoException | null)?.code === "ENOENT";
 }
 
 /**
