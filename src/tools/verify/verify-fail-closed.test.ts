@@ -1,4 +1,4 @@
-import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -29,6 +29,21 @@ afterEach(async () => {
 });
 
 describe("verify refuses to execute without a private workspace", () => {
+  it.each(["dist", "node_modules"])("charges a protected %s directory to the existing execution-copy cap", async folder => {
+    await mkdir(join(dir, folder)); await writeFile(join(dir, folder, "check.mjs"), "x".repeat(6_000));
+    const begin = vi.fn(async () => async () => {});
+    const runner = vi.spyOn(commands, "runCommandKind");
+    const result = await runVerify(spec, { workingDir: dir, config: { ...config, tools: { verify: { maxCopyBytes: 100 } } },
+      inputIntegrity: { paths: [`${folder}/check.mjs`], begin } });
+    expect(result).toMatchObject({ ok: false, errorCode: "workspace-unavailable" });
+    expect(runner).not.toHaveBeenCalled(); expect(begin).not.toHaveBeenCalled();
+  });
+  it("refuses outside protected-copy metadata before following or executing it", async () => {
+    const runner = vi.spyOn(commands, "runCommandKind");
+    const result = await runVerify(spec, { workingDir: dir, inputIntegrity: { paths: ["../outside/check.mjs"], begin: async () => async () => {} } });
+    expect(result).toMatchObject({ ok: false, errorCode: "workspace-unavailable" });
+    expect(result.error).toContain("relative files inside"); expect(runner).not.toHaveBeenCalled();
+  });
   it("rebases absolute source arguments into the execution copy without checkInputs", async () => {
     const result = await runVerify({ kind: "command", cmd: process.execPath,
       args: ["-e", "require('fs').writeFileSync(process.argv[1], 'execution output')", join(dir, "original.txt")], checks: ["exit 0"] }, { workingDir: dir, config });

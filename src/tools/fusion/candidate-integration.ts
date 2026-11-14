@@ -576,6 +576,7 @@ export async function createCandidateIntegration(
         };
         let actualInputExecutions = 0;
         const inputIntegrity = protectedInputs.paths.length === 0 ? undefined : {
+          paths: Object.freeze([...protectedInputs.paths]),
           async begin(dir: string, signal: AbortSignal): Promise<() => Promise<void>> {
             const complete = await protectedInputs.beginExecution(dir, signal);
             let completed = false;

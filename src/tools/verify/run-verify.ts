@@ -214,7 +214,10 @@ export async function runVerify(
   let executionResult: VerifyRunResult | undefined;
   try {
     const maxBytes = ctx.config?.tools?.verify?.maxCopyBytes;
-    workspace = await (ctx.workspace ?? ((dir: string) => createVerifyWorkspace(dir, maxBytes === undefined ? {} : { maxBytes })))(ctx.workingDir);
+    workspace = await (ctx.workspace ?? ((dir: string) => createVerifyWorkspace(dir, {
+      ...(maxBytes === undefined ? {} : { maxBytes }),
+      ...(ctx.inputIntegrity?.paths === undefined ? {} : { privatePaths: ctx.inputIntegrity.paths }),
+    })))(ctx.workingDir);
     if (ctx.signal?.aborted) {
       result = failed("verification cancelled before execution", "cancelled", workspace.isolated);
     } else if (!workspace.isolated || resolve(workspace.dir) === resolve(ctx.workingDir)) {

@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
@@ -34,4 +34,12 @@ it("refuses outside, missing and oversized declared check files", async () => {
   await expect(freezeCheckInputs(project, ["missing.mjs"], signal)).rejects.toThrow();
   await writeFile(join(project, "large.mjs"), Buffer.alloc(2 * 1024 * 1024 + 1));
   await expect(freezeCheckInputs(project, ["large.mjs"], signal)).rejects.toThrow(/byte limit/);
+});
+it("refuses an excluded-directory input whose original ancestor is a link outside the project", async () => {
+  const root = await mkdtemp(join(tmpdir(), "atag-check-linked-")); roots.push(root);
+  const project = join(root, "project"), outside = join(root, "outside"); await mkdir(project); await mkdir(outside);
+  await writeFile(join(outside, "check.mjs"), "outside unchanged");
+  await symlink(outside, join(project, "dist"), process.platform === "win32" ? "junction" : "dir");
+  await expect(freezeCheckInputs(project, ["dist/check.mjs"], signal)).rejects.toThrow(/linked ancestor/);
+  expect(await readFile(join(outside, "check.mjs"), "utf8")).toBe("outside unchanged");
 });

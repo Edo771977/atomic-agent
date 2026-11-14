@@ -319,6 +319,17 @@ it("refuses a normalized project alias in a check before dispatching workers", a
   expect(result.details.candidateIntegration).toMatchObject({ status: "rejected", reason: expect.stringContaining("unsupported absolute project reference") });
   expect(runTurn).not.toHaveBeenCalled();
 });
+it.each(["dist", "node_modules"])("privately verifies a protected input under excluded %s with the built-in runner", async folder => {
+  const { runChecks } = await import("../verify/run-verify.js");
+  const f = await fixture({ runChecks });
+  await mkdir(join(f.root, folder));
+  await writeFile(join(f.root, folder, "check.mjs"), "import{readFileSync}from'node:fs';if(readFileSync('api.json','utf8')!=='candidate')process.exit(1)");
+  f.deps.runTurn = async session => { await writeFile(join(session.workingDir, "api.json"), "candidate"); return { session, reason: "reply", stepCount: 1 }; };
+  const result = await buildFusionDelegateTool(f.deps).run({ tasks: [{ id: "api", instructions: "work", files: ["api.json"] }],
+    contract: { checkInputs: [`${folder}/check.mjs`], checks: [{ kind: "command", cmd: process.execPath, args: [`${folder}/check.mjs`], network: true }] } }, f.ctx);
+  expect(result.details.candidateIntegration).toMatchObject({ status: "promoted", acceptanceReceipt: { checkScope: "protected-declared", checkStatus: "passed", inputs: { declared: 1, verified: 1 } } });
+  expect(await readFile(join(f.root, "api.json"), "utf8")).toBe("candidate");
+});
 
 it("binds an absolute protected check reference to the actual execution copy", async () => {
   const { runChecks } = await import("../verify/run-verify.js"); const f = await fixture({ runChecks });

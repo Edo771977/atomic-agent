@@ -44,6 +44,7 @@ import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { DEFAULT_VERIFY_MAX_COPY_BYTES } from "../../config/tool-config.js";
+import { inputPathIdentity } from "../os/fs/fs-input-path-identity.js";
 
 export const VERIFY_COPY_EXCLUDED: ReadonlySet<string> = new Set([
   "node_modules",
@@ -71,6 +72,8 @@ export interface VerifyWorkspace {
 }
 
 export interface CreateWorkspaceOptions {
+  /** Relative protected files: excluded ancestor directories are copied within the existing byte ceiling. */
+  privatePaths?: readonly string[];
   platform?: NodeJS.Platform;
   tmpRoot?: string;
   maxBytes?: number;
@@ -92,6 +95,7 @@ const CLEANUP_RM_OPTIONS = { recursive: true, force: true, maxRetries: 5, retryD
 export type SymlinkFn = (target: string, path: string, type?: "dir" | "file" | "junction") => Promise<void>;
 
 export interface CopyTreeOptions {
+  privatePaths?: readonly string[];
   platform?: NodeJS.Platform;
   symlink?: SymlinkFn;
   /** Bytes the copy may write (files and refused-link targets); unlimited when omitted. */
@@ -99,7 +103,7 @@ export interface CopyTreeOptions {
 }
 
 function copyLimitError(limit: number): Error {
-  return new Error(`workspace exceeds the ${limit}-byte copy limit (${[...VERIFY_COPY_EXCLUDED].join(", ")} not counted); raise \`tools.verify.maxCopyBytes\` in the config, or move large generated files into one of those directories`);
+  return new Error(`workspace exceeds the ${limit}-byte copy limit (${[...VERIFY_COPY_EXCLUDED].join(", ")} not counted unless an ancestor of a protected check input); raise \`tools.verify.maxCopyBytes\` in the config, or move large generated files into one of those directories`);
 }
 
 const LINK_REFUSED = new Set(["EPERM", "EACCES"]);
@@ -146,7 +150,8 @@ function cloneWithCp(src: string, dest: string): Promise<boolean> {
 }
 
 /** Byte size of the tree minus the excluded directories; stops early past `limit`. */
-export async function measureTree(root: string, limit: number): Promise<number> {
+export async function measureTree(root: string, limit: number, privatePaths: readonly string[] = []): Promise<number> {
+  const protectedPaths = privateCopyPaths(root, privatePaths);
   let total = 0;
   const stack = [root];
   while (stack.length > 0) {
@@ -159,7 +164,7 @@ export async function measureTree(root: string, limit: number): Promise<number> 
     }
     for (const entry of entries) {
       if (entry.isDirectory()) {
-        if (!VERIFY_COPY_EXCLUDED.has(entry.name)) stack.push(join(dir, entry.name));
+        if (!VERIFY_COPY_EXCLUDED.has(entry.name) || requiresPrivate(join(dir, entry.name), protectedPaths)) stack.push(join(dir, entry.name));
         continue;
       }
       if (!entry.isFile()) continue;
@@ -185,11 +190,13 @@ export async function copyTreeWithExclusions(src: string, dest: string, options:
     srcRoot: resolve(src),
     destRoot: resolve(dest),
     budget: { limit: options.maxBytes ?? Number.POSITIVE_INFINITY, used: 0 },
+    privatePaths: privateCopyPaths(src, options.privatePaths ?? []),
   };
   await copyDirectory(src, dest, context);
 }
 
 interface CopyContext {
+  readonly privatePaths: readonly string[];
   readonly platform: NodeJS.Platform;
   readonly link: SymlinkFn;
   readonly srcRoot: string;
@@ -209,6 +216,19 @@ function insideTree(root: string, absolute: string): string | undefined {
   if (rel === "") return rel;
   if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return undefined;
   return rel;
+}
+
+function privateCopyPaths(root: string, paths: readonly string[]): readonly string[] {
+  return Object.freeze(paths.map(path => {
+    const absolute = resolve(root, path);
+    if (isAbsolute(path) || !insideTree(root, absolute)) throw new Error("protected verification paths must be relative files inside the source workspace");
+    return inputPathIdentity(absolute);
+  }));
+}
+
+function requiresPrivate(directory: string, paths: readonly string[]): boolean {
+  const prefix = `${inputPathIdentity(directory)}${sep}`;
+  return paths.some(path => path.startsWith(prefix));
 }
 
 /**
@@ -262,7 +282,7 @@ async function copyDirectory(src: string, dest: string, context: CopyContext): P
         await recreateRefusedLink(from, to, target, context, err);
       }
     } else if (entry.isDirectory()) {
-      if (VERIFY_COPY_EXCLUDED.has(entry.name)) {
+      if (VERIFY_COPY_EXCLUDED.has(entry.name) && !requiresPrivate(from, context.privatePaths)) {
         await linkDirectory(from, to, platform, link);
       } else {
         await copyDirectory(from, to, context);
@@ -297,17 +317,17 @@ export async function createVerifyWorkspace(
       if ((err as NodeJS.ErrnoException).code !== "ENOTDIR") throw err;
     }
   };
-  if (platform === "darwin") {
+  if (platform === "darwin" && (options.privatePaths?.length ?? 0) === 0) {
     const cloned = await (options.clone ?? cloneWithCp)(workingDir, dest);
     if (cloned) return { dir: dest, isolated: true, method: "clonefile", cleanup };
     await cleanup();
   }
   const limit = options.maxBytes ?? VERIFY_COPY_MAX_BYTES;
-  if ((await measureTree(workingDir, limit)) > limit) {
+  if ((await measureTree(workingDir, limit, options.privatePaths)) > limit) {
     return { dir: dest, isolated: false, method: "unavailable", error: copyLimitError(limit).message, cleanup };
   }
   try {
-    await copyTreeWithExclusions(workingDir, dest, { platform, maxBytes: limit, ...(options.symlink === undefined ? {} : { symlink: options.symlink }) });
+    await copyTreeWithExclusions(workingDir, dest, { platform, maxBytes: limit, privatePaths: options.privatePaths, ...(options.symlink === undefined ? {} : { symlink: options.symlink }) });
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
     try {
