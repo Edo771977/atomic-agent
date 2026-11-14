@@ -213,11 +213,11 @@ export function verifyRunShellCalls(
   args: Record<string, unknown>,
 ): Record<string, unknown>[] {
   const calls: Record<string, unknown>[] = [];
-  if (typeof args.cmd === "string") calls.push({ cmd: args.cmd, args: args.args });
+  if (typeof args.cmd === "string") calls.push({ cmd: args.cmd, args: args.args, ...(args.cwd === undefined ? {} : { cwd: args.cwd }), ...(args.env === undefined ? {} : { env: args.env }) });
   const start = args.start;
   if (typeof start === "object" && start !== null) {
     const { cmd, args: startArgs } = start as Record<string, unknown>;
-    if (typeof cmd === "string") calls.push({ cmd, args: startArgs });
+    if (typeof cmd === "string") calls.push({ cmd, args: startArgs, ...(args.cwd === undefined ? {} : { cwd: args.cwd }), ...(args.env === undefined ? {} : { env: args.env }) });
   }
   return calls;
 }

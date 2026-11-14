@@ -1,3 +1,5 @@
+import { resolve } from "node:path";
+import { isInside } from "../../approval/fanout-scope.js";
 import type { DangerousToolOptions } from "../../approval/dangerous-tool.js";
 import { compressToolResult, type CompressedToolResult } from "../../compressor/result-compressor.js";
 import type { ReadScope } from "../../config/index.js";
@@ -191,6 +193,12 @@ export function createCommandReadCheck(options: ConfineReadsOptions): CommandRea
 /** Definitions this module produced, so a second install does not wrap twice. */
 const CONFINED = new WeakSet<ToolDefinition>();
 
+/** Host-built tools with both canonical read guards need no legacy second wrapper. */
+export function markToolReadPolicy(tool: ToolDefinition): ToolDefinition {
+  CONFINED.add(tool);
+  return tool;
+}
+
 /**
  * Wrap every registered read-class tool (and, under a session scope, the
  * shell) so a call is checked before it runs. Call once, after the
@@ -256,7 +264,10 @@ export function confineReads(
       const inner = registry.get(name);
       install(name, async (args, ctx) => {
         for (const call of callsOf(args)) {
-          const refusal = await checkCommand(name, call, ctx);
+          const cwd = name === VERIFY_TOOL && typeof call.cwd === "string" ? resolve(ctx.workingDir, call.cwd) : ctx.workingDir;
+          if (name === VERIFY_TOOL && !isInside(resolve(ctx.workingDir), cwd)) return compressToolResult({ tool: name, status: "error", output: "verify.run: cwd must stay inside the working directory" });
+          const commandContext = cwd === ctx.workingDir ? ctx : { ...ctx, workingDir: cwd, readRoots: [ctx.workingDir, ...(ctx.readRoots ?? [])] };
+          const refusal = await checkCommand(name, call, commandContext);
           if (refusal !== null) return refusal;
         }
         return inner.run(args, ctx);

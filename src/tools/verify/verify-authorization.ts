@@ -19,6 +19,19 @@ export class VerifyGuardRefusal extends Error {
     super(`verify.run: blocked by shell guard: ${guardRule} - ${guardReason}`);
   }
 }
+/** Approval surfaces must honor the canonical credential set even for non-vendor strings. */
+export function maskVerificationSecrets(text: string, known: readonly KnownSecret[]): string {
+  let masked = maskSecrets(text, known);
+  const values = [...new Set(known.map(secret => secret.value).filter(value => value.length > 0))].sort((a, b) => b.length - a.length);
+  for (const value of values) masked = masked.split(value).join("[redacted:credential]");
+  return masked;
+}
+function maskedVerificationValue(value: unknown, known: readonly KnownSecret[]): unknown {
+  if (typeof value === "string") return maskVerificationSecrets(value, known);
+  if (Array.isArray(value)) return value.map(item => maskedVerificationValue(item, known));
+  if (value !== null && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, item]) => [maskVerificationSecrets(key, known), maskedVerificationValue(item, known)]));
+  return value;
+}
 export interface VerifyAuthorizationOptions extends DangerousToolOptions {
   shellPolicy?: ShellGuardPolicy;
   checkCommandReads?: CommandReadCheck;
@@ -57,7 +70,7 @@ function assertDeclaredVerificationSchema(spec: Record<string, unknown>, approva
   if (start !== undefined && present(start, "cmd") && present(start, "command")) throw new Error("ambiguous verification start: cmd and command cannot both be present");
   if (approvalRequired) {
     const unsupported = Object.keys(spec).find(key => !VERIFICATION_FIELDS.has(key));
-    if (unsupported !== undefined) throw new Error(`unsupported verification executor field: ${unsupported}`);
+    if (unsupported !== undefined) throw new Error("unsupported verification executor field");
     if (start !== undefined && Object.keys(start).some(key => key !== "cmd" && key !== "args")) throw new Error("unsupported verification start executor field");
   }
   const nonempty = (value: unknown): boolean => typeof value === "string" && value.length > 0 || Array.isArray(value) && value.length > 0;
@@ -113,15 +126,16 @@ export async function authorizeVerifyBatch(
     const env = Object.fromEntries(Object.entries(logical.env ?? {}).sort(([a], [b]) => a.localeCompare(b)).map(([name, value]) => [name, isSecretEnvName(name) ? `[redacted:env:${name}]` : value]));
     const metadata = JSON.stringify({ commandArgv, commandSegments, targetPaths });
     const metadataWords = [...(commandArgv ?? []), ...commandSegments.flat(), ...targetPaths];
-    const explicitCredential = Object.entries(logical.env ?? {}).some(([name, value]) =>
-      isSecretEnvName(name) && value.length > 0 && metadataWords.some(word => word.includes(value)));
+    const credentialValues = [...known.map(secret => secret.value), ...Object.entries(logical.env ?? {}).filter(([name]) => isSecretEnvName(name)).map(([, value]) => value)];
+    const explicitCredential = credentialValues.some(value => value.length > 0 && metadataWords.some(word => word.includes(value)));
     if (explicitCredential || maskSecrets(metadata, [...known, ...knownSecretsFromEnv(logical.env)]) !== metadata) {
       throw new Error("verification command credentials cannot be safely represented in approval metadata; pass credentials through the explicit environment instead");
     }
-    const preview = maskSecrets([
-      ...commands.map(c => formatShellPreview(c.cmd, c.args, needsShellInterpretation(c.cmd, c.args))),
-      JSON.stringify({ ...logical, cwd, env, checkInputs: ctx.checkInputs ?? [], execution: "in a private verification copy of this project; absolute project references are rebased into that copy" }, null, 2),
-    ].join("\n"), [...known, ...knownSecretsFromEnv(logical.env)]);
+    const previewKnown = [...known, ...knownSecretsFromEnv(logical.env)];
+    const preview = [
+      ...commands.map(c => maskVerificationSecrets(formatShellPreview(c.cmd, c.args, needsShellInterpretation(c.cmd, c.args)), previewKnown)),
+      JSON.stringify(maskedVerificationValue({ ...logical, cwd, env, checkInputs: ctx.checkInputs ?? [], execution: "in a private verification copy of this project; absolute project references are rebased into that copy" }, previewKnown), null, 2),
+    ].join("\n");
     if (Buffer.byteLength(preview) > MAX_AUTHORIZATION_BYTES) throw new Error("verification authorization preview exceeds the size limit");
     const prompt = {
       sessionId: ctx.sessionId, tool: "verify.run", category: dangerous ? "shell_dangerous" as const : "shell" as const,

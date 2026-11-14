@@ -1,4 +1,5 @@
-import type { DangerousToolOptions } from "../../approval/dangerous-tool.js";
+import type { VerifyAuthorizationOptions } from "./verify-authorization.js";
+import type { KnownSecret } from "../../error-reporting/secret-detector.js";
 import type { VerifyRunConfig } from "./run-verify.js";
 import type { ShellGuardPolicy } from "../os/shell-command-guard/index.js";
 import type { ToolRegistry } from "../tool-registry.js";
@@ -98,7 +99,8 @@ export { downsample, sampleProbes, MISSING_SELECTOR_INIT_SCRIPT } from "./page-p
 export type { ProbeSample } from "./page-probe-script.js";
 export { renderVerifyRunSummary, VERIFY_RUN_SUMMARY_MAX_CHARS } from "./verify-run-summary.js";
 
-export interface RegisterVerifyToolsOptions extends DangerousToolOptions {
+export interface RegisterVerifyToolsOptions extends VerifyAuthorizationOptions {
+  resolveKnownSecrets?: () => readonly KnownSecret[];
   /** Browser settings and `tools.verify.maxCopyBytes`. */
   config: VerifyRunConfig;
   /** The shell guard's operator policy, shared with `os.shell.run`. */
@@ -120,6 +122,10 @@ export function registerVerifyTools(
       approvals: options.approvals,
       approvalRequired: options.approvalRequired,
       config: options.config,
+      ...(options.checkCommandReads === undefined ? {} : { checkCommandReads: options.checkCommandReads }),
+      ...(options.checkReadTargets === undefined ? {} : { checkReadTargets: options.checkReadTargets }),
+      ...(options.knownSecrets === undefined ? {} : { knownSecrets: options.knownSecrets }),
+      ...(options.resolveKnownSecrets === undefined ? {} : { resolveKnownSecrets: options.resolveKnownSecrets }),
       ...(options.shellPolicy === undefined ? {} : { shellPolicy: options.shellPolicy }),
     }),
   );

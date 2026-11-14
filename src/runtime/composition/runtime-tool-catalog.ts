@@ -262,6 +262,9 @@ export function registerRuntimeCoreTools(input: {
   registerVerifyTools(toolRegistry, {
     ...dangerous,
     config: { browser: config.browser, tools: { verify: config.tools.verify } },
+    checkCommandReads: createCommandReadCheck(runtimeReadConfinement(config, dangerous)),
+    checkReadTargets: createReadTargetCheck(runtimeReadConfinement(config, dangerous)),
+    resolveKnownSecrets: () => runtimeKnownSecrets(getConfig()),
     // The same guard policy as `os.shell.run`: a `git push` started by
     // verify.run obeys the remote-sync switch too (ATO-1266).
     shellPolicy: {

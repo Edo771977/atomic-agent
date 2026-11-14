@@ -131,6 +131,58 @@ describe("runtime tool assembly phases and live MCP catalog", () => {
     } finally { shellJobs.endAll(); notesStore.close(); profileStore.close(); }
   });
 
+  function verificationRegistry(gate: ApprovalGate) {
+    const config = getConfig(); config.browser.enabled = false; config.web.search.persistCache = false;
+    const profileStore = new ProfileStore({ dbFile: join(directory, "verify-profile.sqlite") });
+    const notesStore = new MemoryStore({ dbFile: join(directory, "verify-notes.sqlite"), maxEntries: 20 });
+    const shellJobs = new osTools.ShellJobRegistry({ jobMaxMs: 1000, maxJobs: 2 });
+    const dangerous = { approvals: gate, approvalRequired: true };
+    const registry = createRuntimeToolRegistry(config, backend, dangerous);
+    registerRuntimeCoreTools({ config, toolRegistry: registry, dangerous, logger,
+      sessionStore: { listRecentWorkingDirs: () => [], listSummaryPage: () => [], listChatLines: () => [] },
+      resolveOriginalRequest: () => undefined, declaredInputs: new osTools.DeclaredInputsRegistry(), shellJobs,
+      skillRegistry: new SkillRegistry({ globalDir: join(directory, "skills"), projectDir: null }), profileStore, notesStore });
+    return { config, registry, close: () => { shellJobs.endAll(); notesStore.close(); profileStore.close(); } };
+  }
+
+  it("keeps configured custom verification credentials private after live config changes", async () => {
+    const prompts: import("../../approval/approval-gate.js").ApprovalRequest[] = [];
+    const gate: ApprovalGate = new ApprovalGate({ level: 1, emit: req => { prompts.push(req); queueMicrotask(() => gate.resolve({ approvalId: req.approvalId, approved: false })); } });
+    const config = getConfig(); config.localModels.apiKey = "InitialCustomCredential126AB";
+    const f = verificationRegistry(gate);
+    try {
+      const current = "RotatedCustomCredential847XY"; config.localModels.apiKey = current;
+      await f.registry.get("verify.run").run({ kind: "command", cmd: "node", args: ["safe.js", current] }, { workingDir: directory, sessionId: "verify-sdk", stepIndex: 0, signal: new AbortController().signal }).catch(() => undefined);
+      expect(prompts).toEqual([]);
+      expect(gate.pendingCount()).toBe(0);
+    } finally { f.close(); }
+  });
+
+  it.each(["page", "command-cwd"] as const)("threads canonical verification read policy for %s through registration", async kind => {
+    const prompts: import("../../approval/approval-gate.js").ApprovalRequest[] = [];
+    const gate: ApprovalGate = new ApprovalGate({ level: 1, emit: req => { prompts.push(req); queueMicrotask(() => gate.resolve({ approvalId: req.approvalId, approved: false })); } });
+    const f = verificationRegistry(gate);
+    try {
+      const { dirname, basename } = await import("node:path");
+      const spec = kind === "page" ? { kind: "page", path: f.config.paths.userConfigFile } : { kind: "command", cmd: "node", args: [basename(f.config.paths.userConfigFile)], cwd: basename(directory) };
+      await f.registry.get("verify.run").run(spec, { workingDir: kind === "page" ? directory : dirname(directory), sessionId: "verify-sdk", stepIndex: 0, signal: new AbortController().signal }).catch(() => undefined);
+      expect(prompts.map(p => p.category)).toEqual(["state_secret"]);
+    } finally { f.close(); }
+  });
+
+  it("keeps embedded verification read policy single when legacy confinement installs", async () => {
+    const prompts: string[] = [];
+    const gate: ApprovalGate = new ApprovalGate({ level: 1, emit: req => { prompts.push(req.category); queueMicrotask(() => gate.resolve({ approvalId: req.approvalId, approved: req.category === "state_secret" })); } });
+    const f = verificationRegistry(gate);
+    try {
+      const before = f.registry.get("verify.run").run;
+      readScope.confineReads(f.registry, { approvals: { approvals: gate, approvalRequired: true }, grantedDirs: () => [], readScope: () => "working-dir", stateSecrets: { stateDir: f.config.paths.stateDir, files: getStateSecretPaths(f.config.paths) } });
+      expect(f.registry.get("verify.run").run).toBe(before);
+      await f.registry.get("verify.run").run({ kind: "command", cmd: "node", args: [f.config.paths.userConfigFile] }, { workingDir: directory, sessionId: "verify-sdk", stepIndex: 0, signal: new AbortController().signal }).catch(() => undefined);
+      expect(prompts).toEqual(["state_secret", "shell"]);
+    } finally { f.close(); }
+  });
+
   it("hands the terminal UI's Exa key advice to the OS tools (ATO-345)", () => {
     const config = getConfig(); config.browser.enabled = false; config.web.search.persistCache = false;
     const profileStore = new ProfileStore({ dbFile: join(directory, "profile.sqlite") });

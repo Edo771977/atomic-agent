@@ -15,8 +15,9 @@
  * before anything runs, at every level; a `dangerous.*` match asks as
  * `shell_dangerous`, which no fan-out scope and no `shell` grant covers.
  */
-import type { DangerousToolOptions } from "../../approval/dangerous-tool.js";
-import { authorizeVerifyBatch, VerifyGuardRefusal } from "./verify-authorization.js";
+import { authorizeVerifyBatch, maskVerificationSecrets, VerifyGuardRefusal, type VerifyAuthorizationOptions } from "./verify-authorization.js";
+import { markToolReadPolicy } from "../read-scope/confine-reads.js";
+import type { KnownSecret } from "../../error-reporting/secret-detector.js";
 import type { CompressedToolResult } from "../../compressor/result-compressor.js";
 import type { ShellGuardPolicy } from "../os/shell-command-guard/index.js";
 import type { ToolDefinition } from "../tool-registry.js";
@@ -25,7 +26,9 @@ import { runVerify, type VerifyRunConfig, type VerifyRunContext } from "./run-ve
 import { parseVerifyRunArgs, type VerifyRunArgs } from "./verify-run-args.js";
 export const VERIFY_RUN_TOOL = "verify.run";
 
-export interface VerifyRunToolOptions extends DangerousToolOptions {
+export interface VerifyRunToolOptions extends VerifyAuthorizationOptions {
+  /** Live canonical runtime credentials, including configured custom keys. */
+  resolveKnownSecrets?: () => readonly KnownSecret[];
   /** Browser settings and `tools.verify.maxCopyBytes`. */
   config: VerifyRunConfig;
   /**
@@ -53,7 +56,7 @@ export function describeVerifyRun(args: VerifyRunArgs): string {
 }
 
 export function buildVerifyRunTool(options: VerifyRunToolOptions): ToolDefinition {
-  return {
+  const definition: ToolDefinition = {
     name: VERIFY_RUN_TOOL,
     description:
       "Run a check against a throwaway copy of the working directory; refuses execution if the copy is unavailable (may require approval). Shared dependency directories and user symlinks retain their targets; the copy does not confine process writes. kind 'command': any test runner, compiler or script ({cmd, args}). kind 'service': {start:{cmd,args}, ready:{port|url}, requests:[{method,path|url,body,expectStatus,expectBody}]}. kind 'page': a local HTML file ({path}) or {url} in a headless browser (with {start, url} the server is started first and the page opens once `ready` passes, by default when the url answers 2xx): {script:[{action:click|key|type|wait,…}]}, then `seconds` of runtime with `probes:[{name, expr}]` sampled every 250 ms; collects uncaught errors, console errors, failed getElementById/querySelector lookups. `checks`: `exit 0`, `exit != 0`, `stdout contains \"x\"`, `stderr not contains \"x\"`, `status 200`, `no errors`, `missing selectors 0`, `probe <name> decreases|increases|equals <v>|reaches <v>|stays <v>`. `network` defaults to false (a proxy-based soft block, not a sandbox). Results are capped: output tails of 8,000 chars, summary of 4,000.",
@@ -67,15 +70,18 @@ export function buildVerifyRunTool(options: VerifyRunToolOptions): ToolDefinitio
         return { tool: VERIFY_RUN_TOOL, status: "error", summary: message, details: { error: message }, truncated: false };
       }
       const description = describeVerifyRun(args);
+      let knownSecrets: readonly KnownSecret[];
+      try { knownSecrets = [...(options.knownSecrets ?? []), ...(options.resolveKnownSecrets?.() ?? [])]; }
+      catch { return { tool: VERIFY_RUN_TOOL, status: "error", summary: "verification authorization credentials are unavailable", details: {}, truncated: false }; }
       try {
-        const approved = await authorizeVerifyBatch([rawArgs], { ...options, allowFanoutScope: true }, ctx);
+        const approved = await authorizeVerifyBatch([rawArgs], { ...options, knownSecrets, allowFanoutScope: true }, ctx);
         args = parseVerifyRunArgs(approved[0]!);
       } catch (error) {
         // Approval denials retain their existing dispatch semantics. Hard
         // policy refusals remain ordinary tool results and never reach IO.
         if (error instanceof Error && error.name === "ApprovalDeniedError") throw error;
-        const message = error instanceof Error ? error.message : String(error);
-        return { tool: VERIFY_RUN_TOOL, status: "error", summary: message, details: { error: message, description, ...(error instanceof VerifyGuardRefusal ? { guardVerdict: "block", guardRule: error.guardRule, guardReason: error.guardReason } : {}) }, truncated: false };
+        const message = maskVerificationSecrets(error instanceof Error ? error.message : String(error), knownSecrets);
+        return { tool: VERIFY_RUN_TOOL, status: "error", summary: message, details: { error: message, description: maskVerificationSecrets(description, knownSecrets), ...(error instanceof VerifyGuardRefusal ? { guardVerdict: "block", guardRule: error.guardRule, guardReason: maskVerificationSecrets(error.guardReason, knownSecrets) } : {}) }, truncated: false };
       }
       const result = await runVerify(args, {
         workingDir: ctx.workingDir,
@@ -95,4 +101,5 @@ export function buildVerifyRunTool(options: VerifyRunToolOptions): ToolDefinitio
       };
     },
   };
+  return options.checkCommandReads !== undefined && options.checkReadTargets !== undefined ? markToolReadPolicy(definition) : definition;
 }
