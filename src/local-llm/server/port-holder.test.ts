@@ -1,3 +1,4 @@
+import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -12,7 +13,7 @@ import {
 } from "./port-holder.js";
 
 const hasVersionFile = (dirs: string[]) => (path: string) =>
-  dirs.some((d) => path === `${d}/backend/backend-version.json` || path === `${d}\\backend\\backend-version.json`);
+  dirs.some((d) => path === join(d, "backend", "backend-version.json"));
 
 describe("output parsers", () => {
   it("lsof -t", () => {
@@ -42,39 +43,39 @@ describe("output parsers", () => {
 
 describe("atagDataDirOf", () => {
   it("recognises <dataDir>/backend/llama-server with its version file", () => {
-    const exists = hasVersionFile(["/tmp/aa-qa/models"]);
-    expect(atagDataDirOf("/tmp/aa-qa/models/backend/llama-server", exists)).toBe("/tmp/aa-qa/models");
+    const exists = hasVersionFile([resolve("/tmp/aa-qa/models")]);
+    expect(atagDataDirOf(resolve("/tmp/aa-qa/models/backend/llama-server"), exists)).toBe(resolve("/tmp/aa-qa/models"));
   });
 
   it("is not fooled by another app's llama-server or a missing version file", () => {
-    const exists = hasVersionFile(["/tmp/aa-qa/models"]);
+    const exists = hasVersionFile([resolve("/tmp/aa-qa/models")]);
     // Atomic Chat's bundled build
     expect(
-      atagDataDirOf("/Users/x/Library/Application Support/Atomic Chat/data/llamacpp/backends/b1/build/bin/llama-server", exists),
+      atagDataDirOf(resolve("/Users/x/Library/Application Support/Atomic Chat/data/llamacpp/backends/b1/build/bin/llama-server"), exists),
     ).toBeNull();
     // right shape, but no backend-version.json beside it
-    expect(atagDataDirOf("/opt/other/backend/llama-server", exists)).toBeNull();
+    expect(atagDataDirOf(resolve("/opt/other/backend/llama-server"), exists)).toBeNull();
     // right folder, wrong binary
-    expect(atagDataDirOf("/tmp/aa-qa/models/backend/ollama", exists)).toBeNull();
+    expect(atagDataDirOf(resolve("/tmp/aa-qa/models/backend/ollama"), exists)).toBeNull();
   });
 });
 
 describe("coreDataDirOf", () => {
-  const CORE_BIN = "/tmp/aa-qa/models/core/versions/0.13.6/data/llamacpp/backends/b9001/macos-arm64/build/bin/llama-server";
-  const verified = (path: string) => path === "/tmp/aa-qa/models/core/versions/0.13.6/verified.json";
+  const CORE_BIN = resolve("/tmp/aa-qa/models/core/versions/0.13.6/data/llamacpp/backends/b9001/macos-arm64/build/bin/llama-server");
+  const verified = (path: string) => path === resolve("/tmp/aa-qa/models/core/versions/0.13.6/verified.json");
 
   it("recognises Atomic Core's llama-server under <dataDir>/core/versions/<v>/data as ours", () => {
-    expect(coreDataDirOf(CORE_BIN, verified)).toBe("/tmp/aa-qa/models");
+    expect(coreDataDirOf(CORE_BIN, verified)).toBe(resolve("/tmp/aa-qa/models"));
     // The plain llama-server shape is not Core's.
-    expect(coreDataDirOf("/tmp/aa-qa/models/backend/llama-server", verified)).toBeNull();
+    expect(coreDataDirOf(resolve("/tmp/aa-qa/models/backend/llama-server"), verified)).toBeNull();
   });
 
   it("needs the version's verified.json and the core/versions/<v>/data shape", () => {
     expect(coreDataDirOf(CORE_BIN, () => false)).toBeNull();
     expect(
-      coreDataDirOf("/Users/x/Library/Application Support/Atomic Chat/data/llamacpp/backends/b1/build/bin/llama-server", () => true),
+      coreDataDirOf(resolve("/Users/x/Library/Application Support/Atomic Chat/data/llamacpp/backends/b1/build/bin/llama-server"), () => true),
     ).toBeNull();
-    expect(coreDataDirOf("/tmp/aa-qa/models/core/versions/0.13.6/data/llamacpp/ollama", verified)).toBeNull();
+    expect(coreDataDirOf(resolve("/tmp/aa-qa/models/core/versions/0.13.6/data/llamacpp/ollama"), verified)).toBeNull();
   });
 
   it("findPortHolder marks Core's server as Core-managed for our data dir", async () => {
@@ -86,27 +87,27 @@ describe("coreDataDirOf", () => {
     expect(await findPortHolder(19092, { run, platform: "darwin", exists: verified })).toEqual({
       pid: 777,
       executable: CORE_BIN,
-      atagDataDir: "/tmp/aa-qa/models",
+      atagDataDir: resolve("/tmp/aa-qa/models"),
       coreManaged: true,
     });
   });
 });
 
 describe("findPortHolder", () => {
-  const exists = hasVersionFile(["/tmp/aa-qa/models"]);
+  const exists = hasVersionFile([resolve("/tmp/aa-qa/models")]);
 
   it("macOS: lsof for the pid, ps comm for the executable", async () => {
     const calls: string[] = [];
     const run: RunCommand = async (file, args) => {
       calls.push(`${file} ${args.join(" ")}`);
       if (file === "lsof") return { code: 0, stdout: "46051\n" };
-      if (file === "ps") return { code: 0, stdout: "/tmp/aa-qa/models/backend/llama-server\n" };
+      if (file === "ps") return { code: 0, stdout: `${resolve("/tmp/aa-qa/models/backend/llama-server")}\n` };
       return null;
     };
     expect(await findPortHolder(19091, { run, platform: "darwin", exists })).toEqual({
       pid: 46051,
-      executable: "/tmp/aa-qa/models/backend/llama-server",
-      atagDataDir: "/tmp/aa-qa/models",
+      executable: resolve("/tmp/aa-qa/models/backend/llama-server"),
+      atagDataDir: resolve("/tmp/aa-qa/models"),
     });
     expect(calls).toEqual([
       "lsof -nP -iTCP:19091 -sTCP:LISTEN -t",
@@ -138,7 +139,7 @@ describe("findPortHolder", () => {
 });
 
 describe("isStateDirInUse", () => {
-  const db = "/tmp/aa-qa/sessions.sqlite";
+  const db = resolve("/tmp/aa-qa/sessions.sqlite");
   const exists = (p: string) => p === db;
 
   it("false only when lsof positively reports nobody has sessions.sqlite open", async () => {
@@ -146,19 +147,19 @@ describe("isStateDirInUse", () => {
       expect([file, ...args]).toEqual(["lsof", "-t", "--", db]);
       return { code: 1, stdout: "" };
     };
-    expect(await isStateDirInUse("/tmp/aa-qa/models", { run, platform: "darwin", exists })).toBe(false);
+    expect(await isStateDirInUse(resolve("/tmp/aa-qa/models"), { run, platform: "darwin", exists })).toBe(false);
   });
 
   it("true when a process holds it", async () => {
     const run: RunCommand = async () => ({ code: 0, stdout: "79429\n" });
-    expect(await isStateDirInUse("/tmp/aa-qa/models", { run, platform: "darwin", exists })).toBe(true);
+    expect(await isStateDirInUse(resolve("/tmp/aa-qa/models"), { run, platform: "darwin", exists })).toBe(true);
   });
 
   it("true whenever it cannot tell: no lsof, Windows, no sessions.sqlite beside the data dir", async () => {
-    expect(await isStateDirInUse("/tmp/aa-qa/models", { run: async () => null, platform: "darwin", exists })).toBe(true);
-    expect(await isStateDirInUse("/tmp/aa-qa/models", { run: async () => ({ code: 1, stdout: "" }), platform: "win32", exists })).toBe(true);
+    expect(await isStateDirInUse(resolve("/tmp/aa-qa/models"), { run: async () => null, platform: "darwin", exists })).toBe(true);
+    expect(await isStateDirInUse(resolve("/tmp/aa-qa/models"), { run: async () => ({ code: 1, stdout: "" }), platform: "win32", exists })).toBe(true);
     expect(
-      await isStateDirInUse("/relocated/models", { run: async () => ({ code: 1, stdout: "" }), platform: "darwin", exists }),
+      await isStateDirInUse(resolve("/relocated/models"), { run: async () => ({ code: 1, stdout: "" }), platform: "darwin", exists }),
     ).toBe(true);
   });
 });

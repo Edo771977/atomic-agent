@@ -48,7 +48,8 @@ function unquote(token: string): string {
   return token;
 }
 
-function expand(pattern: string, cwd: string): string[] {
+function expand(pattern: string, cwd: string, expandGlobs: boolean): string[] {
+  if (!expandGlobs) return [pattern];
   if (!/[*?]/.test(pattern)) return [pattern];
   try {
     const matches = globSync(pattern, {
@@ -70,6 +71,7 @@ function expand(pattern: string, cwd: string): string[] {
 export function nodeCheckPaths(
   commandLine: string,
   cwd: string,
+  options: { expandGlobs?: boolean } = {},
 ): string[] | null {
   for (const segment of commandLine.split(SEGMENT_RE)) {
     const tokens = segment
@@ -82,7 +84,7 @@ export function nodeCheckPaths(
     const paths: string[] = [];
     for (const token of tokens.slice(flagIdx + 1)) {
       if (token.startsWith("-")) continue;
-      paths.push(...expand(token, cwd));
+      paths.push(...expand(token, cwd, options.expandGlobs ?? process.platform !== "win32"));
     }
     return paths;
   }
@@ -96,8 +98,9 @@ export function nodeCheckPaths(
 export function nodeCheckMultiFileNotice(
   commandLine: string,
   cwd: string,
+  options: { expandGlobs?: boolean } = {},
 ): string | null {
-  const paths = nodeCheckPaths(commandLine, cwd);
+  const paths = nodeCheckPaths(commandLine, cwd, options);
   if (paths === null || paths.length < 2) return null;
   return `node --check checks only the first file (${paths[0]}); run one command per file — the other ${paths.length - 1} path${paths.length === 2 ? " was" : "s were"} not checked`;
 }

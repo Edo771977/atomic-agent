@@ -19,6 +19,12 @@ function failedCommand(stderrTail: string): VerifyRunResult {
 }
 
 describe("renderVerifyRunSummary", () => {
+  it.each([null, 0, 1])("reports a timeout before its native exit code %s", (exitCode) => {
+    const summary = renderVerifyRunSummary({ ...failedCommand(""), checks: [], timedOut: true, exitCode });
+    expect(summary).toContain("killed: timed out");
+    expect(summary).not.toContain(`exit ${exitCode}`);
+  });
+
   it("masks a secret in an output tail before clipping it", () => {
     // The token straddles the 1,500-char tail clip: once clipped, only
     // its end would be left, which the detector no longer recognises.

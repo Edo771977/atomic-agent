@@ -25,6 +25,9 @@ import { tmpdir } from "node:os";
 import { basename, extname, join } from "node:path";
 
 import { isSeaBuild } from "../../runtime/self-invocation.js";
+import { resolveWindowsCliInvocation } from "../../llm/provider/subscription-cli/windows-cli-shim.js";
+import { SubscriptionCliNotInstalledError } from "../../llm/provider/subscription-cli/subscription-cli-errors.js";
+import { killProcessTree } from "../../sandbox/kill-process-tree.js";
 import { checkFileParses } from "../os/fs/fs-parse-check.js";
 import { type SyntaxFileResult, tailOfOutput } from "./syntax-check-types.js";
 
@@ -44,7 +47,8 @@ const CHECKER_TIMEOUT_MS = 60_000;
 const CHECKER_OUTPUT_CAP = 64 * 1024;
 
 function isMissingBinary(err: unknown): boolean {
-  return (err as NodeJS.ErrnoException | null)?.code === "ENOENT";
+  return err instanceof SubscriptionCliNotInstalledError ||
+    (err as NodeJS.ErrnoException | null)?.code === "ENOENT";
 }
 
 /**
@@ -83,12 +87,22 @@ export function runChecker(
       if (value === undefined) delete env[key];
       else env[key] = value;
     }
-    const child = spawn(cmd, [...args], {
-      ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
-      stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true,
-      env,
-    });
+    let child: ReturnType<typeof spawn>;
+    try {
+      const invocation = resolveWindowsCliInvocation({ binary: cmd, args, env });
+      child = spawn(invocation.command, invocation.args, {
+        ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+        windowsVerbatimArguments: invocation.windowsVerbatimArguments,
+        env,
+      });
+    } catch (err) {
+      // Windows rejects direct batch-file spawns synchronously. Invalid
+      // argv and an unrepresentable cmd line must also remain "no verdict".
+      resolve({ exitCode: null, stdout: "", stderr: String(err), missing: isMissingBinary(err), timedOut: false });
+      return;
+    }
     let stdout = "";
     let stderr = "";
     let timedOut = false;
@@ -96,7 +110,7 @@ export function runChecker(
     let settled = false;
     const kill = (): void => {
       try {
-        child.kill("SIGKILL");
+        killProcessTree(child, { force: true });
       } catch {
         // already gone
       }
@@ -111,6 +125,7 @@ export function runChecker(
       kill();
     };
     signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted === true) onAbort();
     const finish = (run: CheckerRun): void => {
       if (settled) return;
       settled = true;
@@ -118,10 +133,10 @@ export function runChecker(
       signal?.removeEventListener("abort", onAbort);
       resolve(aborted ? { ...run, aborted: true } : run);
     };
-    child.stdout.on("data", (chunk: Buffer) => {
+    child.stdout?.on("data", (chunk: Buffer) => {
       if (stdout.length < CHECKER_OUTPUT_CAP) stdout += chunk.toString("utf8");
     });
-    child.stderr.on("data", (chunk: Buffer) => {
+    child.stderr?.on("data", (chunk: Buffer) => {
       if (stderr.length < CHECKER_OUTPUT_CAP) stderr += chunk.toString("utf8");
     });
     child.on("error", (err) => {

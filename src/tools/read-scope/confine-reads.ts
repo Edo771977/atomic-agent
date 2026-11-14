@@ -1,5 +1,5 @@
 import type { DangerousToolOptions } from "../../approval/dangerous-tool.js";
-import type { CompressedToolResult } from "../../compressor/result-compressor.js";
+import { compressToolResult, type CompressedToolResult } from "../../compressor/result-compressor.js";
 import type { ReadScope } from "../../config/index.js";
 import { isFusionWorkerSessionId } from "../../session/fusion-worker-session.js";
 import type { ToolContext, ToolDefinition, ToolRegistry } from "../tool-registry.js";
@@ -21,6 +21,8 @@ import {
 } from "./read-scope-shell.js";
 import {
   READ_TOOL_TARGETS,
+  invalidLocalFileUrlReason,
+  invalidReadUrlTarget,
   SHELL_TOOL,
   VERIFY_TOOL,
   verifyRunShellCalls,
@@ -113,6 +115,13 @@ export function confineReads(
     if (!registry.has(name)) continue;
     const inner = registry.get(name);
     install(name, async (args, ctx) => {
+      const invalid = invalidReadUrlTarget(name, args);
+      if (invalid !== null) return compressToolResult({
+        tool: name,
+        status: "error",
+        output: `${name}: ${invalid.url} ${invalid.why}, so the local file was not opened or read.`,
+        details: { url: invalid.url, path: invalid.url, reason: "local_file_refused" },
+      });
       const worker = checkWorkerRead(
         name,
         args,
@@ -246,6 +255,8 @@ export function localPageCheck(
   options: ConfineReadsOptions,
 ): (url: string, ctx: Pick<ToolContext, "sessionId" | "workingDir" | "readRoots">) => string | null {
   return (url, ctx) => {
+    const invalid = invalidLocalFileUrlReason(url);
+    if (invalid !== null) return invalid;
     const args = { url };
     if (checkWorkerRead(LOCAL_PAGE_TOOL, args, ctx, options.grantedDirs(ctx.sessionId)) !== null) {
       return "is outside this worker's directories";

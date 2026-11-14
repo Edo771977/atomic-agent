@@ -76,6 +76,7 @@ import {
   type DaemonStartOptions,
   type EmbeddingDaemonStartOptions,
 } from "./daemon-lifecycle.js";
+import { resolvePlatformAsset } from "../backend/platform-assets.js";
 import { writeBackendVersion } from "../backend/backend-version.js";
 import { getEmbeddingModelDef, getLocalModelDef } from "../catalog/models-catalog.js";
 import { resetConfigCache } from "../../config/config-cache.js";
@@ -695,7 +696,7 @@ describe("startDaemon health-wait failure", () => {
     // revert to a bare `Error` would silently disable the fallback.
     const dataDir = mkdtempSync(`${tmpdir()}/atomic-daemon-health-`);
     try {
-      const binPath = resolveServerBinPath(dataDir, "llama-server");
+      const binPath = resolveServerBinPath(dataDir, resolvePlatformAsset().binaryName);
       mkdirSync(dirname(binPath), { recursive: true });
       writeFileSync(binPath, "#!/bin/sh\n", "utf-8");
       const model = getLocalModelDef("qwen-3.5-4b");
@@ -739,7 +740,7 @@ describe("startDaemon on a port someone else holds", () => {
   it("refuses before spawning, naming the model the holder serves", async () => {
     const dataDir = mkdtempSync(`${tmpdir()}/atomic-daemon-taken-`);
     try {
-      const binPath = resolveServerBinPath(dataDir, "llama-server");
+      const binPath = resolveServerBinPath(dataDir, resolvePlatformAsset().binaryName);
       mkdirSync(dirname(binPath), { recursive: true });
       writeFileSync(binPath, "#!/bin/sh\n", "utf-8");
       const model = getLocalModelDef("qwen-3.5-4b");
@@ -878,7 +879,7 @@ describe("startDaemon throughput probe (F16)", () => {
   });
 
   function stageBackend(dataDir: string): void {
-    const binPath = resolveServerBinPath(dataDir, "llama-server");
+    const binPath = resolveServerBinPath(dataDir, resolvePlatformAsset().binaryName);
     mkdirSync(dirname(binPath), { recursive: true });
     writeFileSync(binPath, "#!/bin/sh\n", "utf-8");
     const model = getLocalModelDef("qwen-3.5-4b");
@@ -995,7 +996,7 @@ describe("--swa-full (F12)", () => {
   });
 
   function stageGemma(dataDir: string): void {
-    const binPath = resolveServerBinPath(dataDir, "llama-server");
+    const binPath = resolveServerBinPath(dataDir, resolvePlatformAsset().binaryName);
     mkdirSync(dirname(binPath), { recursive: true });
     writeFileSync(binPath, "#!/bin/sh\n", "utf-8");
     const model = getLocalModelDef("gemma-4-31b");
@@ -1077,7 +1078,7 @@ describe("--swa-full (F12)", () => {
   it("starts on the file-size fallback when the model file is not GGUF", async () => {
     const dataDir = mkdtempSync(`${tmpdir()}/atomic-daemon-nogguf-`);
     try {
-      const binPath = resolveServerBinPath(dataDir, "llama-server");
+      const binPath = resolveServerBinPath(dataDir, resolvePlatformAsset().binaryName);
       mkdirSync(dirname(binPath), { recursive: true });
       writeFileSync(binPath, "#!/bin/sh\n", "utf-8");
       const model = getLocalModelDef("qwen-3.5-4b");
@@ -1139,7 +1140,7 @@ describe("managed launch requires an api key (#582)", () => {
   });
 
   function stageBackend(dataDir: string): void {
-    const binPath = resolveServerBinPath(dataDir, "llama-server");
+    const binPath = resolveServerBinPath(dataDir, resolvePlatformAsset().binaryName);
     mkdirSync(dirname(binPath), { recursive: true });
     writeFileSync(binPath, "#!/bin/sh\n", "utf-8");
     const model = getLocalModelDef("qwen-3.5-4b");
@@ -1288,7 +1289,7 @@ describe("startDaemon on a 16 GB Mac (backlog 39, 42)", () => {
 
   /** Backend, its version record and Qwen 3.5 4B's real header on disk. */
   function stageQwen35(dataDir: string): void {
-    const binPath = resolveServerBinPath(dataDir, "llama-server");
+    const binPath = resolveServerBinPath(dataDir, resolvePlatformAsset().binaryName);
     mkdirSync(dirname(binPath), { recursive: true });
     writeFileSync(binPath, "#!/bin/sh\n", "utf-8");
     writeBackendVersion(dataDir, BUILD);
@@ -1648,7 +1649,7 @@ describe("startDaemon on a 16 GB Mac (backlog 39, 42)", () => {
 
   /** Gemma 4 31B's header and the catalogue's gemma-4-31b on disk (no projector). */
   function stageGemma31(dataDir: string): void {
-    const binPath = resolveServerBinPath(dataDir, "llama-server");
+    const binPath = resolveServerBinPath(dataDir, resolvePlatformAsset().binaryName);
     mkdirSync(dirname(binPath), { recursive: true });
     writeFileSync(binPath, "#!/bin/sh\n", "utf-8");
     writeBackendVersion(dataDir, BUILD);

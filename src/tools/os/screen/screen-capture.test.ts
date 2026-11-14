@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import type { ApprovalGate } from "../../../approval/approval-gate.js";
 import { ApprovalDeniedError } from "../../../approval/dangerous-tool.js";
@@ -26,7 +27,7 @@ describe("os.screen.capture", () => {
     });
     const result = await tool.run({}, screenCtx());
     expect(result.status).toBe("ok");
-    const path = "/tmp/t/atomic-agent-screens/s1/screen-20261025-142233-417.jpg";
+    const path = join("/tmp/t", "atomic-agent-screens", "s1", "screen-20261025-142233-417.jpg");
     expect(fake.calls.map((call) => [call.command, ...call.args.filter((arg) => !arg.includes("ObjC"))])).toEqual([
       ["osascript", "-l", "JavaScript", "-e"],
       ["screencapture", "-x", "-t", "jpg", path],
@@ -38,7 +39,7 @@ describe("os.screen.capture", () => {
     expect(result.details.scale).toBeCloseTo(1280 / 1440, 6);
     expect(geometry.get("s1")?.scale).toBeCloseTo(1280 / 1440, 6);
     expect(result.summary).toContain("vision.describe");
-    expect(result.summary).toContain("atomic-agent-screens/s1/screen-20261025-142233-417.jpg");
+    expect(result.summary).toContain(join("atomic-agent-screens", "s1", "screen-20261025-142233-417.jpg"));
   });
 
   it("asks as screen_capture after the probe and before anything is captured", async () => {
@@ -112,7 +113,7 @@ describe("os.screen.capture of one window (ATO-532)", () => {
     const { fake, geometry, prompts, tool } = capture({ windows: WINDOWS, pixelSizes: [{ width: 1280, height: 800 }] });
     const result = await tool.run({ app: "notes" }, screenCtx());
     expect(result.status).toBe("ok");
-    const path = "/tmp/t/atomic-agent-screens/s1/window-20261025-142233-417.jpg";
+    const path = join("/tmp/t", "atomic-agent-screens", "s1", "window-20261025-142233-417.jpg");
     expect(fake.ops()[0]).toMatchObject({ op: "probe", windows: true });
     expect(fake.calls[1]).toMatchObject({ command: "screencapture", args: ["-x", "-o", "-t", "jpg", "-l", "301", path] });
     expect(prompts).toHaveLength(1);
@@ -120,7 +121,7 @@ describe("os.screen.capture of one window (ATO-532)", () => {
     expect(String(prompts[0]!.preview)).toContain('Notes — "Groceries"');
     expect(geometry.get("s1")).toEqual({ originX: 100, originY: 50, scale: 2, imageWidth: 1280, imageHeight: 800 });
     // The desktop finds the picture by this line (chat-files.js cfShotPath).
-    expect(result.summary).toMatch(/^saved \/tmp\/t\/atomic-agent-screens\/s1\/window-\S+\.jpg \(/m);
+    expect(result.summary.split(/\r?\n/).filter((line) => line.startsWith(`saved ${path} (`))).toHaveLength(1);
     expect(result.summary).toContain("reply.attachments");
     expect(result.details).toMatchObject({ path, window: { app: "Notes", title: "Groceries" } });
   });
@@ -169,7 +170,7 @@ describe("os.screen.capture of one window (ATO-532)", () => {
     const textOp = fake.ops().find((op) => op.op === "windowText");
     expect(textOp).toMatchObject({ pid: 77, title: "Groceries", maxDepth: 12, maxElements: 800, maxChars: 20000 });
     expect(textOp?.refusedIds).toContain("com.1password.1password");
-    const txt = "/tmp/t/atomic-agent-screens/s1/window-20261025-142233-417.txt";
+    const txt = join("/tmp/t", "atomic-agent-screens", "s1", "window-20261025-142233-417.txt");
     expect(fake.written.get(txt)).toBe("Milk\nBread");
     expect(result.details).toMatchObject({ textPath: txt, textChars: 10, textTruncated: false });
   });

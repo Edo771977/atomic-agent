@@ -249,7 +249,7 @@ describe("tracked paths under excluded directory names", () => {
         return [row("one")];
       },
     });
-    expect(result.outcomes[0]!.applied).toEqual(["scripts/build/extra.sh", "scripts/build/pack.sh"]);
+    expect(result.outcomes[0]!.applied).toEqual([join("scripts", "build", "extra.sh"), join("scripts", "build", "pack.sh")]);
     expect(await readFile(join(repo, "scripts/build/pack.sh"), "utf8")).toBe("echo new\n");
     // Direct mode is not a sandbox: the ignored build output is the original's, through a link.
     expect(await readFile(join(repo, "dist/out.js"), "utf8")).toBe("private build\n");

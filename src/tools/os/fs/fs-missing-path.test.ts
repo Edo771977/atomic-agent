@@ -1,6 +1,6 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { FUSION_WORKER_ID_PREFIX } from "../../../session/fusion-worker-session.js";
 import type { ToolContext } from "../../tool-registry.js";
@@ -86,63 +86,63 @@ describe("missingPathMessage", () => {
 });
 
 describe("candidateRoots", () => {
-  const home = "/Users/u";
+  const home = resolve("/Users/u");
   const exists = async (path: string) =>
-    ["/Users/u/work", "/Users/u/work/projects", "/Users/u"].includes(path);
+    [resolve("/Users/u/work"), resolve("/Users/u/work/projects"), resolve("/Users/u")].includes(path);
 
   it("searches the working folder and the nearest existing ancestor, never home itself", async () => {
     const plan = await candidateRoots({
-      missing: "/Users/u/work/projects/gone/backlinks_demo",
-      workingDir: "/Users/u/work",
+      missing: resolve("/Users/u/work/projects/gone/backlinks_demo"),
+      workingDir: resolve("/Users/u/work"),
       home,
       platform: "darwin",
       exists,
     });
     const dirs = plan.roots.map((r) => r.dir);
-    expect(dirs).toContain("/Users/u/work");
-    expect(dirs).toContain("/Users/u/work/projects");
+    expect(dirs).toContain(resolve("/Users/u/work"));
+    expect(dirs).toContain(resolve("/Users/u/work/projects"));
     expect(dirs).not.toContain(home);
-    expect(dirs).not.toContain("/");
+    expect(dirs).not.toContain(resolve("/"));
   });
 
   it("blocks Desktop, Documents and Downloads the session has not touched", async () => {
     const plan = await candidateRoots({
-      missing: "/Users/u/work/backlinks_demo",
-      workingDir: "/Users/u/work",
+      missing: resolve("/Users/u/work/backlinks_demo"),
+      workingDir: resolve("/Users/u/work"),
       home,
       platform: "darwin",
       exists,
     });
     expect(plan.blocked).toEqual(
-      expect.arrayContaining(["/Users/u/Desktop", "/Users/u/Documents", "/Users/u/Pictures"]),
+      expect.arrayContaining([resolve("/Users/u/Desktop"), resolve("/Users/u/Documents"), resolve("/Users/u/Pictures")]),
     );
-    expect(plan.roots.map((r) => r.dir)).not.toContain("/Users/u/Desktop");
+    expect(plan.roots.map((r) => r.dir)).not.toContain(resolve("/Users/u/Desktop"));
   });
 
   it("searches a protected folder the missing path is already inside", async () => {
     const plan = await candidateRoots({
-      missing: "/Users/u/Desktop/Atomic Agent/backlinks_demo",
-      workingDir: "/Users/u/work",
+      missing: resolve("/Users/u/Desktop/Atomic Agent/backlinks_demo"),
+      workingDir: resolve("/Users/u/work"),
       home,
       platform: "darwin",
       exists,
     });
-    expect(plan.blocked).not.toContain("/Users/u/Desktop");
-    expect(plan.roots).toContainEqual({ dir: "/Users/u/Desktop", depth: 3 });
+    expect(plan.blocked).not.toContain(resolve("/Users/u/Desktop"));
+    expect(plan.roots).toContainEqual({ dir: resolve("/Users/u/Desktop"), depth: 3 });
   });
 
   // ATO-1333: a crowded parent must not use up the working folder's budget.
   it("marks folders above the working folder as outer, and the working folder as near", async () => {
     const plan = await candidateRoots({
-      missing: "/Users/u/work/projects/backlinks_demo",
-      workingDir: "/Users/u/work/projects",
-      home: "/Users/u/home",
+      missing: resolve("/Users/u/work/projects/backlinks_demo"),
+      workingDir: resolve("/Users/u/work/projects"),
+      home: resolve("/Users/u/home"),
       platform: "darwin",
       exists,
     });
-    expect(plan.roots).toContainEqual({ dir: "/Users/u/work/projects", depth: 3 });
-    expect(plan.roots).toContainEqual({ dir: "/Users/u/work", depth: 1, outer: true });
-    expect(plan.roots).toContainEqual({ dir: "/Users/u", depth: 1, outer: true });
+    expect(plan.roots).toContainEqual({ dir: resolve("/Users/u/work/projects"), depth: 3 });
+    expect(plan.roots).toContainEqual({ dir: resolve("/Users/u/work"), depth: 1, outer: true });
+    expect(plan.roots).toContainEqual({ dir: resolve("/Users/u"), depth: 1, outer: true });
   });
 });
 

@@ -35,14 +35,20 @@ describe("node --check over several paths (F9a)", () => {
     ]);
   });
 
+  it("does not claim a glob was expanded by the Windows command shell", () => {
+    expect(nodeCheckPaths("node --check js/*.js", dir, { expandGlobs: false })).toEqual(["js/*.js"]);
+    expect(nodeCheckMultiFileNotice("node --check js/*.js", dir, { expandGlobs: false })).toBeNull();
+    expect(nodeCheckPaths("node --check js/*.js", dir, { expandGlobs: true })).toHaveLength(3);
+  });
+
   it("expands a glob the way the subshell would", () => {
     // On the subshell path the tool hands `node --check js/*.js` to
     // `sh -c` as written and never sees the argv; the notice has to
     // count what the shell will produce.
-    expect(nodeCheckPaths("node --check js/*.js", dir)).toEqual([
-      "js/a.js",
-      "js/b.js",
-      "js/c.js",
+    expect(nodeCheckPaths("node --check js/*.js", dir, { expandGlobs: true })).toEqual([
+      join("js", "a.js"),
+      join("js", "b.js"),
+      join("js", "c.js"),
     ]);
     // A pattern matching nothing passes through verbatim, as in POSIX.
     expect(nodeCheckPaths("node --check js/*.ts", dir)).toEqual(["js/*.ts"]);
@@ -62,7 +68,7 @@ describe("node --check over several paths (F9a)", () => {
   it("notices only when more than one path is checked", () => {
     expect(nodeCheckMultiFileNotice("node --check js/a.js", dir)).toBeNull();
     expect(nodeCheckMultiFileNotice("ls js", dir)).toBeNull();
-    const notice = nodeCheckMultiFileNotice("node --check js/*.js", dir);
+    const notice = nodeCheckMultiFileNotice("node --check js/a.js js/b.js js/c.js", dir);
     expect(notice).toContain("node --check checks only the first file (js/a.js)");
     expect(notice).toContain("run one command per file");
     expect(notice).toContain("2 paths were not checked");
@@ -90,8 +96,14 @@ describe("node --check over several paths (F9a)", () => {
     expect(structured.summary).toContain("$ node --check js/a.js js/b.js");
 
     const subshell = await tool.run({ cmd: "node --check js/*.js" }, ctx);
-    expect(subshell.status).toBe("ok");
-    expect(subshell.summary.startsWith("node --check checks only the first file (js/a.js)")).toBe(true);
+    if (process.platform === "win32") {
+      expect(subshell.status).toBe("error");
+      expect(subshell.summary).toContain("MODULE_NOT_FOUND");
+      expect(subshell.summary).not.toContain("node --check checks only the first file");
+    } else {
+      expect(subshell.status).toBe("ok");
+      expect(subshell.summary.startsWith("node --check checks only the first file (js/a.js)")).toBe(true);
+    }
 
     const single = await tool.run({ cmd: "node", args: ["--check", "js/a.js"] }, ctx);
     expect(single.summary.startsWith("$ node --check js/a.js")).toBe(true);

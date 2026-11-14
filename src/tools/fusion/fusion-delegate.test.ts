@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 import type { RunTurnResult } from "../../agent/agent-loop.js";
 import { resetConfigCache } from "../../config/index.js";
@@ -29,6 +29,8 @@ import { FusionTurnBudget } from "./turn-budget.js";
 import { FusionRunStore } from "./run-checkpoint.js";
 import type { OutcomeRecord } from "./outcome-log.js";
 import type { DelegateTask } from "./delegate-args.js";
+
+const REPO = resolve("/repo");
 
 const logger = new StructuredLogger({ level: "error", sinks: [] });
 
@@ -52,7 +54,7 @@ function fusionMode(over: Partial<ResolvedRunMode> = {}): ResolvedRunMode {
 
 function ctx(over: Partial<ToolContext> = {}): ToolContext {
   return {
-    workingDir: "/repo",
+    workingDir: REPO,
     sessionId: "s-parent",
     stepIndex: 0,
     signal: new AbortController().signal,
@@ -68,7 +70,7 @@ function deps(over: Partial<FusionDelegateDeps> = {}): FusionDelegateDeps {
       minted += 1;
       return createEmptySessionState({
         id: `${FUSION_WORKER_ID_PREFIX}${minted}`,
-        workingDir: "/repo",
+        workingDir: REPO,
         metadata: { fusionWorker: { ...meta } },
       });
     },
@@ -80,7 +82,7 @@ function deps(over: Partial<FusionDelegateDeps> = {}): FusionDelegateDeps {
     // The documented test seam: exercise the fan-out without a gate.
     approvalRequired: false,
     emitEvent: () => {},
-    workingDir: "/repo",
+    workingDir: REPO,
     slotManager: { poolSize: () => 4 },
     resolveRunMode: () => fusionMode(),
     workerSupportsSlotAffinity: () => true,
@@ -93,7 +95,7 @@ function deps(over: Partial<FusionDelegateDeps> = {}): FusionDelegateDeps {
 
 function turnResult(over: Partial<RunTurnResult> = {}): RunTurnResult {
   return {
-    session: createEmptySessionState({ id: "s-w", workingDir: "/repo" }),
+    session: createEmptySessionState({ id: "s-w", workingDir: REPO }),
     reason: "reply",
     stepCount: 1,
     ...over,
@@ -196,7 +198,7 @@ describe("fusion.delegate measured routing", () => {
     try {
       const store = new FusionRunStore({ dir: state });
       const tasks = [{ id: "carried", title: "Old output", instructions: "build" }];
-      const run = store.start({ sessionId: "s-parent", workingDir: "/repo", tasks, waveCount: 1,
+      const run = store.start({ sessionId: "s-parent", workingDir: REPO, tasks, waveCount: 1,
         args: { tasks, contract: { checks: [{ task: "carried", type: "command", command: "test" }] } } });
       run.recordTask({ id: "carried", title: "Old output", status: "ok", reply: "completed before restart", stepCount: 2,
         durationMs: 700, tools: { calls: 0, errors: 0, writes: 0, byTool: {} } });
@@ -278,7 +280,7 @@ describe("fusion.delegate", () => {
   });
   it("hands each worker session the operator's whole request, which its brief may clip", async () => {
     const full = `${"spec ".repeat(2_000)}Read sales.csv.`;
-    const create = vi.fn((meta: FusionWorkerMeta, workingDir?: string) => createEmptySessionState({ id: `${FUSION_WORKER_ID_PREFIX}${meta.taskId}`, workingDir: workingDir ?? "/repo", metadata: { fusionWorker: { ...meta } } }));
+    const create = vi.fn((meta: FusionWorkerMeta, workingDir?: string) => createEmptySessionState({ id: `${FUSION_WORKER_ID_PREFIX}${meta.taskId}`, workingDir: workingDir ?? REPO, metadata: { fusionWorker: { ...meta } } }));
     const result = await buildFusionDelegateTool(deps({ createEphemeralSession: create, resolveOriginalRequest: () => full })).run(
       { tasks: [...TASKS] }, ctx());
     expect(result.status).toBe("ok");
@@ -312,7 +314,7 @@ describe("fusion.delegate", () => {
   it("refuses a fan-out that would write in the agent's state directory (ATO-1267)", async () => {
     const runTurn = vi.fn(async () => turnResult());
     const tool = buildFusionDelegateTool(
-      deps({ runTurn, agentStateDir: "/home/u/.atomic-agent" }),
+      deps({ runTurn, agentStateDir: resolve("review-state/.atomic-agent") }),
     );
     const result = await tool.run(
       {
@@ -320,7 +322,7 @@ describe("fusion.delegate", () => {
           {
             id: "t1",
             title: "Tweak skills",
-            instructions: "Write /home/u/.atomic-agent/skills/x/SKILL.md",
+            instructions: `Write ${resolve("review-state/.atomic-agent/skills/x/SKILL.md")}`,
           },
         ],
       },
@@ -1812,7 +1814,7 @@ describe("fusion.delegate", () => {
     await tool.run(
       {
         tasks: [
-          { id: "t1", title: "One", instructions: "x", files: ["/repo/a.js"] },
+          { id: "t1", title: "One", instructions: "x", files: [join(REPO, "a.js")] },
         ],
       },
       ctx(),
@@ -1824,7 +1826,7 @@ describe("fusion.delegate", () => {
             id: "t2",
             title: "Two",
             instructions: "x",
-            files: ["/elsewhere/b.js"],
+            files: [resolve("/elsewhere/b.js")],
           },
         ],
       },
@@ -1857,7 +1859,7 @@ describe("fusion.delegate — contract inputs (F51)", () => {
       ctx(),
     );
     expect(result.status).toBe("ok");
-    const input = join("/repo", "sales.csv");
+    const input = join(REPO, "sales.csv");
     for (const id of ["s-w-1", "s-w-2"]) {
       const declared = log.indexOf(`declare ${id} ${input}`);
       const turned = log.indexOf(`turn ${id} briefed`);
@@ -2127,7 +2129,7 @@ describe("scopeInsideStateDir (ATO-1267)", () => {
   it("flags the state directory itself and anything under it", () => {
     expect(
       scopeInsideStateDir(
-        ["/repo", "/home/u/.atomic-agent", "/home/u/.atomic-agent/plugins"],
+        [REPO, "/home/u/.atomic-agent", "/home/u/.atomic-agent/plugins"],
         "/home/u/.atomic-agent",
       ),
     ).toEqual(["/home/u/.atomic-agent", "/home/u/.atomic-agent/plugins"]);

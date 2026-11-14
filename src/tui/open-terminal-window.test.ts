@@ -1,3 +1,6 @@
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { delimiter, join } from "node:path";
 import { describe, it, expect, vi } from "vitest";
 
 import {
@@ -127,7 +130,15 @@ describe("openAgentTerminalWindow", () => {
 
 describe("isOnPath", () => {
   it("finds a binary that exists on PATH", () => {
-    expect(isOnPath("sh", { PATH: "/nope:/bin:/usr/bin" })).toBe(true);
+    const dir = mkdtempSync(join(tmpdir(), "terminal-path-"));
+    try {
+      const binary = join(dir, "fixture-binary");
+      writeFileSync(binary, "", { mode: 0o755 });
+      chmodSync(binary, 0o755);
+      expect(isOnPath("fixture-binary", { PATH: [join(dir, "missing"), dir].join(delimiter) })).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("misses one that does not", () => {

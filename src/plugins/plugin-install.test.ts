@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { installPluginFromDir, PluginInstallError, removePlugin, setPluginEnabled, setPluginPartEnabled } from "./plugin-install.js";
 import { listEnabledPluginSkills, resetPluginCache } from "./plugin-runtime.js";
 import { installedPluginDir, readPluginState } from "./plugin-store.js";
@@ -62,7 +62,7 @@ describe("plugin install", () => {
     installPluginFromDir(stateDir, writeClaudePlugin(join(base, "src")));
     setPluginPartEnabled(stateDir, "demo", "skill:tidy", false);
     resetPluginCache();
-    expect(listEnabledPluginSkills(stateDir).map(s => s.dir.split("/").pop())).toEqual(["review"]);
+    expect(listEnabledPluginSkills(stateDir).map(s => basename(s.dir))).toEqual(["review"]);
     setPluginEnabled(stateDir, "demo", false);
     resetPluginCache();
     expect(listEnabledPluginSkills(stateDir)).toEqual([]);

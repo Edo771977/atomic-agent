@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { windowsSystemExecutable } from "./windows-system-executable.js";
 
 /**
  * Stop a child *and everything it started*.
@@ -140,7 +141,7 @@ function runTaskkill(
   const signal: NodeJS.Signals = run.force ? "SIGKILL" : "SIGTERM";
   let taskkill;
   try {
-    taskkill = run.spawnImpl("taskkill", args, {
+    taskkill = run.spawnImpl(windowsSystemExecutable("taskkill.exe"), args, {
       stdio: "ignore",
       windowsHide: true,
     });

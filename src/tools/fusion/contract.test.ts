@@ -191,10 +191,10 @@ describe("contract inputs (F51)", () => {
   it("resolves the declared inputs as the worker's tools would, skipping globs and repeats", () => {
     expect(
       resolveContractInputs(
-        ["sales.csv", "data/*.csv", "/abs/x.json", "sales.csv"],
+        ["sales.csv", "data/*.csv", resolve("review-inputs/x.json"), "sales.csv"],
         "/repo",
       ),
-    ).toEqual([resolve("/repo", "sales.csv"), resolve("/abs/x.json")]);
+    ).toEqual([resolve("/repo", "sales.csv"), resolve("review-inputs/x.json")]);
     expect(resolveContractInputs([], "/repo")).toEqual([]);
   });
 });

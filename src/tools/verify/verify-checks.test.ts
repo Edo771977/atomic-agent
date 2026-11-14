@@ -43,6 +43,14 @@ describe("tokenizeCheck", () => {
 });
 
 describe("evaluateCheck", () => {
+  it.each([null, 0, 1])("never treats a timed-out command's native exit code %s as a completed check", (exitCode) => {
+    for (const check of ["exit 0", "exit 1", "exit != 0", "exit != 1"]) {
+      expect(evaluateCheck(check, { kind: "command", exitCode, timedOut: true })).toMatchObject({
+        ok: false, detail: "killed (timed out)",
+      });
+    }
+  });
+
   it("exit: equality and inequality, with the actual code in the detail", () => {
     expect(evaluateCheck("exit 0", COMMAND)).toMatchObject({ ok: false, detail: "exit 1" });
     expect(evaluateCheck("exit != 0", COMMAND)).toMatchObject({ ok: true });

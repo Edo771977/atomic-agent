@@ -387,7 +387,11 @@ export function buildOsShellTool(options: OsShellToolOptions): ToolDefinition {
     // `node --check a b c` exits 0 having read only `a`. Said first,
     // because nothing in node's own output says it — and a reply built
     // on that exit code claims a check that never ran.
-    const checkNotice = nodeCheckMultiFileNotice(commandLine, cwd);
+    const checkNotice = nodeCheckMultiFileNotice(commandLine, cwd, {
+      // Direct argv was expanded above. Only a POSIX subshell expands
+      // globs itself; cmd.exe passes a literal wildcard to Node.
+      expandGlobs: useShell && process.platform !== "win32",
+    });
     const notices = checkNotice === null ? [] : [checkNotice];
 
     // `background: true` (a dev server, a watcher): watched briefly for

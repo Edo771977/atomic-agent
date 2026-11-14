@@ -9,6 +9,13 @@ import { describe, expect, it, vi } from "vitest";
  * throw is what production actually sees — and mocking `spawn` is the
  * only way to produce it off Windows.
  */
+// Exercise the raw-spawn failure path independently of the real host
+// shim resolver; Windows rewriting has its own invocation tests.
+vi.mock("./host-environment.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./host-environment.js")>();
+  return { ...actual, hostPlatform: () => "linux" };
+});
+
 const SHIM = "C:\\npm\\claude.cmd";
 
 vi.mock("node:child_process", async (importOriginal) => {

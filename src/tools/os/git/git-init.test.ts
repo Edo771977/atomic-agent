@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { buildOsGitInitTool } from "./git-init.js";
 import {
   makeApprovingGate,
@@ -81,7 +81,7 @@ describe("os.git.init", () => {
     expect(result.details.repoRoot).toBe(dir);
     expect(await currentBranch(dir)).toBe("main");
     const toplevel = (await runGitRaw(dir, ["rev-parse", "--show-toplevel"])).stdout.trim();
-    expect(toplevel).toBe(await realpath(dir));
+    expect(resolve(toplevel)).toBe(await realpath(dir));
     expect(result.details.userName).toBeNull();
   });
 
