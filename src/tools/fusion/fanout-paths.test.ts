@@ -59,6 +59,21 @@ describe("resolveFanoutScope", () => {
     expect(scope).toEqual([CWD]);
   });
 
+  it("reads native absolute paths from prose without treating versions or drive-relative words as paths", () => {
+    const cwd = join(process.cwd(), "review-project");
+    const outside = join(process.cwd(), "review-output");
+    const path = join(outside, "result.ts");
+    const scope = resolveFanoutScope([task({ instructions: `Write ${path}; then review.` })], cwd);
+    expect(scope).toContain(outside);
+    expect(resolveFanoutScope([task({ instructions: "Use v1.2.3, https://example.org/file.ts and C:notes.ts." })], cwd)).toEqual([cwd]);
+    if (process.platform === "win32") {
+      expect(resolveFanoutScope([task({ instructions: "Write C:/review-output/result.ts" })], cwd)).toContain("C:\\review-output");
+      expect(resolveFanoutScope([task({ deliverable: "Save \\\\server\\share\\output\\result.ts" })], cwd)).toContain("\\\\server\\share\\output");
+      // File names at the drive/share root must never widen a fan-out to it.
+      expect(resolveFanoutScope([task({ instructions: "Write C:\\result.ts and \\\\server\\share\\result.ts" })], cwd)).toEqual([cwd]);
+    }
+  });
+
   it("always includes the working directory as the floor", () => {
     expect(resolveFanoutScope([task()], CWD)).toEqual([CWD]);
   });

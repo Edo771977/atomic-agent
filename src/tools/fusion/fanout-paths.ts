@@ -39,6 +39,12 @@ import type { DelegateTask } from "./delegate-args.js";
 const PATH_IN_PROSE =
   /(?:^|[\s"'`(])((?:\/|\.\/|~\/)[\w.@+-]+(?:\/[\w.@+-]+)*\.[A-Za-z0-9]{1,8})/g;
 
+// Keep the same conservative filename/extension rule on Windows. A drive
+// must be qualified (C:notes.ts is relative), and UNC names include a share.
+// URLs and version numbers must not silently widen an approval scope.
+const WINDOWS_PATH_IN_PROSE =
+  /(?:^|[\s"'`(])((?:[A-Za-z]:[\\/]|[\\/]{2}[\w.@+-]+[\\/][\w.@+-]+[\\/]|\.\\|~\\)[\w.@+-]+(?:[\\/][\w.@+-]+)*\.[A-Za-z0-9]{1,8})(?=$|[\s"'`),;])/g;
+
 /** Roots too broad to hand to a fan-out, however the brief was written. */
 function isTooBroad(dir: string): boolean {
   const home = homedir();
@@ -53,7 +59,10 @@ function isTooBroad(dir: string): boolean {
 
 function collectFromText(text: string, workingDir: string): string[] {
   const out: string[] = [];
-  for (const match of text.matchAll(PATH_IN_PROSE)) {
+  const patterns = process.platform === "win32"
+    ? [PATH_IN_PROSE, WINDOWS_PATH_IN_PROSE]
+    : [PATH_IN_PROSE];
+  for (const match of patterns.flatMap((pattern) => [...text.matchAll(pattern)])) {
     const raw = match[1];
     if (raw === undefined) continue;
     try {
