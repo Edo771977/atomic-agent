@@ -253,7 +253,7 @@ it("retains recovery and executed task telemetry when post-worker completion han
   const result = await buildFusionDelegateTool(f.deps).run({ tasks: [{ id: "api", instructions: "work", files: ["api.json"] }], contract }, f.ctx);
   expect(result.details.candidateIntegration).toMatchObject({ status: "rejected", patch: { path: expect.any(String) } });
   expect(append).toHaveBeenCalledTimes(1);
-  expect(append.mock.calls[0]![0]).toEqual([expect.objectContaining({ candidate: { receipt: expect.objectContaining({ disposition: "rejected", reason: "interrupted" }), taskChecks: { total: 0, passed: 0, failed: 0 } } })]);
+  expect(append.mock.calls[0]![0]).toEqual([expect.objectContaining({ candidate: { receipt: expect.objectContaining({ disposition: "rejected", reason: "interrupted" }), taskChecks: { total: 0, passed: 0, failed: 0 }, workerRuns: 1 } })]);
 });
 
 it.each(["persistent", "restored"] as const)("rejects protected check input writes inside the actual verify execution copy (%s)", async mutation => {
