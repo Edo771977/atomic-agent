@@ -11,6 +11,7 @@ import { FusionTurnBudget } from "../tools/fusion/turn-budget.js";
 import type { CompletionRequest } from "../llm/provider/completion-types.js";
 import type { LlmProvider } from "../llm/provider/llm-provider.js";
 import type { ResolvedLlmConfig } from "../llm/provider/registry/index.js";
+import { MODELS_DEV_SNAPSHOT_DATE } from "../llm/provider/models-dev/models-dev-snapshot.js";
 
 /**
  * The bundled models.dev snapshot is a community price list frozen at
@@ -77,6 +78,14 @@ describe("snapshot-only pricing is an estimate, not admission pricing", () => {
       resolveModelPricingFor(resolved, "claude-haiku-4-5"), daily)!;
     expect(() => s.beforeSend({ model: "claude-haiku-4-5", messages: [{ role: "user", content: huge }], web_search_options: {} })).not.toThrow();
     expect(s.hint).toMatch(/daily spend limit/);
+    // Its calls are counted by the snapshot's estimate, not only by reported cost.
+    expect(s.hint).not.toMatch(/only by reported cost/);
+    expect(s.hint).toContain(`estimated from the models.dev price snapshot (${MODELS_DEV_SNAPSHOT_DATE})`);
+  });
+
+  it("says the turn cap's meter uses the snapshot's estimate", () => {
+    const s = turn(1).scope();
+    expect(s.hint).toContain(`estimated from the models.dev price snapshot (${MODELS_DEV_SNAPSHOT_DATE})`);
   });
 
   it("still settles an estimate from the snapshot when the reply reports no cost", () => {

@@ -4,6 +4,7 @@ import type { LlmProviderConfigEntry } from "../llm/provider/registry/provider-t
 import type { ResolvedModel } from "../llm/provider/model-resolver.js";
 import { completionCostUsd, longContextRates, reportedCostUsd } from "../llm/provider/usage-cost.js";
 import { readErrnoCode } from "../llm/errno-code.js";
+import { MODELS_DEV_SNAPSHOT_DATE } from "../llm/provider/models-dev/models-dev-snapshot.js";
 import { modelParamProfile } from "../llm/provider/openai/model-params.js";
 import { formatUsd, type FusionTurnBudget } from "../tools/fusion/turn-budget.js";
 import { DailySpendLimitError } from "../llm/reliability/spend-limit-error.js";
@@ -224,11 +225,16 @@ export function createRequestBudgetScope(
   let mode: RequestBudgetMode | undefined = limits?.usd === undefined ? undefined : billing;
   const dayLimit = day?.limitUsd() ?? null;
   const dayText = dayLimit === null ? "" : formatUsd(dayLimit);
-  let hint = mode === "meter" ? !priced
-    ? `turn budget: no verified pricing for provider ${provider.id}; the ${capText} cap is only checked after each reply (configure model pricing to enforce it before sending)`
+  // A snapshot-only price still estimates what each reply cost: say so
+  // rather than "only by reported cost".
+  const snapshotEstimate = `estimated from the models.dev price snapshot (${MODELS_DEV_SNAPSHOT_DATE})`;
+  let hint = mode === "meter" ? !priced ? estimable
+    ? `turn budget: no verified pricing for provider ${provider.id}; its spend is ${snapshotEstimate} and the ${capText} cap is only checked after each reply (configure model pricing to enforce it before sending)`
+    : `turn budget: no verified pricing for provider ${provider.id}; the ${capText} cap is only checked after each reply (configure model pricing to enforce it before sending)`
     : `turn budget: provider ${provider.id} cannot authorize each physical send; the ${capText} cap is only checked after each reply`
-    : dayLimit !== null && billing === "meter" ? !priced
-    ? `daily spend limit: no verified pricing for provider ${provider.id}; its calls count toward the ${dayText} daily limit only by reported cost, and the limit is only checked after each reply (configure model pricing to enforce it before sending)`
+    : dayLimit !== null && billing === "meter" ? !priced ? estimable
+    ? `daily spend limit: no verified pricing for provider ${provider.id}; its calls count toward the ${dayText} daily limit by reported cost or, without one, ${snapshotEstimate}, and the limit is only checked after each reply (configure model pricing to enforce it before sending)`
+    : `daily spend limit: no verified pricing for provider ${provider.id}; its calls count toward the ${dayText} daily limit only by reported cost, and the limit is only checked after each reply (configure model pricing to enforce it before sending)`
     : `daily spend limit: provider ${provider.id} cannot authorize each physical send; the ${dayText} daily limit is only checked after each reply`
     : undefined;
   // Which ledgers hold an upper bound before each send.
