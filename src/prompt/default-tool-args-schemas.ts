@@ -696,6 +696,7 @@ const DEFAULT_TOOL_ARGS_SCHEMAS: ReadonlyMap<string, Schema> = new Map<
         contract: obj({
           // F51: the operator's own files; workers edit them in place.
           inputs: { ...stringArraySchema, maxItems: 32 },
+          checkInputs: { ...stringArraySchema, maxItems: 32 },
           owners: {
             type: "object",
             additionalProperties: { type: "string" },

@@ -53,6 +53,7 @@ export { guardVerifyCommand, guardVerifyRun, verifyRunCommands } from "./verify-
 export type { VerifyGuardResult, VerifyGuardedCommand } from "./verify-run-guard.js";
 export { runVerify, runChecks } from "./run-verify.js";
 export type { VerifyRunResult, VerifyRunContext, VerifyRunConfig } from "./run-verify.js";
+export type { VerificationInputIntegrity } from "./verify-input-integrity.js";
 export {
   parseVerifyRunArgs,
   VERIFY_RUN_DEFAULT_TIMEOUT_MS,

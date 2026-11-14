@@ -66,6 +66,7 @@ import {
   type DelegateContract,
 } from "./contract.js";
 import { readContractInputs } from "./contract-inputs.js";
+import { readCheckInputs } from "./candidate-check-inputs.js";
 import {
   FUSION_ROLES,
   type FusionRole,
@@ -461,6 +462,9 @@ function readContract(
     return null;
   };
   const contract: DelegateContract = {};
+
+  const checkInputs = readCheckInputs(value.checkInputs, problems);
+  if (checkInputs !== undefined) contract.checkInputs = checkInputs;
 
   const inputs = readContractInputs(value.inputs, problems);
   if (inputs !== undefined) contract.inputs = inputs;

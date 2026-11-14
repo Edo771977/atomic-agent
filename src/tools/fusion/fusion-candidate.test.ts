@@ -70,6 +70,10 @@ it("promotes the final checked fanout and preserves original rules and dirty fil
   f.deps.runChecks = async (_, ctx) => { checked.push(ctx.workingDir); return { ok: (await readFile(join(ctx.workingDir, "api.json"), "utf8")).includes("after"), results: [{ ok: true }] }; };
   const result = await buildFusionDelegateTool(f.deps).run({ tasks: [tasks[0]], contract }, f.ctx);
   expect(result.details.candidateIntegration).toMatchObject({ status: "promoted", nonResumable: true });
+  expect(result.summary.startsWith("artifact-evidence: ")).toBe(true);
+  const evidence = JSON.parse(result.summary.split("\n")[0]!.slice("artifact-evidence: ".length));
+  expect(evidence.candidate).toMatchObject({ scope: "candidate-snapshot", disposition: "promoted", receipt: { disposition: "promoted", checkStatus: "passed" } });
+  expect(result.summary.length).toBeLessThanOrEqual(f.deps.outputCharCap);
   expect(checked.every(dir => dir !== f.root)).toBe(true);
   expect(await readFile(join(f.root, "api.json"), "utf8")).toBe('{"name":"after"}');
   expect(await readFile(join(f.root, "personal.txt"), "utf8")).toBe("untracked personal bytes\r\n");
@@ -219,6 +223,154 @@ it("never releases dependents of a no_changes provider in candidate mode", async
   expect((result.details.candidateIntegration as { status: string }).status).toBe("rejected");
 });
 
+it.each(["relative", "absolute"] as const)("freezes %s checkInputs from the original before dispatch", async spelling => {
+  const f = await fixture(); await writeFile(join(f.root, "check.mjs"), "expected=good\nline2\nline3\nline4\nline5\n");
+  f.deps.runChecks = (await import("../verify/run-verify.js")).runChecks;
+  f.deps.runTurn = async session => { await writeFile(join(session.workingDir, "api.json"), "bad"); await writeFile(join(session.workingDir, "check.mjs"), "expected=evil\nline2\nline3\nline4\nline5\n"); return { session, reason: "reply", stepCount: 1 }; };
+  const result = await buildFusionDelegateTool(f.deps).run({ tasks: [{ id: "api", instructions: "work", files: ["api.json"] }], contract: { ...contract, checkInputs: [spelling === "relative" ? "check.mjs" : join(f.root, "check.mjs")] } }, f.ctx);
+  expect(result.details.candidateIntegration, result.summary).toMatchObject({ status: "rejected", acceptanceReceipt: { disposition: "rejected", checkScope: "declared", inputs: { declared: 1, verified: 0 }, reason: "check-inputs-changed" } });
+  expect(await readFile(join(f.root, "api.json"), "utf8")).toBe('{"name":"before"}');
+  expect(await readFile(join(f.root, "check.mjs"), "utf8")).toContain("expected=good");
+});
+
+it("refuses protected checkInputs in direct mode before starting a worker", async () => {
+  const runTurn = vi.fn(); const f = await fixture({ runTurn }, false);
+  const result = await buildFusionDelegateTool(f.deps).run({ tasks: [{ id: "api", instructions: "work" }], contract: { ...contract, checkInputs: ["check.mjs"] } }, f.ctx);
+  expect(result.details.reason).toBe("check-inputs-require-candidate"); expect(runTurn).not.toHaveBeenCalled();
+});
+
+it.each([true, false])("records executed candidate task telemetry after final promotion decision (pass=%s)", async passing => {
+  const append = vi.fn(); const f = await fixture({ outcomeLog: { append } });
+  f.deps.runChecks = async specs => ({ ok: passing, results: specs.map(() => ({ ok: passing })) });
+  f.deps.runTurn = async session => { await writeFile(join(session.workingDir, "api.json"), "candidate"); return { session, reason: "reply", stepCount: 1 }; };
+  await buildFusionDelegateTool(f.deps).run({ tasks: [{ id: "api", instructions: "work", files: ["api.json"] }], contract }, f.ctx);
+  expect(append).toHaveBeenCalledTimes(1);
+  expect(append.mock.calls[0]![0]).toEqual([expect.objectContaining({ type: "task", candidate: expect.objectContaining({ receipt: expect.objectContaining({ disposition: passing ? "promoted" : "rejected" }) }) })]);
+});
+
+it("retains recovery and executed task telemetry when post-worker completion handling throws", async () => {
+  const append = vi.fn(); const f = await fixture({ outcomeLog: { append }, emitEvent: (_, event) => { if (event.type === "fusion_worker" && event.taskId === "fusion.delegate" && event.phase === "finished") throw new Error("injected observer failure"); } });
+  f.deps.runTurn = async session => { await writeFile(join(session.workingDir, "api.json"), "candidate"); return { session, reason: "reply", stepCount: 1 }; };
+  f.deps.runChecks = async specs => ({ ok: true, results: specs.map(() => ({ ok: true })) });
+  const result = await buildFusionDelegateTool(f.deps).run({ tasks: [{ id: "api", instructions: "work", files: ["api.json"] }], contract }, f.ctx);
+  expect(result.details.candidateIntegration).toMatchObject({ status: "rejected", patch: { path: expect.any(String) } });
+  expect(append).toHaveBeenCalledTimes(1);
+  expect(append.mock.calls[0]![0]).toEqual([expect.objectContaining({ candidate: { receipt: expect.objectContaining({ disposition: "rejected", reason: "interrupted" }), taskChecks: { total: 0, passed: 0, failed: 0 }, workerRuns: 1 } })]);
+});
+
+it.each(["persistent", "restored"] as const)("rejects protected check input writes inside the actual verify execution copy (%s)", async mutation => {
+  const { runChecks } = await import("../verify/run-verify.js");
+  const f = await fixture({ runChecks });
+  const original = `import {readFileSync} from 'node:fs'; if (readFileSync('api.json','utf8') !== '{"name":"before"}') throw new Error('bad artifact');`;
+  await writeFile(join(f.root, "check.mjs"), original);
+  f.deps.runTurn = async session => {
+    await writeFile(join(session.workingDir, "api.json"), "bad");
+    await writeFile(join(session.workingDir, "runner.mjs"), `import {readFileSync,writeFileSync} from 'node:fs'; const original=readFileSync('check.mjs','utf8'); writeFileSync('check.mjs','export {};'); await import('./check.mjs'); ${mutation === "restored" ? "writeFileSync('check.mjs',original);" : ""}`);
+    return { session, reason: "reply", stepCount: 1 };
+  };
+  const result = await buildFusionDelegateTool(f.deps).run({ tasks: [{ id: "api", instructions: "work", files: ["api.json", "runner.mjs"] }], contract: { checkInputs: ["check.mjs"], checks: [{ kind: "command", cmd: process.execPath, args: ["runner.mjs"], network: true }] } }, f.ctx);
+  expect(result.details.candidateIntegration).toMatchObject({ status: "rejected", acceptanceReceipt: { disposition: "rejected", checkScope: "declared", inputs: { declared: 1, verified: 0 } } });
+  expect(await readFile(join(f.root, "api.json"), "utf8")).toBe('{"name":"before"}'); expect(await readFile(join(f.root, "check.mjs"), "utf8")).toBe(original);
+});
+
+it.each([true, false])("masks configured known secrets before bounding public artifact output (candidate=%s)", async candidate => {
+  const secret = "configuredOpaqueValueWithoutVendorShape0123456789";
+  const f = await fixture({ knownSecrets: () => [{ label: "configured-test", value: secret }] }, candidate);
+  f.deps.runChecks = async specs => ({ ok: true, results: specs.map(() => ({ ok: true })) });
+  f.deps.runTurn = async session => { await writeFile(join(session.workingDir, "api.json"), "candidate"); return { session, reason: "reply", stepCount: 1 }; };
+  const result = await buildFusionDelegateTool(f.deps).run({ tasks: [{ id: "api", title: `title ${secret}`, instructions: "work", files: ["api.json"] }], contract }, f.ctx);
+  expect(result.summary).not.toContain(secret.slice(0, 12)); expect(result.fullOutput).not.toContain(secret.slice(0, 12));
+  expect(result.summary.length).toBeLessThanOrEqual(f.deps.outputCharCap); expect((result.fullOutput ?? "").length).toBeLessThanOrEqual(f.deps.outputCharCap);
+  expect(result.summary.startsWith("artifact-evidence: ")).toBe(true);
+});
+
+it("reports one candidate task run with two completed worker invocations after a judge retry", async () => {
+  const append = vi.fn(); const f = await fixture({ outcomeLog: { append } });
+  const base = f.deps.resolveRunMode(); f.deps.resolveRunMode = () => ({ ...base, judge: { providerId: "cloud", model: "strong" } });
+  let turns = 0, judged = 0;
+  f.deps.runTurn = async session => { turns += 1; await writeFile(join(session.workingDir, "api.json"), `attempt ${turns}`); return { session, reason: "reply", stepCount: 1 }; };
+  f.deps.runChecks = async specs => ({ ok: true, results: specs.map(() => ({ ok: true })) });
+  f.deps.escalationComplete = async () => ({ content: JSON.stringify({ items: [{ id: "a2", pass: ++judged > 1, why: "verdict" }] }) });
+  await buildFusionDelegateTool(f.deps).run({ tasks: [{ id: "api", instructions: "work", files: ["api.json"] }], contract }, f.ctx);
+  expect(turns).toBe(2); expect(append).toHaveBeenCalledTimes(1);
+  const records = append.mock.calls[0]![0];
+  expect(records).toEqual([expect.objectContaining({ judgeRetried: true, candidate: expect.objectContaining({ workerRuns: 2 }) })]);
+  const { aggregateOutcomes } = await import("./outcome-report.js");
+  const report = aggregateOutcomes(records);
+  expect(report.workers[0]).toMatchObject({ checksPassed: 0, candidate: { taskRuns: 1, knownWorkerRuns: 2, workerRunsUnverified: 0 } });
+});
+
+it("keeps absolute check-generated snapshots inside the execution copy without checkInputs", async () => {
+  const { runChecks } = await import("../verify/run-verify.js");
+  const f = await fixture({ runChecks });
+  f.deps.runTurn = async session => { await writeFile(join(session.workingDir, "api.json"), "candidate"); return { session, reason: "reply", stepCount: 1 }; };
+  const result = await buildFusionDelegateTool(f.deps).run({ tasks: [{ id: "api", instructions: "work", files: ["api.json"] }],
+    contract: { checks: [{ kind: "command", cmd: process.execPath, args: ["-e", "require('fs').writeFileSync(process.argv[1], 'generated snapshot')", join(f.root, "snapshot.txt")], network: true }] } }, f.ctx);
+  expect(result.details.candidateIntegration).toMatchObject({ status: "promoted", acceptanceReceipt: { checkScope: "declared", checkStatus: "passed" } });
+  expect(await readFile(join(f.root, "api.json"), "utf8")).toBe("candidate");
+  await expect(readFile(join(f.root, "snapshot.txt"))).rejects.toThrow();
+});
+it("refuses a normalized project alias in a check before dispatching workers", async () => {
+  const runTurn = vi.fn(async (session: SessionState): Promise<RunTurnResult> => ({ session, reason: "reply", stepCount: 1 }));
+  const f = await fixture({ runTurn, runChecks: async specs => ({ ok: true, results: specs.map(() => ({ ok: true })) }) });
+  const alias = f.root.replace(/\\/g, "/").replace(/\/([^/]+)$/, "/./$1") + "/check.mjs";
+  const result = await buildFusionDelegateTool(f.deps).run({ tasks: [{ id: "api", instructions: "work" }],
+    contract: { checks: [{ kind: "command", cmd: process.execPath, args: [alias] }] } }, f.ctx);
+  expect(result.details.candidateIntegration).toMatchObject({ status: "rejected", reason: expect.stringContaining("unsupported absolute project reference") });
+  expect(runTurn).not.toHaveBeenCalled();
+});
+it.each(["dist", "node_modules"])("privately verifies a protected input under excluded %s with the built-in runner", async folder => {
+  const { runChecks } = await import("../verify/run-verify.js");
+  const f = await fixture({ runChecks });
+  await mkdir(join(f.root, folder));
+  await writeFile(join(f.root, folder, "check.mjs"), "import{readFileSync}from'node:fs';if(readFileSync('api.json','utf8')!=='candidate')process.exit(1)");
+  f.deps.runTurn = async session => { await writeFile(join(session.workingDir, "api.json"), "candidate"); return { session, reason: "reply", stepCount: 1 }; };
+  const result = await buildFusionDelegateTool(f.deps).run({ tasks: [{ id: "api", instructions: "work", files: ["api.json"] }],
+    contract: { checkInputs: [`${folder}/check.mjs`], checks: [{ kind: "command", cmd: process.execPath, args: [`${folder}/check.mjs`], network: true }] } }, f.ctx);
+  expect(result.details.candidateIntegration).toMatchObject({ status: "promoted", acceptanceReceipt: { checkScope: "protected-declared", checkStatus: "passed", inputs: { declared: 1, verified: 1 } } });
+  expect(await readFile(join(f.root, "api.json"), "utf8")).toBe("candidate");
+});
+
+it("binds an absolute protected check reference to the actual execution copy", async () => {
+  const { runChecks } = await import("../verify/run-verify.js"); const f = await fixture({ runChecks });
+  const original = `import {readFileSync} from 'node:fs'; if (readFileSync('api.json','utf8') !== '{"name":"before"}') throw new Error('bad artifact');`;
+  await writeFile(join(f.root, "check.mjs"), original);
+  f.deps.runTurn = async session => {
+    await writeFile(join(session.workingDir, "api.json"), "bad");
+    await writeFile(join(session.workingDir, "runner.mjs"), `import {readFileSync,writeFileSync} from 'node:fs'; import {pathToFileURL} from 'node:url'; const file=process.argv[2]; const original=readFileSync(file,'utf8'); writeFileSync(file,'export {};'); await import(pathToFileURL(file).href); writeFileSync(file,original);`);
+    return { session, reason: "reply", stepCount: 1 };
+  };
+  const result = await buildFusionDelegateTool(f.deps).run({ tasks: [{ id: "api", instructions: "work", files: ["api.json", "runner.mjs"] }], contract: { checkInputs: ["check.mjs"], checks: [{ kind: "command", cmd: process.execPath, args: ["runner.mjs", join(f.root, "check.mjs")], network: true }] } }, f.ctx);
+  expect(result.details.candidateIntegration).toMatchObject({ status: "rejected", acceptanceReceipt: { checkScope: "declared", inputs: { declared: 1, verified: 0 } } });
+  expect(await readFile(join(f.root, "api.json"), "utf8")).toBe('{"name":"before"}');
+});
+
+it.each([true, false])("preserves terminal candidate disposition when post-decision secret metadata fails (pass=%s)", async passing => {
+  let decisionLogged = false, failedCollections = 0;
+  const append = vi.fn((_rows: readonly unknown[]) => { decisionLogged = true; });
+  const f = await fixture({ outcomeLog: { append }, knownSecrets: () => { if (decisionLogged) { failedCollections += 1; throw new Error("PRIVATE-METADATA-FAILURE"); } return []; } });
+  f.deps.runTurn = async session => { await writeFile(join(session.workingDir, "api.json"), "candidate"); return { session, reason: "reply", stepCount: 1 }; };
+  f.deps.runChecks = async specs => ({ ok: passing, results: specs.map(() => ({ ok: passing })) });
+  const result = await buildFusionDelegateTool(f.deps).run({ tasks: [{ id: "api", instructions: "work", files: ["api.json"] }], contract }, f.ctx);
+  expect(result.status).toBe(passing ? "ok" : "error");
+  expect(result.details).toMatchObject({ metadataUnavailable: true, candidateIntegration: { status: passing ? "promoted" : "rejected", nonResumable: true } });
+  expect(append).toHaveBeenCalledTimes(1); expect(failedCollections).toBe(1);
+  expect(append.mock.calls[0]![0]).toEqual([expect.objectContaining({ candidate: expect.objectContaining({ receipt: expect.objectContaining({ disposition: passing ? "promoted" : "rejected" }) }) })]);
+  expect(await readFile(join(f.root, "api.json"), "utf8")).toBe(passing ? "candidate" : '{"name":"before"}');
+  expect(JSON.stringify(result)).not.toContain("PRIVATE-METADATA-FAILURE"); expect(JSON.stringify(result)).not.toContain(f.root);
+});
+
+it("refuses unsafe metadata once when the secret collector fails before the candidate decision", async () => {
+  let calls = 0;
+  const f = await fixture({ knownSecrets: () => { calls += 1; throw new Error("PRIVATE-COLLECTOR-ERROR"); } });
+  f.deps.runTurn = async session => { await writeFile(join(session.workingDir, "api.json"), "candidate"); return { session, reason: "reply", stepCount: 1 }; };
+  f.deps.runChecks = async specs => ({ ok: true, results: specs.map(() => ({ ok: true })) });
+  const result = await buildFusionDelegateTool(f.deps).run({ tasks: [{ id: "api", instructions: "work", files: ["api.json"] }], contract }, f.ctx);
+  expect(result.status).toBe("error"); expect(result.details).toMatchObject({ metadataUnavailable: true, candidateIntegration: { status: "rejected" } });
+  expect(calls).toBe(1); expect(JSON.stringify(result)).not.toContain("PRIVATE-COLLECTOR-ERROR");
+  expect(await readFile(join(f.root, "api.json"), "utf8")).toBe('{"name":"before"}');
+});
+
 describe("the configured copy limit (`tools.verify.maxCopyBytes`)", () => {
   let stateDir: string;
   beforeEach(async () => {
@@ -252,5 +404,57 @@ describe("the configured copy limit (`tools.verify.maxCopyBytes`)", () => {
     const result = await buildFusionDelegateTool(f.deps).run({ tasks }, f.ctx);
     expect(run).not.toHaveBeenCalled();
     expect((result.details.tasks as Array<{ error?: string }>)[0]!.error).toBe("not started: could not create a private workspace: the folder is too large to copy");
+  });
+
+  it("charges post-worker payload growth to the configured candidate budget that remains", async () => {
+    const f = await fixture();
+    const bytes = Buffer.byteLength(await readFile(join(f.root, "api.json"), "utf8")) + Buffer.byteLength(await readFile(join(f.root, "personal.txt"), "utf8"));
+    await writeFile(join(stateDir, "config.json"), JSON.stringify({ version: USER_CONFIG_VERSION, tools: { verify: { maxCopyBytes: bytes * 4 } } }));
+    resetConfigCache();
+    f.deps.runTurn = async session => { await writeFile(join(session.workingDir, "api.json"), '{"name":"after growing"}'); return { session, reason: "reply", stepCount: 1 }; };
+    f.deps.runChecks = async specs => ({ ok: true, results: specs.map(() => ({ ok: true })) });
+    const result = await buildFusionDelegateTool(f.deps).run({ tasks: [{ id: "api", instructions: "work", files: ["api.json"] }], contract }, f.ctx);
+    expect(result.details.candidateIntegration).toMatchObject({ status: "rejected", reason: expect.stringMatching(/remaining candidate copy budget/) });
+    expect(await readFile(join(f.root, "api.json"), "utf8")).toBe('{"name":"before"}');
+  });
+
+  it("retains the dependency-copy refusal cause when worker dependency growth exhausts final staging", async () => {
+    const f = await fixture();
+    const bytes = Buffer.byteLength(await readFile(join(f.root, "api.json"), "utf8")) + Buffer.byteLength(await readFile(join(f.root, "personal.txt"), "utf8"));
+    await mkdir(join(f.root, "node_modules")); await writeFile(join(f.root, "node_modules", "dependency.js"), "x".repeat(100));
+    await writeFile(join(stateDir, "config.json"), JSON.stringify({ version: USER_CONFIG_VERSION, tools: { verify: { maxCopyBytes: bytes * 4 + 250 } } }));
+    resetConfigCache();
+    f.deps.runTurn = async session => {
+      await writeFile(join(session.workingDir, "api.json"), '{"name":"after!"}');
+      await writeFile(join(session.workingDir, "node_modules", "dependency.js"), "y".repeat(200));
+      return { session, reason: "reply", stepCount: 1 };
+    };
+    f.deps.runChecks = async specs => ({ ok: true, results: specs.map(() => ({ ok: true })) });
+    const result = await buildFusionDelegateTool(f.deps).run({ tasks: [{ id: "api", instructions: "work", files: ["api.json"] }], contract }, f.ctx);
+    expect(result.details.candidateIntegration).toMatchObject({ status: "rejected", reason: expect.stringMatching(/remaining candidate copy budget.*private copy of the dependency folders/) });
+    expect(await readFile(join(f.root, "node_modules", "dependency.js"), "utf8")).toBe("x".repeat(100));
+  });
+  it("refuses a known whole final payload copy before dispatching workers", async () => {
+    const runTurn = vi.fn(async (session: SessionState): Promise<RunTurnResult> => ({ session, reason: "reply", stepCount: 1 }));
+    const f = await fixture({ runTurn });
+    await writeFile(join(f.root, "payload.bin"), Buffer.alloc(400 * 1024));
+    await writeFile(join(stateDir, "config.json"), JSON.stringify({ version: USER_CONFIG_VERSION, tools: { verify: { maxCopyBytes: 1024 * 1024 } } }));
+    resetConfigCache();
+    const result = await buildFusionDelegateTool(f.deps).run({ tasks: [{ id: "api", instructions: "work" }], contract }, f.ctx);
+    expect(result.details.reason).toBe("candidate-staging-failed");
+    expect(result.summary).toMatch(/measured final copy exceeds the remaining candidate copy budget/);
+    expect(runTurn).not.toHaveBeenCalled();
+  });
+  it("refuses a known minimum final dependency-copy cost before workers with honest budget context", async () => {
+    const runTurn = vi.fn(async (session: SessionState): Promise<RunTurnResult> => ({ session, reason: "reply", stepCount: 1 }));
+    const f = await fixture({ runTurn });
+    await mkdir(join(f.root, "node_modules"));
+    await writeFile(join(f.root, "node_modules", "dependency.js"), "x".repeat(6_000));
+    await writeFile(join(stateDir, "config.json"), JSON.stringify({ version: USER_CONFIG_VERSION, tools: { verify: { maxCopyBytes: 10_000 } } }));
+    resetConfigCache();
+    const result = await buildFusionDelegateTool(f.deps).run({ tasks: [{ id: "api", instructions: "work" }], contract }, f.ctx);
+    expect(result.details.reason).toBe("candidate-staging-failed");
+    expect(result.summary).toMatch(/configured 10000 bytes; spent \d+ bytes; remaining \d+ bytes; minimum additional 6000 bytes/);
+    expect(runTurn).not.toHaveBeenCalled();
   });
 });

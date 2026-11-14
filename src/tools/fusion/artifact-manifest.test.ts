@@ -3,8 +3,9 @@ import { createHash } from "node:crypto";
 import { lstatSync, mkdtempSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { collectArtifactManifest, parseArtifactManifest } from "./artifact-manifest.js";
+import { attachCandidateArtifactReceipt, collectArtifactManifest, parseArtifactManifest } from "./artifact-manifest.js";
 import type { CollectArtifactManifestInput } from "./artifact-manifest-types.js";
+import type { CandidateAcceptanceReceipt } from "./candidate-acceptance.js";
 
 describe("runtime artifact manifest", () => {
   let dir: string;
@@ -125,6 +126,33 @@ describe("runtime artifact manifest", () => {
     expect(manifest.checks[0]!.status).toBe("unknown");
     expect(manifest.dependencies[0]!.status).toBe("unknown");
     expect(manifest.coverage.reasons).toContain("verification_unknown");
+  });
+
+  it("binds only authoritative candidate snapshots and preserves the validated optional v1 extension", async () => {
+    writeFileSync(join(dir, "file.txt"), "candidate bytes");
+    const snapshot = await collectArtifactManifest(input());
+    const receipt = { version: 1 as const, id: "a".repeat(24), disposition: "promoted" as const, checkScope: "protected-declared" as const,
+      checkStatus: "passed" as const, checkedPayloadDigest: "b".repeat(64), checkPlanDigest: "c".repeat(64), checks: { total: 1, passed: 1, failed: 0 }, inputs: { declared: 1, verified: 1 } };
+    const bound = attachCandidateArtifactReceipt(snapshot, receipt);
+    expect(bound.binding).toEqual({ scope: "candidate-snapshot", receiptId: receipt.id, disposition: "promoted", checkScope: "protected-declared", checkStatus: "passed", checkedPayloadDigest: receipt.checkedPayloadDigest, checkPlanDigest: receipt.checkPlanDigest });
+    expect(parseArtifactManifest(JSON.parse(JSON.stringify(bound)))?.binding).toEqual(bound.binding);
+    const observed = await collectArtifactManifest(input({ coverage: "observed" }));
+    expect(attachCandidateArtifactReceipt(observed, receipt).binding?.disposition).not.toBe("promoted");
+    expect(parseArtifactManifest({ ...bound, binding: { ...bound.binding, scope: "final-project-observation" } })).toBeUndefined();
+    expect(parseArtifactManifest({ ...bound, binding: { ...bound.binding, receiptId: "secret arbitrary id" } })).toBeUndefined();
+    expect(parseArtifactManifest({ ...bound, binding: { ...bound.binding, command: "private-command" } })?.binding).not.toHaveProperty("command");
+  });
+
+  it.each(["protected-zero", "missing-counts", "count-mismatch", "enum-array"])("does not attach accepted proof from an invalid full runtime receipt (%s)", async variant => {
+    writeFileSync(join(dir, "file.txt"), "candidate bytes");
+    const snapshot = await collectArtifactManifest(input());
+    const receipt: Record<string, unknown> = { version: 1, id: "a".repeat(24), disposition: "promoted", checkScope: "protected-declared", checkStatus: "passed",
+      checkedPayloadDigest: "b".repeat(64), checkPlanDigest: "c".repeat(64), checks: { total: 1, passed: 1, failed: 0 }, inputs: { declared: 1, verified: 1 } };
+    if (variant === "protected-zero") receipt.inputs = { declared: 0, verified: 0 };
+    if (variant === "missing-counts") delete receipt.checks;
+    if (variant === "count-mismatch") receipt.checks = { total: 2, passed: 1, failed: 0 };
+    if (variant === "enum-array") receipt.disposition = ["promoted"];
+    expect(attachCandidateArtifactReceipt(snapshot, receipt as unknown as CandidateAcceptanceReceipt).binding).toBeUndefined();
   });
 
   it.each([

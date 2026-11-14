@@ -25,6 +25,8 @@ npm run test:ci
 
 For an affected area use `npm run test:ci -- src/mcp/` or a precise existing file. This is a focused run, not equivalent to the full PR gate. Vitest transpilation alone does not validate test types.
 
+The native Windows reliability gate (`node scripts/run-windows-core-tests.mjs`) uses explicit critical files, including public candidate delegation, frozen check-input/payload binding, artifact output through the actual step commit, dependency readiness and candidate outcome/receipt routing boundaries. It preserves complete critical/deferred classification in the two tool directories and explicitly lists the outside runtime catalog seam. The registry preflight refuses missing or quarantined critical inputs before starting Vitest; `quarantine:self-test` exercises both refusals. The separate Linux full-suite and optional-canvas jobs keep their existing scopes.
+
 ## Debt policy
 
 [The checker](../../scripts/check-test-types.mjs) uses the installed TypeScript parser and all pre-emit diagnostics. Each allowed record includes relative file, TS code, normalized message, source-span text and multiplicity. Line numbers provide navigation but do not authorize debt: line shifts preserve a record, a new message/span consumes a new record, and a second identical occurrence consumes another count. The ledger records compiler version, effective options and root inventory at its last capture/reduction. Coverage is checked independently against the current source tree, so a clean new TSX root is allowed and an omitted existing root fails.

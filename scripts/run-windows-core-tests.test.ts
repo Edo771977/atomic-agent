@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, describe, expect, it } from "vitest";
 // @ts-expect-error -- plain .mjs script without declarations
-import { coreDirectories, criticalFiles, deferredFiles, supplementalFiles, scopeDrift, supplementalDrift, quarantinedGateFiles } from "./run-windows-core-tests.mjs";
+import { coreDirectories, criticalFiles, deferredFiles, externalCriticalFiles, supplementalFiles, scopeDrift, supplementalDrift, quarantinedGateFiles } from "./run-windows-core-tests.mjs";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const scratch = mkdtempSync(join(tmpdir(), "windows-core-scope-"));
@@ -15,10 +15,11 @@ describe("Windows core gate scope", () => {
     expect(scopeDrift(root)).toEqual({ unclassified: [], missing: [], overlapping: [] });
   });
 
-  it("keeps the critical list inside the scanned directories", () => {
+  it("keeps critical tests inside the scanned directories or explicit runtime seam list", () => {
     for (const path of criticalFiles as string[]) {
-      expect((coreDirectories as string[]).some((dir) => path.startsWith(`${dir}/`)), path).toBe(true);
+      expect((coreDirectories as string[]).some((dir) => path.startsWith(`${dir}/`)) || (externalCriticalFiles as string[]).includes(path), path).toBe(true);
     }
+    for (const path of externalCriticalFiles as string[]) expect((criticalFiles as string[]).includes(path), path).toBe(true);
     expect((deferredFiles as string[]).length).toBeGreaterThan(0);
   });
 

@@ -1316,7 +1316,7 @@ function renderBlock(
   const diagnosis = [
     ...(changed === null ? [] : [changed]),
     ...(result.artifactManifest === undefined ? [] : [
-      `manifest: ${result.artifactManifest.coverage.source}, ${result.artifactManifest.artifacts.filter(e => e.sha256 !== undefined).length} hashed, ${result.artifactManifest.coverage.complete ? "complete" : "incomplete"}; inspect details.artifactManifests[task id]`,
+      `manifest: ${result.artifactManifest.coverage.source}, ${result.artifactManifest.artifacts.filter(e => e.sha256 !== undefined).length} hashed, ${result.artifactManifest.coverage.complete ? "complete" : "incomplete"}; runtime observation, not delivery proof`,
     ]),
     ...(result.replacedInputs ?? []).map(describeReplacedInput),
     ...(result.hint ? [`hint: ${result.hint}`] : []),

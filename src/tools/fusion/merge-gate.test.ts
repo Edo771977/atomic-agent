@@ -563,12 +563,13 @@ describe("held-back patches and kept workspaces (isolation)", () => {
       if (message.includes("A judge found these acceptance items NOT met")) retrying = true;
       return runTurn(session, message, options);
     };
+    // Secret-store failures use fixed public text; the raw exception may contain credentials.
     await expect(
       buildFusionDelegateTool(d).run(
         { tasks: [{ id: "one", title: "One", instructions: "write one.txt", files: ["one.txt"] }] },
         ctx(repo),
       ),
-    ).rejects.toThrow("secret store went away");
+    ).rejects.toThrow(new Error("Secret metadata unavailable"));
     expect(retrying).toBe(true);
     const list = (await runGitRaw(repo, ["worktree", "list"])).stdout.trim().split("\n");
     expect(list).toHaveLength(1);

@@ -1,6 +1,7 @@
-import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Browser } from "playwright-core";
 
@@ -29,6 +30,64 @@ afterEach(async () => {
 });
 
 describe("verify refuses to execute without a private workspace", () => {
+  it("executes benign logging with a percent-bearing file label", async () => {
+    const result = await runVerify({ kind: "command", cmd: process.execPath,
+      args: ["-e", "console.log('file: 100% ready')"], network: true }, { workingDir: dir });
+    expect(result.ok).toBe(true);
+    expect(result).toMatchObject({ stdoutTail: "file: 100% ready\n" });
+  });
+  it.each(["canonical", "single-slash", "no-slash"] as const)("rebases a %s source file URL into its execution copy", async spelling => {
+    const execution = join(dir, "execution"); await mkdir(execution);
+    await writeFile(join(execution, "original.txt"), "execution-copy");
+    const canonical = pathToFileURL(join(dir, "original.txt")).href;
+    const url = spelling === "single-slash" ? canonical.replace(/^file:\/\/\//, "file:/") : spelling === "no-slash" ? canonical.replace(/^file:\/\/\//, "file:") : canonical;
+    const runner = vi.spyOn(commands, "runCommandKind");
+    const result = await runVerify({ kind: "command", cmd: process.execPath,
+      args: ["-e", "process.stdout.write(require('node:fs').readFileSync(new URL(process.argv[1]),'utf8'))", url], network: true },
+      { workingDir: dir, workspace: async () => ({ dir: execution, isolated: true, method: "copy", cleanup: async () => {} }) });
+    expect(result).toMatchObject({ ok: true, isolated: true, exitCode: 0, stdoutTail: "execution-copy" });
+    expect(result.error).toBeUndefined();
+    expect(runner).toHaveBeenCalledOnce();
+    expect(runner.mock.calls[0]?.[0].args?.[2]).toBe(pathToFileURL(join(execution, "original.txt")).href);
+    expect(runner.mock.calls[0]?.[1].cwd).toBe(execution);
+    expect(await readFile(join(dir, "original.txt"), "utf8")).toBe("original");
+    expect(await readFile(join(execution, "original.txt"), "utf8")).toBe("execution-copy");
+  });
+  it("refuses a source file URL with a newline in its scheme before execution", async () => {
+    const execution = join(dir, "execution"); await mkdir(execution);
+    await writeFile(join(execution, "original.txt"), "execution-copy");
+    const url = pathToFileURL(join(dir, "original.txt")).href.replace(/^file:/, "fi\nle:");
+    const runner = vi.spyOn(commands, "runCommandKind");
+    const result = await runVerify({ kind: "command", cmd: process.execPath,
+      args: ["-e", "process.stdout.write(require('node:fs').readFileSync(new URL(process.argv[1]),'utf8'))", url], network: true },
+      { workingDir: dir, workspace: async () => ({ dir: execution, isolated: true, method: "copy", cleanup: async () => {} }) });
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("unsupported absolute project reference");
+    expect(runner).not.toHaveBeenCalled();
+    expect(await readFile(join(dir, "original.txt"), "utf8")).toBe("original");
+    expect(await readFile(join(execution, "original.txt"), "utf8")).toBe("execution-copy");
+  });
+  it.each(["dist", "node_modules"])("charges a protected %s directory to the existing execution-copy cap", async folder => {
+    await mkdir(join(dir, folder)); await writeFile(join(dir, folder, "check.mjs"), "x".repeat(6_000));
+    const begin = vi.fn(async () => async () => {});
+    const runner = vi.spyOn(commands, "runCommandKind");
+    const result = await runVerify(spec, { workingDir: dir, config: { ...config, tools: { verify: { maxCopyBytes: 100 } } },
+      inputIntegrity: { paths: [`${folder}/check.mjs`], begin } });
+    expect(result).toMatchObject({ ok: false, errorCode: "workspace-unavailable" });
+    expect(runner).not.toHaveBeenCalled(); expect(begin).not.toHaveBeenCalled();
+  });
+  it("refuses outside protected-copy metadata before following or executing it", async () => {
+    const runner = vi.spyOn(commands, "runCommandKind");
+    const result = await runVerify(spec, { workingDir: dir, inputIntegrity: { paths: ["../outside/check.mjs"], begin: async () => async () => {} } });
+    expect(result).toMatchObject({ ok: false, errorCode: "workspace-unavailable" });
+    expect(result.error).toContain("relative files inside"); expect(runner).not.toHaveBeenCalled();
+  });
+  it("rebases absolute source arguments into the execution copy without checkInputs", async () => {
+    const result = await runVerify({ kind: "command", cmd: process.execPath,
+      args: ["-e", "require('fs').writeFileSync(process.argv[1], 'execution output')", join(dir, "original.txt")], checks: ["exit 0"] }, { workingDir: dir, config });
+    expect(result).toMatchObject({ ok: true, isolated: true });
+    expect(await readFile(join(dir, "original.txt"), "utf8")).toBe("original");
+  });
   it("the public tool fails closed at the copy limit before starting the runner", async () => {
     const runner = vi.spyOn(commands, "runCommandKind");
     const options = {
@@ -232,5 +291,20 @@ describe("verify refuses to execute without a private workspace", () => {
     expect(result.checks).toEqual([expect.objectContaining({ check: "exit 0", ok: false })]);
     expect(result.summary.split("\n")[0]).toBe("verify.run command: FAILED");
     expect(result.summary).toContain("built");
+  });
+
+  it("keeps cancelled executor evidence when the protected-input completion observation also aborts", async () => {
+    const controller = new AbortController();
+    const complete = vi.fn(async () => { controller.signal.throwIfAborted(); });
+    vi.spyOn(commands, "runCommandKind").mockImplementation(async () => {
+      controller.abort();
+      return { commandLine: "node protected-build.js", exitCode: 0, signal: null, timedOut: false, aborted: false, stdout: "protected build\n", stderr: "", stdoutTail: "protected build\n", stderrTail: "", durationMs: 5 };
+    });
+    const result = await runVerify({ kind: "command", cmd: "node", args: ["protected-build.js"], checks: ["exit 0"] }, {
+      workingDir: dir, config, signal: controller.signal, inputIntegrity: { begin: async () => complete },
+    });
+    expect(complete).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({ ok: false, errorCode: "cancelled", aborted: true, isolated: true, commandLine: "node protected-build.js", exitCode: 0, stdoutTail: "protected build\n", timedOut: false });
+    expect(result.checks).toEqual([expect.objectContaining({ check: "exit 0", ok: false })]);
   });
 });

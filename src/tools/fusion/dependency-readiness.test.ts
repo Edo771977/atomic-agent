@@ -86,6 +86,7 @@ describe("dependency readiness before a later worker starts", () => {
     expect(rows[0]!.status).toBe("no_changes");
     expect(f.ran).toEqual(present ? ["core", "ui"] : ["core"]);
     expect(rows[1]!.status).toBe(present ? "ok" : "cancelled");
+    if (present) expect(rows[1]!.artifactManifest?.dependencies).toContainEqual({ provider: "core", requirementIndex: 0, status: "ready" });
   });
 
   it("releases a no_changes provider whose own check ran and passed", async () => {

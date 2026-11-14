@@ -9,6 +9,8 @@ import { checkCi, testArgs } from './run-tests.mjs';
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 /** Directories whose test files must each be classified below. */
 export const coreDirectories = ['src/tools/fusion', 'src/tools/verify'];
+/** Explicit runtime seams outside the directory-wide portability classification. */
+export const externalCriticalFiles = ['src/runtime/composition/runtime-tool-catalog.test.ts'];
 /** Whole files the native Windows gate runs. */
 export const criticalFiles = [
   'src/tools/verify/run-verify.test.ts',
@@ -26,6 +28,23 @@ export const criticalFiles = [
   'src/tools/verify/verify-checks.test.ts',
   'src/tools/verify/verify-run-summary.test.ts',
   'src/tools/fusion/candidate-integration.test.ts',
+  'src/tools/fusion/candidate-evidence.test.ts',
+  'src/tools/fusion/candidate-path-references.test.ts',
+  'src/tools/fusion/candidate-path-aliases.test.ts',
+  'src/tools/fusion/candidate-copy-budget.test.ts',
+  'src/tools/fusion/branch-workspace-copy-plan.test.ts',
+  'src/tools/fusion/candidate-check-inputs.test.ts',
+  'src/tools/verify/rebase-verify-workspace.test.ts',
+  'src/tools/verify/rebase-verify-workspace-literals.test.ts',
+  'src/tools/fusion/fusion-candidate.test.ts',
+  'src/tools/fusion/delegate-descriptor.test.ts',
+  'src/tools/fusion/dependency-readiness.test.ts',
+  'src/tools/fusion/artifact-manifest.integration.test.ts',
+  'src/tools/fusion/artifact-manifest-tasks.test.ts',
+  'src/tools/fusion/artifact-evidence-output.test.ts',
+  'src/tools/fusion/outcome-evidence.test.ts',
+  'src/tools/fusion/candidate-outcomes.test.ts',
+  'src/tools/fusion/candidate-receipt.test.ts',
   'src/tools/fusion/candidate-durability.test.ts',
   'src/tools/fusion/branch-workspace-portability.test.ts',
   'src/tools/fusion/branch-workspace-dependency-links.test.ts',
@@ -34,6 +53,7 @@ export const criticalFiles = [
   'src/tools/fusion/outcome-report.test.ts',
   'src/tools/fusion/outcome-log.test.ts',
   'src/tools/fusion/measured-routing.test.ts',
+  ...externalCriticalFiles,
 ];
 /** Additional whole-file regressions outside the exhaustively classified core directories. */
 export const supplementalFiles = [
@@ -82,7 +102,6 @@ export const supplementalFiles = [
  * file in those directories fails scopeDrift until it is added to one list.
  */
 export const deferredFiles = [
-  'src/tools/fusion/artifact-manifest.integration.test.ts',
   'src/tools/fusion/artifact-manifest.test.ts',
   'src/tools/fusion/branch-diff.test.ts',
   'src/tools/fusion/branch-ignore-policy.test.ts',
@@ -93,11 +112,8 @@ export const deferredFiles = [
   'src/tools/fusion/contract-shape.test.ts',
   'src/tools/fusion/declared-files.test.ts',
   'src/tools/fusion/delegate-args.test.ts',
-  'src/tools/fusion/delegate-descriptor.test.ts',
-  'src/tools/fusion/dependency-readiness.test.ts',
   'src/tools/fusion/escalation.test.ts',
   'src/tools/fusion/failure-breaker.test.ts',
-  'src/tools/fusion/fusion-candidate.test.ts',
   'src/tools/fusion/fusion-delegate.integration.test.ts',
   'src/tools/fusion/fusion-delegate.outcome-log.test.ts',
   'src/tools/fusion/judge.test.ts',
@@ -137,10 +153,10 @@ export const deferredFiles = [
 
 /** Test files in coreDirectories missing from both lists, stale entries, and double entries. */
 export function scopeDrift(base = root) {
-  const present = coreDirectories.flatMap(dir => {
+  const present = [...coreDirectories.flatMap(dir => {
     const abs = join(base, dir);
     return existsSync(abs) ? readdirSync(abs).filter(name => name.endsWith('.test.ts')).map(name => `${dir}/${name}`) : [];
-  }).sort();
+  }), ...externalCriticalFiles.filter(path => existsSync(join(base, path)))].sort();
   const listed = new Set([...criticalFiles, ...deferredFiles]);
   return {
     unclassified: present.filter(path => !listed.has(path)),

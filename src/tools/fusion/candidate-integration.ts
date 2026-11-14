@@ -1,21 +1,24 @@
 import { createHash, randomBytes } from "node:crypto";
 import { createReadStream, type Stats } from "node:fs";
 import { chmod, copyFile, lstat, mkdir, open, opendir, readlink, rename, rm, rmdir, stat, symlink } from "node:fs/promises";
-import { dirname, join, relative, sep } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { isInside } from "../../approval/fanout-scope.js";
 import { renameWithRetrySync, syncDirectoryBestEffort, writeFileSyncedSync } from "../../config/durable-write.js";
 import { resolveUserPath } from "../os/expand-home.js";
 import { inputPathIdentity, windowsComponentIdentity } from "../os/fs/fs-input-path-identity.js";
 import { VERIFY_COPY_EXCLUDED, VERIFY_COPY_MAX_BYTES } from "../verify/verify-workspace-copy.js";
-import { createBranchSet, defaultGitExec, BRANCH_MERGE_DIR, ensureMergeDir, type BranchSet, type BranchWorkspace, type CreateBranchSetOptions, type GitExec } from "./branch-workspace.js";
+import { createBranchSet, planBranchSetCopy, defaultGitExec, BRANCH_MERGE_DIR, ensureMergeDir, type BranchCopyPlan, type BranchSet, type BranchWorkspace, type CreateBranchSetOptions, type GitExec } from "./branch-workspace.js";
 import { workspaceChanges, writeTaskPatch, type SavedTaskPatch } from "./branch-diff.js";
 import { resolveContractInputs } from "./contract-inputs.js";
 import { inspectContractProvides, runContractChecks, type ContractCheckRunner, type ContractReport } from "./contract-checks.js";
 import type { DelegateContract } from "./contract.js";
 import type { DelegateTask } from "./delegate-args.js";
 import type { WorkerTaskResult } from "./worker-result.js";
-import { collectArtifactManifest } from "./artifact-manifest.js";
+import { attachCandidateArtifactReceipt, collectArtifactManifest } from "./artifact-manifest.js";
 import type { ArtifactManifest, ArtifactManifestDependency, ArtifactObservation } from "./artifact-manifest-types.js";
+import { freezeCheckInputs } from "./candidate-check-inputs.js";
+import { rebaseVerifyWorkspaceValue } from "../verify/rebase-verify-workspace.js";
+import type { CandidateAcceptanceReceipt, CandidateRejectionReason } from "./candidate-acceptance.js";
 
 interface Entry { kind: "file" | "symlink" | "directory"; mode: number; hash?: string }
 type Inventory = Map<string, Entry>;
@@ -238,6 +241,8 @@ interface PromotionJournalStep {
 }
 interface PromotionJournal {
   version: 1; candidate: string; project: string; startedAt: string;
+  /** Private checked source, retained across a hard stop until recovery completes. */
+  checkedWorkspace?: string;
   /** `committed`: every step landed and was verified; nothing to undo, delete the journal. */
   state: "promoting" | "committed" | "rolling-back" | "rolled-back-with-conflicts";
   recovery: string;
@@ -246,6 +251,7 @@ interface PromotionJournal {
 const JOURNAL_RECOVERY = "If state is 'committed', delivery completed and was verified: change nothing, just delete this journal and its backup folder. Otherwise steps run in order. 'applied' paths hold the promoted entry; an 'intent' path may hold either. To undo, restore each such path from 'original': a file from 'backup' with its mode, a symlink from 'linkTarget', a directory with its mode; remove the path if 'original' is null. Verify sha256 before trusting a backup. Delete any step's leftover 'temp' file (an .atag-candidate-* staging copy), then this journal and its backup folder.";
 
 export interface CandidateIntegrationReport {
+  acceptanceReceipt?: CandidateAcceptanceReceipt;
   status: "promoted" | "rejected";
   nonResumable: true;
   reason?: string;
@@ -271,6 +277,8 @@ export interface CandidateIntegrationReport {
   promotionJournalNote?: string;
   /** Recovery fallback if a bounded patch cannot be made; cleanup leaves this private workspace intact. */
   retainedWorkspace?: string;
+  /** Checked bytes retained separately when a partial delivery cannot be fully rolled back. */
+  retainedCheckedWorkspace?: string;
   heldArtifactsDir?: string;
   /** Bounded receipt; its explicit incomplete coverage does not replace the complete transaction inventory. */
   artifactManifest?: ArtifactManifest;
@@ -296,33 +304,83 @@ export interface CandidateIntegration {
 export async function createCandidateIntegration(
   realDir: string,
   options: CreateBranchSetOptions & {
+    /** Exact check files from the original, frozen before any worker can edit the candidate. */
+    checkInputs?: readonly string[];
     beforeApply?: (path: string, index: number) => Promise<void>;
     /** Test-only: runs after a step verified its target, immediately before the identity re-check and the replace/remove. */
     beforeCommit?: (path: string) => Promise<void>;
     maxInventoryBytes?: number; maxInventoryEntries?: number; maxInventoryMs?: number } = {},
 ): Promise<CandidateIntegration> {
+  const requestedDir = resolve(realDir);
   const id = `candidate-${randomBytes(6).toString("hex")}`;
   // `tools.verify.maxCopyBytes` when the caller passes it: copies, inventories and hashes share one bound.
   const copyLimit = options.maxCopyBytes ?? VERIFY_COPY_MAX_BYTES;
   const setupSignal = options.signal === undefined ? AbortSignal.timeout(120_000) : AbortSignal.any([options.signal, AbortSignal.timeout(120_000)]);
+  const protectedInputs = await freezeCheckInputs(realDir, options.checkInputs ?? [], setupSignal);
   let refusal: string | undefined;
   const set = await createBranchSet(realDir, [id], {
     ...options, signal: setupSignal, privateDependencyDirectories: true,
     onRefusal: (reason) => { refusal = reason; options.onRefusal?.(reason); },
   });
   if (set === null) throw new Error(`candidate workspace unavailable: ${refusal ?? "private copies exceed the copy limit"}`);
+  let additionalCopyBytes = set.minimumPrivateDependencyCopyBytes?.() ?? 0;
+  const budgetContext = (): string => {
+    const remaining = set.remainingCopyBytes?.() ?? 0;
+    return `configured ${copyLimit} bytes; spent ${copyLimit - remaining} bytes; remaining ${remaining} bytes; minimum additional ${additionalCopyBytes} bytes`;
+  };
+  if ((set.minimumPrivateDependencyCopyBytes?.() ?? 0) > (set.remainingCopyBytes?.() ?? 0)) {
+    await set.cleanup();
+    throw new Error(`candidate workspace unavailable: minimum final private dependency copy exceeds the remaining candidate copy budget (${budgetContext()})`);
+  }
   const workspace = set.workspaces.get(id)!;
+  let checkedPlan: BranchCopyPlan;
+  try {
+    let measuredRefusal: string | undefined;
+    const plan = await planBranchSetCopy(workspace.dir, ["checked-source"], { ...options, signal: setupSignal, privateDependencyDirectories: true,
+      onRefusal: reason => { measuredRefusal = reason; } });
+    if (plan === null) throw new Error(`candidate workspace unavailable: measured final copy exceeds the remaining candidate copy budget (${budgetContext()}): ${measuredRefusal ?? "final copy exceeds the configured limit"}`);
+    additionalCopyBytes = plan.bytes;
+    if (plan.bytes > (set.remainingCopyBytes?.() ?? 0)) throw new Error(`candidate workspace unavailable: measured final copy exceeds the remaining candidate copy budget (${budgetContext()})`);
+    checkedPlan = plan;
+  } catch (err) { await set.cleanup(); throw err; }
   let tracked: ReadonlySet<string>;
   try { tracked = await trackedPaths(set, options.git ?? defaultGitExec); } catch (err) { await set.cleanup(); throw err; }
   const snapshot = (root: string, signal?: AbortSignal, dropped?: Dropped): Promise<Inventory> => inventory(root, workspace, tracked, { bytes: options.maxInventoryBytes ?? copyLimit, entries: options.maxInventoryEntries ?? 100_000, signal: signal === undefined ? AbortSignal.timeout(options.maxInventoryMs ?? 30_000) : AbortSignal.any([signal, AbortSignal.timeout(options.maxInventoryMs ?? 30_000)]) }, dropped);
   /** Bounds for re-verifying single live entries during delivery and rollback. */
   const liveBounds = (signal: AbortSignal): InventoryBounds => ({ bytes: options.maxInventoryBytes ?? copyLimit, entries: 1, signal });
   let retain = false;
+  let verifiedInputs = 0;
+  const verifyProtectedInputs = async (root: string, signal: AbortSignal): Promise<void> => {
+    verifiedInputs = 0;
+    verifiedInputs = await protectedInputs.verify(root, signal);
+  };
+  let checksTotal = 0;
+  let receiptEvidence: ContractReport | undefined;
+  let checkedPayloadDigest: string | undefined;
+  let checkPlanDigest: string | undefined;
+  const receiptId = randomBytes(12).toString("hex");
+  const rejectionReason = (reason: string): CandidateRejectionReason => /cancel|abort|interrupt/i.test(reason) ? "interrupted"
+    : /check input/i.test(reason) ? "check-inputs-changed" : /candidate changed|checked source changed|payload/i.test(reason) ? "payload-changed"
+    : /every task/i.test(reason) ? "task-not-ok" : /integration checks failed/i.test(reason) ? receiptEvidence?.checks.some(check => !check.ok) ? "checks-failed" : "checks-unverified"
+    : /check|runner/i.test(reason) ? "checks-unverified" : /provides/i.test(reason) ? "provides-unverified"
+    : /original project changed/i.test(reason) ? "original-changed" : /delivery|rollback/i.test(reason) ? "delivery-failed" : "other";
+  const receipt = (disposition: CandidateAcceptanceReceipt["disposition"], reason?: string): CandidateAcceptanceReceipt => {
+    const checks = receiptEvidence?.checks ?? [];
+    const passed = checks.filter(check => check.ok).length, failed = checks.length - passed;
+    const complete = checksTotal > 0 && checks.length === checksTotal && receiptEvidence?.checksSkipped === undefined;
+    return { version: 1, id: receiptId, disposition,
+      checkScope: protectedInputs.paths.length > 0 && verifiedInputs === protectedInputs.paths.length ? "protected-declared" : "declared",
+      checkStatus: failed > 0 ? "failed" : complete ? "passed" : "unverified",
+      checks: { total: checksTotal, passed, failed }, inputs: { declared: protectedInputs.paths.length, verified: verifiedInputs },
+      ...(checkedPayloadDigest === undefined ? {} : { checkedPayloadDigest }), ...(checkPlanDigest === undefined ? {} : { checkPlanDigest }),
+      ...(reason === undefined ? {} : { reason: rejectionReason(reason) }) };
+  };
   let base: Inventory;
   const baseDropped: Dropped = new Map();
   try {
     base = await snapshot(set.baseDir, setupSignal, baseDropped);
     if (differences(base, await snapshot(set.realDir, setupSignal)).length > 0) throw new Error("original project changed while creating candidate");
+    await protectedInputs.verify(workspace.dir, setupSignal);
     // A hard process stop cannot write a patch. Normal completion cleans
     // this marker; a stale sweep must preserve the only recovery copy.
     await set.retainForRecovery?.();
@@ -352,6 +410,8 @@ export async function createCandidateIntegration(
     heldArtifactsDir = relative(set.realDir, destination);
   };
   const reject = async (reason: string, report: Partial<CandidateIntegrationReport> = {}): Promise<CandidateIntegrationReport> => {
+    const acceptanceReceipt = receipt("rejected", reason);
+    const evidenceReport = { ...report, acceptanceReceipt, ...(report.artifactManifest === undefined ? {} : { artifactManifest: attachCandidateArtifactReceipt(report.artifactManifest, acceptanceReceipt) }) };
     try {
       // The caller may already be cancelled: recovery gets one independent,
       // bounded opportunity to save changes, then retains the workspace.
@@ -360,11 +420,11 @@ export async function createCandidateIntegration(
       await preserveHeldArtifacts(recoverySignal);
       const changes = await workspaceChanges(set, diffWorkspace, undefined, recoverySignal);
       const patch = await writeTaskPatch({ realDir: set.realDir, set, workspace: diffWorkspace, taskId: id, changes, signal: recoverySignal });
-      return { status: "rejected", nonResumable: true, reason, changes: changes.map(c => c.path), patch, ...(heldArtifactsDir === undefined ? {} : { heldArtifactsDir }), ...report };
+      return { status: "rejected", nonResumable: true, reason, changes: changes.map(c => c.path), patch, ...(heldArtifactsDir === undefined ? {} : { heldArtifactsDir }), ...evidenceReport };
     } catch (err) {
       retain = true;
       await set.retainForRecovery?.();
-      return { status: "rejected", nonResumable: true, reason: `${reason}; patch unavailable: ${err instanceof Error ? err.message : String(err)}; private workspace retained for recovery`, changes: [], retainedWorkspace: workspace.dir, ...(heldArtifactsDir === undefined ? {} : { heldArtifactsDir }), ...report };
+      return { status: "rejected", nonResumable: true, reason: `${reason}; patch unavailable: ${err instanceof Error ? err.message : String(err)}; private workspace retained for recovery`, changes: [], retainedWorkspace: workspace.dir, ...(heldArtifactsDir === undefined ? {} : { heldArtifactsDir }), ...evidenceReport };
     }
   };
 
@@ -486,48 +546,107 @@ export async function createCandidateIntegration(
       let artifactManifest: ArtifactManifest | undefined;
       let ignoredChanges: string[] = [];
       let journal: Awaited<ReturnType<typeof openJournal>> | undefined;
+      let checkedSet: BranchSet | null | undefined;
+      let retainChecked = false;
+      let checkedDir = workspace.dir;
+      const rejectFinal = (reason: string, report: Partial<CandidateIntegrationReport> = {}): Promise<CandidateIntegrationReport> => reject(reason, {
+        ...(evidence === undefined ? {} : { contract: evidence }), ...(artifactManifest === undefined ? {} : { artifactManifest }), ...report,
+      });
       const steps = new Map<string, PromotionJournalStep>();
       try {
         input.signal.throwIfAborted();
-        if (input.rows.length === 0 || input.rows.some(row => row.status !== "ok") || input.tasks?.some(task => !input.rows.some(row => row.id === task.id))) return await reject("candidate not promoted: every task must close with status ok");
+        checksTotal = Math.min(input.contract?.checks?.length ?? 0, 16);
+        if (input.rows.length === 0 || input.rows.some(row => row.status !== "ok") || input.tasks?.some(task => !input.rows.some(row => row.id === task.id))) return await rejectFinal("candidate not promoted: every task must close with status ok");
         const checks = input.contract?.checks ?? [];
-        if (checks.length === 0) return await reject("candidate not promoted: at least one explicit contract integration check is required");
+        if (checks.length === 0 || checks.length > 16) return await rejectFinal("candidate not promoted: one to sixteen explicit contract integration checks are required");
+        if ((input.contract?.checkInputs?.length ?? 0) > 0 && protectedInputs.paths.length === 0) return await rejectFinal("candidate not promoted: declared check inputs were not frozen before workers");
+        if (protectedInputs.paths.length > 0 && input.runChecks?.supportsInputIntegrity !== true) {
+          verifiedInputs = 0;
+          return await rejectFinal("candidate not promoted: check input integrity cannot be attested by this custom check runner");
+        }
+        await verifyProtectedInputs(workspace.dir, input.signal);
+        // One private final source supplies every check and every delivered byte.
+        // Its actual copies spend the original candidate's remaining budget.
+        const beforeChecks = await snapshot(workspace.dir, input.signal);
+        const freezeSignal = AbortSignal.any([input.signal, AbortSignal.timeout(120_000)]);
+        let checkedRefusal: string | undefined;
+        checkedSet = await checkedPlan.create({ ...options, signal: freezeSignal,
+          maxCopyBytes: set.remainingCopyBytes?.() ?? 0, privateDependencyDirectories: true,
+          onRefusal: reason => { checkedRefusal = reason; options.onRefusal?.(reason); } });
+        if (checkedSet === null) return await rejectFinal(`candidate not promoted: checked source copy exceeds the remaining candidate copy budget (${budgetContext()})${checkedRefusal === undefined ? "" : `: ${checkedRefusal.replace(/copy limit/g, "remaining copy allowance")}`}`);
+        checkedDir = checkedSet.workspaces.get("checked-source")!.dir;
+        if (differences(beforeChecks, await snapshot(checkedDir, freezeSignal)).length > 0) return await rejectFinal("candidate changed while freezing its checked payload");
+        await verifyProtectedInputs(checkedDir, input.signal);
+        const rebaseChecked = <T,>(value: T): T => {
+          // The opened alias can be more specific than the canonical root:
+          // preserve private-workspace priority, then match that alias first.
+          for (const source of [workspace.dir, requestedDir, set.realDir]) value = rebaseVerifyWorkspaceValue(value, source, checkedDir);
+          return value;
+        };
+        checkedPayloadDigest = createHash("sha256").update(JSON.stringify([...beforeChecks].sort(([a], [b]) => a.localeCompare(b)))).digest("hex");
+        checkPlanDigest = createHash("sha256").update(JSON.stringify(checks)).digest("hex");
         // Always rerun ALL declared checks on the final candidate, even when
         // a task's earlier isolated gate or dependency release passed them.
         const runner: ContractCheckRunner | undefined = input.runChecks === undefined ? undefined : async (specs, ctx) => {
           const result = await input.runChecks!(specs, ctx);
           return result.ok ? result : { ok: false, results: result.results.map(row => ({ ...row, ok: false })) };
         };
-        const checked = await runContractChecks(checks, runner, { workingDir: workspace.dir, signal: input.signal });
+        let actualInputExecutions = 0;
+        const inputIntegrity = protectedInputs.paths.length === 0 ? undefined : {
+          paths: Object.freeze([...protectedInputs.paths]),
+          async begin(dir: string, signal: AbortSignal): Promise<() => Promise<void>> {
+            const complete = await protectedInputs.beginExecution(dir, signal);
+            let completed = false;
+            return async () => {
+              if (completed) throw new Error("check input execution guard completed twice");
+              await complete(); completed = true; actualInputExecutions += 1;
+            };
+          },
+        };
+        // Source observations do not establish that the actual execution-copy
+        // observations completed; an abort before completion remains unknown.
+        if (inputIntegrity !== undefined) verifiedInputs = 0;
+        const checked = await runContractChecks(rebaseChecked(checks), runner, { workingDir: checkedDir, signal: input.signal, ...(inputIntegrity === undefined ? {} : { inputIntegrity }) });
+        receiptEvidence = { findings: [], checks: checked.outcomes, ...(checked.checksSkipped === undefined ? {} : { checksSkipped: checked.checksSkipped }) };
         input.signal.throwIfAborted();
-        const provides = await inspectContractProvides(input.contract!, input.tasks ?? [], workspace.dir, { results: [...input.rows], signal: input.signal });
+        if (inputIntegrity !== undefined && actualInputExecutions !== checks.length) {
+          verifiedInputs = 0;
+          return await rejectFinal("candidate not promoted: declared check inputs changed or could not be verified in each actual check execution", { contract: receiptEvidence });
+        }
+        await verifyProtectedInputs(checkedDir, input.signal);
+        await verifyProtectedInputs(workspace.dir, input.signal);
+        if (differences(beforeChecks, await snapshot(checkedDir, input.signal)).length > 0) return await rejectFinal("checked source changed during final checks; generated deliverable changes are not allowed");
+        if (differences(beforeChecks, await snapshot(workspace.dir, input.signal)).length > 0) return await rejectFinal("candidate changed during final checks");
+        const provides = await inspectContractProvides(rebaseChecked(input.contract!), rebaseChecked(input.tasks ?? []), checkedDir, { results: [...input.rows], signal: input.signal });
         evidence = { ...provides, checks: checked.outcomes, ...(checked.checksSkipped === undefined ? {} : { checksSkipped: checked.checksSkipped }) };
-        if (checked.checksSkipped !== undefined || checked.outcomes.length !== checks.length || checked.outcomes.some(check => !check.ok)) return await reject("candidate not promoted: final integration checks failed or could not be verified", { contract: evidence });
-        if (provides.providesSkipped !== undefined || provides.findings.some(finding => !finding.present) || provides.findings.length !== (input.contract?.provides?.length ?? 0)) return await reject("candidate not promoted: declared provides are missing or uninspectable", { contract: evidence });
+        receiptEvidence = evidence;
+        if (checked.checksSkipped !== undefined || checked.outcomes.length !== checks.length || checked.outcomes.some(check => !check.ok)) return await rejectFinal("candidate not promoted: final integration checks failed or could not be verified", { contract: evidence });
+        if (provides.providesSkipped !== undefined || provides.findings.some(finding => !finding.present) || provides.findings.length !== (input.contract?.provides?.length ?? 0)) return await rejectFinal("candidate not promoted: declared provides are missing or uninspectable", { contract: evidence });
         input.signal.throwIfAborted();
         const finalDropped: Dropped = new Map();
-        final = await snapshot(workspace.dir, input.signal, finalDropped);
+        final = await snapshot(checkedDir, input.signal, finalDropped);
         const changed = differences(base, final);
         // Ignore rules keep these private, so promotion would silently lose them.
         ignoredChanges = droppedChanges(baseDropped, finalDropped);
-        const lost = await lostToIgnoreRules(changed, base, final, finalDropped, ignoredChanges, input, workspace.dir, set.baseDir, copyLimit);
-        if (lost !== undefined) return await reject(`candidate not promoted: ${lost}`, { contract: evidence, ignoredChanges: ignoredChanges.map(posixPath) });
+        const lost = await lostToIgnoreRules(changed, base, final, finalDropped, ignoredChanges, { ...input, contract: rebaseChecked(input.contract) }, checkedDir, set.baseDir, copyLimit);
+        if (lost !== undefined) return await rejectFinal(`candidate not promoted: ${lost}`, { contract: evidence, ignoredChanges: ignoredChanges.map(posixPath) });
         // Approval rules and other project agent state are operator-owned: a
         // worker cannot loosen or remove them by way of a promoted candidate.
         const agentState = changed.filter(isAgentState);
-        if (agentState.length > 0) return await reject(`candidate not promoted: it changes the project's agent state directory ${AGENT_STATE_DIR}/ (${agentState.map(p => p.split(sep).join("/")).join(", ")}); only the operator may change it`, { contract: evidence });
+        if (agentState.length > 0) return await rejectFinal(`candidate not promoted: it changes the project's agent state directory ${AGENT_STATE_DIR}/ (${agentState.map(p => p.split(sep).join("/")).join(", ")}); only the operator may change it`, { contract: evidence });
         const artifacts: ArtifactObservation[] = changed.map(path => ({ path, source: "snapshot", change: !final!.has(path) ? "deleted" : !base.has(path) ? "new" : base.get(path)?.hash === final!.get(path)?.hash ? "mode" : "modified" }));
         const dependencies = (input.contract?.requires ?? []).flatMap<ArtifactManifestDependency>((requirement, requirementIndex) => {
           const providers = (input.contract?.provides ?? []).filter(provide => provide.name === requirement.name && provide.task !== requirement.task);
           return providers.length === 0 ? [{ provider: "external", requirementIndex, status: "unknown" as const }] : providers.map(provide => ({ provider: provide.task, requirementIndex, status: "ready" as const }));
         });
-        artifactManifest = await collectArtifactManifest({ workingDir: workspace.dir, roots: [workspace.dir], artifacts, dependencies, checks: checked.outcomes.map((check, index) => ({ id: `contract:${index}`, source: "contract", status: check.ok ? "pass" : "fail" })), signal: input.signal, coverage: "snapshot" });
+        artifactManifest = await collectArtifactManifest({ workingDir: checkedDir, roots: [checkedDir], artifacts, dependencies, checks: checked.outcomes.map((check, index) => ({ id: `contract:${index}`, source: "contract", status: check.ok ? "pass" : "fail" })), signal: input.signal, coverage: "snapshot" });
         input.signal.throwIfAborted();
-        if (differences(final, await snapshot(workspace.dir, input.signal)).length > 0) throw new Error("candidate changed during final evidence collection");
+        if (differences(final, await snapshot(checkedDir, input.signal)).length > 0 || differences(final, await snapshot(workspace.dir, input.signal)).length > 0) throw new Error("candidate changed during final evidence collection");
         // No untested three-way merge. Even unrelated new user paths change
         // the tested project state and hold the entire candidate back.
         const realDropped: Dropped = new Map();
-        if (differences(base, await snapshot(set.realDir, input.signal, realDropped)).length > 0) return await reject("candidate not promoted: original project changed since its snapshot", { contract: evidence });
+        if (differences(base, await snapshot(set.realDir, input.signal, realDropped)).length > 0) return await rejectFinal("candidate not promoted: original project changed since its snapshot", { contract: evidence });
+        await verifyProtectedInputs(set.realDir, input.signal);
         // The delegate rebases absolute inputs into the candidate. Restore
         // their original identity before comparing final delivery paths;
         // relative and already-original absolute helper inputs stay guarded too.
@@ -548,7 +667,7 @@ export async function createCandidateIntegration(
             if (before !== undefined && after === undefined) throw new Error(`declared input ${path}: would remove the user's file`);
             if (before?.kind === "file") {
               if (after?.kind !== "file") throw new Error(`declared input ${path}: would remove the user's file`);
-              const beforeLines = await lineCount(join(set.baseDir, path), input.signal, copyLimit), afterLines = await lineCount(join(workspace.dir, path), input.signal, copyLimit);
+              const beforeLines = await lineCount(join(set.baseDir, path), input.signal, copyLimit), afterLines = await lineCount(join(checkedDir, path), input.signal, copyLimit);
               if (beforeLines >= 4 && afterLines * 2 < beforeLines) throw new Error(`declared input ${path}: would replace the user's file (${beforeLines} → ${afterLines} lines)`);
             }
           }
@@ -559,7 +678,7 @@ export async function createCandidateIntegration(
         // Ignored/disposable entries are never delivered or removed, so a
         // directory still holding one in the original cannot be removed.
         const kept = [...realDropped.keys()].filter(entry => removals.some(dir => entry !== dir && atOrUnder(entry, dir))).sort();
-        if (kept.length > 0) return await reject(`candidate not promoted: it deletes directories that still hold ignored or disposable entries in the original, which are never promoted or removed (${kept.map(posixPath).join(", ")}); remove them in the original first or keep the directory`, { contract: evidence, ...(ignoredChanges.length === 0 ? {} : { ignoredChanges: ignoredChanges.map(posixPath) }) });
+        if (kept.length > 0) return await rejectFinal(`candidate not promoted: it deletes directories that still hold ignored or disposable entries in the original, which are never promoted or removed (${kept.map(posixPath).join(", ")}); remove them in the original first or keep the directory`, { contract: evidence, ...(ignoredChanges.length === 0 ? {} : { ignoredChanges: ignoredChanges.map(posixPath) }) });
         const promotionSignal = AbortSignal.any([input.signal, AbortSignal.timeout(120_000)]);
         // The full inventory above proved the original still equals the
         // snapshot. Each step re-verifies only the paths it involves (the
@@ -581,7 +700,11 @@ export async function createCandidateIntegration(
           return { stat: first, parents };
         };
         // Created before the first write; removed once delivery or a full rollback completes.
-        if (changed.length > 0) journal = await openJournal();
+        if (changed.length > 0) {
+          await checkedSet.retainForRecovery?.();
+          journal = await openJournal();
+          journal.journal.checkedWorkspace = checkedDir; journal.write();
+        }
         for (const [index, path] of [...additions, ...files, ...removals].entries()) {
           promotionSignal.throwIfAborted(); await options.beforeApply?.(path, index); promotionSignal.throwIfAborted();
           const verified = await verifyPaths(withAncestors(path), expectedAt, "original project changed during candidate delivery");
@@ -589,7 +712,7 @@ export async function createCandidateIntegration(
           const step = await journal!.step(path, base.get(path), final.get(path), staged); steps.set(path, step);
           const landed = (): void => { applied.push(path); appliedSet.add(path); };
           if (base.get(path)?.kind === "directory" && !final.has(path)) { await commitGuard(path, verified); await rmdir(join(set.realDir, path)); landed(); syncDirectoryBestEffort(dirname(join(set.realDir, path))); }
-          else await writeEntry(workspace.dir, path, final.get(path), verified, landed, staged);
+          else await writeEntry(checkedDir, path, final.get(path), verified, landed, staged);
           step.status = "applied"; journal!.write();
         }
         promotionSignal.throwIfAborted();
@@ -609,7 +732,8 @@ export async function createCandidateIntegration(
               : "Promotion committed and verified, but its journal could neither be marked committed nor removed; it may still read 'promoting'. Nothing to restore: delete the journal and its .promotion-backup folder." };
           });
         }
-        return { status: "promoted", nonResumable: true, changes: changed.map(posixPath), contract: evidence, artifactManifest, ...(ignoredChanges.length === 0 ? {} : { ignoredChanges: ignoredChanges.map(posixPath) }), ...leftover };
+        const acceptanceReceipt = receipt(changed.length === 0 ? "unchanged" : "promoted");
+        return { status: "promoted", nonResumable: true, changes: changed.map(posixPath), contract: evidence, artifactManifest: attachCandidateArtifactReceipt(artifactManifest, acceptanceReceipt), acceptanceReceipt, ...(ignoredChanges.length === 0 ? {} : { ignoredChanges: ignoredChanges.map(posixPath) }), ...leftover };
       } catch (err) {
         // Roll back only bytes we still own. If a user edited a delivered
         // path, retain that edit and report it instead of overwriting it.
@@ -647,7 +771,13 @@ export async function createCandidateIntegration(
           if (rollbackConflicts.length === 0 && journalOk) await journal.remove().catch(() => undefined);
           else { journal.journal.state = "rolled-back-with-conflicts"; record(); promotionJournal = posixPath(relative(set.realDir, journal.file)); }
         }
-        return await reject(`candidate not promoted: ${err instanceof Error ? err.message : String(err)}`, { ...(evidence === undefined ? {} : { contract: evidence }), ...(artifactManifest === undefined ? {} : { artifactManifest }), ...(rollbackConflicts.length === 0 ? {} : { rollbackConflicts }), ...(promotionJournal === undefined ? {} : { promotionJournal }) });
+        if (rollbackConflicts.length > 0 && checkedSet !== undefined && checkedSet !== null) {
+          try { await checkedSet.retainForRecovery?.(); } catch { /* Recovery reporting must survive marker failure. */ }
+          retainChecked = true;
+        }
+        return await rejectFinal(`candidate not promoted: ${err instanceof Error ? err.message : String(err)}`, { ...(rollbackConflicts.length === 0 ? {} : { rollbackConflicts, retainedCheckedWorkspace: checkedDir }), ...(promotionJournal === undefined ? {} : { promotionJournal }) });
+      } finally {
+        if (!retainChecked) await checkedSet?.cleanup();
       }
     },
   };
