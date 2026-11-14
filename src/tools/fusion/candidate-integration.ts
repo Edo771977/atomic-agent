@@ -19,6 +19,7 @@ import type { ArtifactManifest, ArtifactManifestDependency, ArtifactObservation 
 import { freezeCheckInputs } from "./candidate-check-inputs.js";
 import { rebaseVerifyWorkspaceValue } from "../verify/rebase-verify-workspace.js";
 import type { CandidateAcceptanceReceipt, CandidateRejectionReason } from "./candidate-acceptance.js";
+import type { JournalEntry, PromotionJournalStep, PromotionJournal } from "./promotion-recovery.js";
 
 interface Entry { kind: "file" | "symlink" | "directory"; mode: number; hash?: string }
 type Inventory = Map<string, Entry>;
@@ -226,29 +227,8 @@ function differences(a: Inventory, b: Inventory): string[] {
 }
 
 /** What a promotion journal records about one entry (see the fusion README for recovery). */
-interface JournalEntry { kind: Entry["kind"]; mode: number; sha256?: string; linkTarget?: string }
-interface PromotionJournalStep {
-  path: string;
-  action: "write" | "delete" | "mkdir" | "rmdir";
-  /** `intent` is written before the change, `applied` after it. */
-  status: "intent" | "applied" | "not-applied" | "rolled-back" | "rollback-conflict";
-  original: JournalEntry | null;
-  promoted: JournalEntry | null;
-  /** Pre-image bytes of a modified or deleted file, relative to the merge folder. */
-  backup?: string;
-  /** Temp name (relative to the project) the new file or symlink is staged under before its rename; remove it if it is left behind. */
-  temp?: string;
-}
-interface PromotionJournal {
-  version: 1; candidate: string; project: string; startedAt: string;
-  /** Private checked source, retained across a hard stop until recovery completes. */
-  checkedWorkspace?: string;
-  /** `committed`: every step landed and was verified; nothing to undo, delete the journal. */
-  state: "promoting" | "committed" | "rolling-back" | "rolled-back-with-conflicts";
-  recovery: string;
-  steps: PromotionJournalStep[];
-}
-const JOURNAL_RECOVERY = "If state is 'committed', delivery completed and was verified: change nothing, just delete this journal and its backup folder. Otherwise steps run in order. 'applied' paths hold the promoted entry; an 'intent' path may hold either. To undo, restore each such path from 'original': a file from 'backup' with its mode, a symlink from 'linkTarget', a directory with its mode; remove the path if 'original' is null. Verify sha256 before trusting a backup. Delete any step's leftover 'temp' file (an .atag-candidate-* staging copy), then this journal and its backup folder.";
+// Shared with the explicit, validated operator recovery command.
+const JOURNAL_RECOVERY = "Inspect with atomic-agent fusion recover <journal> --project <project> (read-only by default), preview with --dry-run, and explicitly use --rollback to restore verified pre-images while preserving later user edits. Committed delivery cannot be rolled back. Unknown versions or incomplete legacy journals require manual inspection. Completed rollback retains its terminal journal and backups. No automatic recovery runs at startup.";
 
 export interface CandidateIntegrationReport {
   acceptanceReceipt?: CandidateAcceptanceReceipt;
@@ -502,15 +482,15 @@ export async function createCandidateIntegration(
    * A durable record of promotion under the original's merge folder: every
    * step is journaled with its original entry (and pre-image bytes of a
    * modified or deleted file) before it is applied, and marked after, so
-   * a hard stop mid-delivery leaves enough to restore by hand.
+   * a hard stop mid-delivery leaves enough for explicit operator recovery.
    */
-  const openJournal = async (): Promise<{ journal: PromotionJournal; file: string; backups: string; write(): void; step(path: string, original: Entry | undefined, promoted: Entry | undefined, temp?: string): Promise<PromotionJournalStep>; remove(): Promise<void> }> => {
+  const openJournal = async (checkedRoot: string): Promise<{ journal: PromotionJournal; file: string; backups: string; write(): void; step(path: string, original: Entry | undefined, promoted: Entry | undefined, temp?: string): Promise<PromotionJournalStep>; remove(): Promise<void> }> => {
     const merge = await ensureMergeDir(set.realDir);
     // ensureMergeDir may have just created `.atomic-agent/` and its merge
     // folder: flush those new directory entries before relying on them.
     syncDirectoryBestEffort(set.realDir); syncDirectoryBestEffort(dirname(merge)); syncDirectoryBestEffort(merge);
     const file = join(merge, `${id}.promotion.json`), backups = join(merge, `${id}.promotion-backup`);
-    const journal: PromotionJournal = { version: 1, candidate: id, project: set.realDir, startedAt: new Date().toISOString(), state: "promoting", recovery: JOURNAL_RECOVERY, steps: [] };
+    const journal: PromotionJournal = { version: 2, candidate: id, project: set.realDir, startedAt: new Date().toISOString(), ownerPid: process.pid, state: "promoting", recovery: JOURNAL_RECOVERY, steps: [] };
     const write = (): void => {
       const tmp = `${file}.tmp`;
       writeFileSyncedSync(tmp, `${JSON.stringify(journal, null, 2)}\n`, { mode: 0o600 });
@@ -537,7 +517,10 @@ export async function createCandidateIntegration(
           syncDirectoryBestEffort(backups);
         }
         const link = original?.kind === "symlink" ? await readlink(join(set.baseDir, path)) : undefined;
-        const step: PromotionJournalStep = { path: posixPath(path), action, status: "intent", original: describe(original, link), promoted: describe(promoted), ...(backup === undefined ? {} : { backup: posixPath(backup) }), ...(temp === undefined ? {} : { temp: posixPath(temp) }) };
+        const promotedLink = promoted?.kind === "symlink" ? await readlink(join(checkedRoot, path)) : undefined;
+        if (promotedLink !== undefined && createHash("sha256").update(promotedLink).digest("hex") !== promoted?.hash) throw new Error(`candidate changed before journaling: ${path}`);
+        const promotedEntry = describe(promoted, promotedLink);
+        const step: PromotionJournalStep = { path: posixPath(path), action, status: "intent", original: describe(original, link), promoted: promotedEntry, ...(backup === undefined ? {} : { backup: posixPath(backup) }), ...(temp === undefined || promotedEntry === null ? {} : { temp: posixPath(temp), tempEntry: promotedEntry }) };
         journal.steps.push(step); write();
         return step;
       },
@@ -713,7 +696,7 @@ export async function createCandidateIntegration(
         // Created before the first write; removed once delivery or a full rollback completes.
         if (changed.length > 0) {
           await checkedSet.retainForRecovery?.();
-          journal = await openJournal();
+          journal = await openJournal(checkedDir);
           journal.journal.checkedWorkspace = checkedDir; journal.write();
         }
         for (const [index, path] of [...additions, ...files, ...removals].entries()) {
@@ -769,7 +752,7 @@ export async function createCandidateIntegration(
             else {
               // Restoring a file or symlink stages a temp too: journal it first.
               const staged = base.get(path)?.kind === "file" || base.get(path)?.kind === "symlink" ? tempFor(path) : undefined;
-              if (step !== undefined && staged !== undefined) { step.temp = posixPath(staged); journalOk = record() && journalOk; }
+              if (step !== undefined && staged !== undefined) { step.temp = posixPath(staged); step.tempEntry = step.original ?? undefined; journalOk = record() && journalOk; }
               await writeEntry(set.baseDir, path, base.get(path), live, undefined, staged);
             }
             if (step !== undefined) step.status = "rolled-back";
@@ -780,7 +763,7 @@ export async function createCandidateIntegration(
         if (journal !== undefined) {
           // Fully restored: nothing left to recover. Otherwise keep the record.
           if (rollbackConflicts.length === 0 && journalOk) await journal.remove().catch(() => undefined);
-          else { journal.journal.state = "rolled-back-with-conflicts"; record(); promotionJournal = posixPath(relative(set.realDir, journal.file)); }
+          else { journal.journal.state = "rolled-back-with-conflicts"; journal.journal.ownerPid = null; record(); promotionJournal = posixPath(relative(set.realDir, journal.file)); }
         }
         if (rollbackConflicts.length > 0 && checkedSet !== undefined && checkedSet !== null) {
           try { await checkedSet.retainForRecovery?.(); } catch { /* Recovery reporting must survive marker failure. */ }

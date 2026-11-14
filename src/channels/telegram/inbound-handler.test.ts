@@ -218,6 +218,20 @@ describe("handleInboundText", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
+  it("delivers budget advice once to its owning chat before the reply", async () => {
+    const notice = { type: "budget_notice", sessionId: "s-1", providerId: "cloud", reason: "meter", text: "Budget uses reported cost only." } as const;
+    const { runtime } = makeFakeRuntime({ scripts: [{ events: [notice, notice, { ...notice, sessionId: "other", text: "Private other chat" },
+      { type: "llm_event", event: { type: "assistant_reply", text: "done" } }] }] });
+    const api = makeFakeApi();
+    const ctx = makeContext(runtime, api, pointer, OWNER, join(dir, "inbox"));
+    await handleInboundText(makeUpdate("hello"), ctx);
+    const advice = api.sent.filter(message => message.text === notice.text);
+    expect(advice).toHaveLength(1);
+    expect(advice[0]?.chatId).toBe(CHAT);
+    expect(api.sent.some(message => message.text === "Private other chat")).toBe(false);
+    expect(api.sent.at(-1)?.text).toBe("done");
+  });
+
   it("drops group-chat messages when the bot identity is unknown", async () => {
     // Without `getMe` there is no way to tell whether a group message
     // was addressed to us, so the safe answer is to stay quiet.

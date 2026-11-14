@@ -153,6 +153,8 @@ import { readFusionWorkerMeta } from "../../session/fusion-worker-session.js";
 import { createTaskPermitPool, type TaskPermit } from "./task-permits.js";
 import { VERIFY_COPY_MAX_BYTES } from "../verify/verify-workspace-copy.js";
 import { createContractCheckHold } from "./contract-check-hold.js";
+import type { ShellGuardPolicy } from "../os/shell-command-guard/index.js";
+import type { CommandReadCheck, ReadTargetCheck } from "../read-scope/confine-reads.js";
 
 export const FUSION_DELEGATE_TOOL = "fusion.delegate";
 
@@ -169,6 +171,10 @@ export interface FusionDelegateDeps extends WorkerRunnerDeps {
    * `false` to exercise the fan-out without a gate.
    */
   approvalRequired: boolean;
+  /** Shared pre-exec verification policy; installed by runtime composition. */
+  shellPolicy?: ShellGuardPolicy;
+  checkCommandReads?: CommandReadCheck;
+  checkReadTargets?: ReadTargetCheck;
   slotManager: Pick<SlotManager, "poolSize">;
   /** Live read — the operator can leave fusion mid-turn. */
   resolveRunMode: () => ResolvedRunMode;
@@ -391,6 +397,7 @@ export function buildFusionDelegateTool(
       // staging: the same `tools.verify.maxCopyBytes` that bounds
       // `verify.run`'s workspace copy.
       const copyLimitBytes = getConfig().tools?.verify?.maxCopyBytes ?? VERIFY_COPY_MAX_BYTES;
+      const gitObjectLimitBytes = getConfig().tools?.verify?.maxGitObjectBytes ?? VERIFY_COPY_MAX_BYTES;
       const workerProviderId = mode.workerProviderId;
       if (mode.effective !== "fusion" || workerProviderId === null) {
         return error(
@@ -958,7 +965,7 @@ export function buildFusionDelegateTool(
         try {
           const remaining = capped ? turnBudget.timeLeftMs(ctx.sessionId, limits) : undefined;
           const signal = remaining === undefined ? ctx.signal : AbortSignal.any([ctx.signal, AbortSignal.timeout(Math.max(0, remaining))]);
-          candidate = await createCandidateIntegration(candidateOriginalDir, { signal, maxCopyBytes: copyLimitBytes, checkInputs: parsed.contract?.checkInputs });
+          candidate = await createCandidateIntegration(candidateOriginalDir, { signal, maxCopyBytes: copyLimitBytes, maxGitObjectBytes: gitObjectLimitBytes, checkInputs: parsed.contract?.checkInputs });
         } catch (err) {
           return error(`candidate integration could not stage a private workspace: ${err instanceof Error ? err.message : String(err)}`, { reason: "candidate-staging-failed", nonResumable: true });
         }
@@ -1129,9 +1136,16 @@ export function buildFusionDelegateTool(
         sessionId: ctx.sessionId,
         // The operator's project, not a candidate copy: rules and the prompt name it.
         workingDir: candidateOriginalDir,
+        sourceWorkingDir: ctx.workingDir,
         tool: FUSION_DELEGATE_TOOL,
         checks: parsed.contract?.checks ?? [],
         signal: runSignal,
+        ...(deps.shellPolicy === undefined ? {} : { shellPolicy: deps.shellPolicy }),
+        ...(deps.checkCommandReads === undefined ? {} : { checkCommandReads: deps.checkCommandReads }),
+        ...(deps.checkReadTargets === undefined ? {} : { checkReadTargets: deps.checkReadTargets }),
+        ...(deps.knownSecrets === undefined ? {} : { knownSecrets: collectKnownSecrets() }),
+        ...(ctx.readRoots === undefined ? {} : { readRoots: ctx.readRoots }),
+        checkInputs: parsed.contract?.checkInputs ?? [],
       });
       const heldRunChecks = checkHold.runner;
       // Escalation and judge calls name the delegating session, so they
@@ -1405,7 +1419,7 @@ export function buildFusionDelegateTool(
           realDir: ctx.workingDir,
           tasks,
           writeScope,
-          options: { maxCopyBytes: copyLimitBytes },
+          options: { maxCopyBytes: copyLimitBytes, maxGitObjectBytes: gitObjectLimitBytes },
           inputs: contract?.inputs ?? [],
           ...(contract?.provides === undefined ? {} : { provides: contract.provides }),
           run: (rebased, taskWorkspace) =>
@@ -1643,7 +1657,11 @@ export function buildFusionDelegateTool(
                 : { parentContract: parsed.contract }),
               workerMaxSteps: mode.workerMaxSteps,
               workerTimeoutMs: mode.workerTimeoutMs,
-              runChildren: (children, childContract, suffix) => {
+              runChildren: async (children, childContract, suffix) => {
+                // The proposal's complete check contract must be described and
+                // approved before a child can execute even an own self-check.
+                const held = await checkHold.decide(runSignal, childContract?.checks ?? []);
+                if (held !== undefined) return children.map(child => ({ ...notStartedResult(child, held), status: "needs_orchestrator" as const }));
                 // A split stays on the leg its parent ran on and is billed at.
                 for (const child of children) {
                   const parentId = tree.parentOf(child.id);
@@ -1671,9 +1689,10 @@ export function buildFusionDelegateTool(
                       : { knownSecrets: collectKnownSecrets() }),
                   },
                 );
-                const failedChecks = checks.outcomes
-                  .filter((o) => o.task === undefined && !o.ok)
-                  .map((o) => o.detail);
+                const failedChecks = [
+                  ...checks.outcomes.filter((o) => o.task === undefined && !o.ok).map((o) => o.detail),
+                  ...(checks.checksSkipped === undefined ? [] : [checks.checksSkipped]),
+                ];
                 return {
                   rows: applyCheckOutcomes(
                     applyContractFindings(rows, provides.findings),

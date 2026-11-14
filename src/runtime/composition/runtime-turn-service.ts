@@ -33,6 +33,7 @@ import type { GoalSpec, GoalState } from "../../agent/goal/index.js";
 import { createRuntimeGoalRunner } from "./runtime-goal.js";
 import { routeTurnProvider } from "./runtime-turn-router.js";
 import { answerChannelForOrigin, type AnswerChannel } from "../../prompt/answer-style.js";
+import type { RequestBudgetNotices } from "../request-budget-notices.js";
 
 export function prepareRuntimeTurnState() {
   /**
@@ -93,6 +94,7 @@ export interface RuntimeTurnDependencies {
     fallbackChain: Pick<ProviderFallbackChain, "standingOverrideFor" | "setTurnPrimary">;
     /** True when today's spend ceiling refuses a paid link now (ATO-649); the router passes over it. */
     dailyLimitRefuses?: (providerId: string) => boolean;
+    budgetNotices?: RequestBudgetNotices;
   };
   traces: Pick<RuntimeTraces, "ensureRecorder" | "pinSession" | "readContextUsage" | "clearContextUsage" | "releaseSession">;
   telemetry: {
@@ -386,6 +388,7 @@ export function createRuntimeTurnService(
     });
     if (worker) {
       return turnContext.run({ sessionId: session.id }, async () => {
+        const unbindBudgetNotices = deps.inference.budgetNotices?.bind(session.id, worker.parentSessionId);
         try {
           // The worker's request is its brief: the operator's words sit
           // in its ORIGINAL REQUEST block, which is what the input guard
@@ -408,6 +411,7 @@ export function createRuntimeTurnService(
             ...buildLoopTurnBudget(runOptions),
           });
         } finally {
+          unbindBudgetNotices?.();
           turnRequests.delete(session.id);
           turnPreviousReplies?.delete(session.id);
           // The prompt_captured hook still records the worker's window
@@ -506,6 +510,7 @@ export function createRuntimeTurnService(
       // transcript after every completed step (ATO-1109).
       const progress = turnProgressFor(userMessage, runOptions, Date.now());
       markTurnRunning(session.id, progress.initial);
+      const closeBudgetNotices = deps.inference.budgetNotices?.begin(session.id);
       try {
         turnModelModes.set(session.id, modelModePolicy);
         // Recorded for `fusion.delegate`, which quotes it to the workers.
@@ -596,6 +601,7 @@ export function createRuntimeTurnService(
         releaseThrownTurn(session, err, runOptions.signal);
         throw err;
       } finally {
+        closeBudgetNotices?.();
         inFlight.end();
         turnModelModes.delete(session.id);
         // The turn is over, however it ended: the shell jobs it started

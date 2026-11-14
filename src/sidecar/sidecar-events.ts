@@ -24,6 +24,7 @@ export type HostRequestType =
   | "ping";
 
 export type SidecarEventType =
+  | "budget_notice"
   | "compaction_started"
   | "compaction_progress"
   | "compaction_completed"

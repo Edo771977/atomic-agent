@@ -131,6 +131,58 @@ describe("runtime tool assembly phases and live MCP catalog", () => {
     } finally { shellJobs.endAll(); notesStore.close(); profileStore.close(); }
   });
 
+  function verificationRegistry(gate: ApprovalGate) {
+    const config = getConfig(); config.browser.enabled = false; config.web.search.persistCache = false;
+    const profileStore = new ProfileStore({ dbFile: join(directory, "verify-profile.sqlite") });
+    const notesStore = new MemoryStore({ dbFile: join(directory, "verify-notes.sqlite"), maxEntries: 20 });
+    const shellJobs = new osTools.ShellJobRegistry({ jobMaxMs: 1000, maxJobs: 2 });
+    const dangerous = { approvals: gate, approvalRequired: true };
+    const registry = createRuntimeToolRegistry(config, backend, dangerous);
+    registerRuntimeCoreTools({ config, toolRegistry: registry, dangerous, logger,
+      sessionStore: { listRecentWorkingDirs: () => [], listSummaryPage: () => [], listChatLines: () => [] },
+      resolveOriginalRequest: () => undefined, declaredInputs: new osTools.DeclaredInputsRegistry(), shellJobs,
+      skillRegistry: new SkillRegistry({ globalDir: join(directory, "skills"), projectDir: null }), profileStore, notesStore });
+    return { config, registry, close: () => { shellJobs.endAll(); notesStore.close(); profileStore.close(); } };
+  }
+
+  it("keeps configured custom verification credentials private after live config changes", async () => {
+    const prompts: import("../../approval/approval-gate.js").ApprovalRequest[] = [];
+    const gate: ApprovalGate = new ApprovalGate({ level: 1, emit: req => { prompts.push(req); queueMicrotask(() => gate.resolve({ approvalId: req.approvalId, approved: false })); } });
+    const config = getConfig(); config.localModels.apiKey = "InitialCustomCredential126AB";
+    const f = verificationRegistry(gate);
+    try {
+      const current = "RotatedCustomCredential847XY"; config.localModels.apiKey = current;
+      await f.registry.get("verify.run").run({ kind: "command", cmd: "node", args: ["safe.js", current] }, { workingDir: directory, sessionId: "verify-sdk", stepIndex: 0, signal: new AbortController().signal }).catch(() => undefined);
+      expect(prompts).toEqual([]);
+      expect(gate.pendingCount()).toBe(0);
+    } finally { f.close(); }
+  });
+
+  it.each(["page", "command-cwd"] as const)("threads canonical verification read policy for %s through registration", async kind => {
+    const prompts: import("../../approval/approval-gate.js").ApprovalRequest[] = [];
+    const gate: ApprovalGate = new ApprovalGate({ level: 1, emit: req => { prompts.push(req); queueMicrotask(() => gate.resolve({ approvalId: req.approvalId, approved: false })); } });
+    const f = verificationRegistry(gate);
+    try {
+      const { dirname, basename } = await import("node:path");
+      const spec = kind === "page" ? { kind: "page", path: f.config.paths.userConfigFile } : { kind: "command", cmd: "node", args: [basename(f.config.paths.userConfigFile)], cwd: basename(directory) };
+      await f.registry.get("verify.run").run(spec, { workingDir: kind === "page" ? directory : dirname(directory), sessionId: "verify-sdk", stepIndex: 0, signal: new AbortController().signal }).catch(() => undefined);
+      expect(prompts.map(p => p.category)).toEqual(["state_secret"]);
+    } finally { f.close(); }
+  });
+
+  it("keeps embedded verification read policy single when legacy confinement installs", async () => {
+    const prompts: string[] = [];
+    const gate: ApprovalGate = new ApprovalGate({ level: 1, emit: req => { prompts.push(req.category); queueMicrotask(() => gate.resolve({ approvalId: req.approvalId, approved: req.category === "state_secret" })); } });
+    const f = verificationRegistry(gate);
+    try {
+      const before = f.registry.get("verify.run").run;
+      readScope.confineReads(f.registry, { approvals: { approvals: gate, approvalRequired: true }, grantedDirs: () => [], readScope: () => "working-dir", stateSecrets: { stateDir: f.config.paths.stateDir, files: getStateSecretPaths(f.config.paths) } });
+      expect(f.registry.get("verify.run").run).toBe(before);
+      await f.registry.get("verify.run").run({ kind: "command", cmd: "node", args: [f.config.paths.userConfigFile] }, { workingDir: directory, sessionId: "verify-sdk", stepIndex: 0, signal: new AbortController().signal }).catch(() => undefined);
+      expect(prompts).toEqual(["state_secret", "shell"]);
+    } finally { f.close(); }
+  });
+
   it("hands the terminal UI's Exa key advice to the OS tools (ATO-345)", () => {
     const config = getConfig(); config.browser.enabled = false; config.web.search.persistCache = false;
     const profileStore = new ProfileStore({ dbFile: join(directory, "profile.sqlite") });
@@ -504,5 +556,42 @@ describe("runtimeKnownSecrets (ATO-1077)", () => {
       { label: "mcp-gh-GITHUB_TOKEN", value: "Gg1Hh2Ii3Jj4" },
       { label: "mcp-remote-header", value: "Rr1Ss2Tt3Uu4" },
     ]);
+  });
+});
+
+describe("fusion escalation budget notice ownership", () => {
+  it.each(["soft", "meter", "clamp"] as const)("observes %s advice on the parent and suppresses repeated/late notices", async reason => {
+    const { RequestBudgetNotices } = await import("../request-budget-notices.js");
+    const directory = await mkdtemp(join(tmpdir(), "catalog-budget-notice-"));
+    try {
+      const config = getConfig(), toolRegistry = new ToolRegistry();
+      const approvals = new ApprovalGate({ emit: () => {}, level: 5 });
+      const builder = vi.spyOn(fusionTools, "buildFusionDelegateTool");
+      const events: Array<{ owner: string; reason?: string }> = [];
+      const notices = new RequestBudgetNotices((owner, event) => { if (event.type === "budget_notice") events.push({ owner, reason: event.reason }); });
+      const close = notices.begin("parent");
+      const finish = vi.fn();
+      const scope: import("../request-budget.js").RequestBudgetScope = {
+        softBound: false, finish, onResponse: () => {},
+        beforeSend: () => { scope.hint = `fixture ${reason}`; scope.hintReason = reason; },
+      };
+      const observeScope = vi.fn((id: string, request: import("../../llm/provider/completion-types.js").CompletionRequest) => notices.observeScope(id, request, scope));
+      const provider = { complete: vi.fn(async (request: import("../../llm/provider/completion-types.js").CompletionRequest) => {
+        request.requestBudget?.beforeSend({}); request.requestBudget?.beforeSend({});
+        return { content: "fixture", modelId: "fixture" };
+      }) };
+      registerRuntimeFusionAndReadScope({ config, toolRegistry, approvals, dangerous: { approvals, approvalRequired: false }, declaredInputs: new osTools.DeclaredInputsRegistry(),
+        resolveOriginalRequest: () => undefined, runTurn: async () => externalOperation(), createEphemeralSession: () => createEmptySessionState({ id: "worker", workingDir: directory }),
+        prepareLocalLink: async () => {}, emitAgentLoopEventFor: () => {}, resolveCurrentRunMode: () => resolveRunMode(resolveLlmConfig(config)),
+        providerRegistry: { getProvider: () => provider as never }, llama: { measuredTokensPerSecond: () => null, fetchSlots: async () => ({ slots: [] }), probeHealth: async () => "answered" as const },
+        slotManager: { poolSize: () => 2 }, workingDir: directory, logger, dailySpendLimit: { enforce: () => {}, budget: undefined, observeScope } });
+      const wired = builder.mock.calls.at(-1)?.[0];
+      if (!wired?.escalationComplete) throw new Error("escalation seam missing");
+      const request = { providerId: "cloud", prompt: "fixture", maxOutputTokens: 100, signal: new AbortController().signal, sessionId: "parent" };
+      await wired.escalationComplete(request); await wired.escalationComplete(request);
+      expect(observeScope).toHaveBeenCalledWith("cloud", expect.objectContaining({ sessionId: "parent" }), undefined);
+      expect(events).toEqual([{ owner: "parent", reason }]); expect(finish).toHaveBeenCalledTimes(2);
+      close(); scope.beforeSend({}); expect(events).toHaveLength(1);
+    } finally { vi.restoreAllMocks(); await rm(directory, { recursive: true, force: true }); }
   });
 });

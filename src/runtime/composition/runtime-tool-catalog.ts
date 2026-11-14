@@ -13,7 +13,8 @@ import { resolveLlmConfig } from "../../llm/provider/index.js";
 import type { ResolvedRunMode } from "../../llm/run-mode/index.js";
 import { visionCapableAlternatives } from "../../llm/provider/model-vision.js";
 import { resolveModelPricingFor } from "../resolve-model-pricing.js";
-import { createRequestBudgetScope } from "../request-budget.js";
+import { createRequestBudgetScope, type RequestBudgetScope } from "../request-budget.js";
+import type { CompletionRequest } from "../../llm/provider/completion-types.js";
 import type { DailySpendBudget } from "../daily-spend-budget.js";
 import type { ModelProfile } from "../../llm/model-profile.js";
 import type { SlotManager } from "../../llm/slot-manager.js";
@@ -48,6 +49,8 @@ import type { AnalyticsClient } from "../../analytics/analytics-client.js";
 import { buildFusionDelegateTool, readSlotOccupancy, type ContractCheckRunner, type FusionDelegateDeps } from "../../tools/fusion/index.js";
 import {
   confineReads,
+  createCommandReadCheck,
+  createReadTargetCheck,
   localPageCheck,
   type ConfineReadsOptions,
 } from "../../tools/read-scope/index.js";
@@ -259,6 +262,9 @@ export function registerRuntimeCoreTools(input: {
   registerVerifyTools(toolRegistry, {
     ...dangerous,
     config: { browser: config.browser, tools: { verify: config.tools.verify } },
+    checkCommandReads: createCommandReadCheck(runtimeReadConfinement(config, dangerous)),
+    checkReadTargets: createReadTargetCheck(runtimeReadConfinement(config, dangerous)),
+    resolveKnownSecrets: () => runtimeKnownSecrets(getConfig()),
     // The same guard policy as `os.shell.run`: a `git push` started by
     // verify.run obeys the remote-sync switch too (ATO-1266).
     shellPolicy: {
@@ -754,7 +760,9 @@ export function registerRuntimeFusionAndReadScope(input: {
    * holds and settles on. The seam never sees these calls, so nothing
    * counts them twice.
    */
-  dailySpendLimit?: { enforce(providerId: string): void; budget: DailySpendBudget | undefined };
+  dailySpendLimit?: { enforce(providerId: string): void; budget: DailySpendBudget | undefined;
+    observeScope?(providerId: string, request: CompletionRequest, scope: RequestBudgetScope | undefined): RequestBudgetScope | undefined;
+  };
   liveWorkers?: FusionDelegateDeps["liveWorkers"];
   steerWorker?: FusionDelegateDeps["steerWorker"];
   orchestratorTurnSpendUsd?: FusionDelegateDeps["orchestratorTurnSpendUsd"];
@@ -915,9 +923,10 @@ export function registerRuntimeFusionAndReadScope(input: {
         const turnLimited = sessionId !== undefined && turnBudget?.requestLimits(sessionId) !== undefined;
         const resolvedForBudget = turnLimited || dailyBudget !== undefined ? resolveLlmConfig(getConfig()) : undefined;
         const entryForBudget = resolvedForBudget?.providers.find(p => p.id === providerId);
-        const scope = resolvedForBudget === undefined ? undefined : createRequestBudgetScope(turnLimited ? turnBudget : undefined, { ...request, sessionId }, provider, entryForBudget,
+        const baseScope = resolvedForBudget === undefined ? undefined : createRequestBudgetScope(turnLimited ? turnBudget : undefined, { ...request, sessionId }, provider, entryForBudget,
           resolveModelPricingFor(resolvedForBudget, provider.chatModelId ?? entryForBudget?.defaultChatModel ?? entryForBudget?.model ?? null, providerId),
           dailyBudget);
+        const scope = dailySpendLimit?.observeScope?.(providerId, { ...request, sessionId }, baseScope) ?? baseScope;
         let result: Awaited<ReturnType<typeof provider.complete>> | undefined;
         try {
           result = await provider.complete({ ...request, ...(scope === undefined ? {} : { requestBudget: scope, signal: scope.signal ?? signal }) });
@@ -1010,8 +1019,12 @@ export function registerRuntimeFusionAndReadScope(input: {
           workingDir: ctx.workingDir,
           signal: ctx.signal,
           config,
+          shellPolicy: { isGitRemoteSyncEnabled: () => getConfig().git.remoteSync },
           ...(ctx.inputIntegrity === undefined ? {} : { inputIntegrity: ctx.inputIntegrity }),
         }), { supportsInputIntegrity: true as const }),
+      shellPolicy: { isGitRemoteSyncEnabled: () => getConfig().git.remoteSync },
+      checkCommandReads: createCommandReadCheck(runtimeReadConfinement(config, dangerous)),
+      checkReadTargets: createReadTargetCheck(runtimeReadConfinement(config, dangerous)),
       // `verify.syntax`'s own checker: the delegate syntax-checks every
       // green row's changed files itself, so the orchestrator does not
       // spend a step (and its context) on it after each fan-out.

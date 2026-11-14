@@ -62,12 +62,16 @@ import { shouldAdvance } from "./should-advance.js";
  * outage. Every billing refusal ends the turn without the outage wait.
  *
  * **The same for the day's spend ceiling** (`isSpendLimitRefusal`,
- * ATO-649): a paid link refused before anything was sent. With
+ * ATO-649): a paid link refused before anything was sent. Once the
+ * allowance is exhausted, with
  * `onDailyLimit: "stop"` (default) `shouldAdvance` says no and the
  * refusal is thrown as is: no other link is tried. With `"local"` the
  * chain advances to the next link, which is how an over-budget turn
  * lands on the local model; with no link left the turn ends on the
  * limit's sentence.
+ * When only this request's bound exceeds a positive allowance, either
+ * policy may try the remaining configured links, each with its own
+ * admission. Such a refusal never records a provider-health failure.
  *
  * Every thrown error also carries the id of the link that threw it
  * (`attachFailingLink`), for the hosts that say which link a parked turn

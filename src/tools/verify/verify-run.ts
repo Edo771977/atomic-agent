@@ -15,27 +15,20 @@
  * before anything runs, at every level; a `dangerous.*` match asks as
  * `shell_dangerous`, which no fan-out scope and no `shell` grant covers.
  */
-import {
-  requireApproval,
-  savedRuleOverridesScope,
-  type DangerousToolOptions,
-} from "../../approval/dangerous-tool.js";
+import { authorizeVerifyBatch, maskVerificationSecrets, VerifyGuardRefusal, type VerifyAuthorizationOptions } from "./verify-authorization.js";
+import { markToolReadPolicy } from "../read-scope/confine-reads.js";
+import type { KnownSecret } from "../../error-reporting/secret-detector.js";
 import type { CompressedToolResult } from "../../compressor/result-compressor.js";
 import type { ShellGuardPolicy } from "../os/shell-command-guard/index.js";
 import type { ToolDefinition } from "../tool-registry.js";
 import type { BrowserLauncher } from "./run-page-kind.js";
 import { runVerify, type VerifyRunConfig, type VerifyRunContext } from "./run-verify.js";
 import { parseVerifyRunArgs, type VerifyRunArgs } from "./verify-run-args.js";
-import { needsShellInterpretation } from "../os/shell/shell-interpretation.js";
-import {
-  shellRuleSegments,
-  shellRunsUnreadableScript,
-} from "../os/shell/shell-command-argv.js";
-import { guardVerifyRun, verifyRunCommands } from "./verify-run-guard.js";
-
 export const VERIFY_RUN_TOOL = "verify.run";
 
-export interface VerifyRunToolOptions extends DangerousToolOptions {
+export interface VerifyRunToolOptions extends VerifyAuthorizationOptions {
+  /** Live canonical runtime credentials, including configured custom keys. */
+  resolveKnownSecrets?: () => readonly KnownSecret[];
   /** Browser settings and `tools.verify.maxCopyBytes`. */
   config: VerifyRunConfig;
   /**
@@ -63,7 +56,7 @@ export function describeVerifyRun(args: VerifyRunArgs): string {
 }
 
 export function buildVerifyRunTool(options: VerifyRunToolOptions): ToolDefinition {
-  return {
+  const definition: ToolDefinition = {
     name: VERIFY_RUN_TOOL,
     description:
       "Run a check against a throwaway copy of the working directory; refuses execution if the copy is unavailable (may require approval). Shared dependency directories and user symlinks retain their targets; the copy does not confine process writes. kind 'command': any test runner, compiler or script ({cmd, args}). kind 'service': {start:{cmd,args}, ready:{port|url}, requests:[{method,path|url,body,expectStatus,expectBody}]}. kind 'page': a local HTML file ({path}) or {url} in a headless browser (with {start, url} the server is started first and the page opens once `ready` passes, by default when the url answers 2xx): {script:[{action:click|key|type|wait,…}]}, then `seconds` of runtime with `probes:[{name, expr}]` sampled every 250 ms; collects uncaught errors, console errors, failed getElementById/querySelector lookups. `checks`: `exit 0`, `exit != 0`, `stdout contains \"x\"`, `stderr not contains \"x\"`, `status 200`, `no errors`, `missing selectors 0`, `probe <name> decreases|increases|equals <v>|reaches <v>|stays <v>`. `network` defaults to false (a proxy-based soft block, not a sandbox). Results are capped: output tails of 8,000 chars, summary of 4,000.",
@@ -77,80 +70,24 @@ export function buildVerifyRunTool(options: VerifyRunToolOptions): ToolDefinitio
         return { tool: VERIFY_RUN_TOOL, status: "error", summary: message, details: { error: message }, truncated: false };
       }
       const description = describeVerifyRun(args);
-      // Same pre-exec guard as `os.shell.run` (ATO-1266): the copy takes
-      // the writes inside it, not `rm -rf ~` or `sudo`.
-      const guard = guardVerifyRun(args, ctx.workingDir, options.shellPolicy);
-      if (guard.blocked !== null) {
-        const { verdict } = guard.blocked;
-        const message = `verify.run: blocked by shell guard: ${verdict.rule} - ${verdict.reason}`;
-        return {
-          tool: VERIFY_RUN_TOOL,
-          status: "error",
-          summary: message,
-          details: {
-            error: message,
-            description,
-            guardVerdict: verdict.action,
-            guardRule: verdict.rule,
-            guardReason: verdict.reason,
-          },
-          truncated: false,
-        };
-      }
-      const dangerous = guard.dangerous.length > 0;
-      // A fan-out's directory covers ordinary checks, never a dangerous
-      // command: the operator approved a directory of work, not those.
-      const commandSegments = verifyRunCommands(args).flatMap((command) =>
-        shellRuleSegments(
-          command.cmd,
-          command.args,
-          needsShellInterpretation(command.cmd, command.args),
-        ),
-      );
-      const commandUnreadable = verifyRunCommands(args).some((command) =>
-        shellRunsUnreadableScript(
-          command.cmd,
-          command.args,
-          needsShellInterpretation(command.cmd, command.args),
-        ),
-      );
-      // Not after outside content either (`agent.taintReview`), as in os.shell.run.
-      const scopedByFanout =
-        !dangerous &&
-        !(options.approvals.holdsForOutsideContent?.(ctx.sessionId, "shell") ?? false) &&
-        (options.approvals.fanoutScopes?.allows(ctx.sessionId, [ctx.workingDir]) ?? false) &&
-        !savedRuleOverridesScope(options.approvals, {
-          sessionId: ctx.sessionId,
-          tool: VERIFY_RUN_TOOL,
-          category: "shell",
-          commandSegments,
-          ...(commandUnreadable ? { commandUnreadable } : {}),
-          affectedResources: [ctx.workingDir],
-          workdir: ctx.workingDir,
-        });
-      if (!scopedByFanout) {
-        const reason = dangerous
-          ? `${guard.dangerous.map((c) => c.verdict.reason).join("; ")} — verify (${args.kind}) in a throwaway copy of ${ctx.workingDir}; the copy is not a sandbox`
-          : `verify (${args.kind}) in a throwaway copy of ${ctx.workingDir}`;
-        await requireApproval(
-          options,
-          {
-            sessionId: ctx.sessionId,
-            tool: VERIFY_RUN_TOOL,
-            category: dangerous ? "shell_dangerous" : "shell",
-            reason,
-            preview: description,
-            affectedResources: [ctx.workingDir],
-            commandSegments,
-            ...(commandUnreadable ? { commandUnreadable } : {}),
-          },
-          ctx.signal,
-        );
+      let knownSecrets: readonly KnownSecret[];
+      try { knownSecrets = [...(options.knownSecrets ?? []), ...(options.resolveKnownSecrets?.() ?? [])]; }
+      catch { return { tool: VERIFY_RUN_TOOL, status: "error", summary: "verification authorization credentials are unavailable", details: {}, truncated: false }; }
+      try {
+        const approved = await authorizeVerifyBatch([rawArgs], { ...options, knownSecrets, allowFanoutScope: true }, ctx);
+        args = parseVerifyRunArgs(approved[0]!);
+      } catch (error) {
+        // Approval denials retain their existing dispatch semantics. Hard
+        // policy refusals remain ordinary tool results and never reach IO.
+        if (error instanceof Error && error.name === "ApprovalDeniedError") throw error;
+        const message = maskVerificationSecrets(error instanceof Error ? error.message : String(error), knownSecrets);
+        return { tool: VERIFY_RUN_TOOL, status: "error", summary: message, details: { error: message, description: maskVerificationSecrets(description, knownSecrets), ...(error instanceof VerifyGuardRefusal ? { guardVerdict: "block", guardRule: error.guardRule, guardReason: maskVerificationSecrets(error.guardReason, knownSecrets) } : {}) }, truncated: false };
       }
       const result = await runVerify(args, {
         workingDir: ctx.workingDir,
         config: options.config,
         signal: ctx.signal,
+        ...(options.shellPolicy === undefined ? {} : { shellPolicy: options.shellPolicy }),
         ...(options.launchBrowser === undefined ? {} : { launchBrowser: options.launchBrowser }),
         ...(options.workspace === undefined ? {} : { workspace: options.workspace }),
       });
@@ -164,4 +101,5 @@ export function buildVerifyRunTool(options: VerifyRunToolOptions): ToolDefinitio
       };
     },
   };
+  return options.checkCommandReads !== undefined && options.checkReadTargets !== undefined ? markToolReadPolicy(definition) : definition;
 }

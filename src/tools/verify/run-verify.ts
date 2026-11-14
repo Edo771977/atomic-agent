@@ -7,7 +7,10 @@
  * `summary` with failures first. `ok` means the run itself went well
  * AND every check passed; a check that fails to parse fails the run.
  */
-import { resolve, relative, isAbsolute } from "node:path";
+import { resolve } from "node:path";
+import { guardVerifyRun } from "./verify-run-guard.js";
+import { resolveVerifyCwd } from "./verify-authorization.js";
+import type { ShellGuardPolicy } from "../os/shell-command-guard/index.js";
 
 import { getConfig, type AtomicAgentConfig } from "../../config/index.js";
 import type { ProbeSample } from "./page-probe-script.js";
@@ -73,6 +76,7 @@ export type VerifyRunConfig = Pick<AtomicAgentConfig, "browser"> & {
 
 export interface VerifyRunContext {
   readonly inputIntegrity?: VerificationInputIntegrity;
+  readonly shellPolicy?: ShellGuardPolicy;
   readonly workingDir: string;
   /** Browser settings and copy limit; `getConfig().browser` for page runs when omitted. */
   readonly config?: VerifyRunConfig;
@@ -81,17 +85,6 @@ export interface VerifyRunContext {
   readonly launchBrowser?: BrowserLauncher;
   readonly fetchImpl?: FetchLike;
   readonly workspace?: (workingDir: string) => Promise<VerifyWorkspace>;
-}
-
-/** `cwd` relative to the copy, refused when it escapes it. */
-function resolveRunCwd(root: string, cwd: string | undefined): string {
-  if (cwd === undefined) return root;
-  const target = resolve(root, cwd);
-  const rel = relative(root, target);
-  if (rel.startsWith("..") || isAbsolute(rel)) {
-    throw new Error(`verify.run: \`cwd\` must stay inside the working directory (got ${cwd})`);
-  }
-  return target;
 }
 
 function finish(
@@ -117,7 +110,12 @@ function finish(
 }
 
 async function runInWorkspace(args: VerifyRunArgs, dir: string, isolated: boolean, ctx: VerifyRunContext, started: number): Promise<VerifyRunResult> {
-  const cwd = resolveRunCwd(dir, args.cwd);
+  const cwd = resolveVerifyCwd(dir, args.cwd);
+  // The actual rebased argv, environment and cwd are guarded again immediately
+  // before every executor. A copy is not a process sandbox.
+  const guard = guardVerifyRun(args, cwd, ctx.shellPolicy);
+  if (guard.blocked !== null) throw new Error(`verify.run: blocked by shell guard: ${guard.blocked.verdict.rule} - ${guard.blocked.verdict.reason}`);
+  ctx.signal?.throwIfAborted();
   const common = { kind: args.kind, isolated };
   if (args.kind === "command") {
     const out = await runCommandKind(args, { cwd, signal: ctx.signal });

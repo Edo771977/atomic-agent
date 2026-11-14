@@ -18,6 +18,7 @@ import { createRuntimeTraces } from "./composition/runtime-traces.js";
 import { createRuntimeFusionOutcomes } from "./composition/runtime-fusion-outcomes.js";
 import { prepareRuntimeLocalProfile, connectRuntimeLocalProfile } from "./composition/runtime-local-profile.js";
 import { connectRuntimeProviders, createRuntimeModelContext, connectRuntimeFallback, createRuntimeProviderReloads } from "./composition/runtime-inference.js";
+import { RequestBudgetNotices } from "./request-budget-notices.js";
 import { createRuntimeMemoryStores } from "./composition/runtime-memory-stores.js";
 import { createMemoryEmbeddingSwitch } from "./composition/runtime-memory-embedding-switch.js";
 import { createRuntimeMemoryServices, createRuntimeMemoryConsolidator } from "./composition/runtime-memory-services.js";
@@ -466,10 +467,11 @@ export async function createAgentRuntime(
     });
   }
 
+  const budgetNotices = new RequestBudgetNotices(emitAgentLoopEventFor);
   const { prepareLocalLink, llmComplete, llmCompleteStream, dailySpendLimit } = connectRuntimeFallback(options, {
     fallbackChain, resolveActiveLlmSlice, localBackend: connectedLocal.localBackend, profileManager,
     costAccumulator, turnUsageMeter, sessionUsage, dailySpend, resolveModelPricing, resolveCatalogContextWindow,
-    turnBudget: fusionTurnBudget,
+    turnBudget: fusionTurnBudget, budgetNotices,
   });
   // Smart approval (ATO-465): off unless `agent.smartApproval`, read live.
   installRiskReviewer({
@@ -819,7 +821,7 @@ export async function createAgentRuntime(
   const { executeTurn, steer, runTurn, controlGoal } = createRuntimeTurnService(config, {
     sessions: { sessionStore, turnContext, turnRequests, turnPreviousReplies },
     execution: { loop, turnController, steeringInbox, shellJobs, slotManager, llmComplete },
-    inference: { providerRegistry, resolveActiveLlmSlice, resolveCurrentRunMode, resolveRouteVision, resolveActiveModelName, fallbackChain, dailyLimitRefuses: dailySpendLimit.refuses },
+    inference: { providerRegistry, resolveActiveLlmSlice, resolveCurrentRunMode, resolveRouteVision, resolveActiveModelName, fallbackChain, dailyLimitRefuses: dailySpendLimit.refuses, budgetNotices },
     traces, telemetry: { observability, analyticsStateStore, turnUsageMeter, sessionUsage },
     state: turnState, lifecycle, logger,
   });

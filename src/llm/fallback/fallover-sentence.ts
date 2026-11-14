@@ -41,6 +41,8 @@ function whatHappened(failure: FailureCauseId | undefined): string {
       return "isn't installed or signed in";
     case "daily_limit_reached":
       return "hit today's cloud spending limit";
+    case "daily_allowance_insufficient":
+      return "could not fit this request in the remaining daily allowance";
     case "provider_trouble":
     case "provider_timeout":
     case "provider_unreachable":

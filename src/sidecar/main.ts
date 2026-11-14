@@ -79,6 +79,9 @@ export async function bootstrapSidecar(): Promise<{
     (sessionId: string): ((event: AgentLoopEvent) => void) =>
     (event) => {
       switch (event.type) {
+        case "budget_notice":
+          if (event.sessionId === sessionId) protocol.emitEvent("budget_notice", event);
+          break;
         case "compaction_started":
         case "compaction_progress":
         case "compaction_completed":

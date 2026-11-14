@@ -21,6 +21,7 @@ import { createRuntimeTurnService, prepareRuntimeTurnState, stoppedForMoney, typ
 import { resolveModelMode } from "../../llm/model-mode.js";
 import { resolveLlmConfig } from "../../llm/provider/registry/provider-types.js";
 import type { TurnProgress } from "../../session/turn-progress.js";
+import { RequestBudgetNotices } from "../request-budget-notices.js";
 
 function deferred<T>() {
   let resolve: (value: T) => void = () => { throw new Error("promise not initialized"); };
@@ -123,6 +124,22 @@ describe("runtime turn ownership recipes", () => {
     expect(fixture.events).toEqual(["recorder", "pin", "begin", "loop", "finish", "shell-turn", "clear:session", "unpin:session"]);
     expect(fixture.turnRequests.size).toBe(0);
     expect(fixture.rows.get("session")).toBe(output.session);
+  });
+
+  it("opens budget notices only during the owning turn and closes them on failure", async () => {
+    const events: unknown[] = [];
+    const reporter = new RequestBudgetNotices((_owner, event) => { events.push(event); });
+    fixture.deps.inference.budgetNotices = reporter;
+    const scope = { softBound: false, hint: "Metered request.", hintKey: "session:cloud", hintReason: "meter" as const,
+      beforeSend() {}, onResponse() {}, finish() {} };
+    fixture.loop.runTurn.mockImplementationOnce(async () => {
+      reporter.observeScope("cloud", { sessionId: "session", prompt: "hi" }, scope);
+      expect(events).toHaveLength(1);
+      throw new Error("loop failed");
+    });
+    await expect(fixture.service.executeTurn(session(), "request")).rejects.toThrow("loop failed");
+    reporter.observeScope("cloud", { sessionId: "session", prompt: "background" }, { ...scope, hintReason: "soft" });
+    expect(events).toHaveLength(1);
   });
 
   it("loop budgets retain ceiling/leg distinction, option order and the supplied signal", async () => {

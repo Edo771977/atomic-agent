@@ -311,6 +311,8 @@ export function formatAgentEvent(
   ctx?: LlamaHintContext,
 ): string | null {
   switch (event.type) {
+    case "budget_notice":
+      return `» ${event.text}`;
     case "user_message":
       return null;
     case "turn_started":

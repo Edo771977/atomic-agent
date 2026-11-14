@@ -550,7 +550,9 @@ async function dispatchToRuntime(
   let reply: string | null = null;
   let replyAttachments: ReadonlyArray<string> = [];
   let failure: { error: Error; category: LlmFailureCategory } | null = null;
+  const budgetNotices = new Set<string>();
   const eventHook = (event: AgentLoopEvent): void => {
+    if (event.type === "budget_notice" && event.sessionId === session.id) budgetNotices.add(event.text);
     // A progress note is an interim reply; the one that ends the turn
     // follows it and is what the channel posts.
     if (
@@ -584,6 +586,7 @@ async function dispatchToRuntime(
     releaseIfMovedOn(ref, session.id, ctx);
   }
 
+  for (const notice of budgetNotices) await send(ctx, ref.channelId, notice);
   if (controller.signal.aborted) {
     await send(ctx, ref.channelId, "Turn cancelled.");
   } else if (reply !== null) {

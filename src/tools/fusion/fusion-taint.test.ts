@@ -117,7 +117,7 @@ describe("fusion.delegate and the review after outside content", () => {
 /**
  * The orchestrator's declared `contract.checks` run code a tainted worker
  * may have written (a test file): after outside content they are put to
- * the gate as a `shell` request, once per delegate call, before any batch
+ * the gate as individually described `shell` requests, before each complete batch
  * runs (`contract-check-hold.ts`).
  */
 describe("fusion.delegate contract checks after outside content", () => {
@@ -201,9 +201,9 @@ describe("fusion.delegate contract checks after outside content", () => {
     const result = await f.run(oneTask);
     const checkPrompts = f.prompts.filter((p) => p.category === "shell");
     expect(checkPrompts).toHaveLength(1);
-    expect(checkPrompts[0]!.tool).toBe("fusion.delegate");
+    expect(checkPrompts[0]!.tool).toBe("verify.run");
     expect(`${checkPrompts[0]!.reason}\n${checkPrompts[0]!.preview ?? ""}`).toContain("npm test");
-    expect(checkPrompts[0]!.reason).toContain("a web page");
+    expect(checkPrompts[0]!.riskNote).toContain("a web page");
     expect(f.runChecks).not.toHaveBeenCalled();
     expect(result.summary).toContain("contract checks held after outside content: not run");
     const rows = result.details.tasks as { status: string; notes?: string[] }[];
@@ -259,7 +259,7 @@ describe("fusion.delegate contract checks after outside content", () => {
     await f.run(oneTask);
     const checkPrompts = f.prompts.filter((p) => p.category === "shell");
     expect(checkPrompts).toHaveLength(1);
-    expect(checkPrompts[0]!.reason).toContain("a Fusion worker");
+    expect(checkPrompts[0]!.riskNote).toContain("a Fusion worker");
     expect(f.runChecks).not.toHaveBeenCalled();
   });
 
@@ -278,7 +278,7 @@ describe("fusion.delegate contract checks after outside content", () => {
     expect(f.runChecks).toHaveBeenCalled();
   });
 
-  it("asks once across a dependency wave and the final pass", async () => {
+  it("describes and authorizes each dependency and final check batch", async () => {
     const f = checksSetup({ answerChecks: true });
     f.gate.noteUntrustedContent("s-parent", "a web page");
     await f.run({
@@ -295,8 +295,11 @@ describe("fusion.delegate contract checks after outside content", () => {
         ],
       },
     });
-    expect(f.prompts.filter((p) => p.category === "shell")).toHaveLength(1);
-    // The provider's own check before the dependent, then the rest after.
+    const checks = f.prompts.filter((p) => p.category === "shell");
+    expect(checks.length).toBeGreaterThanOrEqual(2);
+    expect(checks.some(p => p.preview?.includes("core-check"))).toBe(true);
+    expect(checks.some(p => p.preview?.includes("all-check"))).toBe(true);
+    // Each exact batch is reviewed again; no earlier root yes covers a later plan.
     expect(f.checkRuns.length).toBeGreaterThanOrEqual(2);
   });
 });

@@ -1,4 +1,5 @@
 import { getConfig } from "../config/index.js";
+import { fusionRecoveryCommand } from "./fusion-recovery-command.js";
 import {
   outcomeLogPath,
   parseReportArgs,
@@ -10,6 +11,9 @@ const HELP =
     "atomic-agent fusion — what the fusion run mode did and cost",
     "",
     "Subcommands:",
+    "  recover <journal> --project <dir> [--status|--dry-run|--rollback] [--json]",
+    "      Inspect interrupted promotion (default read-only), or explicitly",
+    "      roll back verified entries while preserving later user edits.",
     "  report [--days N] [--model X] [--json]",
     "      Per worker model: tasks, first-pass green rate, green after",
     "      retries, top failure categories, escalation and self-check fix",
@@ -39,6 +43,7 @@ export async function fusionCommand(args: string[], io: FusionCommandIo = {}): P
     stdout(HELP);
     return 0;
   }
+  if (sub === "recover") return fusionRecoveryCommand(args.slice(1), { stdout, stderr });
   if (sub !== "report") {
     stderr(`unknown subcommand: ${sub}\n${HELP}`);
     return 2;

@@ -456,3 +456,35 @@ describe("a read naming several outside paths asks about each", () => {
     expect(ran).toBe(1);
   });
 });
+
+describe("legacy verification read cwd normalization", () => {
+  it.each(["command", "service"] as const)("resolves a relative %s cwd exactly once before protecting state reads", async kind => {
+    const workingDir = resolve("legacy-verification-fixture");
+    const stateDir = resolve(workingDir, "state");
+    const prompts: ApprovalRequest[] = [];
+    const gate: ApprovalGate = new ApprovalGate({ level: 4, emit: request => { prompts.push(request); queueMicrotask(() => gate.resolve({ approvalId: request.approvalId, approved: false })); } });
+    let entered = 0;
+    const registry = new ToolRegistry();
+    registry.register({ name: "verify.run", description: "legacy fixture", readonly: true, run: async () => {
+      entered += 1; return compressToolResult({ tool: "verify.run", status: "ok", output: "stub only" });
+    } });
+    confineReads(registry, { approvals: { approvals: gate, approvalRequired: true }, grantedDirs: () => [], readScope: () => "working-dir", stateSecrets: { stateDir, files: [resolve(stateDir, "config.json")] } });
+    const spec = kind === "command" ? { kind, cmd: "node", args: ["config.json"], cwd: "state", env: { NODE_ENV: "test" } } : { kind, start: { cmd: "node", args: ["config.json"] }, cwd: "state", ready: { port: 3000 } };
+    await expect(registry.get("verify.run").run(spec, { workingDir, sessionId: "legacy", stepIndex: 0, signal: new AbortController().signal })).rejects.toThrow();
+    expect(prompts.map(p => p.category)).toEqual(["state_secret"]);
+    expect(entered).toBe(0); expect(gate.pendingCount()).toBe(0);
+  });
+  it("keeps the legacy executor's raw cwd/env and original context unchanged after an ordinary read", async () => {
+    const workingDir = resolve("legacy-verification-fixture");
+    let received: unknown;
+    const registry = new ToolRegistry();
+    registry.register({ name: "verify.run", description: "legacy fixture", readonly: true, run: async (args, ctx) => {
+      received = { args, workingDir: ctx.workingDir }; return compressToolResult({ tool: "verify.run", status: "ok", output: "stub only" });
+    } });
+    const gate = new ApprovalGate({ level: 4, emit: () => { throw new Error("ordinary in-scope read must not prompt"); } });
+    confineReads(registry, { approvals: { approvals: gate, approvalRequired: true }, grantedDirs: () => [], readScope: () => "working-dir" });
+    const spec = { kind: "command", cmd: "node", args: ["safe.json"], cwd: "state", env: { NODE_ENV: "test" } };
+    await registry.get("verify.run").run(spec, { workingDir, sessionId: "legacy", stepIndex: 0, signal: new AbortController().signal });
+    expect(received).toEqual({ args: spec, workingDir }); expect(spec.cwd).toBe("state");
+  });
+});

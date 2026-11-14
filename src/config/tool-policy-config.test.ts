@@ -30,7 +30,7 @@ describe("outbound HTTP and tool configuration ownership", () => {
     const vision = createVisionDefaults();
     expect(http).toStrictEqual({ enabled: true, approvalMode: "writes", hostAllowlist: null, maxResponseBytes: 1_048_576, defaultTimeoutMs: 30_000 });
     expect(projects).toStrictEqual({ roots: [] });
-    expect(tools).toStrictEqual({ shell: { defaultTimeoutMs: 600_000, jobMaxMs: 3_600_000, maxJobs: 3, envPassthrough: ["GITHUB_TOKEN", "NOTION_API_KEY"] }, screen: { enabled: false, point: true }, verify: { maxCopyBytes: 2 * 1024 * 1024 * 1024 } });
+    expect(tools).toStrictEqual({ shell: { defaultTimeoutMs: 600_000, jobMaxMs: 3_600_000, maxJobs: 3, envPassthrough: ["GITHUB_TOKEN", "NOTION_API_KEY"] }, screen: { enabled: false, point: true }, verify: { maxCopyBytes: 2 * 1024 * 1024 * 1024, maxGitObjectBytes: 2 * 1024 * 1024 * 1024 } });
     expect(vision).toStrictEqual({ enabled: true, autoDetect: true, maxImageBytes: 8 * 1024 * 1024, maxImagesPerCall: 4 });
     expect(Object.keys(http)).toEqual(["enabled", "approvalMode", "hostAllowlist", "maxResponseBytes", "defaultTimeoutMs"]);
     expect(projects.roots).not.toBe(createProjectsDefaults().roots);
@@ -118,7 +118,7 @@ describe("outbound HTTP and tool configuration ownership", () => {
   });
 
   it("reads tools.verify.maxCopyBytes with a 2 GiB default", () => {
-    expect(schema.parseUserConfigFile({}).tools.verify).toStrictEqual({ maxCopyBytes: 2 * 1024 * 1024 * 1024 });
+    expect(schema.parseUserConfigFile({}).tools.verify).toStrictEqual({ maxCopyBytes: 2 * 1024 * 1024 * 1024, maxGitObjectBytes: 2 * 1024 * 1024 * 1024 });
     expect(schema.parseUserConfigFile({ tools: { verify: { maxCopyBytes: 8_000_000_000 } } }).tools.verify.maxCopyBytes).toBe(8_000_000_000);
     expect(() => schema.parseUserConfigFile({ tools: { verify: { maxCopyBytes: 0 } } })).toThrow(/tools\.verify\.maxCopyBytes/);
     expect(() => schema.parseUserConfigFile({ tools: { verify: { maxCopyBytes: "lots" } } })).toThrow(/tools\.verify\.maxCopyBytes/);
@@ -132,14 +132,22 @@ describe("outbound HTTP and tool configuration ownership", () => {
     expect(() => schema.parseUserConfigFile({ tools: { verify: { maxCopyBytes: Number.MAX_SAFE_INTEGER } } })).toThrow(/tools\.verify\.maxCopyBytes/);
   });
 
+  it("keeps the private Fusion Git import ceiling configurable and independent of copied payload bytes", () => {
+    const defaults = schema.parseUserConfigFile({}).tools.verify;
+    expect(defaults.maxGitObjectBytes).toBe(2 * 1024 * 1024 * 1024);
+    const configured = schema.parseUserConfigFile({ tools: { verify: { maxCopyBytes: 1024 * 1024, maxGitObjectBytes: 8_000_000_000 } } }).tools.verify;
+    expect(configured.maxCopyBytes).toBe(1024 * 1024); expect(configured.maxGitObjectBytes).toBe(8_000_000_000);
+    for (const value of [0, -1, 1024 ** 4 + 1, "unlimited"]) expect(() => schema.parseUserConfigFile({ tools: { verify: { maxGitObjectBytes: value } } })).toThrow(/tools\.verify\.maxGitObjectBytes/);
+  });
+
   it("short-circuits explicit scalar defaults in all four owners", () => {
     const noDefaults = () => { throw new Error("explicit fields must not read defaults"); };
     const http = { enabled: false, approvalMode: "never", hostAllowlist: [], maxResponseBytes: 1, defaultTimeoutMs: 1 };
     const vision = { enabled: false, autoDetect: false, maxImageBytes: 1, maxImagesPerCall: 1 };
     expect(parseHttpConfig(http, 79, noDefaults)).toStrictEqual(http);
     expect(parseProjectsConfig({ roots: [] }, noDefaults)).toStrictEqual({ roots: [] });
-    expect(parseToolsConfig({ defaultTimeoutMs: 0, jobMaxMs: 1, maxJobs: 1, envPassthrough: [] }, noDefaults, { enabled: true, point: false }, { maxCopyBytes: 1 }))
-      .toStrictEqual({ shell: { defaultTimeoutMs: 0, jobMaxMs: 1, maxJobs: 1, envPassthrough: [] }, screen: { enabled: true, point: false }, verify: { maxCopyBytes: 1 } });
+    expect(parseToolsConfig({ defaultTimeoutMs: 0, jobMaxMs: 1, maxJobs: 1, envPassthrough: [] }, noDefaults, { enabled: true, point: false }, { maxCopyBytes: 1, maxGitObjectBytes: 1 }))
+      .toStrictEqual({ shell: { defaultTimeoutMs: 0, jobMaxMs: 1, maxJobs: 1, envPassthrough: [] }, screen: { enabled: true, point: false }, verify: { maxCopyBytes: 1, maxGitObjectBytes: 1 } });
     expect(parseVisionConfig(vision, noDefaults)).toStrictEqual(vision);
   });
 

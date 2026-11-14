@@ -18,6 +18,8 @@ import { createModelRiskReviewer } from "../../approval/risk-review.js";
 import { createQueryRewriterRunner } from "../../memory/retrieve/query-rewriter-runner.js";
 import { createAlwaysGate } from "../../memory/retrieve/rewriter-gate.js";
 import type { LlmStreamParams } from "../../agent/step/step-contract.js";
+import { RequestBudgetNotices } from "../request-budget-notices.js";
+import type { AgentLoopEvent } from "../../agent/agent-contract.js";
 
 function jsonResponse(completionTokens = 3) {
   return new Response(JSON.stringify({ model: "priced", choices: [{ message: { content: "done" }, finish_reason: "stop" }], usage: { prompt_tokens: 1, completion_tokens: completionTokens, total_tokens: 1 + completionTokens } }), { status: 200, headers: { "content-type": "application/json" } });
@@ -25,7 +27,7 @@ function jsonResponse(completionTokens = 3) {
 
 afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
-function fixture(options: { cap?: number; baseUrl?: string; unpriced?: boolean; inputRate?: number; outputRate?: number; fetch?: typeof fetch } = {}) {
+function fixture(options: { cap?: number; baseUrl?: string; unpriced?: boolean; inputRate?: number; outputRate?: number; fetch?: typeof fetch; budgetNotices?: RequestBudgetNotices } = {}) {
   const cap = options.cap ?? 1;
   const config = configModule.loadConfig();
   const baseUrl = options.baseUrl ?? "https://paid.invalid";
@@ -52,12 +54,26 @@ function fixture(options: { cap?: number; baseUrl?: string; unpriced?: boolean; 
     profileManager: undefined, costAccumulator: undefined, turnUsageMeter: meter,
     resolveModelPricing: () => ({ id: "priced", contextWindow: 32000, source: "user", pricing } as ResolvedModel),
     ...{ turnBudget: budget },
+    budgetNotices: options.budgetNotices,
   });
   const request = { prompt: "hello", grammar: 'root ::= "ok"', slotId: -1, sessionId: "parent", providerId: "cloud", maxOutputTokens: 3 };
   return { budget, wired, request, sent, fetchImpl, meter, config, llm, provider, pricing };
 }
 
 describe("physical completion reservations", () => {
+  it("surfaces metered scope advice through runtime composition before a physical send", async () => {
+    const events: AgentLoopEvent[] = [];
+    const reporter = new RequestBudgetNotices((_owner, event) => { events.push(event); });
+    const close = reporter.begin("parent");
+    const f = fixture({ unpriced: true, budgetNotices: reporter, fetch: async () => {
+      expect(events).toHaveLength(1);
+      return jsonResponse();
+    } });
+    try {
+      await f.wired.llmComplete(f.request);
+      expect(events[0]).toMatchObject({ type: "budget_notice", sessionId: "parent", providerId: "cloud", reason: "meter" });
+    } finally { close(); }
+  });
   it.each([["unary", 400], ["unary", 502], ["stream", 400], ["stream", 502]] as const)("cancels a stalled %s error body after status %s at the turn deadline", async (mode, status) => {
     vi.useFakeTimers();
     let body: ReadableStreamDefaultController<Uint8Array> | undefined;
