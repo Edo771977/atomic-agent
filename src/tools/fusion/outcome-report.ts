@@ -13,6 +13,7 @@ import {
   formatTokenCount,
   formatUsdShort,
 } from "./turn-receipt.js";
+import { taskCheckEvidence } from "./outcome-evidence.js";
 
 /**
  * `atomic-agent fusion report` (and `/fusion report` in the TUI): the
@@ -149,20 +150,6 @@ function median(values: number[]): number {
 }
 
 const rate = (n: number, of: number): number => (of === 0 ? 0 : n / of);
-
-/** This describes the recorded task checks, not independent semantic acceptance. */
-function taskCheckEvidence(row: TaskOutcomeRecord): "passed" | "failed" | "unverified" {
-  if (row.acceptanceScope !== "task-checks" ||
-      !Number.isInteger(row.attempt) || row.attempt < 1 ||
-      row.judgeRetried !== false || row.escalations !== 0 ||
-      typeof row.selfCheckNotice !== "boolean" || row.syntaxDemoted !== false ||
-      (row.merge !== null && row.merge !== "merged") ||
-      !["off", "green", "red", "unverified"].includes(row.judge)) return "unverified";
-  if (row.acceptance === "checks-passed" && row.status === "ok" && row.failure === null &&
-      (row.judge === "off" || row.judge === "green")) return "passed";
-  if (row.acceptance === "checks-failed" && row.status === "failed" && row.failure === "checks") return "failed";
-  return "unverified";
-}
 
 function modelStats(rows: TaskOutcomeRecord[]): ModelStats {
   const first = rows[0]!;

@@ -4,6 +4,7 @@ import type { FusionRoleModels } from "../../llm/run-mode/index.js";
 import type { DelegateTask } from "./delegate-args.js";
 import { OUTCOME_LOG_MAX_BYTES, outcomeLabel, type OutcomeRecord, type TaskOutcomeRecord } from "./outcome-log.js";
 import { readOutcomeRecords } from "./outcome-report.js";
+import { taskCheckEvidence } from "./outcome-evidence.js";
 import type { TaskLeg, WorkerLegRef } from "./role-models.js";
 
 /** Bounded observation window, even if an external writer ignored the rotation limit. */
@@ -95,10 +96,8 @@ function evidence(records: readonly OutcomeRecord[], leg: TaskLeg, task: Delegat
     finite(r.durationMs) && (r.costUsd === null || finite(r.costUsd)) &&
     typeof r.status === "string").sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts)) : [];
   const identityKnown = identity !== undefined && /^[a-f0-9]{64}$/.test(identity);
-  const verified = rows.filter((r) => identityKnown && r.routingIdentity === identity && r.taskRole === (task.role ?? null) && r.acceptanceScope === "task-checks" && r.attempt === 1 && r.escalations === 0 &&
-    r.judgeRetried === false && r.selfCheckNotice === false && (r.merge === null || r.merge === "merged") &&
-    ((r.acceptance === "checks-passed" && r.status === "ok" && r.failure === null) ||
-      (r.acceptance === "checks-failed" && r.status === "failed" && r.failure === "checks")));
+  const verified = rows.filter((r) => identityKnown && r.routingIdentity === identity && r.taskRole === (task.role ?? null) &&
+    r.attempt === 1 && r.selfCheckNotice === false && taskCheckEvidence(r) !== "unverified");
   const passed = verified.filter((r) => r.acceptance === "checks-passed").length;
   const verifiedRows = new Set(verified);
   const costs = verified.flatMap((r) => r.costUsd === null ? [] : [r.costUsd]);

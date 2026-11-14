@@ -32,6 +32,20 @@ function select(records = [...samples("worker", false), ...samples("strong", tru
 }
 
 describe("measured routing evidence and admission", () => {
+  it("rejects contradictory judge, syntax and candidate evidence after history parsing", () => {
+    const dir = mkdtempSync(join(tmpdir(), "routing-contradiction-"));
+    try {
+      const path = join(dir, "outcomes.ndjson");
+      for (const over of [{ judge: "red" }, { judge: "unverified" }, { judge: undefined },
+        { syntaxDemoted: true }, { syntaxDemoted: undefined }, { merge: "held" },
+        { candidate: null }, { candidate: {} }, { candidate: { receipt: { disposition: "promoted" } } }]) {
+        writeFileSync(path, [...samples("worker", false), ...samples("strong", true, over as Partial<TaskOutcomeRecord>)].map(r => JSON.stringify(r)).join("\n"));
+        const result = select(readRoutingHistory(path));
+        expect(result.legs.get("a")?.providerId, JSON.stringify(over)).toBe("worker");
+        expect(result.decisions[0]?.candidates.find(c => c.provider === "strong")?.verifiedSamples).toBe(0);
+      }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
   it("chooses configured build targets and exact requested-role evidence", () => {
     const roles: FusionRoleModels = { byRole: { build: { providerId: "build", model: "builder", local: false } }, mixLocalModels: false, localLegProviderIds: [] };
     const result = select([...samples("worker", false), ...samples("build", true)], { roles });
