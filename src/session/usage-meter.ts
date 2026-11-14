@@ -2,6 +2,7 @@ import type { CompletionUsage } from "../llm/provider/completion-types.js";
 import type { ResolvedModel } from "../llm/provider/model-resolver.js";
 import type { RateLimitWindow } from "../llm/provider/rate-limits.js";
 import { estimateUsageCostUsd } from "../llm/provider/usage-cost.js";
+import { MODELS_DEV_SNAPSHOT_DATE } from "../llm/provider/models-dev/models-dev-snapshot.js";
 import type { DailySpendView } from "./daily-spend.js";
 
 /**
@@ -464,7 +465,8 @@ function sourceLabel(source: CostSource): string {
     case "catalog":
       return "the built-in price list";
     case "snapshot":
-      return "the bundled models.dev price snapshot (an estimate)";
+      // A dated community list (ATO-647): say how old it is.
+      return `the bundled models.dev snapshot of ${MODELS_DEV_SNAPSHOT_DATE}, an estimate`;
     case "live":
       return "the provider's live price list";
   }
