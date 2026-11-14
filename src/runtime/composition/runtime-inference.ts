@@ -339,10 +339,9 @@ export function connectRuntimeFallback(
     sessionUsage,
     dailySpend,
   } = deps;
-  // How a link bills: a local server (any kind pointed at this machine)
-  // bills nothing, a subscription CLI bills by the plan, the rest per
-  // token. One reading for the session readout, the day total and the
-  // daily ceiling.
+  // How a link bills, for the session readout: a local server (any kind
+  // pointed at this machine) bills nothing, a subscription CLI bills by
+  // the plan, the rest per token.
   const linkBilling = (providerId: string): { local: boolean; plan: boolean } => {
     const entry = resolveLlmConfig(getConfig()).providers.find((p) => p.id === providerId);
     return {
@@ -350,6 +349,15 @@ export function connectRuntimeFallback(
         entry === undefined || entry.kind === "llama-server" || isLocalServerUrl(entry.baseUrl ?? entry.url),
       plan: entry?.kind === "subscription-cli",
     };
+  };
+  // How a link bills for the day total and the daily ceiling: the same
+  // rule as the turn budget (`request-budget.ts`). A loopback or private
+  // URL can be a forwarding gateway to a paid service (LiteLLM, a team
+  // proxy on the LAN or a Tailscale address), so only the explicit
+  // runner and plan kinds are free; any other link is counted and capped.
+  const spendBilling = (providerId: string): { local: boolean; plan: boolean } => {
+    const entry = resolveLlmConfig(getConfig()).providers.find((p) => p.id === providerId);
+    return { local: entry?.kind === "llama-server", plan: entry?.kind === "subscription-cli" };
   };
   // ATO-649: fold a metered completion into today's total. Before the
   // session record, so the `usage_updated` event that follows carries it.
@@ -360,7 +368,7 @@ export function connectRuntimeFallback(
   ): void => {
     if (!dailySpend || !result.usage) return;
     dailySpend.record(
-      priceCompletion({ usage: result.usage, ...(model ? { model } : {}), ...linkBilling(servedProviderId) }),
+      priceCompletion({ usage: result.usage, ...(model ? { model } : {}), ...spendBilling(servedProviderId) }),
     );
   };
   // ATO-649: refuse a paid link once today's spend reached
@@ -376,7 +384,7 @@ export function connectRuntimeFallback(
     const costTracking = getConfig().llm?.costTracking;
     const limitUsd = effectiveDailyLimitUsd(costTracking?.dailyLimitUsd);
     if (limitUsd === null) return;
-    const billing = linkBilling(providerId);
+    const billing = spendBilling(providerId);
     if (billing.local || billing.plan) return;
     const today = dailySpend.today();
     if (isOverDailyLimit(today, limitUsd)) {

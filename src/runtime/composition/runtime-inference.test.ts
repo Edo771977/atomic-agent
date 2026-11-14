@@ -343,6 +343,41 @@ describe("runtime provider/context/fallback/reload phases", () => {
       expect(fixture.dailySpend.today().pricedCalls).toBe(1);
     });
 
+    // A private-network URL can be a paid gateway (LiteLLM, a team
+    // proxy): only the explicit runner/plan kinds are free, as in the turn
+    // budget (`request-budget.ts`).
+    function servedOnLan(): void {
+      const llm = config.llm!;
+      config.llm = {
+        ...llm,
+        providers: llm.providers.map((p) => (p.id === "served" ? { ...p, baseUrl: "http://192.168.1.20:8080" } : p)),
+      };
+    }
+
+    it("counts a priced openai-compatible link on a LAN address toward today's total", async () => {
+      const fixture = withDailySpend();
+      servedOnLan();
+      const served = providers.providerRegistry.getProvider("served");
+      if (!served) throw new Error("served fixture missing");
+      vi.spyOn(served, "complete").mockResolvedValue(completion());
+      const wired = connectRuntimeFallback({}, fixture.deps);
+      await wired.llmComplete({ ...params, providerId: "served" });
+      expect(fixture.dailySpend.today().usd).toBeCloseTo(0.00002);
+      expect(fixture.dailySpend.today().pricedCalls).toBe(1);
+    });
+
+    it("refuses a priced LAN link once today's spend reached the limit", async () => {
+      const fixture = withDailySpend(1);
+      servedOnLan();
+      fixture.dailySpend.record({ kind: "priced", usd: 1.2, source: "provider" });
+      const served = providers.providerRegistry.getProvider("served");
+      if (!served) throw new Error("served fixture missing");
+      const servedCall = vi.spyOn(served, "complete").mockResolvedValue(completion());
+      const wired = connectRuntimeFallback({}, fixture.deps);
+      await expect(wired.llmComplete({ ...params, providerId: "served" })).rejects.toBeInstanceOf(DailySpendLimitError);
+      expect(servedCall).not.toHaveBeenCalled();
+    });
+
     it("refuses every paid link once today's spend reached the limit, before sending", async () => {
       const fixture = withDailySpend(1);
       fixture.dailySpend.record({ kind: "priced", usd: 1.2, source: "provider" });
