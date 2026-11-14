@@ -9,9 +9,10 @@
  *    `mcp.server.*`.
  *
  * An entry that matches nothing we know is reported, not guessed at. A
- * list where nothing is recognised is NOT an empty allowlist: it is
- * dropped with a diagnostic and the worker keeps its default tools, since
- * hiding every tool would leave a worker that can only reply.
+ * list where nothing is recognised compiles to no predicate; the fusion
+ * caller (`applyTaskProfiles`) then fails closed, leaving the worker only
+ * the tools in `PROFILE_ALWAYS_ALLOWED`. Compile once: the patterns this
+ * returns are not themselves valid input (`mcp.my-server.search`).
  *
  * The allowlist only ever narrows: it is ANDed with the worker's own
  * exclusions (`isWorkerVisibleTool`), so naming `fusion.delegate` or a

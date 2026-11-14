@@ -11,7 +11,7 @@ Markdown with YAML frontmatter, the format of Claude Code's `.claude/agents/*.md
 
 `model`: a fusion role (`plan`, `build`, `review`, `explore`, `utility`) runs the task on that role's model from `llm.runMode.fusion.roles`; a model name or provider id on the allowed list runs it there; `inherit` or any other name (`sonnet` in a file written for Claude Code) leaves the task on its usual model with a note in `details.profiles`. A task's own `model` or `role` always wins.
 
-`tools`: our names (`os.fs.read`), prefixes (`verify.*`, `mcp.github.*`) or Claude Code names (`Read`, `Grep`, `Glob`, `Bash`, `Edit`, `Write`, `WebFetch`, `WebSearch`, `mcp__server__tool`) ([profile-tools.ts](profile-tools.ts)). The list only narrows: it is ANDed with the worker policy, so it never brings back `fusion.delegate`, memory writes or the screen. `reply`, `tool.view` and `tool.search` always stay. A list where no entry is known is dropped with a note, and the worker keeps its usual tools.
+`tools`: our names (`os.fs.read`), prefixes (`verify.*`, `mcp.github.*`) or Claude Code names (`Read`, `Grep`, `Glob`, `Bash`, `Edit`, `Write`, `WebFetch`, `WebSearch`, `mcp__server__tool`) ([profile-tools.ts](profile-tools.ts)). The list only narrows: it is ANDed with the worker policy, so it never brings back `fusion.delegate`, memory writes or the screen. `reply`, `tool.view` and `tool.search` always stay. A list where no entry is known fails closed with a note: the worker keeps only `reply` and tool discovery. `fusion.delegate` compiles the list once and the worker filter matches the compiled patterns as they are ([task-profiles.ts](../tools/fusion/task-profiles.ts)).
 
 ## Sources and order
 

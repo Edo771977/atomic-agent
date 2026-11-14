@@ -143,7 +143,8 @@ export interface DelegateTask {
   /**
    * The profile as applied by the tool, never read from the wire: its
    * instructions for the brief and its tool allowlist (compiled
-   * patterns; absent = the worker's usual tools).
+   * patterns; absent = the worker's usual tools; empty = none of the
+   * profile's tools were known, so only `reply` and tool discovery).
    */
   agentProfile?: AppliedAgentProfile;
 }

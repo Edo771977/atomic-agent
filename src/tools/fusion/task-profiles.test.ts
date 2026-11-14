@@ -79,15 +79,61 @@ describe("applyTaskProfiles (ATO-566)", () => {
     expect(out.applied[2]?.notes?.[0]).toContain('profile model "sonnet" is not configured here');
   });
 
-  it("a profile whose tools are all unknown keeps the worker's usual tools and says so", () => {
+  it("a profile whose tools are all unknown fails closed: reply and discovery only, and says so", () => {
     const out = applyTaskProfiles(
       [task({ profile: "odd" })],
       setWith({ name: "odd", description: "", prompt: "P", tools: ["Teleport"], source: "user" }),
       ALLOWED,
     );
     if (!out.ok) throw new Error(out.error);
-    expect(out.tasks[0]?.agentProfile?.tools).toBeUndefined();
-    expect(out.applied[0]?.notes?.[0]).toContain("kept its usual tools");
+    expect(out.tasks[0]?.agentProfile?.tools).toEqual([]);
+    expect(out.applied[0]?.tools).toEqual([]);
+    expect(out.applied[0]?.notes?.[0]).toContain("none of the profile's tools are known here");
+    const allows = workerToolFilterFor(out.tasks[0]?.agentProfile?.tools);
+    expect(allows("os.shell.run")).toBe(false);
+    expect(allows("os.fs.write")).toBe(false);
+    expect(allows("os.fs.read")).toBe(false);
+    expect(allows("reply")).toBe(true);
+  });
+});
+
+describe("applyTaskProfiles -> workerToolFilterFor seam", () => {
+  function filterFor(tools: string[]) {
+    const out = applyTaskProfiles(
+      [task({ profile: "p" })],
+      setWith({ name: "p", description: "", prompt: "P", tools, source: "user" }),
+      ALLOWED,
+    );
+    if (!out.ok) throw new Error(out.error);
+    return workerToolFilterFor(out.tasks[0]?.agentProfile?.tools);
+  }
+
+  it("an MCP tool with a hyphenated server keeps the worker to that tool", () => {
+    const allows = filterFor(["mcp__my-server__search"]);
+    expect(allows("mcp.my-server.search")).toBe(true);
+    expect(allows("mcp.my-server.other")).toBe(false);
+    expect(allows("os.shell.run")).toBe(false);
+    expect(allows("os.fs.write")).toBe(false);
+  });
+
+  it("an MCP tool with a camel-case name keeps the worker to that tool", () => {
+    const allows = filterFor(["mcp__github__listIssues"]);
+    expect(allows("mcp.github.listIssues")).toBe(true);
+    expect(allows("os.shell.run")).toBe(false);
+    expect(allows("os.fs.write")).toBe(false);
+  });
+
+  it("a capitalised MCP server keeps the worker to that server", () => {
+    const allows = filterFor(["mcp__GitHub"]);
+    expect(allows("mcp.GitHub.search")).toBe(true);
+    expect(allows("os.shell.run")).toBe(false);
+    expect(allows("os.fs.write")).toBe(false);
+  });
+
+  it("a Claude Code name still maps to our tools", () => {
+    const allows = filterFor(["Read"]);
+    expect(allows("os.fs.read")).toBe(true);
+    expect(allows("os.shell.run")).toBe(false);
   });
 });
 

@@ -93,15 +93,24 @@ export function applyTaskProfiles(
       }
     }
     const compiled = compileToolAllowlist(profile.tools);
+    // A non-empty list none of whose entries we can read fails closed:
+    // the profile meant to narrow the worker, and guessing "all tools"
+    // from a typo hands it shell and writes it was never meant to have.
+    const unreadable = compiled.allows === undefined && compiled.unknown.length > 0;
     if (compiled.unknown.length > 0) {
       notes.push(
-        compiled.allows === undefined
-          ? `none of the profile's tools are known here (${compiled.unknown.join(", ")}); the worker kept its usual tools`
+        unreadable
+          ? `none of the profile's tools are known here (${compiled.unknown.join(", ")}); the worker had only reply and tool discovery`
           : `unknown tools ignored: ${compiled.unknown.join(", ")}`,
       );
     }
+    // The compiled patterns travel on the task and `workerToolFilterFor`
+    // matches them as they are: compiling them a second time rejected
+    // MCP names with a hyphen or a capital and failed open.
+    const tools: readonly string[] | undefined =
+      compiled.allows !== undefined ? compiled.patterns : unreadable ? [] : undefined;
     if (
-      compiled.allows === undefined &&
+      tools === undefined &&
       profile.source !== "builtin" &&
       BUILTIN_AGENT_PROFILES.some((b) => b.name === profile.name)
     ) {
@@ -111,14 +120,14 @@ export function applyTaskProfiles(
       name: profile.name,
       prompt: profile.prompt,
       source: profile.source,
-      ...(compiled.allows === undefined ? {} : { tools: compiled.patterns }),
+      ...(tools === undefined ? {} : { tools }),
     };
     applied.push({
       task: task.id,
       profile: profile.name,
       source: profile.source,
       ...(modelNote === undefined ? {} : { model: modelNote }),
-      tools: compiled.allows === undefined ? "all" : compiled.patterns,
+      tools: tools ?? "all",
       ...(notes.length === 0 ? {} : { notes }),
     });
     return next;

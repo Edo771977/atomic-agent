@@ -195,7 +195,9 @@ function quoteProfile(profile: AppliedAgentProfile, localLeg: boolean): string[]
     prompt,
     profile.tools === undefined
       ? `This profile does not limit your tools: you have a worker's usual tools.`
-      : `This profile limits your tools to: ${profile.tools.join(", ")}. If the task needs another tool, say so in your reply instead of working around it.`,
+      : profile.tools.length === 0
+        ? `None of this profile's tools are known here, so you have only reply and tool discovery. If the task needs a tool, say so in your reply instead of working around it.`
+        : `This profile limits your tools to: ${profile.tools.join(", ")}. If the task needs another tool, say so in your reply instead of working around it.`,
   ];
 }
 
