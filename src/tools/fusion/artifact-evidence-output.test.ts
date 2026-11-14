@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { compressToolResult, fullToolResult } from "../../compressor/result-compressor.js";
-import { toolResultTurn, renderTurnForPrompt } from "../../session/conversation-turn.js";
+import { renderTurnForPrompt } from "../../session/conversation-turn.js";
 import { extendCloudContext, renderCloudTurn } from "../../session/cloud-context.js";
-import { capBatchSummaries } from "../../agent/batch-summary-cap.js";
+import { createEmptySessionState } from "../../session/session-state.js";
+import { appendBatchedTurns } from "../../agent/step/step-commit.js";
+import { maskResultSecrets } from "../tool-output-secrets.js";
 import { projectFusionArtifactEvidence } from "./artifact-evidence-output.js";
 import type { ArtifactManifest } from "./artifact-manifest-types.js";
 
@@ -13,10 +15,12 @@ const input = (value = manifest()) => compressToolResult({ tool: "fusion.delegat
 const evidence = (text: string) => JSON.parse(text.split("\n")[0]!.replace(/^artifact-evidence: /, "")) as Record<string, any>;
 
 describe("model-visible artifact evidence", () => {
-  it.each(["local", "cloud"])("carries runtime hashes and failed checks through the actual %s conversation render seam", mode => {
-    const result = projectFusionArtifactEvidence(input(), 2400);
-    const summary = mode === "cloud" ? fullToolResult(result).summary : capBatchSummaries([result], [{}], 2400)[0]!;
-    const turn = toolResultTurn({ tool: result.tool, status: result.status, summary });
+  it.each(["local", "cloud"] as const)("carries runtime hashes and failed checks through the actual %s conversation render seam", mode => {
+    const result = maskResultSecrets(projectFusionArtifactEvidence(input(), 2400));
+    const session = appendBatchedTurns({ state: createEmptySessionState({ id: "evidence-output", workingDir: process.cwd() }),
+      calls: [{ tool: result.tool, args: {} }], results: [mode === "cloud" ? fullToolResult(result) : result],
+      reasoning: "", terminal: null, modelMode: mode });
+    const turn = session.turns[1]!;
     const prompt = mode === "cloud" ? renderCloudTurn(extendCloudContext(undefined, [turn], new Map()).entries[0]!.turn) : renderTurnForPrompt(turn, { inCurrentMacroTurn: true });
     expect(prompt).toContain('"sha256":"' + "a".repeat(64) + '"');
     expect(prompt).toContain('"status":"fail"');
