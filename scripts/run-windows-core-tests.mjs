@@ -14,6 +14,7 @@ export const criticalFiles = [
   'src/tools/fusion/candidate-integration.test.ts',
   'src/tools/fusion/candidate-durability.test.ts',
   'src/tools/fusion/branch-workspace-portability.test.ts',
+  'src/tools/fusion/branch-workspace-dependency-links.test.ts',
   'src/tools/verify/verify-fail-closed.test.ts',
   'src/tools/fusion/fusion-delegate-concurrency.test.ts',
   'src/tools/fusion/outcome-report.test.ts',
