@@ -20,6 +20,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { USER_CONFIG_VERSION } from "../config/config-schema.js";
 import { isSeaBuild, selfInvocation } from "../runtime/self-invocation.js";
+import { killProcessTree } from "../sandbox/kill-process-tree.js";
 import type { FitTask } from "./fit-task.js";
 import type { AgentTaskOutcome } from "./fit-test-types.js";
 
@@ -36,6 +37,8 @@ export interface AgentTaskRunnerOptions {
    * has exited.
    */
   signal?: AbortSignal;
+  /** Test seam for the platform the child is stopped on (`killProcessTree`). */
+  platform?: NodeJS.Platform;
 }
 
 /** How long a stopped child gets to exit on SIGTERM before SIGKILL. */
@@ -110,14 +113,18 @@ export function createAgentTaskRunner(options: AgentTaskRunnerOptions): (task: F
         let timedOut = false;
         let stopped = false;
         let killTimer: ReturnType<typeof setTimeout> | null = null;
+        // The child's whole tree: on Windows `child.kill` is TerminateProcess
+        // on one pid, and the agent's own children would keep running.
+        const killTree = (force: boolean): void =>
+          killProcessTree(child, { force, ...(options.platform ? { platform: options.platform } : {}) });
         const timer = setTimeout(() => {
           timedOut = true;
-          child.kill("SIGKILL");
+          killTree(true);
         }, options.timeoutMs);
         const onAbort = (): void => {
           stopped = true;
-          child.kill("SIGTERM");
-          killTimer = setTimeout(() => child.kill("SIGKILL"), STOP_KILL_GRACE_MS);
+          killTree(false);
+          killTimer = setTimeout(() => killTree(true), STOP_KILL_GRACE_MS);
         };
         const settle = (): void => {
           clearTimeout(timer);

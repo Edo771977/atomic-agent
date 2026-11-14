@@ -27,6 +27,7 @@ import { runModelsRecommend, runModelsUpgrade } from "./models-recommend.js";
 import { runLocalModelsPullAndRun } from "./models-pull-run.js";
 import { runModelsTasks } from "./models-tasks-command.js";
 import { runModelsFitTest } from "./models-fit-test-command.js";
+import { recoverInterruptedFitTest } from "./models-fit-test-restore.js";
 
 const HELP =
   [
@@ -131,12 +132,25 @@ export function parseStartContextFlags(
   };
 }
 
+/** Subcommands that never touch the local model: no fit-test recovery before them. */
+const FIT_RESTORE_SKIP = new Set(["pull-worker", "downloads", "search", "tasks"]);
+/** Subcommands that change the daemon themselves: the recovery puts the model back without starting it. */
+const FIT_RESTORE_NO_RESTART = new Set(["stop", "stop-embedding", "start", "start-embedding", "update", "remove", "use", "use-device", "engine"]);
+
 export async function modelsCommand(args: string[]): Promise<number> {
   getConfig();
   const sub = args[0];
   if (!sub || sub === "-h" || sub === "--help") {
     process.stdout.write(HELP);
     return 0;
+  }
+  if (!FIT_RESTORE_SKIP.has(sub)) {
+    // A fit-test killed outright (Windows Cancel) left a test model active.
+    try {
+      await recoverInterruptedFitTest({ restart: !FIT_RESTORE_NO_RESTART.has(sub) });
+    } catch (err) {
+      process.stderr.write(`could not put back the model an interrupted fit-test left: ${err instanceof Error ? err.message : String(err)}\n`);
+    }
   }
   const cancel = new AbortController();
   const cancelCore = () => cancel.abort();

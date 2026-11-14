@@ -3,7 +3,8 @@
  * status faked: what the run does to the user's model, prompt caches,
  * embedding daemon and output.
  */
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -93,6 +94,7 @@ vi.mock("../fit-test/index.js", async (importOriginal) => {
 });
 
 import { runModelsFitTest } from "./models-fit-test-command.js";
+import { modelsCommand } from "./models-command.js";
 
 let stateDir: string;
 let tasksPath: string;
@@ -195,5 +197,61 @@ describe("models fit-test and the embedding daemon", () => {
     expect(await runModelsFitTest(fitArgs())).toBe(0);
     expect(fake.emb).toBe(true);
     expect(fake.chat).toBe(true);
+  });
+});
+
+/** A pid that has already exited: a fit-test the desktop's Cancel killed. */
+function deadPid(): number {
+  return spawnSync(process.execPath, ["-e", ""]).pid;
+}
+
+describe("models fit-test restore marker (killed without a signal handler, e.g. Windows Cancel)", () => {
+  const markerPath = (): string => join(stateDir, "fit-test-restore.json");
+
+  it("records the user's models before switching and removes the record once they are back", async () => {
+    Object.assign(fake, { chat: true, emb: true });
+    let seen: unknown = null;
+    fake.duringTask = () => {
+      seen = existsSync(markerPath()) ? JSON.parse(readFileSync(markerPath(), "utf8")) : null;
+    };
+    expect(await runModelsFitTest(fitArgs())).toBe(0);
+    expect(seen).toMatchObject({ pid: process.pid, previous: "qwen-3.5-4b", chatRunning: true, embeddingRunning: true });
+    expect(existsSync(markerPath())).toBe(false);
+  });
+
+  it("the next models command puts the user's model back, starts it again and clears the record", async () => {
+    writeFileSync(
+      markerPath(),
+      JSON.stringify({ pid: deadPid(), startedAt: Date.now(), previous: "qwen-3.5-4b", chatRunning: true, embeddingRunning: true }),
+    );
+    // The killed run left a test model serving, beside the embedding model.
+    Object.assign(fake, { chat: true, emb: true });
+    expect(await modelsCommand(["status"])).toBe(0);
+    expect(fake.calls.map(([name]) => name)).toEqual(["stop", "use", "start", "status"]);
+    expect(callsOf("stop")[0]).toMatchObject({ chatOnly: true, savePromptCache: false });
+    expect(callsOf("use")).toEqual(["qwen-3.5-4b"]);
+    expect(existsSync(markerPath())).toBe(false);
+  });
+
+  it("`models stop` after a killed run puts the model back in config without starting it", async () => {
+    writeFileSync(
+      markerPath(),
+      JSON.stringify({ pid: deadPid(), startedAt: Date.now(), previous: "qwen-3.5-4b", chatRunning: true, embeddingRunning: false }),
+    );
+    Object.assign(fake, { chat: true, emb: false });
+    await modelsCommand(["stop"]);
+    expect(callsOf("use")).toEqual(["qwen-3.5-4b"]);
+    expect(callsOf("start")).toEqual([]);
+    expect(existsSync(markerPath())).toBe(false);
+  });
+
+  it("leaves the record of a fit-test that is still running alone", async () => {
+    writeFileSync(
+      markerPath(),
+      JSON.stringify({ pid: process.ppid, startedAt: Date.now(), previous: "qwen-3.5-4b", chatRunning: true, embeddingRunning: false }),
+    );
+    expect(await modelsCommand(["status"])).toBe(0);
+    expect(fake.calls.map(([name]) => name)).toEqual(["status"]);
+    expect(existsSync(markerPath())).toBe(true);
   });
 });

@@ -13,11 +13,13 @@
  * Stopped by SIGINT (Ctrl+C) or SIGTERM (the desktop's Cancel), the run
  * winds down instead of dying (ATO-1498): the running child is stopped,
  * its temp dirs removed, the previous model put back, and the command
- * exits 130 / 143. A second signal quits at once.
+ * exits 130 / 143. A second signal quits at once. A run killed outright
+ * (Windows Cancel) is put back by the next `models` command or TUI start
+ * from the restore record (`models-fit-test-restore.ts`).
  */
 import { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { getConfig, resetConfigCache } from "../config/index.js";
+import { getConfig } from "../config/index.js";
 import {
   createAgentTaskRunner,
   createFitJudge,
@@ -26,17 +28,15 @@ import {
   readProcessRssBytes,
   runFitTest,
   type FitTestDeps,
-  type LoadedFitModel,
 } from "../fit-test/index.js";
-import { getDaemonStatus, getEmbeddingDaemonStatus, stopEmbeddingDaemon } from "../local-llm/index.js";
 import { readRecommendSnapshot } from "../local-llm/model-upgrade-runner.js";
+import { readCliOption } from "./models-handlers.js";
 import {
-  readCliOption,
-  runLocalModelsStart,
-  runLocalModelsStartEmbedding,
-  runLocalModelsStop,
-  runLocalModelsUse,
-} from "./models-handlers.js";
+  clearFitRestoreMarker,
+  createFitModelSwitcher,
+  readFitModelSnapshot,
+  writeFitRestoreMarker,
+} from "./models-fit-test-restore.js";
 
 const MAX_MODELS = 3;
 const DEFAULT_TIMEOUT_S = 300;
@@ -76,98 +76,6 @@ export function parseFitTestArgs(args: string[]): FitTestArgs | { error: string 
     timeoutMs: timeoutS * 1000,
     outPath: readCliOption(args, "--out") ? resolve(readCliOption(args, "--out") as string) : null,
     json: args.includes("--json"),
-  };
-}
-
-async function chatDaemonStatus() {
-  const cfg = getConfig();
-  return getDaemonStatus(cfg.paths.localModelsDataDir, cfg.localModels.managed.port);
-}
-
-/** What the run found before it touched anything, to put back afterwards. */
-export interface FitModelSnapshot {
-  /** The active managed model. */
-  previous: string | null;
-  chatRunning: boolean;
-  embeddingRunning: boolean;
-}
-
-async function embeddingDaemonStatus() {
-  const cfg = getConfig();
-  return getEmbeddingDaemonStatus(cfg.paths.localModelsDataDir, cfg.localModels.embeddings.port);
-}
-
-export async function readFitModelSnapshot(): Promise<FitModelSnapshot> {
-  return {
-    previous: getConfig().localModels.managed.modelId,
-    chatRunning: (await chatDaemonStatus()).running,
-    embeddingRunning: (await embeddingDaemonStatus().catch(() => ({ running: false }))).running,
-  };
-}
-
-/**
- * Loads the test models in turn and puts the user's models back.
- *
- * Only the chat model is swapped (`models stop --chat-only`): the
- * embedding model keeps serving memory search through the run, and at
- * the end it is left as it was found, up or down.
- *
- * Prompt disk cache (ATO-456): the first stop is the user's own model, so
- * its conversations are saved once, as any stop saves them. Test models
- * start with the cache suspended (`promptCache: "suspend"`): no save
- * path, and none of the restore-time cleanup that deletes saves from
- * another launch, so the user's saves are still there when their model
- * starts again. Their stops save nothing (`savePromptCache: false`).
- */
-export function createFitModelSwitcher(snapshot: FitModelSnapshot) {
-  // A holder: the first stop saves the user's caches, no later one does.
-  const state = { userCachesSaved: false };
-  const stopChat = async (): Promise<void> => {
-    const savePromptCache = !state.userCachesSaved;
-    state.userCachesSaved = true;
-    await runLocalModelsStop(savePromptCache ? { chatOnly: true } : { chatOnly: true, savePromptCache: false });
-  };
-  return {
-    /** Makes `modelId` the active managed model and starts it. */
-    async load(modelId: string, signal: AbortSignal): Promise<LoadedFitModel> {
-      if (signal.aborted) throw new Error("stopped");
-      await stopChat();
-      if ((await runLocalModelsUse(modelId)) !== 0) throw new Error("unknown model id");
-      if ((await runLocalModelsStart({ signal, promptCache: "suspend" })) !== 0) {
-        throw new Error("the model did not start (is it downloaded?)");
-      }
-      resetConfigCache();
-      const cfg = getConfig();
-      const status = await chatDaemonStatus();
-      return {
-        url: cfg.localModels.url,
-        apiKey: cfg.localModels.apiKey,
-        pid: status.pid,
-        release: stopChat,
-      };
-    },
-    /**
-     * Puts back the model that was active before the run, started again
-     * if it was running, and the embedding model as it was. After a stop
-     * the test model may still be loaded (its release did not run), so
-     * it is stopped first.
-     */
-    async restore(stopped: boolean): Promise<void> {
-      if (stopped) await stopChat();
-      if (snapshot.previous !== null) {
-        await runLocalModelsUse(snapshot.previous);
-        if (snapshot.chatRunning) await runLocalModelsStart({});
-      }
-      const embeddingNow = (await embeddingDaemonStatus().catch(() => ({ running: snapshot.embeddingRunning }))).running;
-      if (snapshot.embeddingRunning && !embeddingNow) {
-        await runLocalModelsStartEmbedding();
-      } else if (!snapshot.embeddingRunning && embeddingNow) {
-        // A test model's start brought it up. With no chat model to keep,
-        // the full stop also lets an idle Atomic Core exit.
-        if (snapshot.chatRunning) await stopEmbeddingDaemon(getConfig().paths.localModelsDataDir);
-        else await runLocalModelsStop({ savePromptCache: false });
-      }
-    },
   };
 }
 
@@ -307,9 +215,16 @@ export async function runModelsFitTest(args: string[]): Promise<number> {
   const gpuBudgetGb = await readRecommendSnapshot()
     .then((snap) => snap.machine.gpuBudgetGb)
     .catch(() => null);
+  // A process killed with no chance to run a handler (the desktop's
+  // Cancel on Windows is TerminateProcess) leaves this record behind; the
+  // next `models` command or TUI start puts the models back from it.
+  writeFitRestoreMarker(cfg.paths.stateDir, snapshot);
   const outcome = await runRestoringOnStop(
     (signal) => runFitTest(set, parsed.modelIds, depsFor(signal), { gpuBudgetGb }),
-    (stopped) => switcher.restore(stopped),
+    async (stopped) => {
+      await switcher.restore(stopped);
+      clearFitRestoreMarker(cfg.paths.stateDir);
+    },
   );
   if (outcome.stoppedBy !== null) return outcome.exitCode;
   const run = outcome.result;
