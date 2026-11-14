@@ -477,12 +477,18 @@ export function applyCheckOutcomes(
       ...(detail === undefined ? {} : { detail }),
       ...(output === undefined ? {} : { output }),
     };
-    // A task that stopped to ask (ATO-945) could not have passed its
-    // checks either; its question is the row's next step, not a failure.
+    // A task that stopped to ask (ATO-945) before writing could not have
+    // passed its checks either; its question is the row's next step, not
+    // a failure. One that wrote files is judged on them like any other,
+    // and keeps its question when they fail.
+    const askedBeforeWriting =
+      result.status === "needs_input" &&
+      result.tools.writes === 0 &&
+      (result.changes?.length ?? 0) === 0;
     if (
       failed.length === 0 ||
       result.status === "cancelled" ||
-      result.status === "needs_input"
+      askedBeforeWriting
     ) {
       return { ...result, checks };
     }

@@ -37,6 +37,10 @@ const OPEN_STATUSES: ReadonlySet<WorkerTaskStatus> = new Set([
 
 export const HELD_FOR_REPLAN = "not started: held for the replan";
 
+/** The fix for a task that stopped to ask (ATO-945). */
+export const NEEDS_INPUT_FIX =
+  "answer its question in the brief and send it again; if only the person can answer, ask them in your reply";
+
 export interface ReplanTask {
   id: string;
   status: WorkerTaskStatus;
@@ -84,6 +88,9 @@ export function replanFix(
   ranOnOrchestrator: boolean,
   orchestratorAvailable = true,
 ): string | undefined {
+  // A question is not a failure (ATO-945): another model will not
+  // answer it, the orchestrator (or the person) does.
+  if (status === "needs_input") return NEEDS_INPUT_FIX;
   if (
     attempts >= 2 &&
     status !== "cancelled" &&
@@ -128,7 +135,9 @@ export function describeReplan(
     const used = Math.max(0, runs - 1);
     const left = max - used;
     const onOrchestrator = ranOnOrchestrator(result.id);
-    const stop = left > 0 && runs >= 2 && onOrchestrator;
+    // A question asked again on the orchestrator's model is still a
+    // question to answer, not a failure past what a round fixes.
+    const stop = left > 0 && runs >= 2 && onOrchestrator && result.status !== "needs_input";
     const fix =
       left > 0 && !stop
         ? replanFix(
@@ -142,7 +151,7 @@ export function describeReplan(
     const task: ReplanTask = {
       id: result.id,
       status: result.status,
-      why: (result.error ?? result.status).replace(/\s+/g, " ").slice(0, 300),
+      why: whyOf(result),
       replansLeft: Math.max(0, left - 1),
       ...(fix === undefined ? {} : { fix }),
     };
@@ -153,9 +162,31 @@ export function describeReplan(
   return { pending, exhausted, failedOnOrchestrator, max };
 }
 
+/**
+ * A row's error, or its status when it has none, with the worker's
+ * question after it: for `needs_input` the question is the whole point.
+ */
+function whyOf(result: WorkerTaskResult): string {
+  const base = (result.error ?? result.status).replace(/\s+/g, " ").slice(0, 300);
+  if (result.question === undefined) return base;
+  return `${base}; asks: ${result.question.replace(/\s+/g, " ")}`;
+}
+
 export function renderReplanBlock(report: ReplanReport): string {
   const parts: string[] = [];
-  if (report.pending.length > 0) {
+  if (report.pending.length > 0 && report.pending.every((t) => t.status === "needs_input")) {
+    // Nothing failed: the loop does not hold the next step to the
+    // delegate (`fusion-replan.ts`), so the planner may ask the person.
+    parts.push(
+      [
+        `ANSWER REQUIRED — these tasks stopped to ask. Answer each question in its brief and send it again with \`fusion.delegate\` (same id), or, when only the person can answer, ask them in your reply:`,
+        ...report.pending.map(
+          (t) =>
+            `- ${t.id} (${t.status}): ${t.why} — ${t.replansLeft} more replan${t.replansLeft === 1 ? "" : "s"} after this one`,
+        ),
+      ].join("\n"),
+    );
+  } else if (report.pending.length > 0) {
     parts.push(
       [
         `REPLAN REQUIRED — these tasks did not close. Your next step must be \`fusion.delegate\` again: rewrite each brief from the facts above (the error, the failed checks, the judge's findings), keep each task's id or split it into continuation ids (\`<id>.a\`, \`<id>.b\`, sharing its replans), and include anything held for them.`,

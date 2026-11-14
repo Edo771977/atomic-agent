@@ -7,14 +7,17 @@
  * is in THIRD-PARTY-NOTICES.md. The object, array and integer rules are
  * in `json-schema-gbnf-shapes.ts`.
  *
- * Kept from the original: the object rule (required keys first, then any
- * subset of the optional ones, in schema order, each at most once), the
- * array repetition, `anyOf` / `oneOf` / type-list unions, `enum` /
+ * Kept from the original: the array repetition, `anyOf` / `oneOf` / type-list unions, `enum` /
  * `const` literals, local `$ref`, `allOf` merging, rule names by property
  * path with identical rules shared, and `additionalProperties` absent
  * meaning a closed object (the point here: no invented keys).
  *
  * Changed, and why:
+ *  - Object keys come in any order (`objectRule`), not required-first in
+ *    schema order: models write keys in the order their examples show,
+ *    and an ordered rule rejected valid calls. Exact up to
+ *    `EXACT_OBJECT_KEYS` keys; larger objects track only their required
+ *    keys, so an optional key may repeat there.
  *  - The leaves are the host grammar's rules (`string`, `value`,
  *    `number`, ... in `grammars/tool-call.gbnf`) and `ws` separates
  *    tokens, not the original's own primitives and `space`. A reasoning

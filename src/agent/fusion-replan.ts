@@ -11,7 +11,9 @@ import { isRefusedResult } from "./review-stall.js";
  * planner's next step admits only `fusion.delegate` — the same per-step
  * tool set the stalled review uses (`step-tool-set.ts`) — so a failed
  * part is re-planned from the facts in the same turn instead of waiting
- * for the person to type "continue".
+ * for the person to type "continue". Pending tasks that are all
+ * `needs_input` (a worker's question) do not hold the step: the planner
+ * may answer and re-delegate, or ask the person.
  *
  * Bounded three ways: each task has `autoReplan` replans (counted by the
  * tool); a delegate result without pending tasks lifts the hold; and a
@@ -41,13 +43,18 @@ export function createReplanState(): ReplanState {
   return { pending: null, heldSteps: 0, releaseNoticeOwed: false };
 }
 
-function pendingOf(result: CompressedToolResult): string[] {
+interface PendingTask {
+  id: string;
+  status?: unknown;
+}
+
+function pendingOf(result: CompressedToolResult): PendingTask[] {
   const replan = result.details.replan as
-    | { pending?: Array<{ id?: unknown }> }
+    | { pending?: Array<{ id?: unknown; status?: unknown }> }
     | undefined;
-  return (replan?.pending ?? [])
-    .map((t) => t.id)
-    .filter((id): id is string => typeof id === "string");
+  return (replan?.pending ?? []).filter(
+    (t): t is PendingTask => typeof t.id === "string",
+  );
 }
 
 /** Fold one completed step in. */
@@ -65,8 +72,11 @@ export function observeReplanStep(
   );
   if (delegated.length > 0) {
     const pending = delegated.flatMap(pendingOf);
+    // Only questions (ATO-945): nothing failed, and the answer may be the
+    // person's, so the planner is not held to the delegate.
+    const hold = pending.some((t) => t.status !== "needs_input");
     return {
-      pending: pending.length > 0 ? pending : null,
+      pending: hold ? pending.map((t) => t.id) : null,
       heldSteps: 0,
       releaseNoticeOwed: false,
     };

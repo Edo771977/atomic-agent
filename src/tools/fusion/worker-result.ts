@@ -279,7 +279,9 @@ export interface WorkerTaskResult {
   profile?: { name: string; source: string; tools: readonly string[] | "all" };
   /**
    * The worker's question to the orchestrator, on a `needs_input` row
-   * (ATO-945); at most `MAX_WORKER_QUESTION_CHARS`.
+   * (ATO-945), or on a `failed` one that wrote files before asking and
+   * failed its declared-file or own checks; at most
+   * `MAX_WORKER_QUESTION_CHARS`.
    */
   question?: string;
 }

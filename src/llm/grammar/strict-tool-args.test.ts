@@ -25,6 +25,45 @@ const ALL_TOOLS: StrictArgsTool[] = DEFAULT_TOOL_DESCRIPTORS.map((d) => ({
   schema: d.argsJsonSchema,
 }));
 
+describe("strict tool args: key order", () => {
+  it("accepts every shipped descriptor example", async () => {
+    const plain = await buildGrammar(PLAIN_INSTRUCT_PROFILE);
+    const strict = applyStrictToolArgs(
+      plain,
+      DEFAULT_TOOL_DESCRIPTORS.map((d) => ({ name: d.name, schema: d.argsJsonSchema ?? getDefaultArgsJsonSchema(d.name) })),
+    );
+    const rejected: string[] = [];
+    let total = 0;
+    for (const d of DEFAULT_TOOL_DESCRIPTORS) {
+      for (const example of d.examples ?? []) {
+        let args: unknown;
+        try {
+          args = JSON.parse(example);
+        } catch {
+          continue;
+        }
+        // A gated tool the static grammar does not name (video.generate)
+        // is not the strict rules' to judge.
+        if (!gbnfAccepts(plain, "root", call(d.name, args))) continue;
+        total += 1;
+        if (!gbnfAccepts(strict, "root", call(d.name, args))) rejected.push(`${d.name}: ${example.slice(0, 80)}`);
+      }
+    }
+    expect(total).toBeGreaterThan(20);
+    expect(rejected.join("\n")).toBe("");
+  });
+
+  it("takes a fusion.delegate call with its contract before its tasks", async () => {
+    const plain = await buildGrammar(PLAIN_INSTRUCT_PROFILE);
+    const strict = applyStrictToolArgs(plain, [tool("fusion.delegate")]);
+    const args = {
+      contract: { provides: [{ kind: "file", name: "a.js", task: "a" }] },
+      tasks: [{ instructions: "write a.js", files: ["a.js"], id: "a", title: "A" }],
+    };
+    expect(gbnfAccepts(strict, "root", call("fusion.delegate", args))).toBe(true);
+  });
+});
+
 describe("strict tool args (ATO-633): the generic branch", () => {
   it("leaves the grammar byte-identical with no schemas, and with no tool it admits", async () => {
     const plain = await buildGrammar(PLAIN_INSTRUCT_PROFILE);

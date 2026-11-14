@@ -1,4 +1,7 @@
 import { describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import type { RunTurnResult } from "../../agent/agent-loop.js";
 import { FanoutScopeRegistry } from "../../approval/fanout-scope.js";
@@ -301,5 +304,97 @@ describe("needs_input is not a failure", () => {
     const out = formatDelegateOutput([row(), row({ id: "t2", status: "ok", question: undefined, reply: "done" })], 4000);
     expect(out.split("\n")[0]).toContain("1 ok, 1 needs_input");
     expect(out).toContain(`question: ${QUESTION}`);
+  });
+});
+
+describe("a worker that wrote files before it asked", () => {
+  const write = (path: string) => ({
+    type: "llm_event" as const,
+    event: {
+      type: "tool_call_executed" as const,
+      result: {
+        tool: "os.fs.write",
+        status: "ok" as const,
+        summary: "written",
+        details: { path, existed: false, addedLines: 1, removedLines: 0 },
+        truncated: false,
+      },
+      batchIndex: 0,
+      batchSize: 1,
+    },
+  });
+
+  async function inDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
+    const dir = mkdtempSync(join(tmpdir(), "fusion-ask-"));
+    try {
+      return await fn(dir);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  function writingDeps(dir: string, messages: string[], over: Partial<FusionDelegateDeps> = {}): FusionDelegateDeps {
+    const base = deps(async (_session, userMessage, options) => {
+      messages.push(userMessage);
+      const path = join(dir, "a.js");
+      writeFileSync(path, "a()\n");
+      options.eventHook?.(write(path) as never);
+      options.eventHook?.({
+        type: "llm_event",
+        event: { type: "assistant_reply", text: `wrote a.js.\n${NEEDS_INPUT_MARKER} ${QUESTION}` },
+      });
+      return turnResult();
+    });
+    return {
+      ...base,
+      workingDir: dir,
+      createEphemeralSession: (meta) =>
+        createEmptySessionState({
+          id: `${FUSION_WORKER_ID_PREFIX}${messages.length + 1}`,
+          workingDir: dir,
+          metadata: { fusionWorker: { ...meta } },
+        }),
+      ...over,
+    };
+  }
+
+  it("still has its declared files checked: a missing one fails the task, keeping the question", async () => {
+    await inDir(async (dir) => {
+      const messages: string[] = [];
+      const tool = buildFusionDelegateTool(writingDeps(dir, messages));
+      const result = await tool.run(
+        { tasks: [{ id: "t1", title: "Score", instructions: "Score task", files: ["a.js", "b.js"] }] },
+        { ...ctx(), workingDir: dir },
+      );
+      const r = (result.details.tasks as WorkerTaskResult[])[0]!;
+      expect(r.status).toBe("failed");
+      expect(r.error).toContain("declared file b.js does not exist");
+      expect(r.question).toBe(QUESTION);
+      // Still no self-check turn: a question is not a claim of done.
+      expect(messages).toHaveLength(1);
+    });
+  });
+
+  it("stays needs_input when what it wrote passes its checks", async () => {
+    await inDir(async (dir) => {
+      const messages: string[] = [];
+      const tool = buildFusionDelegateTool(writingDeps(dir, messages));
+      const result = await tool.run(
+        { tasks: [{ id: "t1", title: "Score", instructions: "Score task", files: ["a.js"] }] },
+        { ...ctx(), workingDir: dir },
+      );
+      const r = (result.details.tasks as WorkerTaskResult[])[0]!;
+      expect(r).toMatchObject({ status: "needs_input", question: QUESTION });
+    });
+  });
+
+  it("is failed by its own failing contract check, keeping the question", () => {
+    const [folded] = applyCheckOutcomes(
+      [row({ tools: { calls: 1, errors: 0, writes: 1, byTool: { "os.fs.write": 1 } } })],
+      [{ task: "t1", ok: false, detail: "node js/hud.js exited 1" } as never],
+    );
+    expect(folded?.status).toBe("failed");
+    expect(folded?.error).toContain("checks: node js/hud.js exited 1");
+    expect(folded?.question).toBe(QUESTION);
   });
 });

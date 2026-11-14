@@ -241,6 +241,39 @@ describe("resuming a fusion run (ATO-617)", () => {
       expect(planResume(saved, ["t1"]).rerun).toEqual(["t1", "t2", "t3"]);
     });
 
+    it("carries a needs_input task's question, even past a long reply", () => {
+      const question = "Should the score be the run's total or the best lap?";
+      const run = store.start({ sessionId: "s-parent", workingDir: "/repo", args: { tasks: TASKS }, tasks: TASKS, waveCount: 1 });
+      run.recordTask(row("t1", {
+        status: "needs_input",
+        reply: `${"x".repeat(5_000)}\nNEEDS_INPUT: ${question}`,
+        question,
+      }));
+      run.finish("interrupted");
+      const carried = planResume(store.load(run.runId)!).carried[0]!;
+      expect(carried).toMatchObject({ id: "t1", status: "needs_input", question });
+    });
+
+    it("loads a v1 needs_input row saved without a question", () => {
+      const saved = cutOff(["t1"]);
+      const result = saved.tasks[0]!.result!;
+      result.status = "needs_input";
+      delete (result as { question?: string }).question;
+      writeFileSync(join(dir, `${saved.runId}.json`), JSON.stringify(saved));
+      const loaded = store.load(saved.runId)!;
+      expect(loaded).not.toBeNull();
+      const carried = planResume(loaded).carried[0]!;
+      expect(carried.status).toBe("needs_input");
+      expect(carried).not.toHaveProperty("question");
+    });
+
+    it("refuses a stored question past its bound", () => {
+      const saved = cutOff(["t1"]);
+      (saved.tasks[0]!.result as { question?: string }).question = "q".repeat(5_000);
+      writeFileSync(join(dir, `${saved.runId}.json`), JSON.stringify(saved));
+      expect(store.load(saved.runId)).toBeNull();
+    });
+
     it("loads legacy v1 rows but does not call unknown file-change coverage green", () => {
       const saved = cutOff(["t1"]);
       const result = saved.tasks[0]!.result!;
