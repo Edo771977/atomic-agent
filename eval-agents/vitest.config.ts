@@ -13,7 +13,8 @@ const TEST_TIMEOUT_MARGIN_MS = 220_000;
 export default defineConfig({
   root: resolve(__dirname, ".."),
   test: {
-    include: ["eval-agents/**/*.eval.ts", "eval-agents/**/*.test.ts"],
+    include: ["eval-agents/gaia.eval.ts"],
+    runner: resolve(__dirname, "harness", "campaign-runner.ts"),
     environment: "node",
     globals: false,
     testTimeout: ADAPTER_TIMEOUT_MS + TEST_TIMEOUT_MARGIN_MS,

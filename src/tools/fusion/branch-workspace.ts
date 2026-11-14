@@ -19,9 +19,10 @@
  * task, bypassing clean/smudge filters and Git's stat cache. Untracked files are
  * copied in; ignored directories and ignored files are copied privately
  * so a test run still finds them, except the shared dependency
- * directories (`node_modules`, `target`, `.venv`), which are symlinked
+ * directories (`node_modules`, `target`, `.venv`), which are normally symlinked
  * to the original's and cost no copy budget (with
- * `privateDependencyDirectories`, tasks copy them privately instead).
+ * `privateDependencyDirectories`, tasks copy them privately instead). Denied
+ * or unsupported generated directory links become bounded private copies.
  * Outside git, or when git cannot snapshot
  * (no commit yet, a merge in progress, no git binary), a workspace is
  * a private folder copy without the original's git metadata. Copying
@@ -367,6 +368,8 @@ class PrivateCopyLimitError extends Error {
 interface PrivateCopyBudget {
   left: number;
   signal?: AbortSignal;
+  /** Only links made by this copy operation may be expanded on link failure. */
+  generatedDirectoryLinks: Map<string, string>;
   /**
    * Set while making a workspace that must own its dependency directories:
    * the original they are copied from (the base only holds links to it).
@@ -381,9 +384,23 @@ interface PrivateCopyBudget {
  * the base and every task both blew the copy limit and refused isolation
  * for ordinary repos. Never stamped or merged (`VERIFY_COPY_EXCLUDED`).
  * Writes through the link reach the original, as for `verify.run`;
- * `privateDependencyDirectories` copies them instead.
+ * `privateDependencyDirectories` copies them instead. Hosts that deny or do
+ * not support generated directory links also use budgeted private copies.
  */
 export const SHARED_DEPENDENCY_DIRECTORIES: ReadonlySet<string> = new Set(["node_modules", "target", ".venv"]);
+
+/** Try sharing a real directory; denied/unsupported generated links copy privately. */
+async function linkDirectoryOrCopy(from: string, to: string, budget: PrivateCopyBudget, rel: string): Promise<void> {
+  await mkdir(dirname(to), { recursive: true });
+  try {
+    await symlink(from, to, "dir");
+    budget.generatedDirectoryLinks.set(to, from);
+  } catch (err) {
+    if (!["EPERM", "EACCES", "ENOTSUP", "EOPNOTSUPP"].includes((err as NodeJS.ErrnoException).code ?? "")) throw err;
+    budget.signal?.throwIfAborted();
+    await copyPrivateEntry(from, to, budget, rel, false);
+  }
+}
 
 /** Whether any component of `rel` names a shared dependency directory. */
 function underSharedDependencyDirectory(rel: string): boolean {
@@ -419,8 +436,9 @@ async function copyPrivateEntry(
   }
   const info = await lstat(from);
   if (shared && budget.privateDependenciesFrom === undefined && info.isDirectory()) {
-    await mkdir(dirname(to), { recursive: true });
-    await symlink(await realpath(from), to, "dir");
+    await linkDirectoryOrCopy(await realpath(from), to, budget, rel);
+  } else if (info.isSymbolicLink() && budget.generatedDirectoryLinks.has(from)) {
+    await linkDirectoryOrCopy(budget.generatedDirectoryLinks.get(from)!, to, budget, rel);
   } else if (info.isDirectory()) {
     await mkdir(to, { recursive: true });
     for (const name of await readdir(from)) {
@@ -614,7 +632,7 @@ export async function createBranchSet(
       await cleanupGit(["worktree", "prune"], snapshot.top).catch(() => null);
     }
   };
-  const budget: PrivateCopyBudget = { left: options.maxCopyBytes ?? VERIFY_COPY_MAX_BYTES, ...(options.signal === undefined ? {} : { signal: options.signal }) };
+  const budget: PrivateCopyBudget = { left: options.maxCopyBytes ?? VERIFY_COPY_MAX_BYTES, generatedDirectoryLinks: new Map(), ...(options.signal === undefined ? {} : { signal: options.signal }) };
   try {
     const method: BranchMethod = snapshot === null ? "copy" : "worktree";
     const make = async (name: string, source: string): Promise<string> => {

@@ -26,8 +26,13 @@ Unit tests (scoring + parsing, no LLM):
 
 ```bash
 npm run eval:agents:lint
-npx vitest run --config eval-agents/vitest.config.ts eval-agents/harness
+npx vitest run --config eval-agents/vitest.hermetic.config.ts
 ```
+
+This config selects harness, adapter and launcher unit tests, plus `eval/`
+unit tests. It excludes live `*.eval.ts` campaigns and the separate
+`small-models/` task-fixture utilities, which currently require POSIX/Python
+commands and are not part of this portable harness check.
 
 Smoke (committed fixtures, all agents):
 
@@ -60,6 +65,39 @@ Each run writes `eval-agents/reports/run-<ISO>/`:
 
 - `matrix.csv` / `matrix.jsonl` — per (agent × question) row
 - `environment.json` — pinned model, sampling, git SHA
+- `campaign.json` — selected, attempted, completed, failed and skipped case
+  counts, plus report-write errors and case error provenance. `executed` is
+  retained as an alias of `attempted`: an adapter invocation that throws is
+  still an execution. `completed` counts adapter calls that returned;
+  `failed` counts case errors/wrong answers separately from report failures.
+  An exception gets a failed JSONL/CSV case row; independent matrix writers
+  preserve whichever output remains writable. Counters are saved before
+  matrix writes, and an unusable summary destination also emits them to stderr.
+
+An intended campaign fails if its dataset/task filters select no rows, its
+agent filter selects no adapters, or no selected agent case executes. Missing
+competitor prerequisites remain genuine skipped tests with reasons in the
+matrix; partial skips do not count as executed successes. The scorer-only
+smoke is a separate hermetic unit test and does not establish agent execution.
+The campaign config runs only `gaia.eval.ts`; its runner checks completion
+outside test hooks, so a title filter matching nothing fails too. The
+orchestrator independently validates its fresh completion report after Vitest
+closes. An absent agent filter selects defaults; an explicitly empty string
+or comma-only filter selects no agents and fails.
+Set `ATOMIC_AGENT_GAIA_REPORT_DIR` to place a campaign's reports in a chosen
+directory (the default remains a timestamped directory under `reports/`).
+The launcher resolves a relative report directory against the test child's
+working directory (normally the repository root), then passes the same
+absolute path to the child and completion validator.
+
+Orchestrators launch the installed Vitest JavaScript entry with the current
+Node executable, including on Windows; forwarded arguments stay separate
+argv entries. Spawn errors fail the run, and cancellation waits for the
+test child to close before returning.
+Installed SIGINT/SIGTERM handlers request cancellation through the signal
+passed by smoke/level1; they do not exit or stop daemons inline. The caller
+awaits child close, then its managed-daemon teardown, before exiting 130.
+Health waits honor the same signal, and handlers are removed after teardown.
 
 ## Methodology
 

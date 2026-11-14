@@ -1,6 +1,6 @@
 import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, sep } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 import { createBranchSet } from "./branch-workspace.js";
 import { createCandidateIntegration } from "./candidate-integration.js";
@@ -26,6 +26,13 @@ vi.mock("node:fs", async importOriginal => {
 // Pass-through promise fs: records rename/sync order and injects failures.
 const faults = vi.hoisted(() => ({} as { rm?: (path: string) => boolean; chmod?: (path: string) => boolean; openSync?: (path: string) => boolean }));
 const fsEvents = vi.hoisted(() => [] as [string, string][]);
+const chmodCalls = vi.hoisted(() => [] as [string, number][]);
+vi.mock("../../config/durable-write.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../../config/durable-write.js")>();
+  return { ...actual, syncDirectoryBestEffort: (path: string) => {
+    fsEvents.push(["syncDirectory", path]); return actual.syncDirectoryBestEffort(path);
+  } };
+});
 vi.mock("node:fs/promises", async importOriginal => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
   const fail = (what: string, path: string) => Object.assign(new Error(`injected ${what} failure: ${path}`), { code: "EIO" });
@@ -34,6 +41,7 @@ vi.mock("node:fs/promises", async importOriginal => {
     return (actual.rm as (...args: unknown[]) => Promise<void>)(path, ...rest);
   }) as typeof actual.rm;
   const chmod = (async (path: string, mode: number) => {
+    chmodCalls.push([String(path), mode]);
     if (faults.chmod?.(String(path)) === true) throw fail("chmod", String(path));
     return actual.chmod(path, mode);
   }) as typeof actual.chmod;
@@ -47,12 +55,14 @@ vi.mock("node:fs/promises", async importOriginal => {
   const mocked = { ...actual, rm, chmod, rename, open };
   return { ...mocked, default: mocked };
 });
-afterEach(() => { delete faults.rm; delete faults.chmod; delete faults.openSync; fsEvents.length = 0; });
+afterEach(() => { delete faults.rm; delete faults.chmod; delete faults.openSync; fsEvents.length = 0; chmodCalls.length = 0; });
 
 const roots: string[] = [];
 afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
-async function project() {
-  const root = await mkdtemp(join(tmpdir(), "atag-candidate-test-")); roots.push(root);
+async function project(prefix = join(tmpdir(), "atag-candidate-test-")) {
+  // Runtime paths use async realpath too; temp paths may contain Windows
+  // drive-case/8.3 aliases that would hide events from the exact-path spies.
+  const root = await realpath(await mkdtemp(prefix)); roots.push(root);
   await writeFile(join(root, "api.json"), '{"name":"before"}');
   await writeFile(join(root, "dirty.txt"), "user's uncommitted bytes\r\n");
   return root;
@@ -60,6 +70,14 @@ async function project() {
 const rows: WorkerTaskResult[] = [{ id: "api", title: "api", status: "ok", reply: "done", stepCount: 1, durationMs: 1, tools: { calls: 1, errors: 0, writes: 1, byTool: {} } }];
 const contract = { checks: [{ kind: "command", command: "integration" }] };
 const signal = new AbortController().signal;
+
+it("canonicalizes fixture path aliases before matching runtime filesystem events", async () => {
+  // Keep the redundant component in the actual mkdtemp prefix. This exposes
+  // the same lexical/canonical mismatch as Windows drive-case or 8.3 aliases
+  // without requiring a particular host or filesystem setting.
+  const root = await project(`${tmpdir()}${sep}.${sep}atag-candidate-alias-`);
+  expect(root).toBe(await realpath(root));
+});
 
 it("rejects individually valid files with incompatible final API and retains a patch", async () => {
   const root = await project(); const candidate = await createCandidateIntegration(root);
@@ -293,7 +311,9 @@ it("keeps worker writes under a shared dependency folder private to the candidat
     expect(inner).not.toBeNull();
     try {
       const task = inner!.workspaces.get("worker")!;
-      expect(await realpath(join(task.dir, "node_modules"))).toBe(await realpath(join(candidate.dir, "node_modules")));
+      // Generated links may fall back to a private copy on hosts without link
+      // privileges. In either shape the task must never reach the original.
+      expect(await readFile(join(task.dir, "node_modules", "dep.js"), "utf8")).toBe("dep\n");
       await writeFile(join(task.dir, "node_modules", "dep.js"), "worker write\n");
       await writeFile(join(task.dir, "node_modules", "added.js"), "worker add\n");
     } finally { await inner!.cleanup(); }
@@ -320,13 +340,18 @@ it("gives a folder-copy candidate its own dependency folder too", async () => {
 });
 
 it.each([".ATOMIC-AGENT", ".Atomic-Agent", ".atomic-agent.", ".atomic-agent "])("refuses agent state spelled %j, as a case-insensitive or Win32 filesystem opens it", async name => {
-  const root = await project(); const candidate = await createCandidateIntegration(root);
+  const root = await project();
+  const protectedRules = '{"rules":[{"operator":"owned"}]}';
+  await mkdir(join(root, ".atomic-agent")); await writeFile(join(root, ".atomic-agent", "approval-rules.json"), protectedRules);
+  const candidate = await createCandidateIntegration(root);
   try {
-    await mkdir(join(candidate.dir, name));
+    await mkdir(join(candidate.dir, name), { recursive: true });
     await writeFile(join(candidate.dir, name, "approval-rules.json"), '{"rules":[{"allow":"*"}]}');
     const report = await candidate.finish({ rows, contract, signal, runChecks: pass });
     expect(report.status).toBe("rejected"); expect(report.reason).toContain("agent state");
-    await expect(lstat(join(root, name))).rejects.toThrow();
+    // Rejection legitimately creates .atomic-agent/fusion-merge. On a
+    // case-insensitive host the alias can name that same recovery folder.
+    expect(await readFile(join(root, ".atomic-agent", "approval-rules.json"), "utf8")).toBe(protectedRules);
   } finally { await candidate.cleanup(); }
 });
 
@@ -472,6 +497,7 @@ it("marks a delivered promotion committed before removing its journal and report
 it("keeps promotion backups owner-only while recording the original mode in the journal", async () => {
   const root = await project();
   await writeFile(join(root, "secret.env"), "TOKEN=abc\n"); await chmod(join(root, "secret.env"), 0o644);
+  const originalMode = (await stat(join(root, "secret.env"))).mode & 0o777;
   const seen: { folder?: number; backup?: number; recorded?: number } = {};
   const candidate = await createCandidateIntegration(root, { beforeCommit: async () => {
     const merge = mergeDir(root); const names = await readdir(merge);
@@ -485,8 +511,13 @@ it("keeps promotion backups owner-only while recording the original mode in the 
     await writeFile(join(candidate.dir, "secret.env"), "TOKEN=new\n");
     expect((await candidate.finish({ rows, contract, signal, runChecks: pass })).status).toBe("promoted");
   } finally { await candidate.cleanup(); }
-  expect(seen).toEqual({ folder: 0o700, backup: 0o600, recorded: 0o644 });
-  expect((await stat(join(root, "secret.env"))).mode & 0o777).toBe(0o644);
+  expect(seen.recorded).toBe(originalMode);
+  // Windows chmod represents only the read-only bit. Verify the protection
+  // requests everywhere, and the effective POSIX permission bits on POSIX.
+  expect(chmodCalls.some(([path, mode]) => path.endsWith(".promotion-backup") && mode === 0o700)).toBe(true);
+  expect(chmodCalls.some(([path, mode]) => path.includes(".promotion-backup") && path.endsWith(join("", "0")) && mode === 0o600)).toBe(true);
+  if (process.platform !== "win32") expect(seen).toEqual({ folder: 0o700, backup: 0o600, recorded: 0o644 });
+  expect((await stat(join(root, "secret.env"))).mode & 0o777).toBe(originalMode);
 });
 
 it("rolls back a directory it created even when setting its mode fails", async () => {
@@ -517,8 +548,12 @@ it("flushes a delivered temp file before renaming it and the merge folder's new 
   const tmp = fsEvents[renameAt]![1];
   expect(fsEvents.slice(0, renameAt).some(([kind, path]) => kind === "sync" && path === tmp)).toBe(true);
   // The project root and .atomic-agent gained new entries: both are flushed.
-  const opened = fsEvents.filter(([kind]) => kind === "openSync").map(([, path]) => path);
-  expect(opened).toContain(root); expect(opened).toContain(join(root, ".atomic-agent"));
+  const directories = fsEvents.filter(([kind]) => kind === "syncDirectory").map(([, path]) => path);
+  expect(directories).toContain(root); expect(directories).toContain(join(root, ".atomic-agent"));
+  if (process.platform !== "win32") {
+    const opened = fsEvents.filter(([kind]) => kind === "openSync").map(([, path]) => path);
+    expect(opened).toContain(root); expect(opened).toContain(join(root, ".atomic-agent"));
+  }
 });
 
 it("journals a step as intent, naming its temp file, until the change lands", async () => {
@@ -561,7 +596,7 @@ it("removes the backup folder when the first journal write fails", async () => {
 // it keeps its identity, so only a parent dev/ino re-check at commit sees it.
 async function swapParentForLink(root: string, parent: string): Promise<string> {
   const outside = await mkdtemp(join(tmpdir(), "atag-candidate-outside-")); roots.push(outside);
-  await rename(join(root, parent), join(outside, parent)); await symlink(join(outside, parent), join(root, parent));
+  await rename(join(root, parent), join(outside, parent)); await symlink(join(outside, parent), join(root, parent), process.platform === "win32" ? "junction" : "dir");
   return join(outside, parent);
 }
 

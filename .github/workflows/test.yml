@@ -135,3 +135,42 @@ jobs:
 
       - name: Run tests
         run: node scripts/run-tests.mjs ${{ matrix.scope }}
+
+      - name: Run pure eval harness tests
+        if: matrix.drop_canvas == 'false'
+        run: node node_modules/vitest/vitest.mjs run --config eval-agents/vitest.hermetic.config.ts --maxWorkers=1 --minWorkers=1
+
+  windows-core:
+    name: Windows core reliability
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      # Apply to checkout and every child Git process without changing machine configuration.
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: core.autocrlf
+      GIT_CONFIG_VALUE_0: "false"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "25.7"
+          check-latest: true
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check production types
+        run: npm run lint
+
+      - name: Check test type debt
+        run: npm run typecheck:tests
+
+      - name: Build
+        run: npm run build
+
+      - name: Run native core and pure harness tests
+        run: node scripts/run-windows-core-tests.mjs

@@ -179,6 +179,8 @@ export interface WorkerTaskResult {
    * the daemon rather than at the fan-out's width.
    */
   queueWaitMs?: number | null;
+  /** Call-wide scheduler wait before dispatch; excluded from durationMs and provider queueWaitMs. */
+  schedulerQueueWaitMs?: number;
   tools: WorkerToolStats;
   usage?: CompletionUsage;
   /**

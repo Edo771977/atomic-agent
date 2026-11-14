@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
-import type { TaskOutcomeRecord, TurnOutcomeRecord } from "./outcome-log.js";
+import { taskOutcomeRecord, type TaskOutcomeRecord, type TurnOutcomeRecord } from "./outcome-log.js";
+import type { WorkerTaskResult } from "./worker-result.js";
 import {
   aggregateOutcomes,
   formatFusionReport,
@@ -89,6 +90,66 @@ const RECORDS = [
 ];
 
 describe("fusion report", () => {
+  it("separates actual writer status-only success from declared check evidence", () => {
+    const row: WorkerTaskResult = {
+      id: "task", title: "test", status: "ok", reply: "done", stepCount: 1,
+      durationMs: 1, tools: { calls: 0, errors: 0, writes: 0, byTool: {} },
+    };
+    const context = { provider: "local", model: "small", leg: "local" as const,
+      role: null, attempt: 1, pricing: undefined, merge: null };
+    const record = taskOutcomeRecord(row, context, "session", NOW);
+    const stats = aggregateOutcomes([record]).workers[0]!;
+    expect(stats).toMatchObject({ green: 1, firstPassGreen: 1,
+      checksPassed: 0, checksFailed: 0, checksUnverified: 1 });
+    const text = formatFusionReport(aggregateOutcomes([record]));
+    expect(text).toContain("reported green");
+    expect(text).toContain("checks pass/fail/unverified");
+    expect(text).toContain("worker can modify");
+    expect(text).toContain("semantic correctness");
+
+    const checked = taskOutcomeRecord({ ...row, checks: { total: 1, failed: 0 } }, context, "session", NOW);
+    const failed = taskOutcomeRecord({ ...row, status: "failed", checks: { total: 1, failed: 1 } }, context, "session", NOW);
+    const replan = taskOutcomeRecord({ ...row, checks: { total: 1, failed: 0 } }, { ...context, attempt: 2 }, "session", NOW);
+    expect(aggregateOutcomes([checked, failed, replan]).workers[0]).toMatchObject({
+      green: 2, firstPassGreen: 1, checksPassed: 2, checksFailed: 1, checksUnverified: 0,
+    });
+    const judgedFailure = taskOutcomeRecord({ ...row, status: "failed", checks: { total: 1, failed: 1 },
+      judge: { green: false, total: 1, failed: 1, retried: false, costUsd: null, items: [] },
+    }, context, "session", NOW);
+    expect(aggregateOutcomes([judgedFailure]).workers[0]).toMatchObject({
+      checksPassed: 0, checksFailed: 1, checksUnverified: 0,
+    });
+  });
+
+  it("keeps legacy, missing and contradictory check evidence unverified", () => {
+    const accepted = task({ acceptance: "checks-passed", acceptanceScope: "task-checks" });
+    const records = [
+      task(), // legacy status-only record
+      { ...accepted, acceptanceScope: undefined },
+      { ...accepted, status: "timeout" as const },
+      { ...accepted, failure: "checks" as const },
+      { ...accepted, failure: undefined },
+      { ...accepted, merge: "held" as const },
+      { ...accepted, merge: "conflict" as const },
+      { ...accepted, merge: undefined },
+      { ...accepted, judgeRetried: true },
+      { ...accepted, judgeRetried: undefined },
+      { ...accepted, escalations: 1 },
+      { ...accepted, syntaxDemoted: true },
+      { ...accepted, syntaxDemoted: undefined },
+      { ...accepted, judge: "red" as const },
+      { ...accepted, judge: "unverified" as const },
+      { ...accepted, acceptance: "checks-failed" as const },
+      { ...accepted, attempt: undefined },
+    ] as TaskOutcomeRecord[];
+    expect(aggregateOutcomes(records).workers[0]).toMatchObject({
+      checksPassed: 0, checksFailed: 0, checksUnverified: records.length,
+    });
+    expect(aggregateOutcomes([accepted, { ...accepted, merge: "merged" }]).workers[0]).toMatchObject({
+      checksPassed: 2, checksFailed: 0, checksUnverified: 0,
+    });
+  });
+
   it("aggregates per worker model with first-pass, retries, failures and rates", () => {
     const report = aggregateOutcomes(RECORDS, { days: 7, now: NOW });
     expect(report.tasks).toBe(8);
@@ -149,7 +210,7 @@ describe("fusion report", () => {
   it("prints a plain text table", () => {
     const text = formatFusionReport(aggregateOutcomes(RECORDS, { days: 7, now: NOW }), { days: 7 });
     expect(text).toContain("Fusion outcomes, last 7 days: 8 tasks, 2 turns");
-    expect(text).toMatch(/Worker models\nmodel\s+leg\s+tasks\s+1st-pass/);
+    expect(text).toMatch(/Worker models\nmodel\s+leg\s+tasks\s+reported 1st-pass/);
     expect(text).toMatch(/small \(local-llama\)\s+local\s+6\s+17%\s+50%/);
     expect(text).toContain("syntax 2, max_steps 1");
     expect(text).toContain("Tasks sent to the orchestrator's model");

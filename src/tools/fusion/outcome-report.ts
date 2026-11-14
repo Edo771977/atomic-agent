@@ -34,13 +34,18 @@ export interface ModelStats {
   model: string;
   leg: OutcomeLeg;
   tasks: number;
-  /** Green on the first attempt, with no judge retry and no self-check notice. */
+  /** Reported status ok on the first attempt, with no judge retry or self-check notice. */
   firstPassGreen: number;
   firstPassGreenRate: number;
   green: number;
   greenRate: number;
   /** Green after a replan attempt or a judge retry. */
   greenAfterRetry: number;
+  /** Consistent acceptance records for declared task checks, including replan attempts. */
+  checksPassed: number;
+  checksFailed: number;
+  /** Missing, legacy, or contradictory task-check evidence; never inferred from status ok. */
+  checksUnverified: number;
   topFailures: Array<{ category: FailureCategory; count: number }>;
   escalated: number;
   escalationRate: number;
@@ -145,6 +150,20 @@ function median(values: number[]): number {
 
 const rate = (n: number, of: number): number => (of === 0 ? 0 : n / of);
 
+/** This describes the recorded task checks, not independent semantic acceptance. */
+function taskCheckEvidence(row: TaskOutcomeRecord): "passed" | "failed" | "unverified" {
+  if (row.acceptanceScope !== "task-checks" ||
+      !Number.isInteger(row.attempt) || row.attempt < 1 ||
+      row.judgeRetried !== false || row.escalations !== 0 ||
+      typeof row.selfCheckNotice !== "boolean" || row.syntaxDemoted !== false ||
+      (row.merge !== null && row.merge !== "merged") ||
+      !["off", "green", "red", "unverified"].includes(row.judge)) return "unverified";
+  if (row.acceptance === "checks-passed" && row.status === "ok" && row.failure === null &&
+      (row.judge === "off" || row.judge === "green")) return "passed";
+  if (row.acceptance === "checks-failed" && row.status === "failed" && row.failure === "checks") return "failed";
+  return "unverified";
+}
+
 function modelStats(rows: TaskOutcomeRecord[]): ModelStats {
   const first = rows[0]!;
   const green = rows.filter((r) => r.status === "ok");
@@ -153,12 +172,13 @@ function modelStats(rows: TaskOutcomeRecord[]): ModelStats {
   );
   const failures = new Map<FailureCategory, number>();
   for (const r of rows) {
-    if (r.failure !== null) failures.set(r.failure, (failures.get(r.failure) ?? 0) + 1);
+    if (typeof r.failure === "string") failures.set(r.failure, (failures.get(r.failure) ?? 0) + 1);
   }
   const noticed = rows.filter((r) => r.selfCheckNotice);
   const fixed = noticed.filter((r) => r.status === "ok");
   const priced = rows.filter((r) => r.costUsd !== null);
   const escalated = rows.filter((r) => r.escalations > 0).length;
+  const checks = rows.map(taskCheckEvidence);
   return {
     provider: first.provider,
     model: first.model,
@@ -169,6 +189,9 @@ function modelStats(rows: TaskOutcomeRecord[]): ModelStats {
     green: green.length,
     greenRate: rate(green.length, rows.length),
     greenAfterRetry: green.filter((r) => r.attempt > 1 || r.judgeRetried).length,
+    checksPassed: checks.filter((value) => value === "passed").length,
+    checksFailed: checks.filter((value) => value === "failed").length,
+    checksUnverified: checks.filter((value) => value === "unverified").length,
     topFailures: [...failures.entries()]
       .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
       .slice(0, 3)
@@ -342,7 +365,7 @@ function table(header: string[], rows: string[][]): string[] {
 
 function modelRows(stats: ModelStats[]): string[] {
   return table(
-    ["model", "leg", "tasks", "1st-pass", "green", "after retry", "escalated", "self-check fixed", "median", "tokens in/out", "spend", "top failures"],
+    ["model", "leg", "tasks", "reported 1st-pass", "reported green", "after retry", "checks pass/fail/unverified", "escalated", "self-check fixed", "median", "tokens in/out", "spend", "top failures"],
     stats.map((s) => [
       s.model === s.provider ? s.model : `${s.model} (${s.provider})`,
       s.leg,
@@ -350,6 +373,7 @@ function modelRows(stats: ModelStats[]): string[] {
       pct(s.firstPassGreenRate),
       pct(s.greenRate),
       String(s.greenAfterRetry),
+      `${s.checksPassed}/${s.checksFailed}/${s.checksUnverified}`,
       pct(s.escalationRate),
       s.selfCheckFixRate === null ? "-" : `${s.selfCheckFixed}/${s.selfCheckNotices}`,
       formatDurationShort(s.medianDurationMs),
@@ -403,7 +427,8 @@ export function formatFusionReport(report: FusionReport, options: ReportOptions 
         ? "unpriced (subscription or no price known)"
         : `${formatUsdShort(report.strongSpendUsd)}${report.strongSpendPartial ? " + unpriced (subscription or no price known)" : ""}`
     }`,
-    "1st-pass: green on the first attempt with no judge retry and no self-check notice. after retry: green after a replan or judge retry.",
+    "Reported green: status ok; reported 1st-pass: status ok on the first attempt with no judge retry or self-check notice. after retry: reported green after a replan or judge retry.",
+    "Checks pass/fail/unverified: consistent task-checks acceptance records; missing or contradictory evidence is unverified. Replan attempts can have check evidence. The worker can modify the declared checks and their inputs; passing them does not establish semantic correctness or full integration acceptance.",
   );
   return `${lines.join("\n")}\n`;
 }

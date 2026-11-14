@@ -14,9 +14,9 @@ export const AGENT_FACTORIES: ReadonlyArray<() => AgentAdapter> = [
 ];
 
 export function listAgentAdapters(filterIds?: readonly string[]): AgentAdapter[] {
-  const want = filterIds?.length
-    ? new Set(filterIds.map((id) => id.trim()).filter(Boolean))
-    : null;
+  const want = filterIds === undefined
+    ? null
+    : new Set(filterIds.map((id) => id.trim()).filter(Boolean));
   return AGENT_FACTORIES
     .map((factory) => factory())
     .filter((adapter) => !want || want.has(adapter.id));

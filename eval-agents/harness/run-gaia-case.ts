@@ -18,6 +18,9 @@ export interface RunGaiaCaseOptions {
    * `<tracesOutDir>/<taskId>/` before the temp-workspace is deleted.
    */
   tracesOutDir?: string;
+  /** Invocation accounting, separate from unavailable prerequisite skips. */
+  onAttempt?: () => void;
+  onComplete?: () => void;
 }
 
 export async function runGaiaCase(opts: RunGaiaCaseOptions): Promise<GaiaAgentRunResult> {
@@ -40,6 +43,7 @@ export async function runGaiaCase(opts: RunGaiaCaseOptions): Promise<GaiaAgentRu
   try {
     const attachmentHint = opts.row.file_name || null;
     const prompt = buildGaiaUserPrompt(opts.row.Question, attachmentHint);
+    opts.onAttempt?.();
     const raw = await opts.adapter.runQuestion({
       row: opts.row,
       workingDir: workspace.workingDir,
@@ -50,6 +54,7 @@ export async function runGaiaCase(opts: RunGaiaCaseOptions): Promise<GaiaAgentRu
       chatUrl: opts.chatUrl,
       embedUrl: opts.embedUrl,
     });
+    opts.onComplete?.();
 
     const extracted = extractFinalAnswer(raw.rawReply);
     const correct = questionScorer(extracted, opts.row["Final answer"]);

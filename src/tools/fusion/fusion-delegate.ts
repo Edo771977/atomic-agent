@@ -138,6 +138,7 @@ import { measuredTaskLegs, readRoutingHistory } from "./measured-routing.js";
 import { collectTaskArtifactManifests } from "./artifact-manifest-tasks.js";
 import { createCandidateIntegration, type CandidateIntegration, type CandidateIntegrationReport } from "./candidate-integration.js";
 import { readFusionWorkerMeta } from "../../session/fusion-worker-session.js";
+import { createTaskPermitPool } from "./task-permits.js";
 
 export const FUSION_DELEGATE_TOOL = "fusion.delegate";
 
@@ -646,7 +647,7 @@ export function buildFusionDelegateTool(
           ? parsed.tasks.length
           : parsed.tasks.filter((t) => taskLegs.get(t.id)?.isWorkerLeg !== false)
               .length;
-      const wanted = Math.max(1, Math.min(requested, legTaskCount));
+      const wanted = Math.max(1, Math.min(requested, parsed.tasks.length));
       // A cloud leg has no slot pool, so nothing physical bounds the
       // width — only the bill. `cloudWorkers` is that bound: a
       // `maxWorkers` above it is clamped, and the result says so, since
@@ -654,13 +655,29 @@ export function buildFusionDelegateTool(
       const cloudCap = Number.isFinite(poolSize)
         ? Number.POSITIVE_INFINITY
         : (mode.cloudWorkers ?? DEFAULT_FUSION_CLOUD_WORKERS);
-      const maxWorkers = Math.max(1, Math.min(wanted, poolSize, cloudCap));
-      const cloudCapIsBinding = maxWorkers < wanted && maxWorkers === cloudCap;
+      const workerLegMaxWorkers = Math.max(1, Math.min(wanted, poolSize, cloudCap));
+      const roleLegWidth = (leg: TaskLeg, count: number): number =>
+        Math.max(1, Math.min(count,
+          deps.workerSupportsSlotAffinity(leg.providerId) ? 1 : (mode.cloudWorkers ?? DEFAULT_FUSION_CLOUD_WORKERS),
+          leg.orchestrator === true ? ORCHESTRATOR_TASK_MAX_WIDTH : Number.POSITIVE_INFINITY));
+      // The call's ceiling spans all active legs; an unused main local
+      // pool cannot serialize tasks assigned exclusively to cloud roles.
+      const capacity = Math.min(legTaskCount, workerLegMaxWorkers) +
+        [...roleLegs.values()].reduce((sum, leg) => {
+          const count = parsed.tasks.filter((t) => {
+            const own = taskLegs.get(t.id);
+            return own?.isWorkerLeg === false && own.providerId === leg.providerId;
+          }).length;
+          return sum + (count === 0 ? 0 : roleLegWidth(leg, count));
+        }, 0);
+      const maxWorkers = Math.max(1, Math.min(wanted, capacity));
+      const permits = createTaskPermitPool(maxWorkers);
+      const cloudCapIsBinding = roleLegs.size === 0 && maxWorkers < wanted && maxWorkers === cloudCap;
       // The pool held this fan-out down when it ran fewer at a time than
       // there was work for — whether the orchestrator asked for a wider
       // number or simply had more tasks than the machine has slots.
       const poolIsBinding =
-        !cloudCapIsBinding &&
+        roleLegs.size === 0 && !cloudCapIsBinding &&
         (maxWorkers < wanted || maxWorkers < legTaskCount);
 
       const orchestratorModel =
@@ -1328,7 +1345,8 @@ export function buildFusionDelegateTool(
             parentSessionId: ctx.sessionId,
             tasks,
             concurrentTaskIds,
-            maxWorkers,
+            maxWorkers: workerLegMaxWorkers,
+            acquireTaskPermit: permits.acquire,
             providerId: workerProviderId,
             workerModel,
             workerMaxSteps: mode.workerMaxSteps,
@@ -1390,20 +1408,8 @@ export function buildFusionDelegateTool(
             parentSessionId: ctx.sessionId,
             tasks,
             concurrentTaskIds,
-            maxWorkers: local
-              ? 1
-              : Math.max(
-                  1,
-                  Math.min(
-                    tasks.length,
-                    mode.cloudWorkers ?? DEFAULT_FUSION_CLOUD_WORKERS,
-                    // The strong leg's turns are the costly ones (or a
-                    // subscription's request quota): a modest width.
-                    leg.orchestrator === true
-                      ? ORCHESTRATOR_TASK_MAX_WIDTH
-                      : Number.POSITIVE_INFINITY,
-                  ),
-                ),
+            maxWorkers: Math.min(maxWorkers, roleLegWidth(leg, tasks.length)),
+            acquireTaskPermit: permits.acquire,
             providerId: leg.providerId,
             workerModel:
               onlyRole === "-" ? leg.model : `${leg.model} (${onlyRole})`,
@@ -2168,7 +2174,9 @@ export function buildFusionDelegateTool(
           ? `\n\nNote: ${Math.max(wanted, legTaskCount)} workers' worth of work was sent but the local server has ${poolSize} request slot${poolSize === 1 ? "" : "s"}, so only ${maxWorkers} ran at a time and the rest queued. That number comes from the machine — every slot draws on one shared llama-server context pool (\`localModels.managed.parallel\`, \`"auto"\` by default). Split into fewer, larger tasks if the queueing is costing more than the parallelism buys.`
           : cloudCapIsBinding
             ? `\n\nNote: maxWorkers ${wanted} was clamped to ${maxWorkers}, the cloud worker cap (\`llm.runMode.fusion.cloudWorkers\`); the rest queued behind them.`
-            : "";
+            : maxWorkers < wanted
+              ? `\n\nNote: maxWorkers ${wanted} was clamped to ${maxWorkers} across the active provider pools by their slot, cloud-worker and strong-model limits; the rest queued behind them.`
+              : "";
         // The call's own status is the tasks' summary: a fan-out where
         // every worker failed used to come back `ok`, and an orchestrator
         // reading only the status merged nothing as if it were something.

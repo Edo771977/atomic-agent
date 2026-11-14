@@ -27,6 +27,8 @@ export interface VerifyRunResult {
   readonly durationMs: number;
   /** A run that could not happen (no browser, bad cwd, spawn failure). */
   readonly error?: string;
+  /** Setup/cancellation failures are distinct from a check that actually ran. */
+  readonly errorCode?: "workspace-unavailable" | "cancelled" | "workspace-cleanup-failed";
   readonly commandLine?: string;
   readonly exitCode?: number | null;
   readonly timedOut?: boolean;
@@ -174,16 +176,35 @@ export async function runVerify(
 ): Promise<VerifyRunResult> {
   const started = Date.now();
   const args = parseVerifyRunArgs(rawArgs as Record<string, unknown>);
-  const workspace = await (ctx.workspace ?? createVerifyWorkspace)(ctx.workingDir);
+  const failed = (error: string, errorCode: VerifyRunResult["errorCode"], isolated = false): VerifyRunResult =>
+    finish({ kind: args.kind, isolated, error, ...(errorCode === undefined ? {} : { errorCode }) }, { kind: args.kind }, args.checks, false, started);
+  if (ctx.signal?.aborted) return failed("verification cancelled before execution", "cancelled");
+  let workspace: VerifyWorkspace | undefined;
+  let result: VerifyRunResult;
   try {
-    return await runInWorkspace(args, workspace.dir, workspace.isolated, ctx, started);
+    workspace = await (ctx.workspace ?? createVerifyWorkspace)(ctx.workingDir);
+    if (ctx.signal?.aborted) {
+      result = failed("verification cancelled before execution", "cancelled", workspace.isolated);
+    } else if (!workspace.isolated || resolve(workspace.dir) === resolve(ctx.workingDir)) {
+      result = failed(`verification not started: ${workspace.error ?? "a private workspace copy is unavailable"}`, "workspace-unavailable");
+    } else {
+      result = await runInWorkspace(args, workspace.dir, true, ctx, started);
+      // Executors may settle normally after an abort (a page can skip
+      // remaining script steps). Such an incomplete run cannot pass.
+      if (ctx.signal?.aborted) result = failed("verification cancelled during execution", "cancelled", true);
+    }
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
-    const base = { kind: args.kind, isolated: workspace.isolated, error };
-    return finish(base, { kind: args.kind }, args.checks, false, started);
+    result = failed(error, ctx.signal?.aborted ? "cancelled" : workspace === undefined ? "workspace-unavailable" : undefined, workspace?.isolated ?? false);
   } finally {
-    await workspace.cleanup();
+    try {
+      await workspace?.cleanup();
+    } catch (err) {
+      const error = err instanceof Error ? err.message : String(err);
+      result = failed(`could not clean up verification workspace: ${error}`, "workspace-cleanup-failed", workspace?.isolated ?? false);
+    }
   }
+  return result;
 }
 
 /** The fan-out contract's checks: every spec in order, `ok` when all are. */

@@ -203,10 +203,15 @@ async function observeEntry(root: string, rel: string, bounds: InventoryBounds):
 const sameIdentity = (a: Stats | undefined, b: Stats | undefined): boolean =>
   a === undefined || b === undefined ? a === b
     : a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeMs === b.mtimeMs && a.ctimeMs === b.ctimeMs && a.mode === b.mode;
-/** fsync a regular file; file systems that cannot flush are tolerated. A read-only descriptor flushes on POSIX. */
-async function syncFile(path: string): Promise<void> {
-  const handle = await open(path, "r");
-  try { await handle.sync().catch((err: NodeJS.ErrnoException) => { if (!["EINVAL", "ENOTSUP", "EOPNOTSUPP"].includes(err.code ?? "")) throw err; }); } finally { await handle.close(); }
+/** fsync a writable regular file; Windows also requires a write-capable handle. */
+async function syncFile(path: string, finalMode?: number): Promise<void> {
+  const handle = await open(path, "r+");
+  try {
+    // Retain write access while restoring a possibly read-only final mode;
+    // the flush covers both bytes and final metadata before publication.
+    if (finalMode !== undefined) await chmod(path, finalMode);
+    await handle.sync().catch((err: NodeJS.ErrnoException) => { if (!["EINVAL", "ENOTSUP", "EOPNOTSUPP"].includes(err.code ?? "")) throw err; });
+  } finally { await handle.close(); }
 }
 /** What a step verified: the target's stat (undefined when absent) and each ancestor directory's. */
 interface Verified { stat: Stats | undefined; parents: ReadonlyMap<string, Stats> }
@@ -405,9 +410,11 @@ export async function createCandidateIntegration(
       } else {
         await copyFile(join(root, rel), tmp);
         if (await fileHash(tmp, { bytes: options.maxInventoryBytes ?? VERIFY_COPY_MAX_BYTES, entries: 1, signal: AbortSignal.timeout(30_000) }) !== expected.hash) throw new Error(`candidate changed before delivery: ${rel}`);
+        // copyFile can preserve a read-only source mode. Make only the private
+        // staging copy writable to open the flush handle.
+        await chmod(tmp, 0o600);
         // The bytes reach the disk before the name does.
-        await syncFile(tmp);
-        await chmod(tmp, expected.mode);
+        await syncFile(tmp, expected.mode);
       }
       await commitGuard(rel, verified);
       await rename(tmp, target); landed(); syncDirectoryBestEffort(dirname(target));
