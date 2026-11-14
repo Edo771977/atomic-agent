@@ -93,7 +93,7 @@ describe("agent configuration ownership", () => {
       "tokenBudget", "maxSteps", "providerWait", "task", "toolTimeoutMs",
       "readScope", "approvalLevel", "compaction", "conversationMaxTokens", "conversationMaxPairs",
       "nameSessions", "conversationLowWater", "sessionSectionsMaxTokens", "worldSnapshotMaxTokens",
-      "smartApproval", "smartApprovalModel",
+      "smartApproval", "smartApprovalModel", "taintReview",
       "prompt",
       "tools",
     ]);
@@ -222,7 +222,7 @@ describe("agent configuration ownership", () => {
         "tokenBudget", "maxSteps", "providerWait", "nameSessions", "task", "toolTimeoutMs",
         "readScope", "approvalLevel", "compaction", "conversationMaxTokens", "conversationMaxPairs",
         "conversationLowWater", "sessionSectionsMaxTokens", "worldSnapshotMaxTokens",
-        "smartApproval", "smartApprovalModel",
+        "smartApproval", "smartApprovalModel", "taintReview",
         "prompt", "tools",
       ]);
     } finally {
