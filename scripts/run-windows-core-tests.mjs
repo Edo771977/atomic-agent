@@ -51,6 +51,7 @@ export const supplementalFiles = [
   'src/sandbox/command-runner-kill.test.ts',
   'src/sandbox/command-toolchain-env.test.ts',
   'src/llm/provider/subscription-cli/spawn-einval.test.ts',
+  'src/llm/provider/subscription-cli/host-environment.test.ts',
   'src/tui/open-terminal-window.test.ts',
   'src/tui/components/logo-art.generated.test.ts',
   'src/tui/skills/skill-slash-live.test.tsx',
