@@ -28,11 +28,12 @@ import {
   type FitTestDeps,
   type LoadedFitModel,
 } from "../fit-test/index.js";
-import { getDaemonStatus } from "../local-llm/index.js";
+import { getDaemonStatus, getEmbeddingDaemonStatus, stopEmbeddingDaemon } from "../local-llm/index.js";
 import { readRecommendSnapshot } from "../local-llm/model-upgrade-runner.js";
 import {
   readCliOption,
   runLocalModelsStart,
+  runLocalModelsStartEmbedding,
   runLocalModelsStop,
   runLocalModelsUse,
 } from "./models-handlers.js";
@@ -83,8 +84,33 @@ async function chatDaemonStatus() {
   return getDaemonStatus(cfg.paths.localModelsDataDir, cfg.localModels.managed.port);
 }
 
+/** What the run found before it touched anything, to put back afterwards. */
+export interface FitModelSnapshot {
+  /** The active managed model. */
+  previous: string | null;
+  chatRunning: boolean;
+  embeddingRunning: boolean;
+}
+
+async function embeddingDaemonStatus() {
+  const cfg = getConfig();
+  return getEmbeddingDaemonStatus(cfg.paths.localModelsDataDir, cfg.localModels.embeddings.port);
+}
+
+export async function readFitModelSnapshot(): Promise<FitModelSnapshot> {
+  return {
+    previous: getConfig().localModels.managed.modelId,
+    chatRunning: (await chatDaemonStatus()).running,
+    embeddingRunning: (await embeddingDaemonStatus().catch(() => ({ running: false }))).running,
+  };
+}
+
 /**
- * Loads the test models in turn and puts the user's model back.
+ * Loads the test models in turn and puts the user's models back.
+ *
+ * Only the chat model is swapped (`models stop --chat-only`): the
+ * embedding model keeps serving memory search through the run, and at
+ * the end it is left as it was found, up or down.
  *
  * Prompt disk cache (ATO-456): the first stop is the user's own model, so
  * its conversations are saved once, as any stop saves them. Test models
@@ -93,13 +119,13 @@ async function chatDaemonStatus() {
  * another launch, so the user's saves are still there when their model
  * starts again. Their stops save nothing (`savePromptCache: false`).
  */
-export function createFitModelSwitcher() {
+export function createFitModelSwitcher(snapshot: FitModelSnapshot) {
   // A holder: the first stop saves the user's caches, no later one does.
   const state = { userCachesSaved: false };
   const stopChat = async (): Promise<void> => {
     const savePromptCache = !state.userCachesSaved;
     state.userCachesSaved = true;
-    await runLocalModelsStop(savePromptCache ? {} : { savePromptCache: false });
+    await runLocalModelsStop(savePromptCache ? { chatOnly: true } : { chatOnly: true, savePromptCache: false });
   };
   return {
     /** Makes `modelId` the active managed model and starts it. */
@@ -121,15 +147,26 @@ export function createFitModelSwitcher() {
       };
     },
     /**
-     * Puts back the model that was active before the run. After a stop the
-     * test model may still be loaded (its release did not run), so it is
-     * stopped first.
+     * Puts back the model that was active before the run, started again
+     * if it was running, and the embedding model as it was. After a stop
+     * the test model may still be loaded (its release did not run), so
+     * it is stopped first.
      */
-    async restore(previous: string | null, wasRunning: boolean, stopped: boolean): Promise<void> {
+    async restore(stopped: boolean): Promise<void> {
       if (stopped) await stopChat();
-      if (previous === null) return;
-      await runLocalModelsUse(previous);
-      if (wasRunning) await runLocalModelsStart({});
+      if (snapshot.previous !== null) {
+        await runLocalModelsUse(snapshot.previous);
+        if (snapshot.chatRunning) await runLocalModelsStart({});
+      }
+      const embeddingNow = (await embeddingDaemonStatus().catch(() => ({ running: snapshot.embeddingRunning }))).running;
+      if (snapshot.embeddingRunning && !embeddingNow) {
+        await runLocalModelsStartEmbedding();
+      } else if (!snapshot.embeddingRunning && embeddingNow) {
+        // A test model's start brought it up. With no chat model to keep,
+        // the full stop also lets an idle Atomic Core exit.
+        if (snapshot.chatRunning) await stopEmbeddingDaemon(getConfig().paths.localModelsDataDir);
+        else await runLocalModelsStop({ savePromptCache: false });
+      }
     },
   };
 }
@@ -253,7 +290,8 @@ export async function runModelsFitTest(args: string[]): Promise<number> {
   }
   const judgeKey = parsed.judgeKeyEnv ? (process.env[parsed.judgeKeyEnv] ?? null) : null;
   const judge = createFitJudge({ url: parsed.judgeUrl, model: parsed.judgeModel, apiKey: judgeKey });
-  const switcher = createFitModelSwitcher();
+  const snapshot = await readFitModelSnapshot();
+  const switcher = createFitModelSwitcher(snapshot);
   const depsFor = (signal: AbortSignal): FitTestDeps => ({
     loadModel: (modelId) => switcher.load(modelId, signal),
     runTask: (task, model) =>
@@ -266,14 +304,12 @@ export async function runModelsFitTest(args: string[]): Promise<number> {
     sampleMemory: readProcessRssBytes,
     progress: (line) => process.stderr.write(`${line}\n`),
   });
-  const previous = cfg.localModels.managed.modelId;
-  const wasRunning = (await chatDaemonStatus()).running;
   const gpuBudgetGb = await readRecommendSnapshot()
     .then((snap) => snap.machine.gpuBudgetGb)
     .catch(() => null);
   const outcome = await runRestoringOnStop(
     (signal) => runFitTest(set, parsed.modelIds, depsFor(signal), { gpuBudgetGb }),
-    (stopped) => switcher.restore(previous, wasRunning, stopped),
+    (stopped) => switcher.restore(stopped),
   );
   if (outcome.stoppedBy !== null) return outcome.exitCode;
   const run = outcome.result;

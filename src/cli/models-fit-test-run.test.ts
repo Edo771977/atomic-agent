@@ -173,3 +173,27 @@ describe("models fit-test and the user's prompt caches", () => {
     expect(callsOf("start")).toEqual([{ promptCache: "suspend" }, { promptCache: "suspend" }, { promptCache: null }]);
   });
 });
+
+describe("models fit-test and the embedding daemon", () => {
+  it("keeps memory search up when only the embedding model was running", async () => {
+    Object.assign(fake, { chat: false, emb: true });
+    expect(await runModelsFitTest(fitArgs())).toBe(0);
+    expect(fake.emb).toBe(true);
+    expect(fake.chat).toBe(false);
+    for (const stop of callsOf("stop") as Array<Record<string, unknown>>) expect(stop.chatOnly).toBe(true);
+  });
+
+  it("leaves the embedding model down when it was down before the run", async () => {
+    Object.assign(fake, { chat: false, emb: false });
+    expect(await runModelsFitTest(fitArgs())).toBe(0);
+    expect(fake.emb).toBe(false);
+    expect(fake.chat).toBe(false);
+  });
+
+  it("brings both back when both were running", async () => {
+    Object.assign(fake, { chat: true, emb: true });
+    expect(await runModelsFitTest(fitArgs())).toBe(0);
+    expect(fake.emb).toBe(true);
+    expect(fake.chat).toBe(true);
+  });
+});
