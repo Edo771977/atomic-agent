@@ -75,6 +75,25 @@ describe("ApprovalGate review after outside content (ATO-618)", () => {
     await expect(pending).resolves.toMatchObject({ approved: false });
   });
 
+  it("holds an auto-approved POST (http_write) after outside content", async () => {
+    const { gate, emitted } = setup({ answer: { risk: "high", reason: "posts data out" } });
+    gate.noteUntrustedContent("s1", "a web page");
+    const post = {
+      sessionId: "s1",
+      tool: "os.http.request",
+      category: "http_write" as const,
+      reason: "send an HTTP POST",
+      preview: "POST https://collect.example",
+    };
+    const pending = gate.request(post);
+    await settle();
+    expect(isTaintSensitive("http_write")).toBe(true);
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0]!.category).toBe("http_write");
+    gate.reject(emitted[0]!.approvalId, "no");
+    await expect(pending).resolves.toMatchObject({ approved: false });
+  });
+
   it("asks the person when no reviewer is installed or it is switched off", async () => {
     for (const s of [setup(), setup({ answer: { risk: "low", reason: "x" }, reviewerOn: false })]) {
       s.gate.noteUntrustedContent("s1", "an HTTP response");

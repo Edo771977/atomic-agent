@@ -28,6 +28,7 @@ const TAINT_SENSITIVE: Record<ApprovalCategory, boolean> = {
   fs_write_home: true,
   fs_trash: false,
   http: true,
+  http_write: true,
   shell: true,
   shell_dangerous: true,
   script: true,
