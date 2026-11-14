@@ -108,6 +108,7 @@ Checked snapshot of primitive USER_CONFIG_DEFAULTS values for config version 79.
 - `tools.screen.enabled` (default `false`): the macOS `os.screen.*` computer-use tools ([OS tools](../../tools/os/README.md)); read at start.
 - `tools.screen.point` (default `true`): `os.screen.point`, which only draws marks through the desktop app, plus `os.screen.capture`, on macOS, independent of `tools.screen.enabled`; read at start.
 - `tools.verify.maxCopyBytes` (default `2147483648`, 2 GiB): the largest tree `verify.run` copies into its throwaway workspace off macOS, not counting the linked `node_modules`, `.git`, `dist`, `build`, `target`, `.venv`; a bigger tree is refused, never run in place. A positive integer up to `1099511627776` (1 TiB); a larger value is a validation error. The same limit bounds fusion's isolated branch workspaces and candidate copies.
+- `tools.verify.maxGitObjectBytes` (default `2147483648`, 2 GiB): Fusion-only cumulative ceiling per branch set for inspecting/importing private Git objects, pack transfers and frozen info/global exclusion data. Independent of `maxCopyBytes`, so an efficient tracked checkout does not become a charged payload copy. A positive integer up to `1099511627776` (1 TiB). History too large to import is refused before workers; raise this setting deliberately when needed. It does not change `verify.run`'s folder-copy policy.
 
 ## browser
 

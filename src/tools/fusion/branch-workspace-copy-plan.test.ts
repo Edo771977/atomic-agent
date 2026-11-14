@@ -31,23 +31,21 @@ it.each([false, true])("measures exactly the complete unchanged future branch-se
   finally { await actual?.cleanup(); }
 });
 
-it("preserves the Git method for an empty exit-one stash only after both tracked diffs prove clean", async () => {
+it("preserves the Git method without mutating or refreshing source metadata", async () => {
   const f = await fixture(true); const probes: string[][] = [];
   const git: GitExec = async (args, cwd) => {
-    if (args[0] === "stash") return { command: "git", args: [...args], exitCode: 1, stdout: "", stderr: "", signal: null, durationMs: 0, timedOut: false, truncated: false, inputTruncated: false };
-    if (args[0] === "diff") probes.push([...args]);
+    if (["stash", "diff", "update-index", "worktree"].includes(args[0] ?? "")) probes.push([...args]);
     return defaultGitExec(args, cwd);
   };
   const set = await createBranchSet(f.project, ["a"], { tmpRoot: f.copies, git });
-  try { expect(set?.method).toBe("worktree"); expect(probes).toEqual([["diff", "--quiet"], ["diff", "--cached", "--quiet"]]); }
+  try { expect(set?.method).toBe("worktree"); expect(probes).toEqual([]); }
   finally { await set?.cleanup(); }
 });
 
-it.each(["dirty", "error"])("does not accept a %s stash failure as a verified clean Git snapshot", async kind => {
+it.each(["unmerged", "missing-head"])("retains folder fallback for a source with %s", async kind => {
   const f = await fixture(true);
-  if (kind === "dirty") await writeFile(join(f.project, "a.txt"), "changed");
-  const git: GitExec = async (args, cwd) => args[0] === "stash"
-    ? { command: "git", args: [...args], exitCode: 1, stdout: "", stderr: kind === "error" ? "real stash error" : "", signal: null, durationMs: 0, timedOut: false, truncated: false, inputTruncated: false }
+  const git: GitExec = async (args, cwd) => (kind === "unmerged" && args[0] === "ls-files" && args.includes("--unmerged")) || (kind === "missing-head" && args[0] === "rev-parse" && args.includes("HEAD"))
+    ? { command: "git", args: [...args], exitCode: kind === "unmerged" ? 0 : 1, stdout: kind === "unmerged" ? "unmerged-index-entry\0" : "", stderr: "", signal: null, durationMs: 0, timedOut: false, truncated: false, inputTruncated: false }
     : defaultGitExec(args, cwd);
   const set = await createBranchSet(f.project, ["a"], { tmpRoot: f.copies, git });
   try { expect(set?.method).toBe("copy"); }

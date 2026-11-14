@@ -33,6 +33,9 @@ export const criticalFiles = [
   'src/tools/fusion/candidate-path-aliases.test.ts',
   'src/tools/fusion/candidate-copy-budget.test.ts',
   'src/tools/fusion/branch-workspace-copy-plan.test.ts',
+  'src/tools/fusion/branch-private-git.test.ts',
+  'src/tools/fusion/contract-check-authorization.test.ts',
+  'src/tools/verify/verify-authorization.test.ts',
   'src/tools/fusion/candidate-check-inputs.test.ts',
   'src/tools/verify/rebase-verify-workspace.test.ts',
   'src/tools/verify/rebase-verify-workspace-literals.test.ts',
@@ -58,6 +61,10 @@ export const criticalFiles = [
 ];
 /** Additional whole-file regressions outside the exhaustively classified core directories. */
 export const supplementalFiles = [
+  'src/runtime/request-budget-notices.test.ts',
+  'src/runtime/daily-budget-fallback.test.ts',
+  'src/runtime/request-budget-notice-frontends.test.ts',
+  'src/sidecar/budget-notice.test.ts',
   'src/cli/fusion-recovery.test.ts',
   'src/agent/progress/test-command-key.test.ts',
   'src/import/handoff/handoff-source.test.ts',

@@ -22,6 +22,7 @@ import { loadDotenvFromStateDir } from "./load-dotenv.js";
 import { resolveLlmProviderApiKey } from "./resolve-llm-api-key.js";
 import type { UserLlmFileConfig } from "./llm-config.js";
 import { emitConfigNoticeOnce } from "./config-primitives.js";
+import { DEFAULT_VERIFY_MAX_GIT_OBJECT_BYTES } from "./tool-config.js";
 import type {
   LocalModelsValueSource,
   LocalModelsValueSources,
@@ -487,7 +488,7 @@ export function loadConfig(): AtomicAgentConfig {
         envPassthrough: [...user.tools.shell.envPassthrough],
       },
       screen: { enabled: user.tools.screen.enabled, point: user.tools.screen.point },
-      verify: { maxCopyBytes: user.tools.verify.maxCopyBytes },
+      verify: { maxCopyBytes: user.tools.verify.maxCopyBytes, maxGitObjectBytes: user.tools.verify.maxGitObjectBytes ?? DEFAULT_VERIFY_MAX_GIT_OBJECT_BYTES },
     },
     log: { level: logLevel },
     tasks: {

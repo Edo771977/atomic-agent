@@ -97,7 +97,7 @@ const lines = (n: number, tag = "line"): string =>
   Array.from({ length: n }, (_, i) => `${tag} ${i + 1}`).join("\n") + "\n";
 
 describe("createBranchSet", () => {
-  it("makes a detached worktree per task holding uncommitted and untracked work, and removes them all", async () => {
+  it("makes detached private repositories holding uncommitted and untracked work without source registrations", async () => {
     const repo = await gitRepo({ "a.txt": "committed\n" });
     await writeFile(join(repo, "a.txt"), "uncommitted\n");
     await writeFile(join(repo, "new.txt"), "untracked\n");
@@ -109,7 +109,7 @@ describe("createBranchSet", () => {
       expect(await readFile(join(ws.dir, "new.txt"), "utf8")).toBe("untracked\n");
     }
     const before = (await runGitRaw(repo, ["worktree", "list"])).stdout.trim().split("\n");
-    expect(before).toHaveLength(4); // the repo, the base, two tasks
+    expect(before).toHaveLength(1); // private repositories never register in the source
     // The person's working tree and stash list are untouched.
     expect(await readFile(join(repo, "a.txt"), "utf8")).toBe("uncommitted\n");
     expect((await runGitRaw(repo, ["stash", "list"])).stdout.trim()).toBe("");
@@ -129,7 +129,7 @@ describe("createBranchSet", () => {
     expect(await readdir(root)).toEqual([]);
   });
 
-  it("sweeps a dead run's leftovers and its git worktrees on the next start, never a live run's", async () => {
+  it("sweeps dead private folders without pruning source Git registrations or deleting a live run", async () => {
     const repo = await gitRepo({ "a.txt": "a\n" });
     const root = await tmpRoot();
     const dead = spawnSync(process.execPath, ["-e", ""]).pid!;
@@ -146,7 +146,7 @@ describe("createBranchSet", () => {
     const set = await createBranchSet(repo, ["one"], { tmpRoot: root });
     await set!.cleanup();
     expect((await readdir(root)).sort()).toEqual(["atag-fusion-live00-x2", "unrelated"]);
-    expect((await runGitRaw(repo, ["worktree", "list"])).stdout.trim().split("\n")).toHaveLength(1);
+    expect((await runGitRaw(repo, ["worktree", "list"])).stdout.trim().split("\n")).toHaveLength(2);
   });
 
   it("returns null for a tree too large to copy", async () => {

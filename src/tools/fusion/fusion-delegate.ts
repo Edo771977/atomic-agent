@@ -397,6 +397,7 @@ export function buildFusionDelegateTool(
       // staging: the same `tools.verify.maxCopyBytes` that bounds
       // `verify.run`'s workspace copy.
       const copyLimitBytes = getConfig().tools?.verify?.maxCopyBytes ?? VERIFY_COPY_MAX_BYTES;
+      const gitObjectLimitBytes = getConfig().tools?.verify?.maxGitObjectBytes ?? VERIFY_COPY_MAX_BYTES;
       const workerProviderId = mode.workerProviderId;
       if (mode.effective !== "fusion" || workerProviderId === null) {
         return error(
@@ -964,7 +965,7 @@ export function buildFusionDelegateTool(
         try {
           const remaining = capped ? turnBudget.timeLeftMs(ctx.sessionId, limits) : undefined;
           const signal = remaining === undefined ? ctx.signal : AbortSignal.any([ctx.signal, AbortSignal.timeout(Math.max(0, remaining))]);
-          candidate = await createCandidateIntegration(candidateOriginalDir, { signal, maxCopyBytes: copyLimitBytes, checkInputs: parsed.contract?.checkInputs });
+          candidate = await createCandidateIntegration(candidateOriginalDir, { signal, maxCopyBytes: copyLimitBytes, maxGitObjectBytes: gitObjectLimitBytes, checkInputs: parsed.contract?.checkInputs });
         } catch (err) {
           return error(`candidate integration could not stage a private workspace: ${err instanceof Error ? err.message : String(err)}`, { reason: "candidate-staging-failed", nonResumable: true });
         }
@@ -1418,7 +1419,7 @@ export function buildFusionDelegateTool(
           realDir: ctx.workingDir,
           tasks,
           writeScope,
-          options: { maxCopyBytes: copyLimitBytes },
+          options: { maxCopyBytes: copyLimitBytes, maxGitObjectBytes: gitObjectLimitBytes },
           inputs: contract?.inputs ?? [],
           ...(contract?.provides === undefined ? {} : { provides: contract.provides }),
           run: (rebased, taskWorkspace) =>

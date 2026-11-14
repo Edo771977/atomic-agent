@@ -10,10 +10,12 @@
  * the same snapshot that nobody writes to: the merge base
  * (`branch-merge.ts`).
  *
- * Inside a git repo a workspace is a detached `git worktree` of a
- * snapshot commit: `git stash create` captures the tracked files'
- * uncommitted state without touching the working tree or the stash
- * list (HEAD when there is nothing uncommitted). The commit supplies
+ * Inside Git every workspace has an independent repository and index.
+ * Read-only object/ref imports preserve available history; tracked actual
+ * bytes form a private snapshot whose parent is the source HEAD. Source
+ * config, remotes, alternates, indexes and worktree registrations are never
+ * imported or mutated. The historical method name remains "worktree".
+ * The snapshot supplies
  * Git metadata only: a tracked path whose checkout differs from the
  * original's actual bytes is overlaid from them into the base, then from
  * that frozen base into each task, bypassing clean/smudge filters and
@@ -65,6 +67,7 @@ import { runCommand, type CommandResult } from "../../sandbox/command-runner.js"
 import { buildCommandEnv } from "../../sandbox/command-env.js";
 import { VERIFY_COPY_EXCLUDED, VERIFY_COPY_MAX_BYTES } from "../verify/verify-workspace-copy.js";
 import { createDirectoryIgnorePolicy, type DirectoryIgnorePolicy, type IgnoreGit } from "./branch-ignore-policy.js";
+import { materializePrivateGitWorkspace, preparePrivateGitSnapshot, type PrivateGitSnapshot } from "./private-git-workspace.js";
 
 /** Where conflicting sides are saved for the merge task, relative to the working directory. */
 export const BRANCH_MERGE_DIR = join(".atomic-agent", "fusion-merge");
@@ -246,8 +249,8 @@ export interface BranchSet {
   readonly baseDir: string;
   readonly workspaces: ReadonlyMap<string, BranchWorkspace>;
   /**
-   * Removes every workspace (worktrees included) and prunes git's
-   * records. Never throws. With `keep`, the workspaces of those task ids
+   * Removes every private workspace and its own metadata. Never mutates
+   * source Git records. With `keep`, the workspaces of those task ids
    * and the base stay for a later call (a judge's retry works on in the
    * workspace it was judged red in); a call without `keep` removes the
    * rest.
@@ -277,6 +280,8 @@ export interface CreateBranchSetOptions {
   ignoreGit?: IgnoreGit;
   /** Maximum actual copied bytes across base and tasks; not Git's separate checkout materializations. */
   maxCopyBytes?: number;
+  /** Separate cumulative ceiling for private Git object inspection/imports, default 2 GiB. */
+  maxGitObjectBytes?: number;
   /**
    * Give each task workspace a private copy of the shared dependency
    * directories (charged to the copy budget) instead of a link to the
@@ -306,7 +311,7 @@ async function executeGit(args: readonly string[], cwd: string, signal?: AbortSi
       {
         cwd,
         env: {
-          ...buildCommandEnv(process.env),
+          ...Object.fromEntries(Object.entries(buildCommandEnv(process.env)).filter(([name]) => !/^GIT_/i.test(name))),
           GIT_PAGER: "",
           GIT_TERMINAL_PROMPT: "0",
           LC_ALL: "C",
@@ -807,11 +812,14 @@ interface GitSnapshot {
   untracked: string[];
   /** Ignored entries; a trailing `/` marks a directory. */
   ignored: string[];
+  privateGit: PrivateGitSnapshot;
 }
 
 async function gitSnapshot(
   realDir: string,
   git: GitExec,
+  runRoot: string,
+  options: CreateBranchSetOptions,
 ): Promise<GitSnapshot | null> {
   const topResult = await git(["rev-parse", "--show-toplevel"], realDir);
   if (!ok(topResult)) return null;
@@ -821,17 +829,10 @@ async function gitSnapshot(
   if (rel.startsWith("..")) return null;
   const head = await git(["rev-parse", "--verify", "-q", "HEAD"], realDir);
   if (!ok(head)) return null;
-  // A commit object of the tracked files' current state; the working
-  // tree, the index and the stash list are left exactly as they were.
-  const stash = await git(["stash", "create"], realDir);
-  // Read before `ok` narrows its false branch to null.
-  const emptyStash = stash !== null && stash.exitCode === 1 && !stash.timedOut && !stash.truncated && stash.stdout.trim() === "" && stash.stderr.trim() === "";
-  if (!ok(stash)) {
-    // Git for Windows can return an empty exit 1 for a clean linked worktree.
-    // Establish both working-tree and index cleanliness before using HEAD.
-    if (!emptyStash || !ok(await git(["diff", "--quiet"], realDir)) || !ok(await git(["diff", "--cached", "--quiet"], realDir))) return null;
-  }
-  const commit = stash?.stdout.trim() || head.stdout.trim();
+  const unmerged = await git(["ls-files", "--unmerged", "-z"], top);
+  if (!ok(unmerged) || unmerged.stdout !== "") return null;
+  const merging = await git(["rev-parse", "-q", "--verify", "MERGE_HEAD"], top);
+  if (ok(merging)) return null;
   const tracked = await git(["ls-files", "--cached", "-z"], realDir);
   const untracked = await git(
     ["ls-files", "--others", "--exclude-standard", "-z"],
@@ -842,10 +843,13 @@ async function gitSnapshot(
     realDir,
   );
   if (!ok(tracked) || !ok(untracked) || !ok(ignored)) return null;
+  const privateGit = await preparePrivateGitSnapshot({ source: top, head: head.stdout.trim(), seed: join(runRoot, "snapshot.git"),
+    ...(options.maxGitObjectBytes === undefined ? {} : { maxBytes: options.maxGitObjectBytes }), ...(options.signal === undefined ? {} : { signal: options.signal }) });
   return {
     top,
     rel,
-    commit,
+    commit: privateGit.commit,
+    privateGit,
     tracked: zList(tracked.stdout),
     untracked: zList(untracked.stdout),
     ignored: zList(ignored.stdout),
@@ -860,23 +864,14 @@ async function repositoryTop(realDir: string, git: GitExec): Promise<string | un
   return top === null || relative(top, realDir).startsWith("..") ? undefined : top;
 }
 
-/** One worktree of the snapshot at `root`, with private copies of what git does not carry. */
+/** One independent Git repository at `root`, plus what Git does not carry. */
 async function addWorktree(
   snapshot: GitSnapshot,
   realDir: string,
   root: string,
-  git: GitExec,
   budget: PrivateCopyBudget,
 ): Promise<string> {
-  const added = await git(
-    ["worktree", "add", "--detach", "--quiet", root, snapshot.commit],
-    snapshot.top,
-  );
-  // Read before `ok` narrows: its false branch types a failed run as null.
-  const failure = added?.stderr ?? "git not found";
-  if (!ok(added)) {
-    throw new Error(`git worktree add failed: ${failure.trim()}`);
-  }
+  await materializePrivateGitWorkspace(root, snapshot.privateGit);
   const dir = snapshot.rel.length === 0 ? root : join(root, snapshot.rel);
   await mkdir(dir, { recursive: true });
   for (const path of snapshot.tracked) {
@@ -948,7 +943,6 @@ async function buildBranchSet(
 ): Promise<PlannedBranchSet | null> {
   options.signal?.throwIfAborted();
   const git = options.git ?? ((args, cwd) => executeGit(args, cwd, options.signal));
-  const cleanupGit = options.git ?? defaultGitExec;
   const real = await realpath(realDir);
   const runRoot = await realpath(
     await mkdtemp(
@@ -966,17 +960,18 @@ async function buildBranchSet(
   ).catch(() => undefined);
   let snapshot: GitSnapshot | null;
   try {
-    snapshot = mode.expected?.method === "copy" ? null : await gitSnapshot(real, git);
+    snapshot = mode.expected?.method === "copy" ? null : await gitSnapshot(real, git, runRoot, options);
     if (mode.expected?.method === "worktree" && (snapshot === null || snapshot.top !== mode.expected.top)) {
       throw new Error("planned final Git workspace method or root changed; refusing an unreserved folder copy");
     }
   }
   catch (err) { await removeWorkspaceTree(runRoot); throw err; }
-  await sweepStaleBranchSets(dirname(runRoot), snapshot?.top, git);
+  // New stores have no registrations in the source; never prune its metadata.
+  await sweepStaleBranchSets(dirname(runRoot), undefined, git);
   const roots: string[] = [];
   const workspaceRoots = new Map<string, string>();
-  // Node's `rm` first (it removes a link, symlink or junction, without
-  // following it), then git forgets the worktrees (`forgetRemovedWorktrees`).
+  // Node removes generated links without following them. Every Git store
+  // is inside this run root, so the source needs no registration cleanup.
   const cleanup = async (keep: readonly string[] = []): Promise<void> => {
     if (keep.length > 0) {
       const kept = new Set(
@@ -986,20 +981,16 @@ async function buildBranchSet(
         }),
       );
       const base = roots[0];
-      const removed: string[] = [];
       for (const root of roots.splice(0)) {
         if (kept.has(root) || root === base) {
           roots.push(root);
           continue;
         }
         await removeWorkspaceTree(root).catch(() => undefined);
-        removed.push(root);
       }
-      if (snapshot !== null) await forgetRemovedWorktrees(cleanupGit, snapshot.top, removed);
       return;
     }
     await removeWorkspaceTree(runRoot).catch(() => undefined);
-    if (snapshot !== null) await forgetRemovedWorktrees(cleanupGit, snapshot.top, [runRoot]);
   };
   const limit = options.maxCopyBytes ?? VERIFY_COPY_MAX_BYTES;
   const budget: PrivateCopyBudget = { left: limit, ...(mode.measure === true ? { measurement: { entriesLeft: 100_000 } } : {}), generatedDirectoryLinks: new Map(), dependencyBytes: { unlinked: 0, private: 0 }, ...(options.privateDependencyDirectories === true ? { privateIgnoredDirectories: true } : {}), ...(options.signal === undefined ? {} : { signal: options.signal }) };
@@ -1008,7 +999,7 @@ async function buildBranchSet(
     const make = async (name: string, source: string): Promise<string> => {
       const root = join(runRoot, name);
       roots.push(root);
-      const dir = snapshot !== null ? await addWorktree(snapshot, source, root, git, budget) : root;
+      const dir = snapshot !== null ? await addWorktree(snapshot, source, root, budget) : root;
       if (snapshot === null) await copyPrivateEntry(source, root, budget);
       if (mode.measure !== true) await matchDirectoryModes(source, dir, options.signal);
       return dir;

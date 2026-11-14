@@ -217,7 +217,7 @@ describe("workspace removal never lets git walk a generated link", () => {
     expect((await runGitRaw(repo, ["worktree", "list", "--porcelain"])).stdout.match(/^worktree /gm)).toHaveLength(1);
   });
 
-  it("sweeps a dead run's worktrees the same way", async () => {
+  it("sweeps dead independent Git stores without changing source worktree registrations", async () => {
     const repo = await linkedRepo();
     const { root } = await fixture();
     const dead = await createBranchSet(repo, ["a"], { tmpRoot: root });
@@ -231,7 +231,7 @@ describe("workspace removal never lets git walk a generated link", () => {
       expect(await lstat(runRoot).then(() => true, () => false)).toBe(false);
       expect(removedWhileThere).toEqual([]);
       expect(await readFile(join(repo, "node_modules/dep/index.js"), "utf8")).toBe("dependency\n");
-      expect((await runGitRaw(repo, ["worktree", "list", "--porcelain"])).stdout.match(/^worktree /gm)).toHaveLength(3);
+      expect((await runGitRaw(repo, ["worktree", "list", "--porcelain"])).stdout.match(/^worktree /gm)).toHaveLength(1);
     } finally { await next?.cleanup(); }
     expect((await runGitRaw(repo, ["worktree", "list", "--porcelain"])).stdout.match(/^worktree /gm)).toHaveLength(1);
   });

@@ -339,7 +339,7 @@ describe("loadConfig", () => {
           envPassthrough: ["GITHUB_TOKEN"],
         },
         screen: { enabled: false, point: true },
-        verify: { maxCopyBytes: 2 * 1024 * 1024 * 1024 },
+        verify: { maxCopyBytes: 2 * 1024 * 1024 * 1024, maxGitObjectBytes: 2 * 1024 * 1024 * 1024 },
       },
     });
     const config = loadConfig();

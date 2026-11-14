@@ -57,6 +57,8 @@ export interface RuntimeToolsConfig {
   verify: {
     /** Byte ceiling for `verify.run`'s workspace copy. Mirrors `UserToolsConfig.verify`. */
     maxCopyBytes: number;
+    /** Independent byte ceiling for Fusion's private Git object imports. */
+    maxGitObjectBytes?: number;
   };
 }
 
@@ -124,11 +126,14 @@ export interface UserToolsConfig {
      * 2 GiB. A positive integer, at most 1 TiB.
      */
     maxCopyBytes: number;
+    /** Fusion Git metadata inspection/import ceiling, independent of payload copies. Default 2 GiB, maximum 1 TiB. */
+    maxGitObjectBytes?: number;
   };
 }
 
 /** `tools.verify.maxCopyBytes` default; the one definition (`VERIFY_COPY_MAX_BYTES` re-exports it). */
 export const DEFAULT_VERIFY_MAX_COPY_BYTES = 2 * 1024 * 1024 * 1024;
+export const DEFAULT_VERIFY_MAX_GIT_OBJECT_BYTES = 2 * 1024 * 1024 * 1024;
 
 /** Upper bound for `tools.verify.maxCopyBytes`: 1 TiB, past any tree worth copying per run. */
 export const MAX_VERIFY_MAX_COPY_BYTES = 1024 ** 4;
@@ -156,7 +161,7 @@ export function createToolsDefaults(): UserToolsConfig {
     // type anywhere is not a default.
     // Pointing only draws, so it is on; clicking and typing stay off.
     screen: { enabled: false, point: true },
-    verify: { maxCopyBytes: DEFAULT_VERIFY_MAX_COPY_BYTES },
+    verify: { maxCopyBytes: DEFAULT_VERIFY_MAX_COPY_BYTES, maxGitObjectBytes: DEFAULT_VERIFY_MAX_GIT_OBJECT_BYTES },
   };
 }
 
@@ -215,6 +220,10 @@ export function parseToolsConfig(
         "tools.verify.maxCopyBytes",
         1,
         MAX_VERIFY_MAX_COPY_BYTES,
+      ),
+      maxGitObjectBytes: parseBoundedPositiveInt(
+        rawVerify.maxGitObjectBytes ?? readDefaults().verify.maxGitObjectBytes ?? DEFAULT_VERIFY_MAX_GIT_OBJECT_BYTES,
+        "tools.verify.maxGitObjectBytes", 1, MAX_VERIFY_MAX_COPY_BYTES,
       ),
     },
   };
