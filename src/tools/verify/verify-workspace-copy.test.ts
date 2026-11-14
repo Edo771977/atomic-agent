@@ -117,6 +117,29 @@ describe("createVerifyWorkspace", () => {
     }
   });
 
+  it("recreates an in-tree link with the type of what it points at", async () => {
+    // Windows guesses an untyped link's type from its target, which may not
+    // be copied yet: a directory link would become a broken file link.
+    await mkdir(join(work, "src", "a"));
+    await writeFile(join(work, "src", "f.txt"), "f");
+    await symlink("a", join(work, "src", "dirlink"), "dir");
+    await symlink("f.txt", join(work, "src", "filelink"), "file");
+    const made: { path: string; type: string | undefined }[] = [];
+    const ws = await createVerifyWorkspace(work, {
+      tmpRoot,
+      symlink: async (target, path, type) => {
+        made.push({ path, type });
+        await symlink(target, path, type);
+      },
+    });
+    try {
+      expect(made.find((m) => m.path === join(ws.dir, "src", "dirlink"))?.type).toBe("dir");
+      expect(made.find((m) => m.path === join(ws.dir, "src", "filelink"))?.type).toBe("file");
+    } finally {
+      await ws.cleanup();
+    }
+  });
+
   it("junctions a refused in-tree directory symlink to the copy, never to the original", async () => {
     await mkdir(join(work, "src", "a"));
     await writeFile(join(work, "src", "a", "kept.txt"), "k");

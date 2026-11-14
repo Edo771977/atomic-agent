@@ -8,9 +8,10 @@ function recorder() {
   return {
     runs,
     kills,
-    deps: (platform: NodeJS.Platform) => ({
+    deps: (platform: NodeJS.Platform, ran = true) => ({
       platform,
-      run: (command: string, args: string[]) => { runs.push({ command, args }); },
+      env: { SystemRoot: "C:\\Windows" },
+      run: (command: string, args: string[]) => { runs.push({ command, args }); return ran; },
       kill: (pid: number, signal: string) => { kills.push({ pid, signal }); },
     }),
   };
@@ -21,10 +22,20 @@ describe("signalTree", () => {
     it(`forces the whole tree with taskkill /T /F on Windows for ${name}`, () => {
       const r = recorder();
       signalTree({ pid: 4242 }, name, r.deps("win32"));
-      expect(r.runs).toEqual([{ command: "taskkill", args: ["/pid", "4242", "/T", "/F"] }]);
+      // By absolute path: a launcher may run with an empty PATH (the CI
+      // launcher tests do), where a bare `taskkill` is never found.
+      expect(r.runs).toEqual([{ command: "C:\\Windows\\System32\\taskkill.exe", args: ["/pid", "4242", "/T", "/F"] }]);
       expect(r.kills).toEqual([]);
     });
   }
+
+  it("falls back to killing the root when taskkill cannot run on Windows", () => {
+    const r = recorder();
+    const killed: string[] = [];
+    signalTree({ pid: 4242, kill: (signal: string) => { killed.push(signal); return true; } }, "SIGINT", r.deps("win32", false));
+    expect(r.runs).toHaveLength(1);
+    expect(killed).toEqual(["SIGKILL"]);
+  });
 
   it("signals the child's process group on POSIX", () => {
     const r = recorder();
