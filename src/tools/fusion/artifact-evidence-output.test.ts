@@ -9,6 +9,8 @@ import { projectFusionArtifactEvidence } from "./artifact-evidence-output.js";
 import type { ArtifactManifest } from "./artifact-manifest-types.js";
 import { attachCandidateArtifactReceipt } from "./artifact-manifest.js";
 import type { CandidateAcceptanceReceipt } from "./candidate-acceptance.js";
+import { ToolRegistry } from "../tool-registry.js";
+import type { KnownSecret } from "../../error-reporting/secret-detector.js";
 
 const manifest = (): ArtifactManifest => ({ version: 1, coverage: { source: "observed", complete: false, reasons: ["observed_scope"] },
   artifacts: [{ path: "app.js", change: "modified", source: "file-tool", kind: "file", state: "hashed", sha256: "a".repeat(64), bytes: 7 }],
@@ -108,4 +110,60 @@ describe("model-visible artifact evidence", () => {
     expect(result.summary).not.toContain("never-leak-private-output");
     expect(result.summary).not.toContain("privateOutput");
   });
+
+  it.each(["local", "cloud"] as const)("masks configuration-only credentials before boundary slicing through the actual %s pipeline", async mode => {
+    const cap = 600;
+    const secret = "SyntheticConfigCredentialA1B2C3D4E5F6G7H8";
+    const known: KnownSecret[] = [{ label: "provider-key", value: secret }];
+    const value = manifest(); value.artifacts = []; value.checks = []; value.dependencies = []; value.bytesHashed = 0;
+    const details = { tasks: [{ id: "core", status: "ok", artifactManifest: value }] };
+    const head = projectFusionArtifactEvidence(compressToolResult({ tool: "fusion.delegate", status: "ok", output: "", details }), cap).summary.split("\n")[0]!;
+    const output = "x".repeat(cap - head.length - 1 - 12) + secret;
+    let projected: ReturnType<typeof projectFusionArtifactEvidence> | undefined;
+    const registry = new ToolRegistry({ knownSecrets: () => known });
+    registry.register({ name: "fusion.delegate", description: "fixture", readonly: false, run: async () =>
+      projected = projectFusionArtifactEvidence(compressToolResult({ tool: "fusion.delegate", status: "ok", output, details }), cap, { knownSecrets: known }) });
+    const result = await registry.invoke("fusion.delegate", {}, { workingDir: process.cwd(), sessionId: "masked-output", stepIndex: 0, signal: new AbortController().signal, modelMode: mode });
+    const session = appendBatchedTurns({ state: createEmptySessionState({ id: "masked-output", workingDir: process.cwd() }), calls: [{ tool: result.tool, args: {} }], results: [result], reasoning: "", terminal: null, modelMode: mode });
+    const turn = session.turns[1]!;
+    const prompt = mode === "cloud" ? renderCloudTurn(extendCloudContext(undefined, [turn], new Map()).entries[0]!.turn) : renderTurnForPrompt(turn, { inCurrentMacroTurn: true });
+    expect(prompt).not.toContain(secret.slice(0, 12));
+    expect(result.summary.length).toBeLessThanOrEqual(cap);
+    expect(fullToolResult(result).summary.length).toBeLessThanOrEqual(cap);
+    expect(maskResultSecrets(projected!, known).summary).toBe(projected!.summary);
+    expect(maskResultSecrets(projected!, known).fullOutput).toBe(projected!.fullOutput);
+    expect(() => evidence(result.summary)).not.toThrow();
+  });
+
+  it.each(["local", "cloud"] as const)("budgets after a short configured credential expands to its marker (%s)", async mode => {
+    const cap = 600;
+    const secret = "AbCdEf123";
+    const known: KnownSecret[] = [{ label: "provider-key", value: secret }];
+    const value = manifest(); value.artifacts = []; value.checks = []; value.dependencies = []; value.bytesHashed = 0;
+    const details = { tasks: [{ id: "core", status: "ok", artifactManifest: value }] };
+    const head = projectFusionArtifactEvidence(compressToolResult({ tool: "fusion.delegate", status: "ok", output: "", details }), cap).summary.split("\n")[0]!;
+    const output = "y".repeat(cap - head.length - 1 - secret.length) + secret;
+    const registry = new ToolRegistry({ knownSecrets: () => known });
+    registry.register({ name: "fusion.delegate", description: "fixture", readonly: false, run: async () => projectFusionArtifactEvidence(compressToolResult({ tool: "fusion.delegate", status: "ok", output, details }), cap, { knownSecrets: known }) });
+    const result = await registry.invoke("fusion.delegate", {}, { workingDir: process.cwd(), sessionId: "expanded-output", stepIndex: 0, signal: new AbortController().signal, modelMode: mode });
+    expect(result.summary.length).toBeLessThanOrEqual(cap);
+    expect(fullToolResult(result).summary.length).toBeLessThanOrEqual(cap);
+    expect(() => evidence(result.summary)).not.toThrow();
+    expect(result.summary).not.toMatch(/\[redacted:[^\]]*$/);
+  });
+
+  it("filters configured credentials from raw JSON path and provider fields before serialization", () => {
+    const pathSecret = 'Synthetic"Config\\Credential12345';
+    const providerSecret = "ConfigProviderCredential123";
+    const value = manifest(); value.artifacts[0]!.path = `assets/${pathSecret}.js`; value.dependencies[0]!.provider = providerSecret;
+    const known = [{ label: "path-secret", value: pathSecret }, { label: "provider-key", value: providerSecret }];
+    const result = projectFusionArtifactEvidence(input(value), 2400, { knownSecrets: known });
+    const json = evidence(result.summary);
+    expect(json.tasks[0].artifacts).toEqual([]);
+    expect(json.tasks[0].dependencies).toEqual([]);
+    expect(json.omitted).toBeGreaterThanOrEqual(2);
+    expect(maskResultSecrets(result, known).summary).toBe(result.summary);
+    expect(result.summary).not.toContain("Synthetic");
+  });
+
 });
