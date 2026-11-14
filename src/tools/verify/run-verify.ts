@@ -221,7 +221,7 @@ export async function runVerify(
       result = failed(`verification not started: ${workspace.error ?? "a private workspace copy is unavailable"}`, "workspace-unavailable");
     } else {
       const completeIntegrity = await ctx.inputIntegrity?.begin(workspace.dir, ctx.signal ?? new AbortController().signal);
-      const executionArgs = ctx.inputIntegrity === undefined ? args : rebaseVerifyWorkspaceValue(args, ctx.workingDir, workspace.dir);
+      const executionArgs = rebaseVerifyWorkspaceValue(args, ctx.workingDir, workspace.dir);
       result = await runInWorkspace(executionArgs, workspace.dir, true, ctx, started);
       executionResult = result;
       await completeIntegrity?.();

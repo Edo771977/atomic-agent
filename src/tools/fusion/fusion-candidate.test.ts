@@ -300,6 +300,17 @@ it("reports one candidate task run with two completed worker invocations after a
   expect(report.workers[0]).toMatchObject({ checksPassed: 0, candidate: { taskRuns: 1, knownWorkerRuns: 2, workerRunsUnverified: 0 } });
 });
 
+it("keeps absolute check-generated snapshots inside the execution copy without checkInputs", async () => {
+  const { runChecks } = await import("../verify/run-verify.js");
+  const f = await fixture({ runChecks });
+  f.deps.runTurn = async session => { await writeFile(join(session.workingDir, "api.json"), "candidate"); return { session, reason: "reply", stepCount: 1 }; };
+  const result = await buildFusionDelegateTool(f.deps).run({ tasks: [{ id: "api", instructions: "work", files: ["api.json"] }],
+    contract: { checks: [{ kind: "command", cmd: process.execPath, args: ["-e", "require('fs').writeFileSync(process.argv[1], 'generated snapshot')", join(f.root, "snapshot.txt")], network: true }] } }, f.ctx);
+  expect(result.details.candidateIntegration).toMatchObject({ status: "promoted", acceptanceReceipt: { checkScope: "declared", checkStatus: "passed" } });
+  expect(await readFile(join(f.root, "api.json"), "utf8")).toBe("candidate");
+  await expect(readFile(join(f.root, "snapshot.txt"))).rejects.toThrow();
+});
+
 it("binds an absolute protected check reference to the actual execution copy", async () => {
   const { runChecks } = await import("../verify/run-verify.js"); const f = await fixture({ runChecks });
   const original = `import {readFileSync} from 'node:fs'; if (readFileSync('api.json','utf8') !== '{"name":"before"}') throw new Error('bad artifact');`;

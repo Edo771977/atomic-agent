@@ -29,6 +29,12 @@ afterEach(async () => {
 });
 
 describe("verify refuses to execute without a private workspace", () => {
+  it("rebases absolute source arguments into the execution copy without checkInputs", async () => {
+    const result = await runVerify({ kind: "command", cmd: process.execPath,
+      args: ["-e", "require('fs').writeFileSync(process.argv[1], 'execution output')", join(dir, "original.txt")], checks: ["exit 0"] }, { workingDir: dir, config });
+    expect(result).toMatchObject({ ok: true, isolated: true });
+    expect(await readFile(join(dir, "original.txt"), "utf8")).toBe("original");
+  });
   it("the public tool fails closed at the copy limit before starting the runner", async () => {
     const runner = vi.spyOn(commands, "runCommandKind");
     const options = {
