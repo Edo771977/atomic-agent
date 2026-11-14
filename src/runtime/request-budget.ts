@@ -8,7 +8,7 @@ import { modelParamProfile } from "../llm/provider/openai/model-params.js";
 import { formatUsd, type FusionTurnBudget } from "../tools/fusion/turn-budget.js";
 import { DailySpendLimitError } from "../llm/reliability/spend-limit-error.js";
 import type { DailySpendBudget, DailySpendHold } from "./daily-spend-budget.js";
-import { linkSpendBilling, verifiablePricing, type ModelPricing } from "./link-spend-billing.js";
+import { linkSpendBilling, verifiablePricing, verifiedAdmissionPricing, type ModelPricing } from "./link-spend-billing.js";
 
 // Explicit rejections before generation. 529 is Anthropic's overload answer
 // returned instead of generating. 503 stays charged like 500/502/504:
@@ -202,12 +202,16 @@ export function createRequestBudgetScope(
   const limits = budget === undefined || sessionId === undefined ? undefined : budget.requestLimits(sessionId);
   // An explicit runner or plan, or an unpriced loopback/LAN server; a
   // priced one may be a forwarding gateway to a paid service and is billed.
-  const unbilled = linkSpendBilling(entry, model?.pricing) !== "billed";
+  const admission = verifiedAdmissionPricing(model);
+  const unbilled = linkSpendBilling(entry, admission) !== "billed";
   // Unbilled links are not spend: the day never sees them.
   const day = unbilled ? undefined : daily;
   if (limits === undefined && day === undefined) return undefined;
   const pricing = model?.pricing;
-  const priced = verifiablePricing(pricing);
+  // Admission (`hard` mode, a priced daily hold) needs verified pricing; a
+  // models.dev snapshot price only estimates settlement (`estimable`).
+  const priced = verifiablePricing(admission);
+  const estimable = verifiablePricing(pricing);
   const entryId = entry?.id ?? provider.id;
   const capText = limits?.usd === undefined ? "" : formatUsd(limits.usd);
   // How this link's spend can be bounded: ahead of each send (`hard`),
@@ -406,7 +410,7 @@ export function createRequestBudgetScope(
       // one (an `auto` request can be served at a project's priority tier).
       // A served tier with no known price settles at the whole hold.
       const estimatedCostUsd = (usage: CompletionUsage): number | undefined => {
-        if (!priced) return undefined;
+        if (!estimable) return undefined;
         const multiplier = servedTierMultiplier(usage.serviceTier, tierMultiplier, pricing);
         const usd = completionCostUsd(usage, pricing);
         return usd === undefined || multiplier === undefined ? undefined : usd * multiplier;

@@ -118,6 +118,23 @@ describe("runtime provider/context/fallback/reload phases", () => {
     expect(context.resolveCatalogContextWindow("local")).toBe(8192);
   });
 
+  it("never sizes prompts from a models.dev snapshot window; a configured one still counts (ATO-647 review)", () => {
+    // claude-haiku-4-5 is in the bundled snapshot with a 200k window.
+    const anthropic = { id: "anthropic", kind: "openai-compatible", baseUrl: "https://api.anthropic.com", defaultChatModel: "claude-haiku-4-5" } as const;
+    config = { ...config, llm: { ...resolveLlmConfig(config), activeTextProvider: "anthropic", providers: [
+      ...resolveLlmConfig(config).providers, anthropic,
+    ] } };
+    const context = createRuntimeModelContext(config, providers);
+    expect(context.resolveModelPricing("claude-haiku-4-5", "anthropic")?.source).toBe("snapshot");
+    expect(context.resolveCatalogContextWindow()).toBeNull();
+    expect(context.resolveCatalogContextWindow("anthropic")).toBeNull();
+    config = { ...config, llm: { ...resolveLlmConfig(config), providers: [
+      ...resolveLlmConfig(config).providers.filter((p) => p.id !== "anthropic"),
+      { ...anthropic, userModels: [{ id: "claude-haiku-4-5", kind: "chat", contextWindow: 150_000 }] },
+    ] } };
+    expect(context.resolveCatalogContextWindow("anthropic")).toBe(150_000);
+  });
+
   it("an Ollama route learns its real window once per model and the budget uses it (ATO-1276)", async () => {
     config = { ...config, llm: { ...resolveLlmConfig(config), activeTextProvider: "ollama", providers: [
       ...resolveLlmConfig(config).providers,
@@ -530,7 +547,11 @@ describe("runtime provider/context/fallback/reload phases", () => {
     await wired.llmComplete({ ...params, providerId: "served" });
     const snapshot = fixture.turnUsageMeter.snapshot("turn");
     // #735 records which provider served the turn; no costUsd: unpriced.
-    expect(snapshot).toEqual({ promptTokens: 300, completionTokens: 20, cachedTokens: 100, servedProviderId: "served" });
+    // ATO-1026 adds the local server's own prefill / generation time.
+    expect(snapshot).toEqual({
+      promptTokens: 300, completionTokens: 20, cachedTokens: 100, servedProviderId: "served",
+      prefillMs: 1, genMs: 2, genTokensPerS: 10_000,
+    });
     expect(fixture.costAccumulator.snapshot().sessionUsd).toBe(0);
   });
 

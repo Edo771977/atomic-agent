@@ -19,6 +19,20 @@ export function verifiablePricing(pricing: ModelPricing | undefined): pricing is
 }
 
 /**
+ * The pricing a cap may use to refuse or clamp a request before it is
+ * sent: the resolved model's pricing unless it came only from the bundled
+ * models.dev snapshot. Snapshot prices are a dated community list that
+ * can be stale or wrong (a missing long-context tier, a zero cache rate),
+ * so they estimate a reply's cost after the fact but never admit or
+ * refuse one: a link priced only by the snapshot is metered.
+ */
+export function verifiedAdmissionPricing(
+  model: Pick<ResolvedModel, "pricing" | "source"> | undefined,
+): ModelPricing | undefined {
+  return model === undefined || model.source === "snapshot" ? undefined : model.pricing;
+}
+
+/**
  * How a link bills for the turn budget, the day total and the daily
  * ceiling (ATO-649): `plan` for a subscription CLI, `local` for a link
  * that bills nothing, `billed` for the rest.
