@@ -1584,8 +1584,8 @@ async function runOneTask(
       handBack.signal.aborted;
     if (stopped()) return first;
     // A reply the worker was not allowed to close on (a refusal handed
-    // back) or a split proposal (its files are its children's) is not
-    // the worker's own claim of done.
+    // back), a split proposal (its files are its children's) or a
+    // question is not the worker's own claim of done.
     const provisional = collector.finish({
       id: task.id,
       title: task.title,
@@ -1599,6 +1599,9 @@ async function runOneTask(
     // turn of the same worker on the same files only repeats the damage.
     if ((provisional.replacedInputs?.length ?? 0) > 0) return first;
     if (mayPropose && hasSplitProposal(provisional.reply)) return first;
+    // A worker that ended on a question (ATO-945) stopped before writing
+    // by design: it comes back `needs_input`, not nudged to finish.
+    if (readWorkerQuestion(provisional.reply) !== undefined) return first;
     const stepsLeft = stepBudget.value - first.stepCount;
     const graceSteps = Math.min(SELF_CHECK_GRACE_STEPS, stepsLeft);
     if (graceSteps < SELF_CHECK_MIN_GRACE_STEPS) return first;

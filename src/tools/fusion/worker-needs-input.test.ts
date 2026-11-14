@@ -209,6 +209,36 @@ describe("fusion.delegate — a worker that needs input", () => {
     expect(row).not.toHaveProperty("question");
   });
 
+  it("gets no self-check turn: a question is not a claim of done", async () => {
+    // Our self-check runs on the provisional `ok` reply; without the
+    // guard, a worker that asked (and so never wrote js/hud.js) got a
+    // "declared files missing" notice and more steps instead of
+    // coming back `needs_input`.
+    const messages: string[] = [];
+    const tool = buildFusionDelegateTool(
+      deps(async (_session, userMessage, options) => {
+        messages.push(userMessage);
+        options.eventHook?.({
+          type: "llm_event",
+          event: { type: "assistant_reply", text: `I read the brief.\n${NEEDS_INPUT_MARKER} ${QUESTION}` },
+        });
+        return turnResult();
+      }),
+    );
+    const result = await tool.run(
+      {
+        tasks: [
+          { id: "t1", title: "Score", instructions: "Score task", files: ["js/hud.js"] },
+        ],
+      },
+      ctx(),
+    );
+    expect(messages).toHaveLength(1);
+    const row = (result.details.tasks as WorkerTaskResult[])[0]!;
+    expect(row).toMatchObject({ status: "needs_input", question: QUESTION });
+    expect(row.selfCheckNotice).toBeUndefined();
+  });
+
   it("does not read a question from a worker that failed", async () => {
     const tool = buildFusionDelegateTool(
       deps(async (_session, _message, options) => {
