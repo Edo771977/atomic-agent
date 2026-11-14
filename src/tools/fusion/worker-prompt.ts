@@ -177,10 +177,22 @@ function quoteContract(contract: DelegateContract, taskId: string): string[] {
  * apart from the TASK, which says what it does. A profile that narrowed
  * the tools says so, so a worker that misses a tool does not hunt for it.
  */
-function quoteProfile(profile: AppliedAgentProfile): string[] {
+/**
+ * The PROFILE block's instructions on a local leg (ATO-566). A profile
+ * may carry up to 16K chars; a local worker shares one small server
+ * context with its siblings, as for `LOCAL_ORIGINAL_REQUEST_CHAR_BUDGET`,
+ * so past this the block keeps the head and says it was clipped.
+ */
+export const LOCAL_PROFILE_PROMPT_CHAR_BUDGET = 2_000;
+
+function quoteProfile(profile: AppliedAgentProfile, localLeg: boolean): string[] {
+  const clip = localLeg && profile.prompt.length > LOCAL_PROFILE_PROMPT_CHAR_BUDGET;
+  const prompt = clip
+    ? `${profile.prompt.slice(0, LOCAL_PROFILE_PROMPT_CHAR_BUDGET).trimEnd()}\n[profile instructions clipped to the first ${LOCAL_PROFILE_PROMPT_CHAR_BUDGET.toLocaleString("en-US")} of ${profile.prompt.length.toLocaleString("en-US")} chars for a local worker; the TASK and RULES are what you must follow]`
+    : profile.prompt;
   return [
     `PROFILE ${profile.name} — how to work on this task; the TASK above says what to do, and the RULES below still apply.`,
-    profile.prompt,
+    prompt,
     ...(profile.tools === undefined
       ? []
       : [`This profile limits your tools to: ${profile.tools.join(", ")}. If the task needs another tool, say so in your reply instead of working around it.`]),
@@ -269,7 +281,7 @@ export function renderWorkerBrief(
     lines.push(``, ...quoteContract(options.contract, task.id));
   }
   if (task.agentProfile) {
-    lines.push(``, ...quoteProfile(task.agentProfile));
+    lines.push(``, ...quoteProfile(task.agentProfile, options.localLeg === true));
   }
   lines.push(
     ``,

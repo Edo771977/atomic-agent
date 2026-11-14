@@ -105,6 +105,25 @@ describe("workerToolFilterFor (ATO-566)", () => {
 });
 
 describe("renderWorkerBrief with a profile (ATO-566)", () => {
+  it("clamps a long profile prompt on a local leg, with a note, and keeps it whole on a cloud leg", () => {
+    // A profile may carry up to 16K chars of instructions; a local
+    // worker shares one small server context, so its PROFILE block is
+    // bounded the way its quoted request is.
+    const prompt = `HEAD ${"x".repeat(15_000)} TAIL`;
+    const profiled = task({ agentProfile: { name: "big", prompt } });
+    const local = renderWorkerBrief(profiled, { workingDir: "/w", localLeg: true });
+    expect(local).toContain("PROFILE big");
+    expect(local).toContain("HEAD ");
+    expect(local).not.toContain(" TAIL");
+    expect(local).toMatch(/profile instructions clipped to the first 2,000 of 15,010 chars/);
+    const start = local.indexOf("PROFILE big");
+    const end = local.indexOf("RULES:");
+    expect(end - start).toBeLessThan(2_600);
+    const cloud = renderWorkerBrief(profiled, { workingDir: "/w" });
+    expect(cloud).toContain(" TAIL");
+    expect(cloud).not.toContain("clipped to the first");
+  });
+
   it("quotes the profile's instructions after the task, before the rules, and names the tool limit", () => {
     const brief = renderWorkerBrief(
       task({ agentProfile: { name: "review", prompt: "REVIEW RULES", tools: ["os.fs.read"] } }),
