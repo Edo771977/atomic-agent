@@ -68,10 +68,38 @@ describe("json-schema-to-gbnf: objects", () => {
     expect(accepts({ path: "a", recursive: "yes" })).toBe(false);
   });
 
-  it("puts required keys first, in schema order (the original's ordering)", () => {
+  it("takes the keys in any order, each at most once, the required ones exactly once", () => {
     const { accepts } = compile(obj({ repo: { type: "string" }, path: { type: "string" } }, ["path"]));
     expect(accepts({ path: "p", repo: "r" })).toBe(true);
-    expect(accepts({ repo: "r", path: "p" })).toBe(false);
+    expect(accepts({ repo: "r", path: "p" })).toBe(true);
+    expect(accepts({ repo: "r" })).toBe(false);
+    expect(accepts('{"repo":"r","path":"p","repo":"s"}')).toBe(false);
+    expect(accepts('{"path":"p","path":"q"}')).toBe(false);
+    const three = compile(schema);
+    expect(three.accepts({ recursive: true, limit: 1, path: "a" })).toBe(true);
+    expect(three.accepts({ limit: 1, path: "a" })).toBe(true);
+  });
+
+  it("an object with many keys: any order, required ones exactly once, no invented key", () => {
+    const props: Record<string, unknown> = {};
+    for (const k of ["id", "title", "instructions", "files", "deliverable", "dependsOn", "role", "model"]) {
+      props[k] = k === "files" || k === "dependsOn" ? { type: "array", items: { type: "string" } } : { type: "string" };
+    }
+    const { accepts, converted } = compile(obj(props, ["id", "instructions"]));
+    expect(converted.added.length).toBeLessThan(40);
+    expect(accepts({ files: ["a"], deliverable: "d", id: "t", instructions: "i" })).toBe(true);
+    expect(accepts({ model: "m", instructions: "i", role: "r", id: "t", title: "x", files: [], dependsOn: [], deliverable: "d" })).toBe(true);
+    expect(accepts({ files: ["a"], id: "t" })).toBe(false);
+    expect(accepts('{"id":"t","instructions":"i","id":"u"}')).toBe(false);
+    expect(accepts({ id: "t", instructions: "i", invented: 1 })).toBe(false);
+  });
+
+  it("past the tracked-required bound, keeps the schema-order rule", () => {
+    const props = Object.fromEntries(["a", "b", "c", "d", "e", "f"].map((k) => [k, { type: "string" }]));
+    const { accepts } = compile(obj(props, ["a", "b", "c", "d", "e"]));
+    expect(accepts({ a: "1", b: "1", c: "1", d: "1", e: "1", f: "1" })).toBe(true);
+    expect(accepts({ b: "1", a: "1", c: "1", d: "1", e: "1" })).toBe(false);
+    expect(accepts({ a: "1", b: "1", c: "1", d: "1" })).toBe(false);
   });
 
   it("an object with no properties: closed is `{}`, open is any object", () => {
