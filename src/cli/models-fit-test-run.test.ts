@@ -247,16 +247,24 @@ describe("models fit-test restore marker (killed without a signal handler, e.g. 
     expect(existsSync(markerPath())).toBe(false);
   });
 
-  it("the next models command puts the user's model back, starts it again and clears the record", async () => {
+  it("the next models command puts the user's model back in config without blocking on its start, and clears the record", async () => {
     writeMarker({ pid: deadPid(), startedAt: Date.now(), previous: "qwen-3.5-4b", chatRunning: true, embeddingRunning: true, swapped: true });
     // The killed run left a test model serving, beside the embedding model.
     Object.assign(fake, { chat: true, emb: true });
     expect(await modelsCommand(["status"])).toBe(0);
-    expect(fake.calls.map(([name]) => name)).toEqual(["stop", "use", "start", "status"]);
+    // A read-only command does not wait minutes for a model start.
+    expect(fake.calls.map(([name]) => name)).toEqual(["stop", "use", "status"]);
     expect(callsOf("stop")[0]).toMatchObject({ chatOnly: true, savePromptCache: false });
     expect(callsOf("use")).toEqual(["qwen-3.5-4b"]);
-    expect(callsOf("start")).toEqual([{ promptCache: "suspend" }]);
+    expect(stderr).toMatch(/qwen-3\.5-4b starts again on next use/);
     expect(existsSync(markerPath())).toBe(false);
+  });
+
+  it("a fit-test after a killed run starts the user's model again first, so the new run puts it back running", async () => {
+    writeMarker({ pid: deadPid(), startedAt: Date.now(), previous: "qwen-3.5-4b", chatRunning: true, embeddingRunning: false, swapped: true });
+    expect(await modelsCommand(["fit-test", ...fitArgs()])).toBe(0);
+    expect(fake.calls.slice(0, 3).map(([name]) => name)).toEqual(["stop", "use", "start"]);
+    expect(fake.chat).toBe(true);
   });
 
   it("`models stop` after a killed run puts the model back in config without starting it", async () => {

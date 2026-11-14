@@ -403,6 +403,9 @@ async function restoreFromMarker(dataDir: string, marker: FitRestoreMarker, rest
       : "an interrupted models fit-test left its restore record; checking your model\n",
   );
   await createFitModelSwitcher(marker, { userCachesSaved: true }).restore(status.running, { restart, swapped });
+  if (!restart && marker.chatRunning && marker.previous !== null && !(await chatDaemonStatus()).running) {
+    process.stderr.write(`${marker.previous} starts again on next use (TUI, desktop app or \`atomic-agent models start\`)\n`);
+  }
 }
 
 /**
