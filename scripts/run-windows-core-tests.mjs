@@ -9,6 +9,16 @@ import { checkCi, testArgs } from './run-tests.mjs';
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const criticalFiles = [
   'src/tools/fusion/candidate-integration.test.ts',
+  'src/tools/fusion/candidate-evidence.test.ts',
+  'src/tools/fusion/fusion-candidate.test.ts',
+  'src/tools/fusion/delegate-descriptor.test.ts',
+  'src/tools/fusion/dependency-readiness.test.ts',
+  'src/tools/fusion/artifact-manifest.integration.test.ts',
+  'src/tools/fusion/artifact-manifest-tasks.test.ts',
+  'src/tools/fusion/artifact-evidence-output.test.ts',
+  'src/tools/fusion/outcome-evidence.test.ts',
+  'src/tools/fusion/candidate-outcomes.test.ts',
+  'src/tools/fusion/candidate-receipt.test.ts',
   'src/tools/fusion/candidate-durability.test.ts',
   'src/tools/fusion/branch-workspace-portability.test.ts',
   'src/tools/verify/verify-fail-closed.test.ts',
