@@ -4,11 +4,11 @@
  * embedding daemon and output.
  */
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { resetConfigCache } from "../config/index.js";
+import { getConfig, resetConfigCache } from "../config/index.js";
 import { USER_CONFIG_VERSION } from "../config/config-schema.js";
 import { FIT_TASK_SET_KIND, FIT_TASK_SET_VERSION } from "../fit-test/fit-task.js";
 
@@ -264,5 +264,29 @@ describe("models fit-test --json", () => {
     expect(run.models.map((m) => m.modelId)).toEqual(["qwen-3.5-2b", "qwen-3.5-9b"]);
     expect(stderr).toContain("stopped");
     expect(stderr).toContain("active model: qwen-3.5-4b");
+  });
+});
+
+describe("models fit-test beside another client of the local model", () => {
+  it("refuses while a TUI or the desktop holds the local model, touching nothing", async () => {
+    const sessions = join(getConfig().paths.localModelsDataDir, "sessions");
+    mkdirSync(sessions, { recursive: true });
+    // A live process other than this one: the test runner's parent.
+    writeFileSync(join(sessions, String(process.ppid)), String(process.ppid));
+    expect(await runModelsFitTest(fitArgs())).toBe(1);
+    expect(stderr).toMatch(/another atomic-agent session is using the local model/);
+    expect(fake.calls).toEqual([]);
+    expect(stdout).toBe("");
+  });
+
+  it("refuses while another fit-test is running", async () => {
+    writeFileSync(
+      join(stateDir, "fit-test-restore.json"),
+      JSON.stringify({ pid: process.ppid, startedAt: Date.now(), previous: "qwen-3.5-4b", chatRunning: true, embeddingRunning: false }),
+    );
+    expect(await runModelsFitTest(fitArgs())).toBe(1);
+    expect(stderr).toMatch(/another models fit-test is running/);
+    expect(fake.calls).toEqual([]);
+    expect(existsSync(join(stateDir, "fit-test-restore.json"))).toBe(true);
   });
 });

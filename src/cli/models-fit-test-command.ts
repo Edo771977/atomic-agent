@@ -34,9 +34,12 @@ import { readCliOption } from "./models-handlers.js";
 import {
   clearFitRestoreMarker,
   createFitModelSwitcher,
+  fitRestoreMarkerLive,
   readFitModelSnapshot,
+  readFitRestoreMarker,
   writeFitRestoreMarker,
 } from "./models-fit-test-restore.js";
+import { hasOtherLiveSessions } from "../local-llm/server/session-registry.js";
 
 const MAX_MODELS = 3;
 const DEFAULT_TIMEOUT_S = 300;
@@ -189,6 +192,20 @@ export async function runModelsFitTest(args: string[]): Promise<number> {
   const cfg = getConfig();
   if (cfg.localModels.mode !== "managed") {
     process.stderr.write("fit-test loads models itself, so it needs managed mode (`atomic-agent models use <id>`)\n");
+    return 1;
+  }
+  // fit-test stops and swaps the local model under every other client.
+  // The TUI and the desktop register in the session registry; the
+  // sidecar, `serve` and scheduled tasks do not, so they are not seen.
+  const other = readFitRestoreMarker(cfg.paths.stateDir);
+  if (other !== null && fitRestoreMarkerLive(other)) {
+    process.stderr.write(`another models fit-test is running (pid ${other.pid}); wait for it to finish\n`);
+    return 1;
+  }
+  if (hasOtherLiveSessions(cfg.paths.localModelsDataDir)) {
+    process.stderr.write(
+      "another atomic-agent session is using the local model (a TUI or the desktop app); close it first, since fit-test stops and swaps the model\n",
+    );
     return 1;
   }
   const set = parseFitTaskSet(JSON.parse(readFileSync(parsed.tasksPath, "utf8")));
