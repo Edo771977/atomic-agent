@@ -715,8 +715,12 @@ it.each([
   await chmod(join(root, "src"), mode); await chmod(join(root, "src", "deep"), mode);
   const candidate = await createCandidateIntegration(root, method === "worktree" ? {} : { git: async () => null });
   try {
-    expect((await stat(join(candidate.dir, "src"))).mode & 0o777).toBe(mode);
-    expect((await stat(join(candidate.dir, "src", "deep"))).mode & 0o777).toBe(mode);
+    // Windows keeps no POSIX directory modes (chmod only toggles the
+    // read-only attribute, so both read back as 0o666 there): staging and
+    // promotion succeeding is what this covers on every platform.
+    const expected = process.platform === "win32" ? (await stat(join(root, "src"))).mode & 0o777 : mode;
+    expect((await stat(join(candidate.dir, "src"))).mode & 0o777).toBe(expected);
+    expect((await stat(join(candidate.dir, "src", "deep"))).mode & 0o777).toBe(expected);
     await writeFile(join(candidate.dir, "src", "deep", "a.ts"), "y\n");
     const report = await candidate.finish({ rows, contract, signal, runChecks: pass });
     expect(report.status).toBe("promoted");
