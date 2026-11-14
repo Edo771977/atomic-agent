@@ -100,6 +100,32 @@ it("keeps the plain size reason when no dependency folder had to be copied", asy
   expect(reasons).toEqual(["the folder is too large to copy"]);
 });
 
+it("blames the source tree, not unlinkable dependencies, when the limit would not hold without them", async () => {
+  links.deny = () => "EPERM";
+  const root = await project();
+  await writeFile(join(root, "big.bin"), "b".repeat(5 * DEP_BYTES));
+  const reasons: string[] = [];
+  // The base fits (dependencies included); the task's copy of big.bin alone cannot.
+  expect(await createBranchSet(root, ["a"], { git: async () => null, maxCopyBytes: 8 * DEP_BYTES, onRefusal: reason => reasons.push(reason) })).toBeNull();
+  expect(reasons).toEqual(["the folder is too large to copy"]);
+});
+
+it("names the size reason when a candidate cannot be staged", async () => {
+  const root = await project();
+  await writeFile(join(root, "big.bin"), "b".repeat(5 * DEP_BYTES));
+  await expect(createCandidateIntegration(root, { git: async () => null, maxCopyBytes: 3 * DEP_BYTES })).rejects.toThrow(
+    "candidate workspace unavailable: the folder is too large to copy",
+  );
+});
+
+it("names the candidate's private dependency copy when only it overflows the limit", async () => {
+  const root = await project();
+  // The base links the dependencies; the candidate's own copy of them cannot fit.
+  await expect(createCandidateIntegration(root, { git: async () => null, maxCopyBytes: DEP_BYTES / 2 })).rejects.toThrow(
+    `candidate workspace unavailable: the candidate's private copy of the dependency folders exceeds the copy limit (${DEP_BYTES / 2} bytes)`,
+  );
+});
+
 it("copies a candidate's dependency directory from the original only once when nothing can be linked", async () => {
   links.deny = () => "EPERM";
   const root = await project();

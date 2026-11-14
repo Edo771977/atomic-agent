@@ -300,8 +300,12 @@ export async function createCandidateIntegration(
 ): Promise<CandidateIntegration> {
   const id = `candidate-${randomBytes(6).toString("hex")}`;
   const setupSignal = options.signal === undefined ? AbortSignal.timeout(120_000) : AbortSignal.any([options.signal, AbortSignal.timeout(120_000)]);
-  const set = await createBranchSet(realDir, [id], { ...options, signal: setupSignal, privateDependencyDirectories: true });
-  if (set === null) throw new Error("candidate workspace unavailable: private copies exceed the copy limit");
+  let refusal: string | undefined;
+  const set = await createBranchSet(realDir, [id], {
+    ...options, signal: setupSignal, privateDependencyDirectories: true,
+    onRefusal: (reason) => { refusal = reason; options.onRefusal?.(reason); },
+  });
+  if (set === null) throw new Error(`candidate workspace unavailable: ${refusal ?? "private copies exceed the copy limit"}`);
   const workspace = set.workspaces.get(id)!;
   let tracked: ReadonlySet<string>;
   try { tracked = await trackedPaths(set, options.git ?? defaultGitExec); } catch (err) { await set.cleanup(); throw err; }

@@ -366,7 +366,49 @@ async function copyFileKeepingMode(from: string, to: string): Promise<void> {
 }
 
 class PrivateCopyLimitError extends Error {
-  constructor() { super("the private workspace copies exceed the copy byte limit"); }
+  /** `pending`: bytes of the file that did not fit, not yet charged. */
+  constructor(readonly pending = 0) { super("the private workspace copies exceed the copy byte limit"); }
+}
+
+/** Why a dependency directory was copied: no link was possible, or a candidate must own it. */
+type DependencyCopyKind = "unlinked" | "private";
+
+/**
+ * Run a dependency directory's copy, charging its bytes (including a
+ * file that did not fit) to `kind`; a nested dependency directory is
+ * charged to the outermost copy only.
+ */
+async function chargeDependencyCopy(budget: PrivateCopyBudget, kind: DependencyCopyKind, copy: () => Promise<void>): Promise<void> {
+  if (budget.chargingDependency === true) return copy();
+  budget.chargingDependency = true;
+  const before = budget.left;
+  let pending = 0;
+  try {
+    await copy();
+  } catch (err) {
+    if (err instanceof PrivateCopyLimitError) pending = err.pending;
+    throw err;
+  } finally {
+    delete budget.chargingDependency;
+    budget.dependencyBytes[kind] += before - budget.left + pending;
+  }
+}
+
+/**
+ * The refusal for a copy that hit the limit: dependency copies are named
+ * only when the rest of what was copied, the file that did not fit
+ * included, would have fitted without them.
+ */
+function copyLimitReason(budget: PrivateCopyBudget, limit: number, err: PrivateCopyLimitError): string {
+  const needed = limit - budget.left + err.pending;
+  const blame = (bytes: number): boolean => bytes > 0 && needed - bytes <= limit;
+  if (blame(budget.dependencyBytes.unlinked)) {
+    return `dependency folders could not be linked on this system and copying them exceeds the copy limit (${limit} bytes)`;
+  }
+  if (blame(budget.dependencyBytes.private)) {
+    return `the candidate's private copy of the dependency folders exceeds the copy limit (${limit} bytes)`;
+  }
+  return "the folder is too large to copy";
 }
 
 interface PrivateCopyBudget {
@@ -388,8 +430,10 @@ interface PrivateCopyBudget {
   privateDependencyRepository?: { top: string; rel: string; worktree: boolean };
   /** Set while making a private-dependency set's base: unlinkable dependencies get an empty placeholder. */
   dependencyPlaceholders?: boolean;
-  /** A dependency directory was copied because no link was possible. */
-  dependencyCopied?: boolean;
+  /** Bytes charged by dependency directory copies, by why they were copied. */
+  dependencyBytes: Record<DependencyCopyKind, number>;
+  /** Set while a dependency directory's copy is being charged. */
+  chargingDependency?: boolean;
 }
 
 /**
@@ -452,8 +496,7 @@ async function linkDirectoryOrCopy(from: string, to: string, budget: PrivateCopy
     await mkdir(to, { recursive: true });
     return;
   }
-  budget.dependencyCopied = true;
-  await copyPrivateEntry(from, to, budget, rel, false);
+  await chargeDependencyCopy(budget, "unlinked", () => copyPrivateEntry(from, to, budget, rel, false));
 }
 
 /** Whether any component of `rel` names a shared dependency directory. */
@@ -484,7 +527,7 @@ async function copyPrivateEntry(
     // A user's own link (or a path only the source has) keeps its normal copy.
     if (own !== null && !own.isSymbolicLink()) {
       // Nested shared names redirect to the same original path: copied too.
-      await copyPrivateEntry(origin, to, budget, rel, false);
+      await chargeDependencyCopy(budget, "private", () => copyPrivateEntry(origin, to, budget, rel, false));
       return;
     }
   }
@@ -503,7 +546,7 @@ async function copyPrivateEntry(
     await mkdir(dirname(to), { recursive: true });
     await recreateLink(from, to, budget, rel);
   } else if (info.isFile()) {
-    if (info.size > budget.left) throw new PrivateCopyLimitError();
+    if (info.size > budget.left) throw new PrivateCopyLimitError(info.size);
     budget.left -= info.size;
     await copyFileKeepingMode(from, to);
     budget.signal?.throwIfAborted();
@@ -786,7 +829,7 @@ export async function createBranchSet(
     }
   };
   const limit = options.maxCopyBytes ?? VERIFY_COPY_MAX_BYTES;
-  const budget: PrivateCopyBudget = { left: limit, generatedDirectoryLinks: new Map(), ...(options.signal === undefined ? {} : { signal: options.signal }) };
+  const budget: PrivateCopyBudget = { left: limit, generatedDirectoryLinks: new Map(), dependencyBytes: { unlinked: 0, private: 0 }, ...(options.signal === undefined ? {} : { signal: options.signal }) };
   try {
     const method: BranchMethod = snapshot === null ? "copy" : "worktree";
     const make = async (name: string, source: string): Promise<string> => {
@@ -844,9 +887,7 @@ export async function createBranchSet(
   } catch (err) {
     await cleanup();
     if (err instanceof PrivateCopyLimitError) {
-      options.onRefusal?.(budget.dependencyCopied === true
-        ? `dependency folders could not be linked on this system and copying them exceeds the copy limit (${limit} bytes)`
-        : "the folder is too large to copy");
+      options.onRefusal?.(copyLimitReason(budget, limit, err));
       return null;
     }
     throw err;
