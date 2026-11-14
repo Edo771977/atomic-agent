@@ -23,13 +23,19 @@ function counts(value: unknown): CandidateCheckCounts | undefined {
 /** Presence, including malformed or unknown metadata, always excludes direct quality evidence. */
 export const hasCandidateOutcome = (row: TaskOutcomeRecord): boolean => "candidate" in row;
 
+/** Invocation counts remain useful even when unrelated acceptance or check evidence is invalid. */
+export function candidateWorkerRuns(row: TaskOutcomeRecord): number | undefined {
+  return object(row.candidate) && count(row.candidate.workerRuns) && row.candidate.workerRuns > 0 ? row.candidate.workerRuns : undefined;
+}
+
 export function candidateOutcomeEvidence(row: TaskOutcomeRecord): CandidateOutcomeEvidence | undefined {
   if (!object(row.candidate)) return undefined;
   const receipt = parseCandidateAcceptanceReceipt(row.candidate.receipt);
   const taskChecks = counts(row.candidate.taskChecks);
   if (receipt === undefined || taskChecks === undefined || taskChecks.total > receipt.checks.total ||
       taskChecks.passed > receipt.checks.passed || taskChecks.failed > receipt.checks.failed) return undefined;
-  return { receipt, taskChecks, ...(count(row.candidate.workerRuns) && row.candidate.workerRuns > 0 ? { workerRuns: row.candidate.workerRuns } : {}) };
+  const workerRuns = candidateWorkerRuns(row);
+  return { receipt, taskChecks, ...(workerRuns === undefined ? {} : { workerRuns }) };
 }
 
 /** Final disposition is telemetry: even promoted candidates never train per-model quality rates. */

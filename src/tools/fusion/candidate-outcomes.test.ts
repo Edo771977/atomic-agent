@@ -133,4 +133,12 @@ describe("candidate outcome telemetry", () => {
     const row = withCandidateOutcome(record(), receipt, [], "private-task", 1_000_000);
     expect(row.candidate?.workerRuns).toBe(1_000_000);
   });
+  it.each(["receipt", "task-checks"] as const)("preserves known worker runs independently of malformed %s evidence", (field) => {
+    const valid = withCandidateOutcome(record(), receipt, [], "private-task", 2);
+    const malformed = field === "receipt"
+      ? withCandidateOutcome(record(), { ...receipt, version: 2 } as unknown as CandidateAcceptanceReceipt, [], "private-task", 2)
+      : { ...valid, candidate: { ...valid.candidate!, taskChecks: { total: -1, passed: 0, failed: 0 } } };
+    expect(aggregateOutcomes(parseOutcomeLines(JSON.stringify(malformed))).workers[0]).toMatchObject({ checksPassed: 0,
+      candidate: { taskRuns: 1, knownWorkerRuns: 2, workerRunsUnverified: 0, promoted: 0, unverified: 1, taskChecksUnverified: 1 } });
+  });
 });

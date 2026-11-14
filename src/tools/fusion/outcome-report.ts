@@ -14,7 +14,7 @@ import {
   formatUsdShort,
 } from "./turn-receipt.js";
 import { taskCheckEvidence } from "./outcome-evidence.js";
-import { candidateOutcomeEvidence, hasCandidateOutcome } from "./candidate-outcomes.js";
+import { candidateOutcomeEvidence, candidateWorkerRuns, hasCandidateOutcome } from "./candidate-outcomes.js";
 import type { CandidateRejectionReason } from "./candidate-acceptance.js";
 
 /**
@@ -178,10 +178,11 @@ function candidateStats(rows: TaskOutcomeRecord[]): CandidateTaskRunStats {
   for (const row of rows) {
     if (!hasCandidateOutcome(row)) continue;
     stats.taskRuns += 1;
+    const workerRuns = candidateWorkerRuns(row);
+    if (workerRuns === undefined) stats.workerRunsUnverified += 1;
+    else stats.knownWorkerRuns += workerRuns;
     const evidence = candidateOutcomeEvidence(row);
-    if (evidence?.receipt === undefined) { stats.unverified += 1; stats.taskChecksUnverified += 1; stats.workerRunsUnverified += 1; continue; }
-    if (evidence.workerRuns === undefined) stats.workerRunsUnverified += 1;
-    else stats.knownWorkerRuns += evidence.workerRuns;
+    if (evidence?.receipt === undefined) { stats.unverified += 1; stats.taskChecksUnverified += 1; continue; }
     stats[evidence.receipt.disposition] += 1;
     if (evidence.receipt.reason !== undefined) reasons.set(evidence.receipt.reason, (reasons.get(evidence.receipt.reason) ?? 0) + 1);
     const checked = evidence.taskChecks;
@@ -469,7 +470,7 @@ export function formatFusionReport(report: FusionReport, options: ReportOptions 
     }`,
     "Reported green: status ok; reported 1st-pass: status ok on the first attempt with no judge retry or self-check notice. after retry: reported green after a replan or judge retry.",
     "Checks pass/fail/unverified: consistent task-checks acceptance records; missing or contradictory evidence is unverified. Replan attempts can have check evidence. The worker can modify the declared checks and their inputs; passing them does not establish semantic correctness or full integration acceptance.",
-    "Candidate task runs count aggregated task rows by final disposition, not candidate calls or individual worker invocations. Known worker runs count explicit task invocations, including judge retries; missing or invalid counts stay unknown. Rows are grouped under the configured leg even when retries or escalations used other providers; cost, usage and duration remain row-reported metrics, not complete billing or physical provider performance. Final own checks count only task-attributed final reruns; call-level integration green gives no individual model credit. Candidate rows are telemetry only: promoted-only rates are conditioned on success and never train measured routing quality. Missing or malformed candidate metadata stays unverified.",
+    "Candidate task runs count aggregated task rows by final disposition, not candidate calls or individual worker invocations. Known worker runs count explicit task invocations, including judge retries; missing or invalid counts stay unknown. Invocation counts remain independent of disposition and check validity. Rows are grouped under the configured leg even when retries or escalations used other providers; cost, usage and duration remain row-reported metrics, not complete billing or physical provider performance. Final own checks count only task-attributed final reruns; call-level integration green gives no individual model credit. Candidate rows are telemetry only: promoted-only rates are conditioned on success and never train measured routing quality. Missing or malformed candidate metadata stays unverified.",
   );
   return `${lines.join("\n")}\n`;
 }
