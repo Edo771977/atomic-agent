@@ -70,12 +70,15 @@ const SECRET_HEADER = /authorization|api[-_]?key|token|secret|password|cookie|au
  * per call, so a key added through `/providers` mid-session is covered.
  */
 export function runtimeKnownSecrets(
-  config: Partial<Pick<AtomicAgentConfig, "llm" | "localModels" | "webhooks" | "mcp">>,
+  config: Partial<Pick<AtomicAgentConfig, "llm" | "localModels" | "webhooks" | "mcp" | "web" | "composio">>,
   env: NodeJS.ProcessEnv = process.env,
 ): KnownSecret[] {
   const out = knownSecretsFromEnv(env);
   const add = (label: string, value: unknown): void => {
     if (typeof value === "string" && value.length > 0) out.push({ label, value });
+  };
+  const addEnv = (label: string, name: string | undefined): void => {
+    if (name !== undefined) add(label, env[name]);
   };
   const addHeaders = (label: string, headers: Readonly<Record<string, string>> | undefined): void => {
     for (const [name, value] of Object.entries(headers ?? {})) {
@@ -88,8 +91,14 @@ export function runtimeKnownSecrets(
   };
   for (const entry of config.llm?.providers ?? []) {
     add(`${entry.id}-key`, entry.apiKey);
+    // Explicit credential references are secrets whatever their variable name.
+    // Do not sweep unrelated environment values into the masking set.
+    addEnv(`${entry.id}-key`, entry.apiKeyEnvVar);
     addHeaders(`${entry.id}-header`, entry.headers);
   }
+  addEnv("exa-key", config.web?.search.exa.apiKeyEnv);
+  addEnv("brave-key", config.web?.search.brave.apiKeyEnv);
+  addEnv("composio-key", config.composio?.apiKeyEnv);
   add("local-models-key", config.localModels?.apiKey);
   for (const [name, hook] of Object.entries(config.webhooks ?? {})) {
     add(`webhook-${name}-secret`, hook.secret);

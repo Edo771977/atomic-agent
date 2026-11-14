@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
@@ -28,6 +28,9 @@ import { createRuntimeToolRegistry, registerRuntimeCoreTools, connectRuntimeMcpC
 import { ModelProfileManager } from "../../llm/model-profile-manager.js";
 import { PLAIN_INSTRUCT_PROFILE } from "../../llm/model-profile.js";
 import { buildGrammar } from "../../llm/grammar/build-grammar.js";
+import { appendBatchedTurns } from "../../agent/step/step-commit.js";
+import { renderTurnForPrompt } from "../../session/conversation-turn.js";
+import { extendCloudContext, renderCloudTurn } from "../../session/cloud-context.js";
 
 const logger = new StructuredLogger({ level: "error", sinks: [] });
 const externalOperation = (): never => { throw new Error("Test must not perform external work"); };
@@ -357,12 +360,50 @@ describe("fusion escalation calls in the session readout (ATO-1388)", () => {
 });
 
 describe("runtimeKnownSecrets (ATO-1077)", () => {
+  it.each(["local", "cloud"] as const)("masks a custom provider environment key through runtime composition, the real delegate and the next %s conversation", async mode => {
+    const directory = await mkdtemp(join(tmpdir(), "catalog-custom-key-"));
+    const stateDirectory = await mkdtemp(join(tmpdir(), "catalog-custom-key-state-"));
+    const secret = "SyntheticLabCredential493825ABCD";
+    try {
+      vi.stubEnv("ATOMIC_AGENT_STATE_DIR", stateDirectory); vi.stubEnv("LAB_BOX", secret); resetConfigCache();
+      const config = getConfig(); config.browser.enabled = false; config.agent.batchToolResultCharCap = 2400;
+      config.llm = { providers: [{ id: "lab", kind: "openai-compatible", baseUrl: "https://unused.invalid/v1", apiKeyEnvVar: "LAB_BOX", defaultChatModel: "synthetic" }], activeTextProvider: "lab", activeEmbeddingProvider: "lab", toolTransport: "auto" };
+      const approvals = new ApprovalGate({ emit: () => {}, level: 5 }); const dangerous = { approvals, approvalRequired: false };
+      const registry = createRuntimeToolRegistry(config, backend, dangerous);
+      const resolved: ResolvedRunMode = { ...resolveRunMode(resolveLlmConfig(config)), stored: "fusion", effective: "fusion", orchestratorProviderId: "lab", orchestratorModel: "synthetic", workerProviderId: "lab", workerModel: "synthetic", primaryProviderId: "lab", workers: 1, workerMaxSteps: 7, workerTimeoutMs: 60_000, degraded: null };
+      registerRuntimeFusionAndReadScope({ config, toolRegistry: registry, approvals, dangerous, declaredInputs: new osTools.DeclaredInputsRegistry(),
+        resolveOriginalRequest: () => undefined, createEphemeralSession: (meta, dir) => createEmptySessionState({ id: `fusion-worker-${meta.taskId}`, workingDir: dir ?? directory, metadata: { fusionWorker: meta } }),
+        runTurn: async (session, _message, options) => {
+          const path = join(session.workingDir, "api.json"); await writeFile(path, '{"ready":true}');
+          options?.eventHook?.({ type: "llm_event", event: { type: "tool_call_executed", result: { tool: "os.fs.write", status: "ok", summary: "written", details: { path, existed: false, addedLines: 1, removedLines: 0 }, truncated: false }, batchIndex: 0, batchSize: 1 } });
+          options?.eventHook?.({ type: "llm_event", event: { type: "assistant_reply", text: `worker text ${secret} ${"padding ".repeat(300)}` } });
+          return { session, reason: "reply", stepCount: 1 };
+        }, prepareLocalLink: async () => {}, emitAgentLoopEventFor: () => {}, resolveCurrentRunMode: () => resolved,
+        providerRegistry: { getProvider: () => undefined }, llama: { measuredTokensPerSecond: () => null, fetchSlots: async () => ({ slots: [] }), probeHealth: async () => "answered" as const }, slotManager: { poolSize: () => 2 }, workingDir: directory, logger });
+      const result = await registry.invoke("fusion.delegate", { tasks: [{ id: "api", instructions: "write api.json", files: ["api.json"] }] }, { workingDir: directory, sessionId: "custom-key-parent", stepIndex: 0, signal: new AbortController().signal, modelMode: mode });
+      expect(result.status, result.summary).toBe("ok");
+      const session = appendBatchedTurns({ state: createEmptySessionState({ id: "custom-key-parent", workingDir: directory }), calls: [{ tool: result.tool, args: {} }], results: [result], reasoning: "", terminal: null, modelMode: mode });
+      const turn = session.turns[1]!;
+      const prompt = mode === "cloud" ? renderCloudTurn(extendCloudContext(undefined, [turn], new Map()).entries[0]!.turn) : renderTurnForPrompt(turn, { inCurrentMacroTurn: true });
+      expect(prompt).not.toContain(secret); expect(prompt).not.toContain(secret.slice(0, 12)); expect(prompt).toContain("[redacted:lab-key]");
+      expect(result.summary.length).toBeLessThanOrEqual(2400);
+      expect(JSON.parse(result.summary.split("\n")[0]!.slice("artifact-evidence: ".length)).outcome.status).toBe("ok");
+    } finally { vi.unstubAllEnvs(); resetConfigCache(); await rm(directory, { recursive: true, force: true }); await rm(stateDirectory, { recursive: true, force: true }); }
+  });
+
   it("resolves a provider's custom key environment name without treating unrelated environment values as secrets", () => {
-    const config = { llm: { providers: [{ id: "lab", kind: "openai-compatible", apiKeyEnvVar: "LAB_BOX" }] } } as Parameters<typeof runtimeKnownSecrets>[0];
+    const config = { llm: { providers: [{ id: "lab", kind: "openai-compatible", apiKeyEnvVar: "LAB_BOX" }], activeTextProvider: "lab", activeEmbeddingProvider: "lab", toolTransport: "auto" } } satisfies Parameters<typeof runtimeKnownSecrets>[0];
     const secrets = runtimeKnownSecrets(config, { LAB_BOX: "SyntheticCustomCredential493825", ATOMIC_AGENT_KEY_LAB: "SyntheticAtomicCredential837251", UNRELATED_BOX: "ordinary public value" });
     expect(secrets).toContainEqual({ label: "lab-key", value: "SyntheticCustomCredential493825" });
     expect(secrets.some(secret => secret.value === "SyntheticAtomicCredential837251")).toBe(true);
     expect(secrets.some(secret => secret.value === "ordinary public value")).toBe(false);
+  });
+
+  it("includes explicitly configured search and integration key references with ordinary names", () => {
+    const config = { web: { search: { exa: { apiKeyEnv: "LAB_EXA" }, brave: { apiKeyEnv: "LAB_BRAVE" } } }, composio: { apiKeyEnv: "LAB_COMPOSIO" } } as unknown as Parameters<typeof runtimeKnownSecrets>[0];
+    expect(runtimeKnownSecrets(config, { LAB_EXA: "SyntheticExa493825", LAB_BRAVE: "SyntheticBrave493825", LAB_COMPOSIO: "SyntheticComposio493825", PUBLIC_VALUE: "public" })).toEqual([
+      { label: "exa-key", value: "SyntheticExa493825" }, { label: "brave-key", value: "SyntheticBrave493825" }, { label: "composio-key", value: "SyntheticComposio493825" },
+    ]);
   });
   it("lists the env's secret variables and the credentials stored in config", () => {
     const config = {
