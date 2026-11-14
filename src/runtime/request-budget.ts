@@ -6,6 +6,8 @@ import { completionCostUsd, longContextRates, reportedCostUsd } from "../llm/pro
 import { readErrnoCode } from "../llm/errno-code.js";
 import { modelParamProfile } from "../llm/provider/openai/model-params.js";
 import { formatUsd, type FusionTurnBudget } from "../tools/fusion/turn-budget.js";
+import { DailySpendLimitError } from "../llm/reliability/spend-limit-error.js";
+import type { DailySpendBudget, DailySpendHold } from "./daily-spend-budget.js";
 
 // Explicit rejections before generation. 529 is Anthropic's overload answer
 // returned instead of generating. 503 stays charged like 500/502/504:
@@ -75,7 +77,7 @@ function verifiablePricing(pricing: ModelPricing | undefined): pricing is ModelP
  * `priority` bills about 2x) needs a configured multiplier, so an
  * unknown modifier refuses instead of being under-reserved.
  */
-function serviceTierMultiplier(body: Record<string, unknown>, pricing: ModelPricing): number {
+function serviceTierMultiplier(body: Record<string, unknown>, pricing: ModelPricing, label: string): number {
   const tier = body.service_tier;
   if (tier === undefined || tier === null) return 1;
   if (typeof tier === "string") {
@@ -83,7 +85,7 @@ function serviceTierMultiplier(body: Record<string, unknown>, pricing: ModelPric
     if (configured !== undefined) return configured;
     if (BASE_SERVICE_TIERS.has(tier.toLowerCase())) return 1;
   }
-  throw new Error(`turn budget cannot price service_tier ${JSON.stringify(tier)}; declare it in the model's pricing.serviceTierMultipliers or remove it`);
+  throw new Error(`${label} cannot price service_tier ${JSON.stringify(tier)}; declare it in the model's pricing.serviceTierMultipliers or remove it`);
 }
 
 /**
@@ -124,39 +126,51 @@ const MIN_OUTPUT_TOKENS = 1024;
 
 type Hold = ReturnType<FusionTurnBudget["reserveRequest"]>;
 
+/** The holds one physical send takes: the turn's and the day's. */
+interface SendHolds {
+  turn?: Hold;
+  daily?: DailySpendHold;
+}
+
+function releaseHolds(holds: SendHolds): void {
+  holds.turn?.release();
+  holds.daily?.release();
+}
+
 function isCapRefusal(error: unknown): boolean {
-  return error instanceof Error && error.message.startsWith("turn budget cannot cover this request");
+  return error instanceof DailySpendLimitError ||
+    (error instanceof Error && error.message.startsWith("turn budget cannot cover this request"));
 }
 
 /**
  * Reserves `upperUsd(output)` for the largest output in
  * [min(MIN_OUTPUT_TOKENS, output), output] that the remaining allowance
- * covers. Reservation is synchronous, so the search cannot race another
- * request. Refuses with the full bound's error when even the smallest
- * output does not fit.
+ * (turn and day) covers. Reservation is synchronous, so the search cannot
+ * race another request. Refuses with the full bound's error when even the
+ * smallest output does not fit.
  */
-function reserveFitting(budget: FusionTurnBudget, sessionId: string, output: number, upperUsd: (output: number) => number): { hold: Hold; output: number } {
-  const attempt = (tokens: number): Hold | undefined => {
-    try { return budget.reserveRequest(sessionId, upperUsd(tokens)); } catch (error) {
+function reserveFitting(reserve: (usd: number) => SendHolds, output: number, upperUsd: (output: number) => number): { holds: SendHolds; output: number } {
+  const attempt = (tokens: number): SendHolds | undefined => {
+    try { return reserve(upperUsd(tokens)); } catch (error) {
       if (isCapRefusal(error)) return undefined;
       throw error;
     }
   };
   const full = attempt(output);
-  if (full !== undefined) return { hold: full, output };
+  if (full !== undefined) return { holds: full, output };
   const floor = Math.min(MIN_OUTPUT_TOKENS, output);
   const smallest = floor < output ? attempt(floor) : undefined;
-  if (smallest === undefined) return { hold: budget.reserveRequest(sessionId, upperUsd(output)), output };
-  smallest.release();
+  if (smallest === undefined) return { holds: reserve(upperUsd(output)), output };
+  releaseHolds(smallest);
   let fits = floor;
   let misses = output;
   while (misses - fits > 1) {
     const middle = Math.floor((fits + misses) / 2);
     const probe = attempt(middle);
     if (probe === undefined) misses = middle;
-    else { probe.release(); fits = middle; }
+    else { releaseHolds(probe); fits = middle; }
   }
-  return { hold: budget.reserveRequest(sessionId, upperUsd(fits)), output: fits };
+  return { holds: reserve(upperUsd(fits)), output: fits };
 }
 
 export interface RequestBudgetScope extends CompletionRequestBudget {
@@ -175,42 +189,73 @@ export interface RequestBudgetScope extends CompletionRequestBudget {
   finish(result?: CompletionResult): void;
 }
 
-/** A scope survives retries; each physical send acquires a separate hold. */
+/**
+ * A scope survives retries; each physical send acquires a separate hold.
+ *
+ * Two ledgers share one scope: the turn budget (`budget`, when the owning
+ * session has request limits) and the day's spend (`daily`, ATO-649,
+ * whenever the runtime keeps a day total). Both hold the same upper bound
+ * before a send, release it on the same explicit rejections and settle the
+ * same amount in `finish`, so a call is counted once and a retried send
+ * that may have been billed is charged on both.
+ */
 export function createRequestBudgetScope(
   budget: FusionTurnBudget | undefined,
   request: CompletionRequest,
   provider: LlmProvider,
   entry: LlmProviderConfigEntry | undefined,
   model: ResolvedModel | undefined,
+  daily?: DailySpendBudget,
 ): RequestBudgetScope | undefined {
   const sessionId = request.budgetOwnerSessionId ?? request.sessionId;
-  if (budget === undefined || sessionId === undefined) return undefined;
-  const limits = budget.requestLimits(sessionId);
-  if (limits === undefined) return undefined;
+  const limits = budget === undefined || sessionId === undefined ? undefined : budget.requestLimits(sessionId);
   // A loopback/private URL can be a forwarding gateway to a paid service.
   // Only an explicit runner/plan kind is free without configured zero rates.
   const unbilled = entry?.kind === "subscription-cli" || entry?.kind === "llama-server";
+  // Unbilled links are not spend: the day never sees them.
+  const day = unbilled ? undefined : daily;
+  if (limits === undefined && day === undefined) return undefined;
   const pricing = model?.pricing;
   const priced = verifiablePricing(pricing);
   const entryId = entry?.id ?? provider.id;
-  const capText = limits.usd === undefined ? "" : formatUsd(limits.usd);
-  // Without verified pricing or per-send authorization the cap cannot be
-  // enforced ahead of time: meter the reply instead of refusing every request.
-  let mode: RequestBudgetMode | undefined = limits.usd === undefined ? undefined
-    : unbilled ? "unbilled"
+  const capText = limits?.usd === undefined ? "" : formatUsd(limits.usd);
+  // How this link's spend can be bounded: ahead of each send (`hard`),
+  // only after the reply (`meter`), or not at all (`unbilled`). Without
+  // verified pricing or per-send authorization a cap cannot be enforced
+  // ahead of time: meter the reply instead of refusing every request.
+  const billing: RequestBudgetMode = unbilled ? "unbilled"
     : !priced || provider.supportsRequestBudget !== true ? "meter"
     : "hard";
-  let hint = mode !== "meter" ? undefined : !priced
+  let mode: RequestBudgetMode | undefined = limits?.usd === undefined ? undefined : billing;
+  const dayLimit = day?.limitUsd() ?? null;
+  const dayText = dayLimit === null ? "" : formatUsd(dayLimit);
+  let hint = mode === "meter" ? !priced
     ? `turn budget: no verified pricing for provider ${provider.id}; the ${capText} cap is only checked after each reply (configure model pricing to enforce it before sending)`
-    : `turn budget: provider ${provider.id} cannot authorize each physical send; the ${capText} cap is only checked after each reply`;
-  const priceRequired = mode === "hard";
+    : `turn budget: provider ${provider.id} cannot authorize each physical send; the ${capText} cap is only checked after each reply`
+    : dayLimit !== null && billing === "meter" ? !priced
+    ? `daily spend limit: no verified pricing for provider ${provider.id}; its calls count toward the ${dayText} daily limit only by reported cost, and the limit is only checked after each reply (configure model pricing to enforce it before sending)`
+    : `daily spend limit: provider ${provider.id} cannot authorize each physical send; the ${dayText} daily limit is only checked after each reply`
+    : undefined;
+  // Which ledgers hold an upper bound before each send.
+  const turnPriced = mode === "hard";
+  const dayPriced = day !== undefined && dayLimit !== null && billing === "hard";
+  const priceRequired = turnPriced || dayPriced;
+  const label = turnPriced ? "turn budget" : "daily spend limit";
   const caps = [request.maxTokens, request.maxOutputTokens, entry?.maxOutputTokens].filter((value): value is number => typeof value === "number" && Number.isFinite(value) && value > 0);
   // No context-window fallback: providers reject a window-sized output
   // limit, and reserving one would hold dollars per request.
   const outputCap = caps.length > 0 ? Math.min(...caps) : undefined;
-  const timeLeft = budget.requestTimeLeftMs(sessionId);
+  const timeLeft = limits === undefined ? undefined : budget!.requestTimeLeftMs(sessionId!);
   if (timeLeft !== undefined && timeLeft <= 0) throw new Error("the turn time cap has been reached before this request");
-  let held = !priceRequired && limits.usd !== undefined ? budget.reserveRequest(sessionId, 0) : undefined;
+  // A metered day holds nothing; the zero hold still refuses once today's
+  // total is at the ceiling. Taken before the turn's, so a refusal leaves
+  // no turn hold behind.
+  let dayHeld = day !== undefined && !dayPriced ? day.reserve(entryId, 0) : undefined;
+  let held: Hold | undefined;
+  try { held = !turnPriced && limits?.usd !== undefined ? budget!.reserveRequest(sessionId!, 0) : undefined; } catch (error) {
+    dayHeld?.release();
+    throw error;
+  }
   const deadline = new AbortController();
   const signal = request.signal === undefined ? deadline.signal : AbortSignal.any([request.signal, deadline.signal]);
   const timer = timeLeft === undefined ? undefined : setTimeout(() => deadline.abort(new DOMException("the turn time cap stopped this request", "AbortError")), timeLeft);
@@ -218,18 +263,28 @@ export function createRequestBudgetScope(
   let done = false;
   // Multiplier of the most recent physical send; settlement prices usage with it.
   let tierMultiplier = 1;
+  const hintKey = `${sessionId ?? ""}:${provider.id}`;
+  const reserveBoth = (usd: number): SendHolds => {
+    const turn = turnPriced ? budget!.reserveRequest(sessionId!, usd) : undefined;
+    let dailyHold: DailySpendHold | undefined;
+    try { dailyHold = dayPriced ? day!.reserve(entryId, usd) : undefined; } catch (error) {
+      turn?.release();
+      throw error;
+    }
+    return { ...(turn === undefined ? {} : { turn }), ...(dailyHold === undefined ? {} : { daily: dailyHold }) };
+  };
   const scope: RequestBudgetScope = {
     signal,
     ...(mode === undefined ? {} : { mode }),
     softBound: false,
-    ...(hint === undefined ? {} : { hint, hintKey: `${sessionId}:${provider.id}` }),
+    ...(hint === undefined ? {} : { hint, hintKey }),
     beforeSend(body) {
       if (done) throw new Error("request budget scope is already closed");
       if (signal.aborted) throw signal.reason;
       if (!priceRequired) return;
       // A retry after an ambiguous dispatch can have been billed too.
-      held?.settle();
-      held = undefined;
+      if (turnPriced) { held?.settle(); held = undefined; }
+      if (dayPriced) { dayHeld?.settle(); dayHeld = undefined; }
       if (request.signal?.aborted) throw request.signal.reason;
       const wireCaps = [body.max_tokens, body.max_completion_tokens].filter((value): value is number => typeof value === "number" && Number.isFinite(value) && value > 0);
       const explicitCaps = outputCap === undefined ? wireCaps : [outputCap, ...wireCaps];
@@ -244,11 +299,15 @@ export function createRequestBudgetScope(
           ? Math.min(SOFT_OUTPUT_RESERVE_TOKENS, Math.floor(window)) : SOFT_OUTPUT_RESERVE_TOKENS;
         if (!scope.softBound) {
           scope.softBound = true;
-          mode = "soft";
-          scope.mode = mode;
-          hint = `turn budget: provider entry ${entryId} has no maxOutputTokens; each request reserves an assumed ${ceiling}-token reply, so the ${capText} cap can be exceeded by one reply's extra output (set maxOutputTokens for a hard cap)`;
+          if (turnPriced) {
+            mode = "soft";
+            scope.mode = mode;
+            hint = `turn budget: provider entry ${entryId} has no maxOutputTokens; each request reserves an assumed ${ceiling}-token reply, so the ${capText} cap can be exceeded by one reply's extra output (set maxOutputTokens for a hard cap)`;
+          } else {
+            hint = `daily spend limit: provider entry ${entryId} has no maxOutputTokens; each request reserves an assumed ${ceiling}-token reply, so the ${dayText} daily limit can be exceeded by one reply's extra output (set maxOutputTokens for a hard limit)`;
+          }
           scope.hint = hint;
-          scope.hintKey = `${sessionId}:${provider.id}`;
+          scope.hintKey = hintKey;
         }
       } else {
         ceiling = Math.floor(Math.min(...explicitCaps));
@@ -275,11 +334,11 @@ export function createRequestBudgetScope(
       let inputTokens = bodyTokens;
       if (addsProviderSideInput(body)) {
         if (model?.source === "default" || !Number.isFinite(model?.contextWindow) || model!.contextWindow <= 0) {
-          throw new Error("turn budget cannot bound provider-side input (web search plugins or server tools) without a verified model context window");
+          throw new Error(`${label} cannot bound provider-side input (web search plugins or server tools) without a verified model context window`);
         }
         inputTokens = Math.max(bodyTokens, model!.contextWindow);
       }
-      const multiplier = serviceTierMultiplier(body, pricing!);
+      const multiplier = serviceTierMultiplier(body, pricing!, label);
       // The bound can cross a long-context threshold the real prompt does
       // not: reserving the higher tier then only overestimates.
       const long = pricing!.longContext !== undefined && inputTokens > pricing!.longContext.thresholdTokens ? longContextRates(pricing!) : undefined;
@@ -294,11 +353,12 @@ export function createRequestBudgetScope(
       const inputRate = Math.max(...inputRates);
       const outputRate = long === undefined ? pricing!.output : Math.max(pricing!.output, long.output);
       const copies = [body.n, body.best_of].filter(value => value !== undefined);
-      if (!copies.every(value => typeof value === "number" && Number.isInteger(value) && value > 0)) throw new Error("turn budget cannot verify the request's completion count");
+      if (!copies.every(value => typeof value === "number" && Number.isInteger(value) && value > 0)) throw new Error(`${label} cannot verify the request's completion count`);
       const outputCopies = Math.max(1, ...(copies as number[]));
       const upperUsd = (output: number) => ((inputTokens * inputRate + output * outputRate) * outputCopies * multiplier) / 1_000_000;
-      const fitting = reserveFitting(budget, sessionId, ceiling, upperUsd);
-      held = fitting.hold;
+      const fitting = reserveFitting(reserveBoth, ceiling, upperUsd);
+      if (turnPriced) held = fitting.holds.turn;
+      if (dayPriced) dayHeld = fitting.holds.daily;
       if (fitting.output < ceiling) {
         // Clamp a written ceiling to what the allowance covers; a soft
         // bound only assumes the smaller reply.
@@ -311,6 +371,8 @@ export function createRequestBudgetScope(
       if (RELEASED_STATUSES.has(status)) {
         held?.release();
         held = undefined;
+        // A metered day's zero hold stays: its reply may still come.
+        if (dayPriced) { dayHeld?.release(); dayHeld = undefined; }
       }
     },
     onSendFailed(error) {
@@ -318,6 +380,7 @@ export function createRequestBudgetScope(
       if (code !== undefined && UNSENT_ERRNOS.has(code)) {
         held?.release();
         held = undefined;
+        if (dayPriced) { dayHeld?.release(); dayHeld = undefined; }
       }
     },
     finish(result) {
@@ -335,10 +398,25 @@ export function createRequestBudgetScope(
       done = true;
       if (timer !== undefined) clearTimeout(timer);
       const usage = result?.usage;
+      // One settled amount for both ledgers.
+      const settledUsd = usage === undefined ? undefined : reportedCostUsd(usage) ??
+        (billing === "unbilled" ? 0 : usage.incomplete === true ? undefined : estimatedCostUsd(usage));
       // A metered request holds nothing, so a missing estimate charges zero.
-      held?.settle(usage === undefined ? (priceRequired ? undefined : 0) : reportedCostUsd(usage) ??
-        (mode === "unbilled" ? 0 : usage.incomplete === true ? undefined : estimatedCostUsd(usage)));
+      held?.settle(usage === undefined ? (turnPriced ? undefined : 0) : settledUsd);
       held = undefined;
+      if (day !== undefined) {
+        if (dayHeld !== undefined) {
+          // No reply on a metered day: nothing is known to have been billed.
+          if (usage === undefined && !dayPriced) dayHeld.release();
+          else dayHeld.settle(settledUsd);
+        } else if (usage !== undefined) {
+          // A reply whose send took no hold (released on a rejection the
+          // provider then retried past, or a provider that never calls
+          // beforeSend): still today's spend.
+          day.charge(settledUsd);
+        }
+        dayHeld = undefined;
+      }
     },
   };
   return scope;

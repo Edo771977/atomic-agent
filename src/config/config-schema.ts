@@ -150,6 +150,7 @@ import {
   type UserLlmFileConfig,
 } from "./llm-config.js";
 import type { UserLlmRunModeConfig } from "./llm-run-mode-config.js";
+import type { UserLlmRouterConfig } from "./llm-router-config.js";
 import { defaultProviderModelMode } from "./model-mode.js";
 
 export type { ApprovalLevel } from "../approval/approval-level.js";
@@ -565,8 +566,34 @@ export interface AtomicAgentConfig {
     allowCloudSampling?: boolean;
     costTracking?: {
       enabled: boolean;
+      /**
+       * Add today's spend, all sessions together, to the composer
+       * readout (ATO-649): `$0.31 · today $1.20`. The session's own cost
+       * is shown either way (ATO-569).
+       */
       showInStatusBar: boolean;
+      /**
+       * UTC hour (0-23) the spend day starts at, for `dailyLimitUsd` and
+       * the day total: the day is the UTC calendar day shifted to start
+       * at this hour. Default 0 (UTC midnight).
+       */
       dailyResetHourUtc: number;
+      /**
+       * Daily spend ceiling in USD, all sessions together (ATO-649).
+       * Unset (or not a positive number) means no ceiling. Once today's
+       * priced spend reaches it, paid cloud links are refused before the
+       * request is sent; `onDailyLimit` says what the turn does then.
+       * Calls with no known price do not count toward it. Read live.
+       */
+      dailyLimitUsd?: number;
+      /**
+       * At the daily ceiling (ATO-649): `"stop"` (default) pauses cloud
+       * calls for the rest of the day and ends the turn saying so;
+       * `"local"` moves the turn on to the local model (when
+       * `fallback.appendLocal` or the chain puts one there) with a notice
+       * in the chat. Read live.
+       */
+      onDailyLimit?: "stop" | "local";
     };
     /**
      * Cross-provider fallover. `chain` is an ordered list of provider ids
@@ -600,6 +627,15 @@ export interface AtomicAgentConfig {
     openrouter?: {
       preferCacheRoutes?: boolean;
     };
+    /**
+     * Opt-in rule-based model router (ATO-483): rules that put a
+     * configured provider first in a turn's fallback chain by what the
+     * request looks like. Off unless `enabled`; does nothing under the
+     * local run mode or Fusion (the cloud mode routes between cloud
+     * providers). See
+     * `src/llm/router/`.
+     */
+    router?: UserLlmRouterConfig;
   };
 }
 
