@@ -17,7 +17,7 @@ it("keeps differently cased POSIX input paths distinct", () => {
 it("deduplicates registry identities using native case rules and retains the first display spelling", () => {
   const upper = join(tmpdir(), "PERSONAL.TXT"), lower = join(tmpdir(), "personal.txt");
   const registry = new DeclaredInputsRegistry(); registry.declare("worker", [upper, lower]);
-  expect(registry.inputsOf("worker")).toEqual(process.platform === "win32" ? [upper] : [upper, lower]);
+  expect(registry.inputsOf("worker")).toEqual(process.platform === "win32" || process.platform === "darwin" ? [upper] : [upper, lower]);
 });
 
 it("folds Windows trailing dots/spaces and NTFS stream suffixes into the file's identity", () => {
@@ -33,4 +33,12 @@ it("folds Windows trailing dots/spaces and NTFS stream suffixes into the file's 
 it("keeps trailing dots, spaces and colons significant on POSIX", () => {
   expect(inputPathIdentity("/proj/input.txt.", "linux")).not.toBe(inputPathIdentity("/proj/input.txt", "linux"));
   expect(inputPathIdentity("/proj/input.txt::$DATA", "linux")).not.toBe(inputPathIdentity("/proj/input.txt", "linux"));
+});
+
+it("folds case (and Unicode normalization) on macOS, where APFS is case-insensitive by default", () => {
+  expect(inputPathIdentity("/project/Data.csv", "darwin")).toBe(inputPathIdentity("/project/data.csv", "darwin"));
+  expect(inputPathIdentity("/Project/DATA/../Data.CSV", "darwin")).toBe(inputPathIdentity("/project/data.csv", "darwin"));
+  // APFS also opens a decomposed spelling as the same file.
+  expect(inputPathIdentity("/project/café.txt", "darwin")).toBe(inputPathIdentity("/project/café.txt", "darwin"));
+  expect(inputPathIdentity("/project/data.csv.", "darwin")).not.toBe(inputPathIdentity("/project/data.csv", "darwin"));
 });
