@@ -506,3 +506,40 @@ describe("runtimeKnownSecrets (ATO-1077)", () => {
     ]);
   });
 });
+
+describe("fusion escalation budget notice ownership", () => {
+  it.each(["soft", "meter", "clamp"] as const)("observes %s advice on the parent and suppresses repeated/late notices", async reason => {
+    const { RequestBudgetNotices } = await import("../request-budget-notices.js");
+    const directory = await mkdtemp(join(tmpdir(), "catalog-budget-notice-"));
+    try {
+      const config = getConfig(), toolRegistry = new ToolRegistry();
+      const approvals = new ApprovalGate({ emit: () => {}, level: 5 });
+      const builder = vi.spyOn(fusionTools, "buildFusionDelegateTool");
+      const events: Array<{ owner: string; reason?: string }> = [];
+      const notices = new RequestBudgetNotices((owner, event) => { if (event.type === "budget_notice") events.push({ owner, reason: event.reason }); });
+      const close = notices.begin("parent");
+      const finish = vi.fn();
+      const scope: import("../request-budget.js").RequestBudgetScope = {
+        softBound: false, finish, onResponse: () => {},
+        beforeSend: () => { scope.hint = `fixture ${reason}`; scope.hintReason = reason; },
+      };
+      const observeScope = vi.fn((id: string, request: import("../../llm/provider/completion-types.js").CompletionRequest) => notices.observeScope(id, request, scope));
+      const provider = { complete: vi.fn(async (request: import("../../llm/provider/completion-types.js").CompletionRequest) => {
+        request.requestBudget?.beforeSend({}); request.requestBudget?.beforeSend({});
+        return { content: "fixture", modelId: "fixture" };
+      }) };
+      registerRuntimeFusionAndReadScope({ config, toolRegistry, approvals, dangerous: { approvals, approvalRequired: false }, declaredInputs: new osTools.DeclaredInputsRegistry(),
+        resolveOriginalRequest: () => undefined, runTurn: async () => externalOperation(), createEphemeralSession: () => createEmptySessionState({ id: "worker", workingDir: directory }),
+        prepareLocalLink: async () => {}, emitAgentLoopEventFor: () => {}, resolveCurrentRunMode: () => resolveRunMode(resolveLlmConfig(config)),
+        providerRegistry: { getProvider: () => provider as never }, llama: { measuredTokensPerSecond: () => null, fetchSlots: async () => ({ slots: [] }), probeHealth: async () => "answered" as const },
+        slotManager: { poolSize: () => 2 }, workingDir: directory, logger, dailySpendLimit: { enforce: () => {}, budget: undefined, observeScope } });
+      const wired = builder.mock.calls.at(-1)?.[0];
+      if (!wired?.escalationComplete) throw new Error("escalation seam missing");
+      const request = { providerId: "cloud", prompt: "fixture", maxOutputTokens: 100, signal: new AbortController().signal, sessionId: "parent" };
+      await wired.escalationComplete(request); await wired.escalationComplete(request);
+      expect(observeScope).toHaveBeenCalledWith("cloud", expect.objectContaining({ sessionId: "parent" }), undefined);
+      expect(events).toEqual([{ owner: "parent", reason }]); expect(finish).toHaveBeenCalledTimes(2);
+      close(); scope.beforeSend({}); expect(events).toHaveLength(1);
+    } finally { vi.restoreAllMocks(); await rm(directory, { recursive: true, force: true }); }
+  });
+});

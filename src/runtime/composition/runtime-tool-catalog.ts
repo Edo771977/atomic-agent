@@ -13,7 +13,8 @@ import { resolveLlmConfig } from "../../llm/provider/index.js";
 import type { ResolvedRunMode } from "../../llm/run-mode/index.js";
 import { visionCapableAlternatives } from "../../llm/provider/model-vision.js";
 import { resolveModelPricingFor } from "../resolve-model-pricing.js";
-import { createRequestBudgetScope } from "../request-budget.js";
+import { createRequestBudgetScope, type RequestBudgetScope } from "../request-budget.js";
+import type { CompletionRequest } from "../../llm/provider/completion-types.js";
 import type { DailySpendBudget } from "../daily-spend-budget.js";
 import type { ModelProfile } from "../../llm/model-profile.js";
 import type { SlotManager } from "../../llm/slot-manager.js";
@@ -755,7 +756,9 @@ export function registerRuntimeFusionAndReadScope(input: {
    * holds and settles on. The seam never sees these calls, so nothing
    * counts them twice.
    */
-  dailySpendLimit?: { enforce(providerId: string): void; budget: DailySpendBudget | undefined };
+  dailySpendLimit?: { enforce(providerId: string): void; budget: DailySpendBudget | undefined;
+    observeScope?(providerId: string, request: CompletionRequest, scope: RequestBudgetScope | undefined): RequestBudgetScope | undefined;
+  };
   liveWorkers?: FusionDelegateDeps["liveWorkers"];
   steerWorker?: FusionDelegateDeps["steerWorker"];
   orchestratorTurnSpendUsd?: FusionDelegateDeps["orchestratorTurnSpendUsd"];
@@ -916,9 +919,10 @@ export function registerRuntimeFusionAndReadScope(input: {
         const turnLimited = sessionId !== undefined && turnBudget?.requestLimits(sessionId) !== undefined;
         const resolvedForBudget = turnLimited || dailyBudget !== undefined ? resolveLlmConfig(getConfig()) : undefined;
         const entryForBudget = resolvedForBudget?.providers.find(p => p.id === providerId);
-        const scope = resolvedForBudget === undefined ? undefined : createRequestBudgetScope(turnLimited ? turnBudget : undefined, { ...request, sessionId }, provider, entryForBudget,
+        const baseScope = resolvedForBudget === undefined ? undefined : createRequestBudgetScope(turnLimited ? turnBudget : undefined, { ...request, sessionId }, provider, entryForBudget,
           resolveModelPricingFor(resolvedForBudget, provider.chatModelId ?? entryForBudget?.defaultChatModel ?? entryForBudget?.model ?? null, providerId),
           dailyBudget);
+        const scope = dailySpendLimit?.observeScope?.(providerId, { ...request, sessionId }, baseScope) ?? baseScope;
         let result: Awaited<ReturnType<typeof provider.complete>> | undefined;
         try {
           result = await provider.complete({ ...request, ...(scope === undefined ? {} : { requestBudget: scope, signal: scope.signal ?? signal }) });
