@@ -154,4 +154,65 @@ describe("ApprovalGate review after outside content (ATO-618)", () => {
     expect(review).not.toHaveBeenCalled();
     expect(emitted).toHaveLength(0);
   });
+
+  it("holds a fan-out after outside content instead of letting level 4 run it", async () => {
+    const { gate, emitted } = setup({ answer: { risk: "low", reason: "x" } });
+    expect(isTaintSensitive("fusion_fanout")).toBe(true);
+    gate.noteUntrustedContent("s1", "a web page");
+    const pending = gate.request({ ...curl, tool: "fusion.delegate", category: "fusion_fanout", reason: "fan out" });
+    await settle();
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0]!.category).toBe("fusion_fanout");
+    gate.reject(emitted[0]!.approvalId, "no");
+    await expect(pending).resolves.toMatchObject({ approved: false });
+  });
+
+  describe("Fusion workers (followTaint)", () => {
+    const worker = (gate: ApprovalGate) => {
+      gate.setSessionPolicy("w1", { onPrompt: "refuse", reason: "refused by the worker policy" });
+      gate.followTaint("w1", "s1");
+    };
+    const post = { ...curl, sessionId: "w1", tool: "os.http.request", category: "http_write" as const };
+
+    it("holds a worker's silent approvals while its orchestrator is tainted", async () => {
+      const { gate, emitted } = setup();
+      worker(gate);
+      gate.noteUntrustedContent("s1", "a web page");
+      expect(gate.holdsForOutsideContent("w1", "shell")).toBe(true);
+      await expect(gate.request(post)).resolves.toMatchObject({ approved: false, reason: "refused by the worker policy" });
+      await expect(gate.request({ ...curl, sessionId: "w1" })).resolves.toMatchObject({ approved: false });
+      expect(emitted).toHaveLength(0);
+    });
+
+    it("marks the orchestrator when a worker reads outside content", async () => {
+      const { gate } = setup();
+      worker(gate);
+      gate.noteUntrustedContent("w1", "a web page");
+      expect(gate.holdsForOutsideContent("s1", "http")).toBe(true);
+      // The worker's own turn start clears only its own taint, not the parent's.
+      gate.clearUntrustedContent("w1");
+      expect(gate.holdsForOutsideContent("w1", "http")).toBe(true);
+    });
+
+    it("drops the link with the worker's grants", async () => {
+      const { gate } = setup();
+      worker(gate);
+      gate.clearSessionGrants("w1");
+      gate.noteUntrustedContent("s1", "a web page");
+      expect(gate.holdsForOutsideContent("w1", "shell")).toBe(false);
+      gate.clearUntrustedContent("s1");
+      gate.noteUntrustedContent("w1", "a web page");
+      expect(gate.holdsForOutsideContent("s1", "shell")).toBe(false);
+    });
+
+    it("changes nothing while agent.taintReview is off", async () => {
+      const { gate } = setup({ taintReview: false });
+      worker(gate);
+      gate.noteUntrustedContent("s1", "a web page");
+      await expect(gate.request(post)).resolves.toMatchObject({ approved: true });
+      await expect(
+        gate.request({ ...curl, tool: "fusion.delegate", category: "fusion_fanout", reason: "fan out" }),
+      ).resolves.toMatchObject({ approved: true });
+    });
+  });
 });

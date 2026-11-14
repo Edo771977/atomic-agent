@@ -512,6 +512,8 @@ export interface WorkerRunnerDeps {
         ApprovalGate,
         | "fanoutScopes"
         | "followDeclined"
+        | "followTaint"
+        | "holdsForOutsideContent"
         | "clearSessionGrants"
         | "hasDeclinedUnder"
         | "forgetDeclinedUnder"
@@ -1091,6 +1093,10 @@ async function runOneTask(
     // for its workers: inside the scope or not, a write of it goes to the
     // gate, which refuses it (`ApprovalGate.followDeclined`).
     deps.approvals.followDeclined?.(id, options.parentSessionId);
+    // Outside content, both ways (`agent.taintReview`): the worker is held
+    // for what its orchestrator read, and what the worker reads holds the
+    // orchestrator, whose context its findings reach (`followTaint`).
+    deps.approvals.followTaint?.(id, options.parentSessionId);
     // The contract's inputs (F51), resolved as this worker's tools will
     // resolve them: `os.fs.write` on one is refused whatever the brief
     // says, with no `overwrite` exemption — the orchestrator redeclares.

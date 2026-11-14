@@ -44,6 +44,7 @@ import {
 } from "./risk-review.js";
 import {
   formatTaintNote,
+  FUSION_WORKER_TAINT_SOURCE,
   isTaintSensitive,
   TAINT_REVIEW_LOW_REASON,
   UntrustedTaint,
@@ -387,6 +388,11 @@ export class ApprovalGate {
   private readonly riskReviewed = new Set<string>();
   /** Which sessions read outside content this turn (`untrusted-taint.ts`, ATO-618). */
   private readonly taint = new UntrustedTaint();
+  /**
+   * Fusion worker session → its orchestrator (`followTaint`): the worker
+   * is held for what the parent read, and the parent for what it reads.
+   */
+  private readonly taintParentBySession = new Map<string, string>();
   /** Approval ids re-entering `request` after the taint check: no silent approval. */
   private readonly taintHeld = new Set<string>();
   /** `agent.taintReview`, read live; off until bootstrap wires it. */
@@ -453,6 +459,45 @@ export class ApprovalGate {
   /** Record that `sessionId` read outside content (`source`) in its running turn. */
   noteUntrustedContent(sessionId: string, source: string): void {
     this.taint.mark(sessionId, source);
+    // A worker hands its findings back as text: what it read reaches the
+    // orchestrator's context with them.
+    for (const parent of this.taintAncestors(sessionId)) {
+      this.taint.mark(parent, FUSION_WORKER_TAINT_SOURCE);
+    }
+  }
+
+  /**
+   * Link `sessionId` (a Fusion worker) to `parentSessionId` (its
+   * orchestrator) for the review after outside content, until
+   * `clearSessionGrants(sessionId)`: the worker counts as tainted while the
+   * parent is (its brief may carry what the parent read), and outside
+   * content the worker reads taints the parent too.
+   */
+  followTaint(sessionId: string, parentSessionId: string): void {
+    this.taintParentBySession.set(sessionId, parentSessionId);
+  }
+
+  /** The session's own outside sources and, for a worker, its parent's. */
+  private taintSourcesOf(sessionId: string): readonly string[] {
+    const own = this.taint.sources(sessionId);
+    const ancestors = this.taintAncestors(sessionId);
+    if (ancestors.length === 0) return own;
+    const all = new Set(own);
+    for (const parent of ancestors) {
+      for (const source of this.taint.sources(parent)) all.add(source);
+    }
+    return all.size === own.length ? own : [...all];
+  }
+
+  /** The orchestrators above `sessionId`, nearest first; a cycle stops the walk. */
+  private taintAncestors(sessionId: string): string[] {
+    const chain: string[] = [];
+    let next = this.taintParentBySession.get(sessionId);
+    while (next !== undefined && next !== sessionId && !chain.includes(next)) {
+      chain.push(next);
+      next = this.taintParentBySession.get(next);
+    }
+    return chain;
   }
 
   /**
@@ -465,7 +510,7 @@ export class ApprovalGate {
    */
   holdsForOutsideContent(sessionId: string, category: ApprovalCategory): boolean {
     if (!isTaintSensitive(category) || !this.taintReview()) return false;
-    return this.taint.sources(sessionId).length > 0;
+    return this.taintSourcesOf(sessionId).length > 0;
   }
 
   /** Forget the outside content of `sessionId`'s last turn; called when a turn starts. */
@@ -501,7 +546,7 @@ export class ApprovalGate {
    * reset — the per-session keying already isolates other sessions). The
    * standing level is untouched: it is a durable posture, grants are not.
    * What the session's user declined this turn (`declinedInTurn`), and a
-   * worker's link to its parent's (`followDeclined`), go with them.
+   * worker's links to its parent (`followDeclined`, `followTaint`), go with them.
    */
   clearSessionGrants(sessionId?: string): void {
     this.readScopeGrants.clear(sessionId);
@@ -509,11 +554,13 @@ export class ApprovalGate {
       this.grantsBySession.clear();
       this.declinedBySession.clear();
       this.declinedParentBySession.clear();
+      this.taintParentBySession.clear();
       return;
     }
     this.grantsBySession.delete(sessionId);
     this.declinedBySession.delete(sessionId);
     this.declinedParentBySession.delete(sessionId);
+    this.taintParentBySession.delete(sessionId);
   }
 
   /**
@@ -721,7 +768,7 @@ export class ApprovalGate {
   /** The outside sources that hold `request` back, or `null` to let the auto-approval stand. */
   private taintedSources(request: ApprovalRequest): readonly string[] | null {
     if (!isTaintSensitive(request.category) || !this.taintReview()) return null;
-    const sources = this.taint.sources(request.sessionId);
+    const sources = this.taintSourcesOf(request.sessionId);
     return sources.length > 0 ? sources : null;
   }
 

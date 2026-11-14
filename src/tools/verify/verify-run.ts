@@ -114,8 +114,10 @@ export function buildVerifyRunTool(options: VerifyRunToolOptions): ToolDefinitio
           needsShellInterpretation(command.cmd, command.args),
         ),
       );
+      // Not after outside content either (`agent.taintReview`), as in os.shell.run.
       const scopedByFanout =
         !dangerous &&
+        !(options.approvals.holdsForOutsideContent?.(ctx.sessionId, "shell") ?? false) &&
         (options.approvals.fanoutScopes?.allows(ctx.sessionId, [ctx.workingDir]) ?? false) &&
         !savedRuleOverridesScope(options.approvals, {
           sessionId: ctx.sessionId,
