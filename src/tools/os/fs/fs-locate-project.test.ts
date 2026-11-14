@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, mkdir, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, parse } from "node:path";
+import { join } from "node:path";
 import { resourceClassFor } from "../../../agent/tool-resource-class.js";
 import {
   getToolDescriptorByName,
@@ -18,9 +18,9 @@ describe("os.fs.locate_project", () => {
     // realpath so expectations survive symlinked tmp dirs
     // (macOS /var -> /private/var) now that candidates are canonicalized.
     temporaryRoot = await realpath(await mkdtemp(join(tmpdir(), "locate-project-api-")));
-    // The parent deliberately contains "api" to cover the original
-    // random-name collision every run. Configured-root-only assertions
-    // below use a neutral cwd: the search includes every cwd ancestor.
+    // The parent deliberately contains "api", the old ambiguous query.
+    // The ambiguity cases now use a distinctive project name longer
+    // than mkdtemp's random suffix, keeping cwd inside this fixture.
     base = join(temporaryRoot, "workspace");
     await mkdir(base);
   });
@@ -32,11 +32,11 @@ describe("os.fs.locate_project", () => {
   it("reports ambiguity instead of guessing when two dirs match equally", async () => {
     const rootA = join(base, "root-a");
     const rootB = join(base, "root-b");
-    await mkdir(join(rootA, "api"), { recursive: true });
-    await mkdir(join(rootB, "api"), { recursive: true });
+    await mkdir(join(rootA, "ambiguous-project-fixture"), { recursive: true });
+    await mkdir(join(rootB, "ambiguous-project-fixture"), { recursive: true });
 
     const tool = makeTool({ projectRoots: [rootA, rootB] });
-    const res = await tool.run({ name: "api" }, makeCtx(parse(base).root));
+    const res = await tool.run({ name: "ambiguous-project-fixture" }, makeCtx(base));
 
     expect(res.status).toBe("ok");
     expect(res.details?.found).toBe(false);
@@ -46,19 +46,19 @@ describe("os.fs.locate_project", () => {
     expect(res.summary).toContain("do not guess");
     const candidates = res.details?.candidates as Array<{ path: string }>;
     expect(candidates.map((c) => c.path).sort()).toEqual([
-      join(rootA, "api"),
-      join(rootB, "api"),
+      join(rootA, "ambiguous-project-fixture"),
+      join(rootB, "ambiguous-project-fixture"),
     ]);
   });
 
   it("keeps reporting ambiguity even when limit clamps the displayed list", async () => {
     const rootA = join(base, "root-a");
     const rootB = join(base, "root-b");
-    await mkdir(join(rootA, "api"), { recursive: true });
-    await mkdir(join(rootB, "api"), { recursive: true });
+    await mkdir(join(rootA, "ambiguous-project-fixture"), { recursive: true });
+    await mkdir(join(rootB, "ambiguous-project-fixture"), { recursive: true });
 
     const tool = makeTool({ projectRoots: [rootA, rootB] });
-    const res = await tool.run({ name: "api", limit: 1 }, makeCtx(parse(base).root));
+    const res = await tool.run({ name: "ambiguous-project-fixture", limit: 1 }, makeCtx(base));
 
     expect(res.details?.ambiguous).toBe(true);
     expect(res.details?.found).toBe(false);
