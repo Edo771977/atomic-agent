@@ -45,6 +45,20 @@ describe("measureTree", () => {
     expect(await measureTree(work, 5)).toBeGreaterThan(5);
     expect(await measureTree(work, 5)).toBeLessThan(13 + 10 + 18);
   });
+
+  it("does not count or follow an external directory link while measuring the work tree", async () => {
+    const external = join(root, "external-data");
+    await mkdir(external);
+    await writeFile(join(external, "large.bin"), Buffer.alloc(4096));
+    const link = join(work, "external-link");
+    // This is a directory-alias case in addition to the genuine file-link
+    // cases below. A Windows junction exercises it without that privilege.
+    await symlink(external, link, process.platform === "win32" ? "junction" : "dir");
+    expect((await lstat(link)).isSymbolicLink()).toBe(true);
+    const ownBytes = 13 + 10 + 18;
+    expect(await measureTree(work, Number.MAX_SAFE_INTEGER)).toBe(ownBytes);
+    expect(await measureTree(work, ownBytes)).toBe(ownBytes);
+  });
 });
 
 describe("VERIFY_COPY_MAX_BYTES", () => {
