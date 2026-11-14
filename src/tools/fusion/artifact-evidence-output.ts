@@ -5,16 +5,20 @@ import { parseArtifactManifest } from "./artifact-manifest.js";
 import type { ArtifactManifest } from "./artifact-manifest-types.js";
 import type { CandidateAcceptanceReceipt } from "./candidate-acceptance.js";
 import { parseCandidateAcceptanceReceipt } from "./candidate-receipt.js";
+import { frameUntrustedText } from "../untrusted-tool-output.js";
+import { neutraliseControlMarkers } from "../control-marker-guard.js";
 
 export const ARTIFACT_EVIDENCE_OUTPUT_MAX_CHARS = 4_000;
 const PREFIX = "artifact-evidence: ";
 const TASKS = 16;
+const SCAN_ROWS = 256;
 const FACTS = 8;
+const PROSE_SOURCE = "Fusion worker reports";
 const record = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);
 const safeText = (value: string, known: readonly KnownSecret[]): boolean => maskSecrets(value, known) === value;
 const safeName = (value: unknown, known: readonly KnownSecret[]): value is string => typeof value === "string" && /^[a-zA-Z0-9_.-]{1,80}$/.test(value) && safeText(value, known);
 const safePath = (value: string | null, known: readonly KnownSecret[]): value is string => value !== null && value.length <= 256 && !posix.isAbsolute(value) &&
-  !win32.isAbsolute(value) && !/[\u0000-\u001f\u007f]/.test(value) && !value.split(/[\\/]/).includes("..") && safeText(value, known);
+  !win32.isAbsolute(value) && !/[\p{Cc}\p{Cf}]/u.test(value) && !value.split(/[\\/]/).includes("..") && safeText(value, known);
 
 export interface ArtifactEvidenceOutputOptions { knownSecrets?: readonly KnownSecret[] }
 
@@ -43,6 +47,23 @@ function withOutput(result: CompressedToolResult, summary: string, fullOutput: s
   Object.defineProperty(out, "fullOutput", { value: fullOutput, enumerable: false });
   Object.defineProperty(out, "fullOutputTruncated", { value: truncated, enumerable: false });
   return out;
+}
+
+/** Keep both nonce fences intact: clipping only ever applies to the untrusted body. */
+function framedProse(source: string, budget: number): { text: string; truncated: boolean } {
+  const visible = source.replace(/\r\n/g, "\n").replace(/[\p{Cc}\p{Cf}]/gu, char => char === "\n" || char === "\t" ? char : `\\u{${char.codePointAt(0)!.toString(16)}}`);
+  const safe = neutraliseControlMarkers(visible).replace(/artifact-evidence[ \t]*:/gi, "untrusted-artifact-claim:");
+  const overhead = frameUntrustedText("", PROSE_SOURCE).length;
+  if (safe.length === 0 || budget <= overhead) return { text: "", truncated: safe.length > 0 };
+  let body = clipMasked(safe, budget - overhead);
+  let framed = frameUntrustedText(body, PROSE_SOURCE);
+  // Marker neutralisation and a cutoff can alter a boundary match. Reframe
+  // after reducing the body rather than cutting through the closing fence.
+  while (framed.length > budget && body.length > 0) {
+    body = clipMasked(body, body.length - (framed.length - budget));
+    framed = frameUntrustedText(body, PROSE_SOURCE);
+  }
+  return { text: body.length > 0 && framed.length <= budget ? framed : "", truncated: body.length < safe.length };
 }
 
 function projectManifest(manifest: ArtifactManifest, candidate: boolean, known: readonly KnownSecret[], receipt?: CandidateAcceptanceReceipt): Record<string, unknown> {
@@ -82,16 +103,17 @@ export function projectFusionArtifactEvidence(result: CompressedToolResult, maxC
   const rows = Array.isArray(result.details.tasks) ? result.details.tasks : [];
   const tasks: Record<string, unknown>[] = [];
   let omitted = 0;
-  for (const row of rows.slice(0, TASKS)) {
+  for (const row of rows.slice(0, SCAN_ROWS)) {
     if (!record(row) || row.artifactManifest === undefined) continue;
     const manifest = parseArtifactManifest(row.artifactManifest);
     if (manifest === undefined || !safeName(row.id, known)) { omitted += 1; continue; }
+    if (tasks.length === TASKS) { omitted += 1; continue; }
     const status = typeof row.status === "string" && ["ok", "failed", "cancelled", "timeout", "queued", "max_steps", "needs_orchestrator", "no_changes"].includes(row.status) ? row.status : "unknown";
     const projected = projectManifest(manifest, false, known);
     tasks.push({ id: row.id, status, ...projected });
     omitted += projected.omitted as number;
   }
-  omitted += Math.max(0, rows.length - TASKS);
+  omitted += Math.max(0, rows.length - SCAN_ROWS);
   const report = record(result.details.candidateIntegration) ? result.details.candidateIntegration : undefined;
   const manifest = report?.artifactManifest === undefined ? undefined : parseArtifactManifest(report.artifactManifest);
   if (report?.artifactManifest !== undefined && manifest === undefined) omitted += 1;
@@ -103,17 +125,23 @@ export function projectFusionArtifactEvidence(result: CompressedToolResult, maxC
   };
   const candidateOmitted = candidate === undefined ? undefined : (candidate as Record<string, unknown>).omitted;
   if (typeof candidateOmitted === "number") omitted += candidateOmitted;
-  if (candidate === undefined && tasks.length === 0 && omitted === 0) {
-    const text = clipMasked(source, cap);
-    const kept = safeText(text, known) ? text : "";
-    return withOutput(result, kept, kept, result.truncated || kept.length < source.length);
-  }
   if (cap < 2) {
     return withOutput(result, "", "", true);
   }
-  const budget = Math.min(ARTIFACT_EVIDENCE_OUTPUT_MAX_CHARS, Math.max(2, cap - PREFIX.length));
-  const value: { version: 1; tasks: Record<string, unknown>[]; candidate?: Record<string, unknown>; omitted: number } = {
-    version: 1, tasks, ...(candidate === undefined ? {} : { candidate }), omitted,
+  const taskCounts: Record<string, number> = {};
+  for (const row of rows.slice(0, SCAN_ROWS)) {
+    const status = record(row) && typeof row.status === "string" && ["ok", "failed", "cancelled", "timeout", "queued", "max_steps", "needs_orchestrator", "no_changes"].includes(row.status) ? row.status : "unknown";
+    taskCounts[status] = (taskCounts[status] ?? 0) + 1;
+  }
+  if (rows.length > SCAN_ROWS) taskCounts.unknown = (taskCounts.unknown ?? 0) + rows.length - SCAN_ROWS;
+  const outcome = { status: result.status, ...(rows.length === 0 ? {} : { tasks: taskCounts }), ...(receipt === undefined ? {} : { candidateDisposition: receipt.disposition, checkStatus: receipt.checkStatus,
+    ...(receipt.reason === undefined ? {} : { candidateReason: receipt.reason }) }) };
+  const minimal = JSON.stringify({ version: 1, tasks: [], outcome, omitted });
+  // Leave room for the outcome and readable prose on small local contexts.
+  // Tiny caps may spend more than 40% on the minimal whole runtime document.
+  const budget = Math.min(ARTIFACT_EVIDENCE_OUTPUT_MAX_CHARS, Math.max(2, cap - PREFIX.length), Math.max(minimal.length, Math.floor(cap * 0.4) - PREFIX.length));
+  const value: { version: 1; tasks: Record<string, unknown>[]; candidate?: Record<string, unknown>; outcome: typeof outcome; omitted: number } = {
+    version: 1, tasks, ...(candidate === undefined ? {} : { candidate }), outcome, omitted,
   };
   let privacyOmitted = false;
   const serialize = () => {
@@ -137,16 +165,25 @@ export function projectFusionArtifactEvidence(result: CompressedToolResult, maxC
       const coverage = entry.coverage;
       if (record(coverage)) { coverage.complete = false; const reasons = coverage.reasons as string[]; if (!reasons.includes("metadata_truncated")) reasons.push("metadata_truncated"); }
     } else if (value.tasks.length > 0) { value.tasks.pop(); value.omitted += 1; }
-    else if (value.candidate !== undefined) { delete value.candidate; value.omitted += 1; }
+    else if (value.candidate !== undefined) {
+      // The full validated receipt is more useful than duplicate inventory
+      // binding/digest fields. Keep it while it fits; the compact outcome
+      // still carries disposition/reason if the full receipt must be omitted.
+      const full = value.candidate;
+      if (Object.keys(full).some(key => !["scope", "disposition", "receipt"].includes(key))) {
+        value.candidate = { ...(full.scope === undefined ? {} : { scope: full.scope }), ...(full.disposition === undefined ? {} : { disposition: full.disposition }),
+          ...(full.receipt === undefined ? {} : { receipt: full.receipt }) }; value.omitted += 1;
+      } else { delete value.candidate; value.omitted += 1; }
+    }
     else break;
   }
   const json = serialize();
   let head = json.length <= budget ? `${PREFIX}${json}` : cap >= PREFIX.length + 2 ? `${PREFIX}{}` : "{}";
   if (!safeText(head, known)) { head = cap >= PREFIX.length + 2 && safeText(`${PREFIX}{}`, known) ? `${PREFIX}{}` : "{}"; privacyOmitted = true; }
-  const prose = clipMasked(source, cap - head.length - 1);
-  const joined = `${head}${prose.length > 0 ? `\n${prose}` : ""}`;
+  const prose = framedProse(source, cap - head.length - 1);
+  const joined = `${head}${prose.text.length > 0 ? `\n${prose.text}` : ""}`;
   // A cutoff can change a detector's boundary match. Keep just the stable
   // JSON rather than let a later mandatory mask expand the bounded result.
   const output = safeText(joined, known) ? joined : head;
-  return withOutput(result, output, output, result.truncated || output.length < head.length + source.length + 1 || value.omitted > 0 || privacyOmitted);
+  return withOutput(result, output, output, result.truncated || prose.truncated || output !== joined || value.omitted > 0 || privacyOmitted);
 }
