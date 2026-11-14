@@ -41,6 +41,38 @@ describe("toRow", () => {
     expect(toRow({ cost: { input: 1, output: 1 } })).toBeUndefined();
   });
 
+  it("carries models.dev's context_over_200k tier into longContext", () => {
+    expect(toRow({
+      limit: { context: 1_000_000, output: 64_000 },
+      cost: {
+        input: 3, output: 15, cache_read: 0.3, cache_write: 3.75,
+        context_over_200k: { input: 6, output: 22.5, cache_read: 0.6, cache_write: 7.5 },
+      },
+    })).toEqual({
+      context: 1_000_000,
+      output: 64_000,
+      cost: {
+        input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75,
+        longContext: { thresholdTokens: 200_000, input: 6, output: 22.5, cacheRead: 0.6, cacheWrite: 7.5 },
+      },
+    });
+  });
+
+  it("omits a zero cache rate so it prices at the input rate, not free", () => {
+    expect(toRow({
+      limit: { context: 1_000_000 },
+      cost: {
+        input: 1.4, output: 4.4, cache_read: 0, cache_write: 0,
+        context_over_200k: { input: 2.8, output: 8.8, cache_read: 0, cache_write: 0 },
+      },
+    })).toEqual({
+      context: 1_000_000,
+      cost: { input: 1.4, output: 4.4, longContext: { thresholdTokens: 200_000, input: 2.8, output: 8.8 } },
+    });
+    expect(toRow({ limit: { context: 8000 }, cost: { input: 1, output: 2, context_over_200k: { input: 0, output: 0 } } }))
+      .toEqual({ context: 8000, cost: { input: 1, output: 2 } });
+  });
+
   it("treats a zero price as unknown, not free", () => {
     expect(toRow(api.moonshotai.models["kimi-unlisted"])).toEqual({ context: 32_000, output: 4000 });
   });
@@ -60,5 +92,6 @@ describe("renderSnapshot", () => {
       '    "kimi-k3.1-pro": {"context":1048576,"output":1048576,"cost":{"input":2,"output":10,"cacheRead":0.2,"cacheWrite":2}},',
     );
     expect(source).toContain('export const MODELS_DEV_SNAPSHOT_DATE = "2026-11-12";');
+    expect(source).toContain("readonly longContext?: {");
   });
 });

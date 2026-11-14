@@ -54,3 +54,14 @@ describe("modelsDevCatalogEntry", () => {
     ).toBeUndefined();
   });
 });
+
+describe("the committed models.dev snapshot (ATO-647 review)", () => {
+  it("carries no zero cache rate, which would price cache traffic as free", async () => {
+    const { MODELS_DEV_SNAPSHOT } = await import("./models-dev-snapshot.js");
+    const zero = Object.entries(MODELS_DEV_SNAPSHOT).flatMap(([provider, models]) =>
+      Object.entries(models)
+        .filter(([, row]) => row.cost?.cacheRead === 0 || row.cost?.cacheWrite === 0)
+        .map(([id]) => `${provider}/${id}`));
+    expect(zero).toEqual([]);
+  });
+});

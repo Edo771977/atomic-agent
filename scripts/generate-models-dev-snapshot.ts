@@ -9,7 +9,10 @@
  * output limits and the per-1M-token prices. Models that do not produce
  * text, or publish no context limit, are dropped. A price of zero in and
  * zero out is dropped too: models.dev uses it for "not listed", and an
- * unknown price must stay unknown rather than read as free.
+ * unknown price must stay unknown rather than read as free. For the same
+ * reason a zero cache rate is omitted (pricing then bills cache traffic
+ * at the input rate), and models.dev's `context_over_200k` tier becomes
+ * `pricing.longContext` with a 200k threshold.
  *
  * models.dev data is MIT licensed; see THIRD-PARTY-NOTICES.md.
  */
@@ -23,11 +26,16 @@ const OUT_PATH = fileURLToPath(
   new URL("../src/llm/provider/models-dev/models-dev-snapshot.ts", import.meta.url),
 );
 
+type Rates = { input: number; output: number; cacheRead?: number; cacheWrite?: number };
+
 type Row = {
   context: number;
   output?: number;
-  cost?: { input: number; output: number; cacheRead?: number; cacheWrite?: number };
+  cost?: Rates & { longContext?: Rates & { thresholdTokens: number } };
 };
+
+/** models.dev's `context_over_200k` tier applies above 200k prompt tokens. */
+const LONG_CONTEXT_THRESHOLD_TOKENS = 200_000;
 
 async function loadApi(source: string | undefined): Promise<Record<string, unknown>> {
   if (source !== undefined) return JSON.parse(await readFile(source, "utf8")) as Record<string, unknown>;
@@ -44,6 +52,21 @@ const asRecord = (value: unknown): Record<string, unknown> | undefined =>
     ? (value as Record<string, unknown>)
     : undefined;
 
+/** Per-1M rates from a models.dev cost block; zero cache rates are left out. */
+function toRates(cost: Record<string, unknown> | undefined): Rates | undefined {
+  const input = num(cost?.input);
+  const output = num(cost?.output);
+  if (input === undefined || output === undefined || input + output <= 0) return undefined;
+  const cacheRead = num(cost?.cache_read);
+  const cacheWrite = num(cost?.cache_write);
+  return {
+    input,
+    output,
+    ...(cacheRead === undefined || cacheRead === 0 ? {} : { cacheRead }),
+    ...(cacheWrite === undefined || cacheWrite === 0 ? {} : { cacheWrite }),
+  };
+}
+
 export function toRow(model: Record<string, unknown>): Row | undefined {
   const outputs = asRecord(model.modalities)?.output;
   if (Array.isArray(outputs) && !outputs.includes("text")) return undefined;
@@ -54,16 +77,12 @@ export function toRow(model: Record<string, unknown>): Row | undefined {
   const output = num(limit?.output);
   if (output !== undefined && output > 0) row.output = output;
   const cost = asRecord(model.cost);
-  const input = num(cost?.input);
-  const out = num(cost?.output);
-  if (input !== undefined && out !== undefined && input + out > 0) {
-    const cacheRead = num(cost?.cache_read);
-    const cacheWrite = num(cost?.cache_write);
+  const base = toRates(cost);
+  if (base !== undefined) {
+    const long = toRates(asRecord(cost?.context_over_200k));
     row.cost = {
-      input,
-      output: out,
-      ...(cacheRead === undefined ? {} : { cacheRead }),
-      ...(cacheWrite === undefined ? {} : { cacheWrite }),
+      ...base,
+      ...(long === undefined ? {} : { longContext: { thresholdTokens: LONG_CONTEXT_THRESHOLD_TOKENS, ...long } }),
     };
   }
   return row;
@@ -96,6 +115,13 @@ export function renderSnapshot(api: Record<string, unknown>, date: string): stri
     "    readonly output: number;",
     "    readonly cacheRead?: number;",
     "    readonly cacheWrite?: number;",
+    "    readonly longContext?: {",
+    "      readonly thresholdTokens: number;",
+    "      readonly input: number;",
+    "      readonly output: number;",
+    "      readonly cacheRead?: number;",
+    "      readonly cacheWrite?: number;",
+    "    };",
     "  };",
     "};",
     "",

@@ -10,6 +10,13 @@ export type ModelsDevRow = {
     readonly output: number;
     readonly cacheRead?: number;
     readonly cacheWrite?: number;
+    readonly longContext?: {
+      readonly thresholdTokens: number;
+      readonly input: number;
+      readonly output: number;
+      readonly cacheRead?: number;
+      readonly cacheWrite?: number;
+    };
   };
 };
 
@@ -21,7 +28,7 @@ export const MODELS_DEV_SNAPSHOT: Readonly<
 > = {
   "alibaba": {
     "deepseek-v4-flash-0731": {"context":1000000,"output":384000,"cost":{"input":0.44,"output":1.32,"cacheRead":0.088}},
-    "glm-5.2": {"context":1000000,"output":131072,"cost":{"input":1.4,"output":4.4,"cacheRead":0.28,"cacheWrite":0}},
+    "glm-5.2": {"context":1000000,"output":131072,"cost":{"input":1.4,"output":4.4,"cacheRead":0.28}},
     "kimi-k3": {"context":1048576,"output":1048576,"cost":{"input":3,"output":15,"cacheRead":0.3}},
     "qvq-max": {"context":131072,"output":8192,"cost":{"input":1.2,"output":4.8}},
     "qwen-flash": {"context":1000000,"output":32768,"cost":{"input":0.05,"output":0.4,"cacheRead":0.01,"cacheWrite":0.0625}},
