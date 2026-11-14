@@ -322,6 +322,14 @@ export async function createCandidateIntegration(
     onRefusal: (reason) => { refusal = reason; options.onRefusal?.(reason); },
   });
   if (set === null) throw new Error(`candidate workspace unavailable: ${refusal ?? "private copies exceed the copy limit"}`);
+  const budgetContext = (): string => {
+    const remaining = set.remainingCopyBytes?.() ?? 0;
+    return `configured ${copyLimit} bytes; spent ${copyLimit - remaining} bytes; remaining ${remaining} bytes; minimum additional ${set.minimumPrivateDependencyCopyBytes?.() ?? 0} bytes`;
+  };
+  if ((set.minimumPrivateDependencyCopyBytes?.() ?? 0) > (set.remainingCopyBytes?.() ?? 0)) {
+    await set.cleanup();
+    throw new Error(`candidate workspace unavailable: minimum final private dependency copy exceeds the remaining candidate copy budget (${budgetContext()})`);
+  }
   const workspace = set.workspaces.get(id)!;
   let tracked: ReadonlySet<string>;
   try { tracked = await trackedPaths(set, options.git ?? defaultGitExec); } catch (err) { await set.cleanup(); throw err; }
@@ -553,7 +561,7 @@ export async function createCandidateIntegration(
         checkedSet = await createBranchSet(workspace.dir, ["checked-source"], { ...options, signal: freezeSignal,
           maxCopyBytes: set.remainingCopyBytes?.() ?? 0, privateDependencyDirectories: true,
           onRefusal: reason => { checkedRefusal = reason; options.onRefusal?.(reason); } });
-        if (checkedSet === null) return await rejectFinal(`candidate not promoted: checked source copy exceeds the remaining candidate copy budget${checkedRefusal === undefined ? "" : `: ${checkedRefusal}`}`);
+        if (checkedSet === null) return await rejectFinal(`candidate not promoted: checked source copy exceeds the remaining candidate copy budget (${budgetContext()})${checkedRefusal === undefined ? "" : `: ${checkedRefusal.replace(/copy limit/g, "remaining copy allowance")}`}`);
         checkedDir = checkedSet.workspaces.get("checked-source")!.dir;
         if (differences(beforeChecks, await snapshot(checkedDir, freezeSignal)).length > 0) return await rejectFinal("candidate changed while freezing its checked payload");
         await verifyProtectedInputs(checkedDir, input.signal);

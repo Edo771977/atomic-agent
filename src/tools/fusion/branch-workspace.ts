@@ -235,6 +235,8 @@ export interface BranchWorkspace {
 export interface BranchSet {
   /** Actual private-copy budget left; a candidate's final checked copy shares this ceiling. */
   remainingCopyBytes?(): number;
+  /** Already measured dependency bytes for one more private workspace; a minimum floor, not an exact reservation. */
+  minimumPrivateDependencyCopyBytes?(): number;
   /** Keep a rejected candidate for manual recovery when a bounded patch cannot be saved; never resumable. */
   retainForRecovery?(): Promise<void>;
   readonly method: BranchMethod;
@@ -1022,7 +1024,9 @@ export async function createBranchSet(
         ...(directoryIgnorePolicy === undefined ? {} : { directoryIgnorePolicy }),
       });
     }
-    return { method, realDir: real, baseDir, workspaces, cleanup, remainingCopyBytes: () => budget.left, retainForRecovery: () => writeFile(join(runRoot, OWNER_FILE), JSON.stringify({ pid: process.pid, recovery: true, createdAt: new Date().toISOString() })) };
+    return { method, realDir: real, baseDir, workspaces, cleanup, remainingCopyBytes: () => budget.left,
+      minimumPrivateDependencyCopyBytes: () => taskIds.length === 0 ? 0 : Math.floor(budget.dependencyBytes.private / taskIds.length),
+      retainForRecovery: () => writeFile(join(runRoot, OWNER_FILE), JSON.stringify({ pid: process.pid, recovery: true, createdAt: new Date().toISOString() })) };
   } catch (err) {
     await cleanup();
     if (err instanceof PrivateCopyLimitError) {

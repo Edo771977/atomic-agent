@@ -418,4 +418,16 @@ describe("the configured copy limit (`tools.verify.maxCopyBytes`)", () => {
     const result = await buildFusionDelegateTool(f.deps).run({ tasks: [{ id: "api", instructions: "work", files: ["api.json"] }], contract }, f.ctx);
     expect(result.details.candidateIntegration).toMatchObject({ status: "rejected", reason: expect.stringMatching(/remaining candidate copy budget.*private copy of the dependency folders/) });
   });
+  it("refuses a known minimum final dependency-copy cost before workers with honest budget context", async () => {
+    const runTurn = vi.fn(async (session: SessionState): Promise<RunTurnResult> => ({ session, reason: "reply", stepCount: 1 }));
+    const f = await fixture({ runTurn });
+    await mkdir(join(f.root, "node_modules"));
+    await writeFile(join(f.root, "node_modules", "dependency.js"), "x".repeat(6_000));
+    await writeFile(join(stateDir, "config.json"), JSON.stringify({ version: USER_CONFIG_VERSION, tools: { verify: { maxCopyBytes: 10_000 } } }));
+    resetConfigCache();
+    const result = await buildFusionDelegateTool(f.deps).run({ tasks: [{ id: "api", instructions: "work" }], contract }, f.ctx);
+    expect(result.details.reason).toBe("candidate-staging-failed");
+    expect(result.summary).toMatch(/configured 10000 bytes; spent \d+ bytes; remaining \d+ bytes; minimum additional 6000 bytes/);
+    expect(runTurn).not.toHaveBeenCalled();
+  });
 });
