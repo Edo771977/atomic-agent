@@ -49,7 +49,8 @@ export function parsePromotionJournal(raw: string): PromotionJournal {
       !allowed(value.state, ["promoting", "committed", "rolling-back", "rolled-back-with-conflicts", "rolled-back"]) || !Array.isArray(value.steps) || value.steps.length > MAX_STEPS ||
       (value.checkedWorkspace !== undefined && typeof value.checkedWorkspace !== "string") || (value.recovery !== undefined && typeof value.recovery !== "string")) return fail("invalid journal header");
   const paths = new Set<string>();
-  for (const step of value.steps) {
+  const steps: unknown[] = value.steps;
+  for (const step of steps) {
     if (!record(step) || Object.keys(step).some(key => !["path", "action", "status", "original", "promoted", "backup", "temp", "tempEntry"].includes(key)) || !safePath(step.path) ||
         !allowed(step.action, ["write", "delete", "mkdir", "rmdir"]) || !allowed(step.status, ["intent", "applied", "not-applied", "rolled-back", "rollback-conflict"]) || !entry(step.original) || !entry(step.promoted)) return fail("invalid journal step");
     const identity = pathIdentity(step.path);
@@ -65,7 +66,7 @@ export function parsePromotionJournal(raw: string): PromotionJournal {
       if (!safePath(step.temp) || dirname(step.temp) !== dirname(step.path) || !/^\.atag-candidate-[a-f0-9]{16}$/.test(basename(step.temp)) || !entry(step.tempEntry) || step.tempEntry === null || step.tempEntry.kind === "directory") return fail("invalid staging path or identity");
     } else if (step.tempEntry !== undefined) return fail("staging identity without path");
   }
-  if (value.retainedStaging !== undefined && (!Array.isArray(value.retainedStaging) || value.retainedStaging.length > MAX_STEPS || value.retainedStaging.some(path => !safePath(path) || !/^\.atag-candidate-[a-f0-9]{16}$/.test(basename(path)) || !value.steps.some(step => record(step) && typeof step.path === "string" && dirname(step.path) === dirname(path))))) return fail("invalid retained staging paths");
+  if (value.retainedStaging !== undefined && (!Array.isArray(value.retainedStaging) || value.retainedStaging.length > MAX_STEPS || value.retainedStaging.some(path => !safePath(path) || !/^\.atag-candidate-[a-f0-9]{16}$/.test(basename(path)) || !steps.some(step => record(step) && typeof step.path === "string" && dirname(step.path) === dirname(path))))) return fail("invalid retained staging paths");
   return value as unknown as PromotionJournal;
 }
 function alive(pid: number | null): boolean {
