@@ -530,7 +530,11 @@ describe("runtime provider/context/fallback/reload phases", () => {
     await wired.llmComplete({ ...params, providerId: "served" });
     const snapshot = fixture.turnUsageMeter.snapshot("turn");
     // #735 records which provider served the turn; no costUsd: unpriced.
-    expect(snapshot).toEqual({ promptTokens: 300, completionTokens: 20, cachedTokens: 100, servedProviderId: "served" });
+    // ATO-1026 adds the local server's own prefill / generation time.
+    expect(snapshot).toEqual({
+      promptTokens: 300, completionTokens: 20, cachedTokens: 100, servedProviderId: "served",
+      prefillMs: 1, genMs: 2, genTokensPerS: 10_000,
+    });
     expect(fixture.costAccumulator.snapshot().sessionUsd).toBe(0);
   });
 
