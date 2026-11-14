@@ -134,8 +134,14 @@ export function parseStartContextFlags(
 
 /** Subcommands that never touch the local model: no fit-test recovery before them. */
 const FIT_RESTORE_SKIP = new Set(["pull-worker", "downloads", "search", "tasks"]);
-/** Subcommands that change the daemon themselves: the recovery puts the model back without starting it. */
-const FIT_RESTORE_NO_RESTART = new Set(["stop", "stop-embedding", "start", "start-embedding", "update", "remove", "use", "use-device", "engine"]);
+/**
+ * Subcommands before which the recovery starts the user's model again.
+ * Only `fit-test`, whose snapshot must see it running to put it back
+ * running: no other subcommand needs a running model, and a start can
+ * take minutes, so before them the model is put back in config and
+ * starts on its next use (TUI, desktop, `models start`).
+ */
+const FIT_RESTORE_RESTART = new Set(["fit-test"]);
 
 export async function modelsCommand(args: string[]): Promise<number> {
   getConfig();
@@ -147,7 +153,7 @@ export async function modelsCommand(args: string[]): Promise<number> {
   if (!FIT_RESTORE_SKIP.has(sub)) {
     // A fit-test killed outright (Windows Cancel) left a test model active.
     try {
-      await recoverInterruptedFitTest({ restart: !FIT_RESTORE_NO_RESTART.has(sub) });
+      await recoverInterruptedFitTest({ restart: FIT_RESTORE_RESTART.has(sub) });
     } catch (err) {
       process.stderr.write(`could not put back the model an interrupted fit-test left: ${err instanceof Error ? err.message : String(err)}\n`);
     }

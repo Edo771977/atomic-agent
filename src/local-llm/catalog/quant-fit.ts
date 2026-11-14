@@ -215,7 +215,8 @@ export function rateQuant(
  *  1. among the 4-bit-or-more quants that fit the GPU (or the RAM of a
  *     machine without one) and answer at a pleasant speed, the most
  *     precise one (the larger file breaks a tie);
- *  2. else the fastest of the ones that fit;
+ *  2. else the smallest file of the ones that fit (none is pleasant,
+ *     and a smaller file decodes faster);
  *  3. else the smallest 4-bit-or-more quant that is a tight fit;
  *  4. else nothing — never a 2- or 3-bit file, never one that only runs
  *     from disk.

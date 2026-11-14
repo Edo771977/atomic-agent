@@ -35,6 +35,8 @@ import {
   clearFitRestoreMarker,
   createFitModelSwitcher,
   fitRestoreMarkerLive,
+  fitRunDeadlineMs,
+  markFitRestoreSwapped,
   readFitModelSnapshot,
   readFitRestoreMarker,
   writeFitRestoreMarker,
@@ -197,7 +199,7 @@ export async function runModelsFitTest(args: string[]): Promise<number> {
   // fit-test stops and swaps the local model under every other client.
   // The TUI and the desktop register in the session registry; the
   // sidecar, `serve` and scheduled tasks do not, so they are not seen.
-  const other = readFitRestoreMarker(cfg.paths.stateDir);
+  const other = readFitRestoreMarker(cfg.paths.localModelsDataDir);
   if (other !== null && fitRestoreMarkerLive(other)) {
     process.stderr.write(`another models fit-test is running (pid ${other.pid}); wait for it to finish\n`);
     return 1;
@@ -216,7 +218,9 @@ export async function runModelsFitTest(args: string[]): Promise<number> {
   const judgeKey = parsed.judgeKeyEnv ? (process.env[parsed.judgeKeyEnv] ?? null) : null;
   const judge = createFitJudge({ url: parsed.judgeUrl, model: parsed.judgeModel, apiKey: judgeKey });
   const snapshot = await readFitModelSnapshot();
-  const switcher = createFitModelSwitcher(snapshot);
+  const switcher = createFitModelSwitcher(snapshot, {
+    onSwapped: () => markFitRestoreSwapped(cfg.paths.localModelsDataDir),
+  });
   const depsFor = (signal: AbortSignal): FitTestDeps => ({
     loadModel: (modelId) => switcher.load(modelId, signal),
     runTask: (task, model) =>
@@ -235,12 +239,27 @@ export async function runModelsFitTest(args: string[]): Promise<number> {
   // A process killed with no chance to run a handler (the desktop's
   // Cancel on Windows is TerminateProcess) leaves this record behind; the
   // next `models` command or TUI start puts the models back from it.
-  writeFitRestoreMarker(cfg.paths.stateDir, snapshot);
+  writeFitRestoreMarker(cfg.paths.localModelsDataDir, snapshot, {
+    stateDir: cfg.paths.stateDir,
+    maxRunMs: fitRunDeadlineMs(parsed.modelIds.length, set.tasks.length, parsed.timeoutMs),
+  });
+  // A failed restore must not hide the finished report: it is reported,
+  // the record stays for the next `models` command to retry, and the
+  // command exits 1 after printing the run.
+  const restoreState = { failed: false };
   const outcome = await runRestoringOnStop(
     (signal) => runFitTest(set, parsed.modelIds, depsFor(signal), { gpuBudgetGb }),
     async (stopped) => {
-      await switcher.restore(stopped);
-      clearFitRestoreMarker(cfg.paths.stateDir);
+      try {
+        await switcher.restore(stopped);
+      } catch (err) {
+        restoreState.failed = true;
+        process.stderr.write(
+          `putting your model back failed: ${err instanceof Error ? err.message : String(err)}; the next \`atomic-agent models\` command tries again\n`,
+        );
+        return;
+      }
+      clearFitRestoreMarker(cfg.paths.localModelsDataDir);
     },
   );
   if (outcome.stoppedBy !== null) return outcome.exitCode;
@@ -248,5 +267,5 @@ export async function runModelsFitTest(args: string[]): Promise<number> {
   const body = `${JSON.stringify(run, null, 2)}\n`;
   if (parsed.outPath !== null) writeFileSync(parsed.outPath, body, { encoding: "utf8", mode: 0o600 });
   process.stdout.write(parsed.json ? body : formatFitTable(run));
-  return 0;
+  return restoreState.failed ? 1 : 0;
 }

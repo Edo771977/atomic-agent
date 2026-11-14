@@ -116,4 +116,50 @@ describe("what a fit-test task's child inherits", () => {
     expect(env.ATOMIC_AGENT_STATE_DIR).toMatch(/atomic-fit-/);
     expect(env.PATH).toBe(process.env.PATH);
   });
+
+  it("drops the parent's agent and browser settings, keeping only the asset paths the child needs", async () => {
+    const parent = {
+      ATOMIC_AGENT_BROWSER_CDP_URL: "ws://127.0.0.1:9222/devtools/browser/x",
+      ATOMIC_AGENT_BROWSER_EXECUTABLE_PATH: "/opt/chrome",
+      ATOMIC_AGENT_LLAMA_URL: "http://127.0.0.1:9999",
+      ATOMIC_AGENT_SESSION_PARENT_PID: "4242",
+      ATOMIC_AGENT_KEY_MY_VPS: "ssh-planted",
+      PLAYWRIGHT_BROWSERS_PATH: "/opt/pw",
+      CHROME_PATH: "/opt/chrome",
+      ATOMIC_AGENT_GRAMMARS_DIR: "/opt/atag/grammars",
+      ATOMIC_AGENT_RG_PATH: "/opt/atag/rg",
+    };
+    const saved = Object.fromEntries(Object.keys(parent).map((k) => [k, process.env[k]]));
+    Object.assign(process.env, parent);
+    try {
+      let env: NodeJS.ProcessEnv = {};
+      spawnMock.mockImplementation((_cmd: string, _args: string[], options: { env: NodeJS.ProcessEnv }) => {
+        env = options.env;
+        const child = fakeProcess(4401);
+        setTimeout(() => child.emit("close", 0), 1);
+        return child;
+      });
+      await createAgentTaskRunner({ modelUrl: "http://127.0.0.1:1", modelApiKey: null, timeoutMs: 60_000 })(TASK);
+      for (const name of [
+        "ATOMIC_AGENT_BROWSER_CDP_URL",
+        "ATOMIC_AGENT_BROWSER_EXECUTABLE_PATH",
+        "ATOMIC_AGENT_LLAMA_URL",
+        "ATOMIC_AGENT_SESSION_PARENT_PID",
+        "ATOMIC_AGENT_KEY_MY_VPS",
+        "PLAYWRIGHT_BROWSERS_PATH",
+        "CHROME_PATH",
+      ]) {
+        expect(env[name], name).toBeUndefined();
+      }
+      expect(env.ATOMIC_AGENT_GRAMMARS_DIR).toBe("/opt/atag/grammars");
+      expect(env.ATOMIC_AGENT_RG_PATH).toBe("/opt/atag/rg");
+      // The replay is not the user's activity.
+      expect(env.ATOMIC_AGENT_ANALYTICS).toBe("off");
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  });
 });
