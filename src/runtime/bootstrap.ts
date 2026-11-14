@@ -64,6 +64,8 @@ import { resolveLlmConfig } from "../llm/provider/index.js";
 
 import { CostAccumulator } from "../llm/provider/cost-accumulator.js";
 import { SessionUsageLedger, forwardWorkerUsage } from "../session/usage-meter.js";
+import { DAILY_SPEND_FILE_NAME, DailySpendStore, dailySpendViewFor } from "../session/daily-spend.js";
+import { hasPricedCloudLink } from "./resolve-model-pricing.js";
 
 import { ProviderFallbackChain } from "../llm/fallback/index.js";
 import { createFallbackChainResolver } from "./fallback-chain-resolver.js";
@@ -412,9 +414,26 @@ export async function createAgentRuntime(
   // ATO-569: what each session has spent and the account limits last
   // seen, for the composer readout. Every change goes out as a
   // session-scoped `usage_updated` event (TUI, HTTP stream frame).
+  // ATO-649: today's spend over every session, persisted so it survives
+  // a restart, for the readout and the `dailyLimitUsd` ceiling. Stamped
+  // on the live event only when the operator asked for it.
+  const dailySpend = new DailySpendStore({
+    path: join(config.paths.stateDir, DAILY_SPEND_FILE_NAME),
+    resetHourUtc: () => getConfig().llm?.costTracking?.dailyResetHourUtc ?? 0,
+  });
   const sessionUsage = new SessionUsageLedger({
-    onChange: (sessionId, usage) =>
-      emitAgentLoopEventFor(sessionId, { type: "usage_updated", sessionId, usage }),
+    onChange: (sessionId, usage) => {
+      // Only when a configured cloud link has a known price: with none,
+      // "today $0.00" could never move.
+      const today = dailySpendViewFor(dailySpend, getConfig().llm?.costTracking, () =>
+        hasPricedCloudLink(resolveLlmConfig(getConfig())),
+      );
+      emitAgentLoopEventFor(sessionId, {
+        type: "usage_updated",
+        sessionId,
+        usage: today ? { ...usage, today } : usage,
+      });
+    },
   });
 
   const modelContext = createRuntimeModelContext(config, providers);
@@ -447,9 +466,9 @@ export async function createAgentRuntime(
     });
   }
 
-  const { prepareLocalLink, llmComplete, llmCompleteStream } = connectRuntimeFallback(options, {
+  const { prepareLocalLink, llmComplete, llmCompleteStream, dailySpendLimit } = connectRuntimeFallback(options, {
     fallbackChain, resolveActiveLlmSlice, localBackend: connectedLocal.localBackend, profileManager,
-    costAccumulator, turnUsageMeter, sessionUsage, resolveModelPricing, resolveCatalogContextWindow,
+    costAccumulator, turnUsageMeter, sessionUsage, dailySpend, resolveModelPricing, resolveCatalogContextWindow,
     turnBudget: fusionTurnBudget,
   });
   // Smart approval (ATO-465): off unless `agent.smartApproval`, read live.
@@ -459,6 +478,8 @@ export async function createAgentRuntime(
     sideCallSlotId: () => slotManager.sideCallSlotId(),
     userRequest: (sessionId) => turnRequests.get(sessionId), logger,
   });
+  // Review after outside content (ATO-618): off unless `agent.taintReview`, read live.
+  approvals.setTaintReview(() => getConfig().agent.taintReview);
   const { taskStore, webhookSessionStore } = createRuntimeTaskStores({ config, logger });
   const { reflectionRunner, memoryContextProvider } = createRuntimeMemoryServices({
     config, profileStore, notesStore, linkStore, lessonStore, procedureStore, voteStore, embeddingClient,
@@ -578,6 +599,7 @@ export async function createAgentRuntime(
       fusionOutcomes.beginTurn(sessionId);
     },
     forgetDeclinedApprovals: (sessionId: string) => approvals.forgetDeclined(sessionId),
+    clearUntrustedContent: (sessionId: string) => approvals.clearUntrustedContent(sessionId),
     denyPendingApprovals: (sessionId: string, reason: string) => {
       approvals.denyPendingForSession(sessionId, reason);
     },
@@ -797,7 +819,7 @@ export async function createAgentRuntime(
   const { executeTurn, steer, runTurn, controlGoal } = createRuntimeTurnService(config, {
     sessions: { sessionStore, turnContext, turnRequests, turnPreviousReplies },
     execution: { loop, turnController, steeringInbox, shellJobs, slotManager, llmComplete },
-    inference: { providerRegistry, resolveActiveLlmSlice, resolveCurrentRunMode, resolveRouteVision, resolveActiveModelName, fallbackChain },
+    inference: { providerRegistry, resolveActiveLlmSlice, resolveCurrentRunMode, resolveRouteVision, resolveActiveModelName, fallbackChain, dailyLimitRefuses: dailySpendLimit.refuses },
     traces, telemetry: { observability, analyticsStateStore, turnUsageMeter, sessionUsage },
     state: turnState, lifecycle, logger,
   });
@@ -814,6 +836,8 @@ export async function createAgentRuntime(
     providerRegistry, llama, approvals, dangerous, slotManager, workingDir, logger,
     turnBudget: fusionTurnBudget,
     sessionUsage,
+    costAccumulator,
+    dailySpendLimit,
     liveWorkers: fusionLiveWorkers,
     runCheckpoints: fusionRuns,
     outcomeLog: fusionOutcomes.outcomeLog,

@@ -209,27 +209,46 @@ export function buildMergeGate(input: MergeGateInput): MergeGate {
       }
     }
     const checksRed = gated.status === "failed";
+    // A task that stopped to ask (ATO-945) keeps its question and its
+    // status, but what it wrote before asking is merged only when its own
+    // checks passed: red work must not reach the folder under a question.
+    const asked = gated.status === "needs_input";
+    if (asked && (gated.checks?.failed ?? 0) > 0) {
+      const detail = gated.checks?.detail;
+      return {
+        row: gated,
+        merge: false,
+        reason: `its own checks failed${detail === undefined ? "" : `: ${detail}`}`,
+      };
+    }
     const ownTask = rebased(task, workspace.roots, workspace.dir);
     // A syntax-only failure must not reach the folder either: the pass
-    // after the merge stays for waves that ran in place.
-    if (!checksRed && gated.status === "ok" && input.syntax?.runner !== undefined) {
-      const [checked] = await runSyntaxPass([gated], [ownTask], {
+    // after the merge stays for waves that ran in place. A needs_input
+    // row is checked as if done; a failure holds it back, still asking.
+    if (!checksRed && (gated.status === "ok" || asked) && input.syntax?.runner !== undefined) {
+      const [ran] = await runSyntaxPass([asked ? { ...gated, status: "ok" } : gated], [ownTask], {
         runner: input.syntax.runner,
         workingDir: workspace.dir,
         roots: rebaseScope(input.syntax.roots, workspace.roots, workspace.dir),
         signal: input.signal,
         ...(input.knownSecrets === undefined ? {} : { knownSecrets: input.knownSecrets }),
       });
-      if (checked !== undefined) {
+      if (ran !== undefined) {
+        const syntaxRed = ran.status === "failed";
+        // A question outranks the syntax verdict for the row's status; the
+        // verdict stays on `syntax` and in the held-back note.
+        const checked: WorkerTaskResult = asked
+          ? { ...gated, ...(ran.syntax === undefined ? {} : { syntax: ran.syntax }) }
+          : ran;
         gated = checked;
         if (checked.syntax !== undefined && checked.syntax.error === undefined) {
           input.state.syntaxGated.add(row.id);
         }
-        if (checked.status === "failed") {
+        if (syntaxRed) {
           return {
             row: checked,
             merge: false,
-            reason: (checked.error ?? "syntax failed").split("; ")[0]!,
+            reason: (ran.error ?? "syntax failed").split("; ")[0]!,
           };
         }
       }

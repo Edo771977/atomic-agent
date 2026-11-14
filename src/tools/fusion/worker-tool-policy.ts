@@ -1,5 +1,6 @@
 import type { ApprovalCategory } from "../../approval/approval-level.js";
 import { roleAdmits, type ToolRole } from "../tool-roles.js";
+import { PROFILE_ALWAYS_ALLOWED } from "../../agent-profiles/profile-tools.js";
 
 /**
  * What a fusion worker may and may not do.
@@ -54,6 +55,29 @@ export const WORKER_EXCLUDED_TOOLS: ReadonlySet<string> = new Set([
 /** `RunTurnOptions.toolFilter` for a worker turn. */
 export function isWorkerVisibleTool(name: string): boolean {
   return !WORKER_EXCLUDED_TOOLS.has(name);
+}
+
+/**
+ * The worker's `toolFilter` with a subagent profile's allowlist (ATO-566)
+ * on top: a tool must pass both, so a profile can only narrow what a
+ * worker sees, never bring back an excluded tool. No allowlist: exactly
+ * `isWorkerVisibleTool`.
+ *
+ * `allowlist` is what `applyTaskProfiles` stored on the task: patterns
+ * already compiled from the profile's entries (exact names, `prefix.*`),
+ * matched as they are and never translated a second time — a second
+ * pass rejected the MCP names it had produced (`mcp.my-server.search`)
+ * and failed open. An empty list is a profile none of whose tools are
+ * known here: the worker keeps only `reply` and tool discovery.
+ */
+export function workerToolFilterFor(
+  allowlist: readonly string[] | undefined,
+): (name: string) => boolean {
+  if (allowlist === undefined) return isWorkerVisibleTool;
+  const exact = new Set([...PROFILE_ALWAYS_ALLOWED, ...allowlist.filter((p) => !p.endsWith(".*"))]);
+  const prefixes = allowlist.filter((p) => p.endsWith(".*")).map((p) => p.slice(0, -1));
+  return (name) =>
+    isWorkerVisibleTool(name) && (exact.has(name) || prefixes.some((prefix) => name.startsWith(prefix)));
 }
 
 /**

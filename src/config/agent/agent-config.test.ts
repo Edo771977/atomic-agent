@@ -67,6 +67,15 @@ describe("agent configuration ownership", () => {
     expect(parseSmartApprovalModel("cloud-x", "f")).toBe("cloud-x");
   });
 
+  it("parses the review after outside content: off by default (ATO-618)", () => {
+    const defaults = createAgentDefaults();
+    expect(defaults.taintReview).toBe(false);
+    expect(parseAgentConfig({}, () => defaults).taintReview).toBe(false);
+    expect(parseAgentConfig({ taintReview: true }, () => defaults).taintReview).toBe(true);
+    expect(thrownError(() => parseAgentConfig({ taintReview: "maybe" }, () => defaults)))
+      .toBeInstanceOf(ConfigValidationError);
+  });
+
   it("reads smart approval through the whole-file parser", () => {
     const parsed = parseUserConfigFile({
       ...USER_CONFIG_DEFAULTS,
@@ -84,7 +93,7 @@ describe("agent configuration ownership", () => {
       "tokenBudget", "maxSteps", "providerWait", "task", "toolTimeoutMs",
       "readScope", "approvalLevel", "compaction", "conversationMaxTokens", "conversationMaxPairs",
       "nameSessions", "conversationLowWater", "sessionSectionsMaxTokens", "worldSnapshotMaxTokens",
-      "smartApproval", "smartApprovalModel",
+      "smartApproval", "smartApprovalModel", "taintReview",
       "prompt",
       "tools",
     ]);
@@ -213,7 +222,7 @@ describe("agent configuration ownership", () => {
         "tokenBudget", "maxSteps", "providerWait", "nameSessions", "task", "toolTimeoutMs",
         "readScope", "approvalLevel", "compaction", "conversationMaxTokens", "conversationMaxPairs",
         "conversationLowWater", "sessionSectionsMaxTokens", "worldSnapshotMaxTokens",
-        "smartApproval", "smartApprovalModel",
+        "smartApproval", "smartApprovalModel", "taintReview",
         "prompt", "tools",
       ]);
     } finally {

@@ -212,11 +212,33 @@ export async function openStreamOnLink(
   if (scope !== undefined) { request.requestBudget = scope; request.signal = scope.signal ?? request.signal; }
   async function* budgetedStream(): AsyncGenerator<StreamChunk, CompletionResult, void> {
     let result: CompletionResult | undefined;
+    // Reply text that arrived, for a stream that ends without a result
+    // (a cancel): the day's ledger prices it instead of the whole hold.
+    let outputBytes = 0;
+    const counted = async function* (): AsyncGenerator<StreamChunk, CompletionResult, void> {
+      const inner = provider.completeStream(request);
+      let finished = false;
+      try {
+        for (;;) {
+          const step = await inner.next();
+          if (step.done) { finished = true; return step.value; }
+          outputBytes += Buffer.byteLength(step.value.delta, "utf8") + Buffer.byteLength(step.value.reasoningDelta, "utf8");
+          yield step.value;
+        }
+      } catch (error) {
+        finished = true;
+        throw error;
+      } finally {
+        // A consumer that stops early closes the provider's stream too,
+        // as `yield*` would.
+        if (!finished) await inner.return(undefined as never);
+      }
+    };
     try {
-      result = yield* provider.completeStream(request);
+      result = yield* counted();
       return result;
     } finally {
-      scope?.finish(result);
+      scope?.finish(result, result === undefined ? { outputBytes } : undefined);
     }
   }
   const stream = scope === undefined ? provider.completeStream(request) : budgetedStream();

@@ -55,6 +55,13 @@ describe("model-visible artifact evidence", () => {
     expect(evidence(result.summary).omitted).toBe(0);
   });
 
+  it("names a task that asked a question needs_input, not unknown, in rows and counts", () => {
+    const result = projectFusionArtifactEvidence(compressToolResult({ tool: "fusion.delegate", status: "ok", output: "1 task: 1 needs_input", details: { tasks: [{ id: "core", status: "needs_input", artifactManifest: manifest() }] } }), 4000);
+    const head = evidence(result.summary) as { tasks: { id: string; status: string }[]; outcome: { tasks: Record<string, number> } };
+    expect(head.tasks[0]).toMatchObject({ id: "core", status: "needs_input" });
+    expect(head.outcome.tasks).toEqual({ needs_input: 1 });
+  });
+
   it("distinguishes a successful tool return from partial worker failure even when observations are omitted", () => {
     const result = projectFusionArtifactEvidence(compressToolResult({ tool: "fusion.delegate", status: "ok", output: "2 tasks: 1 ok, 1 failed", details: { tasks: [{ id: "a", status: "ok" }, { id: "b", status: "failed" }] } }), 1000);
     expect(evidence(result.summary).outcome).toEqual({ status: "ok", tasks: { ok: 1, failed: 1 } });

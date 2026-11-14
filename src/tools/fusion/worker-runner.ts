@@ -7,6 +7,10 @@ import type { TurnOrigin } from "../../runtime/turn-controller.js";
 import type { DelegateTask } from "./delegate-args.js";
 import type { TaskPermit } from "./task-permits.js";
 import type { DelegateContract } from "./contract.js";
+import {
+  readWorkerQuestion,
+  WORKER_NEEDS_INPUT_NOTE,
+} from "./worker-question.js";
 import type { CompletionUsage } from "../../llm/provider/completion-types.js";
 import type { FusionEscalationTarget } from "../../llm/run-mode/index.js";
 import { completionCostUsd, estimateUsageCostUsd } from "../../llm/provider/usage-cost.js";
@@ -49,7 +53,7 @@ import { localWorkerReasoningBudgetTokens } from "../../llm/reasoning-budget.js"
 import {
   FUSION_WORKER_APPROVAL_REFUSED,
   WORKER_TOOL_ROLE,
-  isWorkerVisibleTool,
+  workerToolFilterFor,
   workerRefusalFor,
 } from "./worker-tool-policy.js";
 import type { ToolRole } from "../tool-roles.js";
@@ -508,6 +512,10 @@ export interface WorkerRunnerDeps {
         ApprovalGate,
         | "fanoutScopes"
         | "followDeclined"
+        | "followTaint"
+        | "holdsForOutsideContent"
+        | "outsideContentSources"
+        | "request"
         | "clearSessionGrants"
         | "hasDeclinedUnder"
         | "forgetDeclinedUnder"
@@ -1087,6 +1095,10 @@ async function runOneTask(
     // for its workers: inside the scope or not, a write of it goes to the
     // gate, which refuses it (`ApprovalGate.followDeclined`).
     deps.approvals.followDeclined?.(id, options.parentSessionId);
+    // Outside content, both ways (`agent.taintReview`): the worker is held
+    // for what its orchestrator read, and what the worker reads holds the
+    // orchestrator, whose context its findings reach (`followTaint`).
+    deps.approvals.followTaint?.(id, options.parentSessionId);
     // The contract's inputs (F51), resolved as this worker's tools will
     // resolve them: `os.fs.write` on one is refused whatever the brief
     // says, with no `overwrite` exemption — the orchestrator redeclares.
@@ -1580,8 +1592,8 @@ async function runOneTask(
       handBack.signal.aborted;
     if (stopped()) return first;
     // A reply the worker was not allowed to close on (a refusal handed
-    // back) or a split proposal (its files are its children's) is not
-    // the worker's own claim of done.
+    // back), a split proposal (its files are its children's) or a
+    // question is not the worker's own claim of done.
     const provisional = collector.finish({
       id: task.id,
       title: task.title,
@@ -1595,6 +1607,9 @@ async function runOneTask(
     // turn of the same worker on the same files only repeats the damage.
     if ((provisional.replacedInputs?.length ?? 0) > 0) return first;
     if (mayPropose && hasSplitProposal(provisional.reply)) return first;
+    // A worker that ended on a question (ATO-945) stopped before writing
+    // by design: it comes back `needs_input`, not nudged to finish.
+    if (readWorkerQuestion(provisional.reply) !== undefined) return first;
     const stepsLeft = stepBudget.value - first.stepCount;
     const graceSteps = Math.min(SELF_CHECK_GRACE_STEPS, stepsLeft);
     if (graceSteps < SELF_CHECK_MIN_GRACE_STEPS) return first;
@@ -1685,7 +1700,7 @@ async function runOneTask(
       providerId: options.providerId,
       maxSteps,
       taskMaxDurationMs,
-      toolFilter: isWorkerVisibleTool,
+      toolFilter: workerToolFilterFor(task.agentProfile?.tools),
       toolRole: WORKER_TOOL_ROLE,
       ...(options.workerReasoning === undefined || options.workerReasoning === "unbounded"
         ? {}
@@ -1968,7 +1983,7 @@ async function runOneTask(
           providerId: target.providerId,
           maxSteps: stepBudget.value,
           taskMaxDurationMs: timeoutMs,
-          toolFilter: isWorkerVisibleTool,
+          toolFilter: workerToolFilterFor(task.agentProfile?.tools),
           toolRole: WORKER_TOOL_ROLE,
           signal: AbortSignal.any([
             options.signal,
@@ -2246,7 +2261,31 @@ async function runOneTask(
   // its files are its children's, and the delegate checks them on the
   // parent once they ran.
   const proposedSplit = mayPropose && hasSplitProposal(result.reply);
+  // A worker that ended its own turn on a question (ATO-945) stopped by
+  // design: it is `needs_input`, not `ok`. One that wrote nothing is not
+  // checked, because it was told to stop before writing; one that did
+  // write has its declared files checked as if it had finished, and a
+  // contradiction fails it with the question still on the row.
+  const question =
+    !proposedSplit && result.status === "ok"
+      ? readWorkerQuestion(result.reply)
+      : undefined;
+  if (question !== undefined && task.files !== undefined && task.files.length > 0) {
+    const report = await inspectDeclaredFiles(task.files, workingDir, startedAt);
+    if (result.tools.writes > 0 || report.modified.length > 0) {
+      result = applyDeclaredFileReport(result, report);
+    }
+  }
+  if (question !== undefined) {
+    result = {
+      ...result,
+      ...(result.status === "ok" ? { status: "needs_input" as const } : {}),
+      question,
+      notes: [...(result.notes ?? []), WORKER_NEEDS_INPUT_NOTE],
+    };
+  }
   if (
+    question === undefined &&
     !proposedSplit &&
     task.files !== undefined &&
     task.files.length > 0 &&
@@ -2294,6 +2333,11 @@ function workerPhase(
 /** One line for the operator's feed — never the whole reply. */
 function summarise(result: WorkerTaskResult): string {
   if (result.status === "needs_orchestrator") return "needs the orchestrator";
+  if (result.status === "needs_input" && result.question !== undefined) {
+    const cap = Math.min(120, WORKER_REPLY_CHAR_BUDGET);
+    const q = result.question;
+    return `asks: ${q.length > cap ? `${q.slice(0, cap)}…` : q}`;
+  }
   const text = (result.error ?? result.reply).replace(/\s+/g, " ").trim();
   if (text.length === 0) return result.status;
   const cap = Math.min(120, WORKER_REPLY_CHAR_BUDGET);

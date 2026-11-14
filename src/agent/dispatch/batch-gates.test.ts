@@ -25,6 +25,21 @@ describe("dispatch gate owner seams", () => {
     expect(fusion).not.toHaveBeenCalled(); expect(check).not.toHaveBeenCalled(); expect(run).not.toHaveBeenCalled();
   });
 
+  it("refuses a call the turn's toolFilter hides, and runs everything without a filter (ATO-566)", async () => {
+    const run = vi.fn(async () => result("os.fs.write"));
+    const read = vi.fn(async () => result("os.fs.read"));
+    const registry = new ToolRegistry();
+    registry.register({ name: "os.fs.write", description: "fixture", readonly: false, run });
+    registry.register({ name: "os.fs.read", description: "fixture", readonly: true, run: read });
+    const calls = toBatchInputs([{ tool: "os.fs.write", args: { path: "f", content: "x" } }, { tool: "os.fs.read", args: { path: "f" } }]);
+    const filtered = await executeBatch(calls, registry, context({ toolFilter: (name) => name !== "os.fs.write" }));
+    expect(filtered.results[0]?.compressed).toMatchObject({ status: "error", details: { tool_filter: true, tool: "os.fs.write" } });
+    expect(filtered.results[0]?.compressed?.summary).toContain("is not available in this turn");
+    expect(run).not.toHaveBeenCalled(); expect(read).toHaveBeenCalledTimes(1);
+    await executeBatch(calls, registry, context());
+    expect(run).toHaveBeenCalledTimes(1);
+  });
+
   it("retains synchronous check→record visibility across sibling calls using one real tracker", () => {
     const tracker = new ToolLoopTracker({ warningThreshold: 2 });
     const events: string[] = [];

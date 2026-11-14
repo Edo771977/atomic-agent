@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createRequestBudgetScope } from "./request-budget.js";
+import { createDailySpendBudget } from "./daily-spend-budget.js";
+import { DailySpendStore } from "../session/daily-spend.js";
+import { DailySpendLimitError } from "../llm/reliability/spend-limit-error.js";
 import { FusionTurnBudget } from "../tools/fusion/turn-budget.js";
 import { OpenAiProvider } from "../llm/provider/openai/openai-provider.js";
 import { OpenAiHttpError } from "../llm/provider/openai/openai-http.js";
@@ -300,6 +306,20 @@ describe("request budget scope", () => {
       expect(spent(budget)).toBeCloseTo((1_000 * 3 + 1_000 * 15) / 1_000_000, 9);
     });
 
+    it("charges a metered turn's retried success after a released 429 or unsent failure", () => {
+      for (const reject of [(s: ReturnType<typeof createRequestBudgetScope>) => s!.onResponse(429), (s: ReturnType<typeof createRequestBudgetScope>) => s!.onSendFailed?.(refused("ECONNREFUSED"))]) {
+        const budget = new FusionTurnBudget();
+        budget.begin("p", 0, { usd: 1 });
+        const s = createRequestBudgetScope(budget, { sessionId: "p", prompt: "hi" } as CompletionRequest, { id: "c" } as LlmProvider, entry, undefined)!;
+        expect(s.mode).toBe("meter");
+        s.beforeSend({});
+        reject(s);
+        s.beforeSend({});
+        s.finish({ usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2, costUsd: 0.5 } } as never);
+        expect(spent(budget)).toBeCloseTo(0.5, 9);
+      }
+    });
+
     it("still refuses a metered request once the cap is reached", () => {
       const budget = new FusionTurnBudget();
       budget.begin("p", 0, { usd: 1 });
@@ -419,6 +439,201 @@ describe("request budget scope", () => {
       expect(() => scoped(0.9, priced).scope().beforeSend(body())).not.toThrow();
       // Below the threshold the base rates still apply.
       expect(() => scoped(0.1, priced).scope().beforeSend({ model: "m", messages: [] })).not.toThrow();
+    });
+  });
+
+  describe("the daily spend limit as a second hold in the same scope (ATO-649)", () => {
+    function day(limitUsd?: number) {
+      const store = new DailySpendStore({ path: join(mkdtempSync(join(tmpdir(), "daily-budget-")), "daily-spend.json") });
+      const daily = createDailySpendBudget(store, () => (limitUsd === undefined ? undefined : { dailyLimitUsd: limitUsd }));
+      return { store, daily };
+    }
+    // No session: no turn budget, only the day's ledger.
+    const request = () => ({ prompt: "hi", maxOutputTokens: 4096 } as CompletionRequest);
+    const body = () => ({ model: "m", messages: [{ role: "user", content: "hi" }] });
+    const usage = { promptTokens: 1_000, completionTokens: 1_000, totalTokens: 2_000 };
+    const estimate = (1_000 * 3 + 1_000 * 15) / 1_000_000;
+
+    it("lets only one of two parallel sends through when the remaining allowance covers one", () => {
+      // One 4096-token send holds about $0.0646; the smallest clamped
+      // (1024-token) reply about $0.0185, more than what is left.
+      const { store, daily } = day(0.07);
+      const a = createRequestBudgetScope(undefined, request(), provider, entry, model, daily);
+      const b = createRequestBudgetScope(undefined, request(), provider, entry, model, daily);
+      expect(a).toBeDefined();
+      a!.beforeSend(body());
+      expect(() => b!.beforeSend(body())).toThrow(DailySpendLimitError);
+      a!.finish({ usage } as never);
+      expect(store.today().usd).toBeCloseTo(estimate, 9);
+      // The hold is gone once settled: the next send fits again.
+      const c = createRequestBudgetScope(undefined, request(), provider, entry, model, daily)!;
+      expect(() => c.beforeSend(body())).not.toThrow();
+    });
+
+    it("charges a send retried after a 5xx, which may have been billed", () => {
+      const { store, daily } = day(10);
+      const s = createRequestBudgetScope(undefined, request(), provider, entry, model, daily)!;
+      s.beforeSend(body());
+      s.onResponse(500);
+      s.beforeSend(body());
+      s.onResponse(200);
+      s.finish({ usage } as never);
+      expect(store.today().pricedCalls).toBe(2);
+      expect(store.today().usd).toBeGreaterThan(estimate + 0.06);
+    });
+
+    it("releases a send refused with ECONNREFUSED", () => {
+      const { store, daily } = day(10);
+      const s = createRequestBudgetScope(undefined, request(), provider, entry, model, daily)!;
+      s.beforeSend(body());
+      s.onSendFailed?.(refused("ECONNREFUSED"));
+      s.finish(undefined);
+      expect(store.today()).toMatchObject({ usd: 0, pricedCalls: 0, unpricedCalls: 0 });
+    });
+
+    it("settles the day with the turn budget's settled amount, once", () => {
+      const { store, daily } = day(10);
+      const budget = new FusionTurnBudget();
+      budget.begin("p", 0, { usd: 5 });
+      const s = createRequestBudgetScope(budget, { ...request(), sessionId: "p" }, provider, entry, model, daily)!;
+      s.beforeSend(body());
+      s.finish({ usage } as never);
+      s.finish({ usage } as never);
+      expect(spent(budget)).toBeCloseTo(estimate, 9);
+      expect(store.today().usd).toBeCloseTo(spent(budget), 9);
+      expect(store.today().pricedCalls).toBe(1);
+    });
+
+    it("counts the day even without a ceiling, charging nothing ahead", () => {
+      const { store, daily } = day();
+      const s = createRequestBudgetScope(undefined, request(), provider, entry, model, daily)!;
+      const sent = body();
+      s.beforeSend(sent);
+      expect(sent).toEqual(body());
+      s.finish({ usage } as never);
+      expect(store.today()).toMatchObject({ pricedCalls: 1 });
+      expect(store.today().usd).toBeCloseTo(estimate, 9);
+    });
+
+    it("meters a link without a price under a ceiling: no refusal, a hint, reported cost or an unpriced call", () => {
+      const { store, daily } = day(1);
+      const unpriced = { ...model, pricing: undefined };
+      const s = createRequestBudgetScope(undefined, request(), provider, entry, unpriced, daily)!;
+      expect(() => s.beforeSend(body())).not.toThrow();
+      expect(s.hint).toMatch(/daily/);
+      s.finish({ usage: { ...usage, costUsd: 0.25 } } as never);
+      const t = createRequestBudgetScope(undefined, request(), provider, entry, unpriced, daily)!;
+      t.beforeSend(body());
+      t.finish({ usage } as never);
+      expect(store.today()).toMatchObject({ usd: 0.25, pricedCalls: 1, unpricedCalls: 1 });
+    });
+
+    it("refuses a metered link once today's total is at the ceiling", () => {
+      const { store, daily } = day(1);
+      store.record({ kind: "priced", usd: 1, source: "provider" });
+      expect(() => createRequestBudgetScope(undefined, request(), provider, entry, { ...model, pricing: undefined }, daily))
+        .toThrow(DailySpendLimitError);
+    });
+
+    describe("a daily limit alone bounds the reply the provider will actually send", () => {
+      const capped = { ...entry, maxOutputTokens: 4096 } as LlmProviderConfigEntry;
+      it("leaves a request's larger cap (a truncation step-up) on the wire", () => {
+        const { daily } = day(100);
+        const s = createRequestBudgetScope(undefined, { prompt: "hi", maxTokens: 16_000 } as CompletionRequest, provider, capped, model, daily)!;
+        const sent = { ...body(), max_tokens: 16_000 };
+        s.beforeSend(sent);
+        expect(sent.max_tokens).toBe(16_000);
+        expect(s.hint).toBeUndefined();
+        s.finish({ usage } as never);
+      });
+
+      it("leaves an extraBody cap above the request's on the wire", () => {
+        const { daily } = day(100);
+        const s = createRequestBudgetScope(undefined, request(), provider, entry, model, daily)!;
+        const sent = { ...body(), max_tokens: 32_000 };
+        s.beforeSend(sent);
+        expect(sent.max_tokens).toBe(32_000);
+        s.finish({ usage } as never);
+      });
+
+      it("clamps only to fit the remaining allowance, and says so", () => {
+        const { store, daily } = day(0.02);
+        store.add(0.001);
+        const s = createRequestBudgetScope(undefined, request(), provider, entry, model, daily)!;
+        const sent: Record<string, unknown> = { ...body(), max_tokens: 4096 };
+        s.beforeSend(sent);
+        expect(sent.max_tokens as number).toBeLessThan(4096);
+        expect(s.hint).toMatch(/daily spend limit: .*capped at \d+ tokens.*\$0\.02 left/);
+        s.finish({ usage } as never);
+      });
+
+      it("words a send that does not fit as a possible overrun, not a reached limit", () => {
+        const { store, daily } = day(0.01);
+        store.add(0.008);
+        const s = createRequestBudgetScope(undefined, request(), provider, entry, model, daily)!;
+        let error: unknown;
+        try { s.beforeSend({ ...body(), max_tokens: 4096 }); } catch (caught) { error = caught; }
+        expect(error).toBeInstanceOf(DailySpendLimitError);
+        expect((error as Error).message).toMatch(/could exceed the remaining daily allowance \(\$0\.00 left of \$0\.01\)/);
+        expect((error as Error).message).not.toMatch(/limit reached/);
+      });
+    });
+
+    describe("an abandoned send counts its input bound and streamed output, not its whole hold", () => {
+      const bodyTokens = (sent: object) => Math.ceil(Buffer.byteLength(JSON.stringify(sent), "utf8") / 3) + 1024;
+      function aborted(streamedBytes?: number) {
+        const { store, daily } = day(5);
+        const caller = new AbortController();
+        const s = createRequestBudgetScope(undefined, { ...request(), signal: caller.signal }, provider, entry, model, daily)!;
+        const sent: Record<string, unknown> = body();
+        s.beforeSend(sent);
+        caller.abort();
+        s.finish(undefined, streamedBytes === undefined ? undefined : { outputBytes: streamedBytes });
+        return { store, input: bodyTokens(sent) * 3 / 1_000_000 };
+      }
+
+      it("charges a cancelled send at its input bound", () => {
+        const { store, input } = aborted();
+        expect(store.today().usd).toBeCloseTo(input, 9);
+        expect(store.today().usd).toBeLessThan(0.01);
+      });
+
+      it("adds the output streamed before the cancel", () => {
+        const { store, input } = aborted(3_000);
+        expect(store.today().usd).toBeCloseTo(input + 1_000 * 15 / 1_000_000, 9);
+      });
+
+      it("prices a reply without usage by its input bound and returned text", () => {
+        const { store, daily } = day(5);
+        const s = createRequestBudgetScope(undefined, request(), provider, entry, model, daily)!;
+        const sent: Record<string, unknown> = body();
+        s.beforeSend(sent);
+        s.finish({ content: "x".repeat(300), reasoningContent: "", usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0, incomplete: true } } as never);
+        expect(store.today().usd).toBeCloseTo((bodyTokens(sent) * 3 + 100 * 15) / 1_000_000, 9);
+      });
+
+      it("still charges the whole hold for a send that failed ambiguously without a cancel", () => {
+        const { store, daily } = day(5);
+        const s = createRequestBudgetScope(undefined, request(), provider, entry, model, daily)!;
+        s.beforeSend(body());
+        s.onResponse(502);
+        s.finish(undefined);
+        expect(store.today().usd).toBeGreaterThan(0.06);
+      });
+    });
+
+    it("leaves an unpriced loopback/LAN server out of the day, and counts a priced one", () => {
+      const { daily } = day(1);
+      const ollama = { id: "ollama", kind: "openai-compatible", baseUrl: "http://localhost:11434/v1" } as LlmProviderConfigEntry;
+      expect(createRequestBudgetScope(undefined, request(), provider, ollama, { ...model, pricing: undefined }, daily)).toBeUndefined();
+      const gateway = { id: "gw", kind: "openai-compatible", baseUrl: "http://192.168.1.20:4000" } as LlmProviderConfigEntry;
+      expect(createRequestBudgetScope(undefined, request(), provider, gateway, model, daily)?.mode).toBeUndefined();
+      expect(createRequestBudgetScope(undefined, request(), provider, gateway, model, daily)).toBeDefined();
+    });
+
+    it.each(["llama-server", "subscription-cli"])("leaves a %s link out of the day", kind => {
+      const { daily } = day(1);
+      expect(createRequestBudgetScope(undefined, request(), provider, { id: "x", kind } as LlmProviderConfigEntry, model, daily)).toBeUndefined();
     });
   });
 });

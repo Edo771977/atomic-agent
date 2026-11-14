@@ -14,11 +14,13 @@ import type { ResolvedRunMode } from "../../llm/run-mode/index.js";
 import { visionCapableAlternatives } from "../../llm/provider/model-vision.js";
 import { resolveModelPricingFor } from "../resolve-model-pricing.js";
 import { createRequestBudgetScope } from "../request-budget.js";
+import type { DailySpendBudget } from "../daily-spend-budget.js";
 import type { ModelProfile } from "../../llm/model-profile.js";
 import type { SlotManager } from "../../llm/slot-manager.js";
 import { createFusionFormatProbeFor } from "./fusion-format-check.js";
 import { configuredFusionRoutingIdentity } from "./fusion-routing-identity.js";
 import type { SessionUsageLedger } from "../../session/usage-meter.js";
+import type { CostAccumulator } from "../../llm/provider/cost-accumulator.js";
 import { isLocalServerUrl } from "../../llm/provider/openai/local-server-url.js";
 import { ToolRegistry } from "../../tools/tool-registry.js";
 import { knownSecretsFromEnv, type KnownSecret } from "../../error-reporting/secret-detector.js";
@@ -54,6 +56,8 @@ import { DEFAULT_TOOL_DESCRIPTORS } from "../../prompt/tool-descriptors.js";
 import type { McpServerConfig } from "../../mcp/mcp-types.js";
 import { loadPluginMcpServers } from "../../plugins/plugin-mcp.js";
 import { createPluginMcpLiveStop } from "../../plugins/plugin-mcp-live.js";
+import { listPluginSubagents } from "../../plugins/plugin-subagents.js";
+import { loadAgentProfiles, normaliseProfileName, type AgentProfile } from "../../agent-profiles/index.js";
 import type { ToolDescriptor } from "../../prompt/stable-prefix.js";
 import { filterToolDescriptorsByConfig } from "../filter-disabled-tools.js";
 import { readAtomicMailApiKey } from "../../atomic-mail/index.js";
@@ -133,6 +137,28 @@ function runtimeReadConfinement(
   };
 }
 
+/**
+ * Enabled plugins' `agents/*.md` as subagent profiles, named
+ * `plugin:agent`; a name that does not normalise is skipped.
+ */
+function pluginAgentProfiles(stateDir: string): AgentProfile[] {
+  const out: AgentProfile[] = [];
+  for (const p of listPluginSubagents(stateDir).profiles) {
+    const [plugin, agent] = [normaliseProfileName(p.plugin), normaliseProfileName(p.name.slice(p.plugin.length + 1))];
+    if (plugin === null || agent === null || p.prompt.trim().length === 0) continue;
+    out.push({
+      name: `${plugin}:${agent}`,
+      description: p.description,
+      prompt: p.prompt.trim(),
+      ...(p.model === undefined ? {} : { model: p.model }),
+      ...(p.tools.length === 0 ? {} : { tools: p.tools }),
+      source: "plugin",
+      file: p.file,
+    });
+  }
+  return out;
+}
+
 export function createRuntimeToolRegistry(
   config: AtomicAgentConfig,
   browserBackend: BrowserBackend,
@@ -144,6 +170,10 @@ export function createRuntimeToolRegistry(
   const toolRegistry = new ToolRegistry({
     ...(outputSpill ? { outputSpill } : {}),
     knownSecrets: () => runtimeKnownSecrets(getConfig()),
+    // Outside text read on a session holds its risky silent approvals
+    // for the rest of the turn when `agent.taintReview` is on (ATO-618).
+    onUntrustedOutput: (sessionId, source) =>
+      dangerous.approvals.noteUntrustedContent(sessionId, source),
   });
   toolRegistry.register(finishTool);
   toolRegistry.register(replyTool);
@@ -715,6 +745,16 @@ export function registerRuntimeFusionAndReadScope(input: {
   turnBudget?: FusionDelegateDeps["turnBudget"];
   /** The composer's `$` readout: escalation and judge calls land here (ATO-1388). */
   sessionUsage?: Pick<SessionUsageLedger, "record">;
+  /** `llm.costTracking`'s session and day totals: escalation and judge calls count here too (ATO-1497). */
+  costAccumulator?: Pick<CostAccumulator, "recordTurn">;
+  /**
+   * Today's spend ceiling (ATO-649), for escalation and judge calls, which
+   * go straight to the provider past the fallback seam: `enforce` is the
+   * seam's early refusal, `budget` the daily ledger their request scope
+   * holds and settles on. The seam never sees these calls, so nothing
+   * counts them twice.
+   */
+  dailySpendLimit?: { enforce(providerId: string): void; budget: DailySpendBudget | undefined };
   liveWorkers?: FusionDelegateDeps["liveWorkers"];
   steerWorker?: FusionDelegateDeps["steerWorker"];
   orchestratorTurnSpendUsd?: FusionDelegateDeps["orchestratorTurnSpendUsd"];
@@ -737,7 +777,7 @@ export function registerRuntimeFusionAndReadScope(input: {
     prepareLocalLink, emitAgentLoopEventFor, resolveCurrentRunMode, providerRegistry,
     llama, approvals, dangerous, slotManager, workingDir, logger, turnBudget,
     orchestratorTurnSpendUsd, liveWorkers, steerWorker, runCheckpoints, sessionUsage,
-    outcomeLog, turnLedger, localFormatCheck } = input;
+    outcomeLog, turnLedger, localFormatCheck, costAccumulator, dailySpendLimit } = input;
 
 
   // The orchestrator's fan-out. Registered UNCONDITIONALLY: the tool
@@ -868,11 +908,16 @@ export function registerRuntimeFusionAndReadScope(input: {
           maxOutputTokens,
           signal,
         };
-        const resolvedForBudget = sessionId !== undefined && turnBudget?.requestLimits(sessionId) !== undefined
-          ? resolveLlmConfig(getConfig()) : undefined;
+        // The daily ceiling refuses a paid link before anything is sent,
+        // as the fallback seam does for every other call (ATO-649).
+        dailySpendLimit?.enforce(providerId);
+        const dailyBudget = dailySpendLimit?.budget;
+        const turnLimited = sessionId !== undefined && turnBudget?.requestLimits(sessionId) !== undefined;
+        const resolvedForBudget = turnLimited || dailyBudget !== undefined ? resolveLlmConfig(getConfig()) : undefined;
         const entryForBudget = resolvedForBudget?.providers.find(p => p.id === providerId);
-        const scope = resolvedForBudget === undefined ? undefined : createRequestBudgetScope(turnBudget, { ...request, sessionId }, provider, entryForBudget,
-          resolveModelPricingFor(resolvedForBudget, provider.chatModelId ?? entryForBudget?.defaultChatModel ?? entryForBudget?.model ?? null, providerId));
+        const scope = resolvedForBudget === undefined ? undefined : createRequestBudgetScope(turnLimited ? turnBudget : undefined, { ...request, sessionId }, provider, entryForBudget,
+          resolveModelPricingFor(resolvedForBudget, provider.chatModelId ?? entryForBudget?.defaultChatModel ?? entryForBudget?.model ?? null, providerId),
+          dailyBudget);
         let result: Awaited<ReturnType<typeof provider.complete>> | undefined;
         try {
           result = await provider.complete({ ...request, ...(scope === undefined ? {} : { requestBudget: scope, signal: scope.signal ?? signal }) });
@@ -900,6 +945,21 @@ export function registerRuntimeFusionAndReadScope(input: {
             });
           } catch {
             // The readout never takes an escalation down.
+          }
+        }
+        // The same call in `llm.costTracking`'s session and day totals
+        // (ATO-1497), gated like the fallback seam's: any call with usage,
+        // no session needed.
+        if (costAccumulator !== undefined && result.usage !== undefined) {
+          try {
+            const model = resolveModelPricingFor(resolveLlmConfig(getConfig()), result.modelId, providerId);
+            costAccumulator.recordTurn({
+              modelId: result.modelId,
+              usage: result.usage,
+              ...(model === undefined ? {} : { model }),
+            });
+          } catch {
+            // Cost tracking never takes an escalation down.
           }
         }
         return {
@@ -930,6 +990,17 @@ export function registerRuntimeFusionAndReadScope(input: {
       workingDir,
       // Fan-outs never write in the agent's own state directory (ATO-1267).
       agentStateDir: config.paths.stateDir,
+      // Subagent profiles a task may name (ATO-566), read per fan-out so a
+      // new file or a trust answer applies without a restart. Project
+      // files load only once the folder trusted them.
+      resolveAgentProfiles: (dir) =>
+        loadAgentProfiles({
+          workingDir: dir,
+          stateDir: config.paths.stateDir,
+          configFile: config.paths.userConfigFile,
+          startupTrust: config.skills.projectTrust,
+          pluginProfiles: () => pluginAgentProfiles(config.paths.stateDir),
+        }),
       outputCharCap: config.agent.batchToolResultCharCap,
       // A contract's declared `checks` run through the verify family,
       // each on a throwaway copy of the workspace, so a fan-out is judged

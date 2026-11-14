@@ -29,7 +29,7 @@ const CONFIG: Pick<AtomicAgentConfig, "browser"> = {
   },
 };
 
-function fakeGate(over: { approved?: boolean; scoped?: boolean } = {}): {
+function fakeGate(over: { approved?: boolean; scoped?: boolean; tainted?: boolean } = {}): {
   gate: ApprovalGate;
   request: ReturnType<typeof vi.fn>;
 } {
@@ -37,6 +37,7 @@ function fakeGate(over: { approved?: boolean; scoped?: boolean } = {}): {
   const gate = {
     request,
     fanoutScopes: { allows: () => over.scoped ?? false },
+    holdsForOutsideContent: () => over.tainted ?? false,
   } as unknown as ApprovalGate;
   return { gate, request };
 }
@@ -147,6 +148,13 @@ describe("verify.run behind the shell guard", () => {
     const plain = fakeGate();
     await buildVerifyRunTool({ approvals: plain.gate, approvalRequired: true, config: CONFIG }).run(run, ctx());
     expect(plain.request.mock.calls[0]?.[0]).toMatchObject({ category: "shell" });
+  });
+
+  it("asks an ordinary check inside a fan-out scope after outside content", async () => {
+    const run = { kind: "command", cmd: process.execPath, args: ["-e", "0"], checks: ["exit 0"] };
+    const tainted = fakeGate({ scoped: true, tainted: true });
+    await buildVerifyRunTool({ approvals: tainted.gate, approvalRequired: true, config: CONFIG }).run(run, ctx());
+    expect(tainted.request.mock.calls[0]?.[0]).toMatchObject({ category: "shell" });
   });
 
   it("refuses a git push when the operator switched remote sync off", async () => {

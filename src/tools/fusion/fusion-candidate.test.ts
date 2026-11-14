@@ -91,6 +91,23 @@ it("keeps rejected no-check output as a patch and refuses resume without dispatc
   expect(resumed.details.reason).toBe("candidate-nonresumable"); expect(run).not.toHaveBeenCalled();
 });
 
+it("rejects the candidate, keeping its patch, when its checks are held after outside content", async () => {
+  const prompts: string[] = [];
+  const gate: ApprovalGate = new ApprovalGate({ level: 4, emit: req => { prompts.push(req.category); queueMicrotask(() => gate.resolve({ approvalId: req.approvalId, approved: req.category !== "shell" })); } });
+  gate.setTaintReview(() => true);
+  const f = await fixture({ approvals: gate, approvalRequired: true });
+  gate.noteUntrustedContent(f.ctx.sessionId, "a web page");
+  f.deps.runTurn = async session => { await writeFile(join(session.workingDir, "api.json"), '{"name":"after"}'); return { session, reason: "reply", stepCount: 1 }; };
+  const runChecks = vi.fn(async () => ({ ok: true, results: [{ ok: true }] }));
+  f.deps.runChecks = runChecks;
+  const result = await buildFusionDelegateTool(f.deps).run({ tasks: [tasks[0]], contract }, f.ctx);
+  expect(runChecks).not.toHaveBeenCalled();
+  expect(prompts.filter(c => c === "shell")).toHaveLength(1);
+  expect(result.details.candidateIntegration).toMatchObject({ status: "rejected", reason: expect.stringContaining("contract checks held after outside content: not run"), patch: { method: "git" } });
+  expect((result.details.candidateIntegration as { acceptanceReceipt?: { reason?: string; checkStatus?: string } }).acceptanceReceipt).toMatchObject({ reason: "checks-unverified", checkStatus: "unverified" });
+  expect(await readFile(join(f.root, "api.json"), "utf8")).toBe('{"name":"before"}');
+});
+
 it("holds passing output when the user changes the original during execution", async () => {
   const f = await fixture();
   f.deps.runTurn = async session => { await writeFile(join(session.workingDir, "api.json"), "candidate"); await writeFile(join(f.root, "personal.txt"), "new user edit"); return { session, reason: "reply", stepCount: 1 }; };

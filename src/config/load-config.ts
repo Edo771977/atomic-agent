@@ -295,6 +295,7 @@ export function loadConfig(): AtomicAgentConfig {
       thinking: user.localModels.thinking,
       reasoningBudgetTokens: user.localModels.reasoningBudgetTokens,
       drySampler: user.localModels.drySampler,
+      strictToolArgs: user.localModels.strictToolArgs,
       valueSources: localModelsValueSources(user.localModels),
       managed: { ...user.localModels.managed },
       embeddings: { ...user.localModels.embeddings },
@@ -323,6 +324,7 @@ export function loadConfig(): AtomicAgentConfig {
       approvalLevel: user.agent.approvalLevel,
       smartApproval: user.agent.smartApproval,
       smartApprovalModel: user.agent.smartApprovalModel,
+      taintReview: user.agent.taintReview,
       stablePrefixHashSalt:
         readEnv("ATOMIC_AGENT_STABLE_PREFIX_SALT") ??
         ENV_DEFAULTS.STABLE_PREFIX_SALT,
@@ -781,5 +783,24 @@ function mapUserLlmToRuntime(
     // Without this `llm.openrouter.preferCacheRoutes: false` never
     // reached the provider factory, which fell back to `true`.
     ...(llm.openrouter ? { openrouter: { ...llm.openrouter } } : {}),
+    // ATO-649: `llm.costTracking` never reached the runtime before, so a
+    // hand-set `dailyLimitUsd` did nothing.
+    ...(llm.costTracking
+      ? {
+          costTracking: {
+            enabled: llm.costTracking.enabled ?? false,
+            showInStatusBar: llm.costTracking.showInStatusBar ?? false,
+            dailyResetHourUtc: llm.costTracking.dailyResetHourUtc ?? 0,
+            ...(llm.costTracking.dailyLimitUsd !== undefined
+              ? { dailyLimitUsd: llm.costTracking.dailyLimitUsd }
+              : {}),
+            ...(llm.costTracking.onDailyLimit !== undefined
+              ? { onDailyLimit: llm.costTracking.onDailyLimit }
+              : {}),
+          },
+        }
+      : {}),
+    // Without this the router block (ATO-483) never reached the runtime.
+    ...(llm.router ? { router: llm.router } : {}),
   };
 }

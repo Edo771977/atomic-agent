@@ -30,6 +30,7 @@ import {
 import {
   applyCheckOutcomes,
   applyContractFindings,
+  CONTRACT_CHECKS_HELD,
   inspectContractProvides,
   renderContractLine,
   runContractChecks,
@@ -103,12 +104,18 @@ import {
 import type { DelegateTask } from "./delegate-args.js";
 import {
   ORCHESTRATOR_TASK_MODEL,
+  allowedModels,
   resolveTaskLegs,
   unknownModels,
   type TaskLeg,
 } from "./role-models.js";
 import { provideSearchPaths, type DelegateContract } from "./contract.js";
 import { completionCostUsd, estimateUsageCostUsd } from "../../llm/provider/usage-cost.js";
+import { applyTaskProfiles, shadowedBuiltinNote, type AppliedProfileReport } from "./task-profiles.js";
+import {
+  builtinAgentProfileSet,
+  type AgentProfileSet,
+} from "../../agent-profiles/index.js";
 import {
   FusionTurnBudget,
   ORCHESTRATOR_TASK_CAP_INSTRUCTION,
@@ -145,6 +152,7 @@ import { projectFusionArtifactEvidence } from "./artifact-evidence-output.js";
 import { readFusionWorkerMeta } from "../../session/fusion-worker-session.js";
 import { createTaskPermitPool, type TaskPermit } from "./task-permits.js";
 import { VERIFY_COPY_MAX_BYTES } from "../verify/verify-workspace-copy.js";
+import { createContractCheckHold } from "./contract-check-hold.js";
 
 export const FUSION_DELEGATE_TOOL = "fusion.delegate";
 
@@ -252,6 +260,12 @@ export interface FusionDelegateDeps extends WorkerRunnerDeps {
   localGrammarProbeFor?: LocalGrammarProbeFor;
   /** Its verdicts across fan-outs; one per tool unless injected. */
   localGrammarSmoke?: LocalGrammarSmoke;
+  /**
+   * The subagent profiles a task may name (ATO-566), loaded for the
+   * folder the fan-out runs in: built-ins, the user's, plugins' and the
+   * project's trusted ones. Absent (tests, embedders), the built-ins.
+   */
+  resolveAgentProfiles?: (workingDir: string) => AgentProfileSet;
 }
 
 /**
@@ -363,7 +377,7 @@ export function buildFusionDelegateTool(
   return {
     name: FUSION_DELEGATE_TOOL,
     description:
-      "Delegate independent parts of the work to worker agents that run concurrently. You choose how many run at once with `maxWorkers`. A task that needs more room than the default can say so with `maxSteps` / `timeoutMs`; both are clamped to a multiple of the configured default and the result tells you when that happened. An optional `contract` (owners, provides, requires, checks; candidate-only immutable checkInputs) is prepended to every brief and checked after the fan-out. Give each `provides` entry a one-line `shape` (a signature, a return shape, what a field means): it is pasted into the brief of every worker that relies on it, and matching names is not matching meaning. Args: { tasks: [{ id, instructions, title?, deliverable?, files?, etaSeconds?, maxSteps?, timeoutMs?, role?, model? }] (1..16), maxWorkers?, contract? }. To continue a run cut off by a restart: { resume: runId, confirm?: [taskId] } and nothing else.",
+      "Delegate independent parts of the work to worker agents that run concurrently. You choose how many run at once with `maxWorkers`. A task that needs more room than the default can say so with `maxSteps` / `timeoutMs`; both are clamped to a multiple of the configured default and the result tells you when that happened. An optional `contract` (owners, provides, requires, checks; candidate-only immutable checkInputs) is prepended to every brief and checked after the fan-out. Give each `provides` entry a one-line `shape` (a signature, a return shape, what a field means): it is pasted into the brief of every worker that relies on it, and matching names is not matching meaning. A task may name a subagent `profile` (built-in: explore, review, research, read-only unless a user's or project's profile of the same name overrides them; or one the user defined): the worker gets that profile's instructions and tool list. Args: { tasks: [{ id, instructions, title?, deliverable?, files?, etaSeconds?, maxSteps?, timeoutMs?, role?, model?, profile? }] (1..16), maxWorkers?, contract? }. To continue a run cut off by a restart: { resume: runId, confirm?: [taskId] } and nothing else.",
     readonly: false,
     async run(rawArgs, ctx): Promise<CompressedToolResult> {
       if (isFusionWorkerSessionId(ctx.sessionId)) {
@@ -432,6 +446,37 @@ export function buildFusionDelegateTool(
       // refuses the call; without `roles` every task is on the worker
       // leg, as before.
       const workerLegRef = { providerId: workerProviderId, model: workerModel };
+      // Subagent profiles (ATO-566): applied before the legs are picked,
+      // since a profile's model can set the task's role.
+      let profileReports: AppliedProfileReport[] = [];
+      if (parsed.tasks.some((t) => t.profile !== undefined)) {
+        let profiles: AgentProfileSet;
+        try {
+          profiles =
+            deps.resolveAgentProfiles?.(ctx.workingDir) ??
+            builtinAgentProfileSet();
+        } catch (err) {
+          deps.logger.warn("fusion: loading agent profiles failed", {
+            error: err instanceof Error ? err.message : String(err),
+          });
+          profiles = builtinAgentProfileSet();
+        }
+        if (profiles.diagnostics.length > 0) {
+          deps.logger.warn("fusion: agent profile problems", {
+            diagnostics: profiles.diagnostics,
+          });
+        }
+        const profiled = applyTaskProfiles(
+          parsed.tasks,
+          profiles,
+          allowedModels(workerLegRef, mode.roles),
+        );
+        if (!profiled.ok) {
+          return error(profiled.error, { field: "tasks", reason: "unknown-profile" });
+        }
+        parsed.tasks.splice(0, parsed.tasks.length, ...profiled.tasks);
+        profileReports = profiled.applied;
+      }
       // `model: "orchestrator"`: a worker turn on the orchestrator's own
       // leg, under every worker rule. Counted against its own per-turn
       // cap (`maxOrchestratorTasksPerTurn`), since that leg is often an
@@ -825,8 +870,11 @@ export function buildFusionDelegateTool(
       // so re-delegating a declined write is asked about again.
       const declinedInScope =
         deps.approvals.hasDeclinedUnder?.(ctx.sessionId, writeScope) ?? false;
+      // Nor after outside content (`agent.taintReview`): the standing yes
+      // was given before the text that may now be steering the fan-out.
       const alreadyApproved =
         !declinedInScope &&
+        !(deps.approvals.holdsForOutsideContent?.(ctx.sessionId, "fusion_fanout") ?? false) &&
         (deps.approvals.fanoutScopes?.turnGrantCovers(
           ctx.sessionId,
           writeScope,
@@ -1071,6 +1119,21 @@ export function buildFusionDelegateTool(
       const runSignal = capped
         ? AbortSignal.any([ctx.signal, budgetAbort.signal])
         : ctx.signal;
+      // The contract's checks run what the workers wrote: after outside
+      // content (`agent.taintReview`) they wait on one more yes, asked
+      // once for the call, whichever batch comes first (ATO-618).
+      const checkHold = createContractCheckHold({
+        runner: deps.runChecks,
+        approvals: deps.approvals,
+        approvalRequired: deps.approvalRequired,
+        sessionId: ctx.sessionId,
+        // The operator's project, not a candidate copy: rules and the prompt name it.
+        workingDir: candidateOriginalDir,
+        tool: FUSION_DELEGATE_TOOL,
+        checks: parsed.contract?.checks ?? [],
+        signal: runSignal,
+      });
+      const heldRunChecks = checkHold.runner;
       // Escalation and judge calls name the delegating session, so they
       // count in its spend readout like the workers' own calls (ATO-1388).
       const sideComplete: FusionDelegateDeps["escalationComplete"] =
@@ -1083,6 +1146,7 @@ export function buildFusionDelegateTool(
       const executionIdentities = new Map<string, string | undefined>();
       const workerDeps: FusionDelegateDeps = {
         ...deps,
+        ...(heldRunChecks === undefined ? {} : { runChecks: heldRunChecks }),
         ...(deps.knownSecrets === undefined ? {} : { knownSecrets: () => collectKnownSecrets() ?? [] }),
         ...(candidate === undefined ? {} : { ruleWorkdir: candidateOriginalDir }),
         ...(deps.resolveRoutingIdentity === undefined ? {} : { runTurn: (session, message, options) => {
@@ -1350,7 +1414,7 @@ export function buildFusionDelegateTool(
             contract: parsed.contract,
             tasks: parsed.tasks,
             concurrent: tasks.map((t) => t.id),
-            runChecks: deps.runChecks,
+            runChecks: heldRunChecks,
             ...(deps.knownSecrets === undefined
               ? {}
               : { knownSecrets: collectKnownSecrets() }),
@@ -1598,7 +1662,7 @@ export function buildFusionDelegateTool(
                 );
                 const checks = await runContractChecks(
                   childContract.checks ?? [],
-                  deps.runChecks,
+                  heldRunChecks,
                   {
                     workingDir: ctx.workingDir,
                     signal: runSignal,
@@ -1750,7 +1814,7 @@ export function buildFusionDelegateTool(
                 check.task === id && (rechecking || !gateState.checkOutcomes.has(index) || stale.has(index))
                   ? [{ check, index }] : [],
               );
-              const checks = await runContractChecks(own.map((c) => c.check), deps.runChecks, {
+              const checks = await runContractChecks(own.map((c) => c.check), heldRunChecks, {
                 workingDir: ctx.workingDir, signal: runSignal,
                 ...(deps.knownSecrets === undefined ? {} : { knownSecrets: collectKnownSecrets() }),
               });
@@ -1955,7 +2019,7 @@ export function buildFusionDelegateTool(
           );
           const checks = await runContractChecks(
             pending.map((p) => p.check),
-            deps.runChecks,
+            heldRunChecks,
             {
               workingDir: ctx.workingDir,
               signal: runSignal,
@@ -1976,6 +2040,17 @@ export function buildFusionDelegateTool(
                 })
               : [],
           );
+          // Held after outside content: each row whose own checks were
+          // among them says so, its status kept but its acceptance unverified.
+          if (checks.checksSkipped?.includes(CONTRACT_CHECKS_HELD) === true) {
+            const heldTasks = new Set(pending.flatMap((p) => (typeof p.check.task === "string" ? [p.check.task] : [])));
+            const note = `${CONTRACT_CHECKS_HELD} (acceptance unverified)`;
+            out = out.map((r) =>
+              heldTasks.has(r.id) && !(r.notes ?? []).includes(note)
+                ? { ...r, notes: [...(r.notes ?? []), note] }
+                : r,
+            );
+          }
           const byIndex = new Map(gateState.checkOutcomes);
           if (ran) {
             pending.forEach((p, i) => {
@@ -2261,6 +2336,22 @@ export function buildFusionDelegateTool(
             };
           });
         }
+        // The profile each task ran under (ATO-566), with its source and
+        // the tools it left; the shadowed-built-in note rides with it.
+        if (profileReports.length > 0) {
+          const byTask = new Map(profileReports.map((p) => [p.task, p]));
+          results = results.map((r) => {
+            const report = byTask.get(r.id);
+            if (report === undefined) return r;
+            const shadow = shadowedBuiltinNote(report.profile, report.source);
+            const notes = (report.notes ?? []).filter((n) => n === shadow);
+            return {
+              ...r,
+              profile: { name: report.profile, source: report.source, tools: report.tools },
+              ...(notes.length === 0 ? {} : { notes: [...(r.notes ?? []), ...notes] }),
+            };
+          });
+        }
         let roleSpendUsd = 0;
         for (const [providerId, pricing] of rolePricing) {
           if (pricing === undefined) continue;
@@ -2306,7 +2397,7 @@ export function buildFusionDelegateTool(
         // reading only the status merged nothing as if it were something.
         // Workers that were never served or timed out before a single step
         // count as nothing delivered too (ATO-234).
-        const candidateReport = candidate === undefined ? undefined : await candidate.finish({ rows: results, tasks: parsed.tasks, ...(parsed.contract === undefined ? {} : { contract: parsed.contract }), ...(deps.runChecks === undefined ? {} : { runChecks: deps.runChecks }), signal: runSignal });
+        const candidateReport = candidate === undefined ? undefined : await candidate.finish({ rows: results, tasks: parsed.tasks, ...(parsed.contract === undefined ? {} : { contract: parsed.contract }), ...(deps.runChecks === undefined ? {} : { runChecks: deps.runChecks, holdChecks: (signal) => checkHold.decide(signal) }), signal: runSignal });
         completedCandidateReport = candidateReport;
         terminalTaskCount = results.length;
         const outcome = delegateOutcome(results);
@@ -2418,6 +2509,7 @@ export function buildFusionDelegateTool(
               ...(escalationSpendUsd > 0 ? { escalationSpendUsd } : {}),
               ...(judgeSpendUsd > 0 ? { judgeSpendUsd } : {}),
               ...(roleSpendUsd > 0 ? { roleSpendUsd } : {}),
+              ...(profileReports.length === 0 ? {} : { profiles: profileReports }),
               ...(merges.length === 0 ? {} : { merges }),
               ...(replan === undefined ||
             (replan.pending.length === 0 &&

@@ -42,6 +42,13 @@ import {
   type RiskLevel,
   type RiskReviewer,
 } from "./risk-review.js";
+import {
+  formatTaintNote,
+  FUSION_WORKER_TAINT_SOURCE,
+  isTaintSensitive,
+  TAINT_REVIEW_LOW_REASON,
+  UntrustedTaint,
+} from "./untrusted-taint.js";
 
 export interface ApprovalRequest {
   approvalId: string;
@@ -379,6 +386,17 @@ export class ApprovalGate {
   private riskReviewer: RiskReviewer | undefined;
   /** Requests on their way back into `request` after a review (see `requestAfterReview`). */
   private readonly riskReviewed = new Set<string>();
+  /** Which sessions read outside content this turn (`untrusted-taint.ts`, ATO-618). */
+  private readonly taint = new UntrustedTaint();
+  /**
+   * Fusion worker session → its orchestrator (`followTaint`): the worker
+   * is held for what the parent read, and the parent for what it reads.
+   */
+  private readonly taintParentBySession = new Map<string, string>();
+  /** Approval ids re-entering `request` after the taint check: no silent approval. */
+  private readonly taintHeld = new Set<string>();
+  /** `agent.taintReview`, read live; off until bootstrap wires it. */
+  private taintReview: () => boolean = () => false;
 
   constructor(options: { emit: ApprovalEmitter; level?: ApprovalLevel }) {
     this.emitter = options.emit;
@@ -427,6 +445,88 @@ export class ApprovalGate {
     this.riskReviewer = reviewer;
   }
 
+  /**
+   * Live switch for the review after outside content (`agent.taintReview`,
+   * ATO-618). While it returns true, a request the level or a session
+   * grant would run silently, of a category `isTaintSensitive` names, on
+   * a session that read outside content this turn, goes to the risk
+   * reviewer and then the person instead.
+   */
+  setTaintReview(enabled: () => boolean): void {
+    this.taintReview = enabled;
+  }
+
+  /** Record that `sessionId` read outside content (`source`) in its running turn. */
+  noteUntrustedContent(sessionId: string, source: string): void {
+    this.taint.mark(sessionId, source);
+    // A worker hands its findings back as text: what it read reaches the
+    // orchestrator's context with them.
+    for (const parent of this.taintAncestors(sessionId)) {
+      this.taint.mark(parent, FUSION_WORKER_TAINT_SOURCE);
+    }
+  }
+
+  /**
+   * Link `sessionId` (a Fusion worker) to `parentSessionId` (its
+   * orchestrator) for the review after outside content, until
+   * `clearSessionGrants(sessionId)`: the worker counts as tainted while the
+   * parent is (its brief may carry what the parent read), and outside
+   * content the worker reads taints the parent too.
+   */
+  followTaint(sessionId: string, parentSessionId: string): void {
+    this.taintParentBySession.set(sessionId, parentSessionId);
+  }
+
+  /** The session's own outside sources and, for a worker, its parent's. */
+  private taintSourcesOf(sessionId: string): readonly string[] {
+    const own = this.taint.sources(sessionId);
+    const ancestors = this.taintAncestors(sessionId);
+    if (ancestors.length === 0) return own;
+    const all = new Set(own);
+    for (const parent of ancestors) {
+      for (const source of this.taint.sources(parent)) all.add(source);
+    }
+    return all.size === own.length ? own : [...all];
+  }
+
+  /** The orchestrators above `sessionId`, nearest first; a cycle stops the walk. */
+  private taintAncestors(sessionId: string): string[] {
+    const chain: string[] = [];
+    let next = this.taintParentBySession.get(sessionId);
+    while (next !== undefined && next !== sessionId && !chain.includes(next)) {
+      chain.push(next);
+      next = this.taintParentBySession.get(next);
+    }
+    return chain;
+  }
+
+  /**
+   * Whether a `category` call on `sessionId` would be held for outside
+   * content right now (`agent.taintReview` on, category sensitive, session
+   * tainted). For tools that skip the gate on their own for a call they
+   * deem harmless, like a GET under `http.approvalMode: "writes"`: on a
+   * tainted session such a call can carry data out in its URL, so the
+   * tool requests approval anyway and the hold decides (ATO-618).
+   */
+  holdsForOutsideContent(sessionId: string, category: ApprovalCategory): boolean {
+    if (!isTaintSensitive(category) || !this.taintReview()) return false;
+    return this.taintSourcesOf(sessionId).length > 0;
+  }
+
+  /**
+   * The outside sources `sessionId` (and, for a worker, its orchestrator)
+   * read this turn, for a caller that names them on its own request
+   * (a Fusion delegate's held contract checks). Empty when clean.
+   */
+  outsideContentSources(sessionId: string): readonly string[] {
+    return this.taintSourcesOf(sessionId);
+  }
+
+  /** Forget the outside content of `sessionId`'s last turn; called when a turn starts. */
+  clearUntrustedContent(sessionId: string): void {
+    this.taint.clear(sessionId);
+  }
+
   /** Remove the session's policy so its requests prompt again. */
   clearSessionPolicy(sessionId: string): void {
     this.policiesBySession.delete(sessionId);
@@ -455,7 +555,7 @@ export class ApprovalGate {
    * reset — the per-session keying already isolates other sessions). The
    * standing level is untouched: it is a durable posture, grants are not.
    * What the session's user declined this turn (`declinedInTurn`), and a
-   * worker's link to its parent's (`followDeclined`), go with them.
+   * worker's links to its parent (`followDeclined`, `followTaint`), go with them.
    */
   clearSessionGrants(sessionId?: string): void {
     this.readScopeGrants.clear(sessionId);
@@ -463,11 +563,13 @@ export class ApprovalGate {
       this.grantsBySession.clear();
       this.declinedBySession.clear();
       this.declinedParentBySession.clear();
+      this.taintParentBySession.clear();
       return;
     }
     this.grantsBySession.delete(sessionId);
     this.declinedBySession.delete(sessionId);
     this.declinedParentBySession.delete(sessionId);
+    this.taintParentBySession.delete(sessionId);
   }
 
   /**
@@ -537,8 +639,16 @@ export class ApprovalGate {
         automatic: true,
       });
     }
-    const auto = rule?.decision === "ask" ? null : this.autoApproval(request);
+    const auto =
+      rule?.decision === "ask" || this.taintHeld.has(approvalId)
+        ? null
+        : this.autoApproval(request);
     if (auto) {
+      // After outside content, a risky action is not run silently
+      // (ATO-618). A saved allow rule is the person's own narrow choice
+      // and still answers, so the hold only stands in for level and grant.
+      const sources = rule?.decision === "allow" ? null : this.taintedSources(request);
+      if (sources !== null) return this.requestAfterTaint(request, sources, signal);
       // A grant is logged for the turn summary; the standing level is not.
       if (!isAutoApprovedAt(this.level, request.category)) {
         recordAutoApproval("grant", request.category, auto.replace(/^auto-approved \((.*)\)$/, "$1"));
@@ -660,6 +770,79 @@ export class ApprovalGate {
         signal ? { signal } : {},
       );
     } finally {
+      this.riskReviewed.delete(request.approvalId);
+    }
+  }
+
+  /** The outside sources that hold `request` back, or `null` to let the auto-approval stand. */
+  private taintedSources(request: ApprovalRequest): readonly string[] | null {
+    if (!isTaintSensitive(request.category) || !this.taintReview()) return null;
+    const sources = this.taintSourcesOf(request.sessionId);
+    return sources.length > 0 ? sources : null;
+  }
+
+  /**
+   * A request held after outside content: the reviewer (when on, and the
+   * category is one it may settle) is asked whether the action serves the
+   * user's request; `low` runs it, anything else and every failure puts it
+   * to the person, skipping the level and grants. A session under a refuse
+   * policy (a Fusion worker) is reviewed too: the request is one its level
+   * or grant would have run anyway, so a `low` restores that and nothing
+   * more; any other answer, or no reviewer, gets the policy's refusal.
+   */
+  private async requestAfterTaint(
+    request: ApprovalRequest,
+    sources: readonly string[],
+    signal: AbortSignal | undefined,
+  ): Promise<ApprovalDecision> {
+    const reviewer = this.riskReviewer;
+    let consulted = false;
+    let verdict: Awaited<ReturnType<typeof runRiskReview>> = null;
+    if (
+      reviewer !== undefined &&
+      reviewer.enabled?.() !== false &&
+      isRiskReviewEligible(request.category)
+    ) {
+      consulted = true;
+      verdict = await runRiskReview(
+        reviewer,
+        { request, externalSources: sources },
+        signal ? { signal } : {},
+      );
+    }
+    if (signal?.aborted) {
+      throw new ApprovalGateError(
+        "approval aborted before a decision was made",
+        request.approvalId,
+      );
+    }
+    if (verdict?.risk === "low") {
+      recordAutoApproval(
+        "risk-review",
+        request.category,
+        verdict.reason.length > 0
+          ? `risk review after outside content: low (${verdict.reason})`
+          : "risk review after outside content: low",
+      );
+      return {
+        approvalId: request.approvalId,
+        approved: true,
+        reason: TAINT_REVIEW_LOW_REASON,
+      };
+    }
+    this.taintHeld.add(request.approvalId);
+    this.riskReviewed.add(request.approvalId);
+    try {
+      return this.request(
+        {
+          ...request,
+          riskNote: formatTaintNote(sources, consulted ? formatRiskNote(verdict) : null),
+          ...(verdict !== null ? { riskLevel: verdict.risk } : {}),
+        },
+        signal ? { signal } : {},
+      );
+    } finally {
+      this.taintHeld.delete(request.approvalId);
       this.riskReviewed.delete(request.approvalId);
     }
   }

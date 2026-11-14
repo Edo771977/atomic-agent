@@ -1,4 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// Records listeners instead of polling, so a test can play "the poll
+// never saw it": a write that lands before watchFile takes its first stat.
+const fsWatch = vi.hoisted(() => ({ silent: false }));
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...actual,
+    watchFile: ((...args: Parameters<typeof actual.watchFile>) => (fsWatch.silent ? undefined : actual.watchFile(...args))) as typeof actual.watchFile,
+  };
+});
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -98,6 +109,21 @@ describe("plugin MCP live stop (ATO-1407)", () => {
       await vi.waitFor(() => expect(manager.listServerNames()).toEqual(["demo-remote"]), { timeout: 3000, interval: 20 });
     } finally {
       unwatch();
+    }
+  });
+
+  it("notices a write that lands before the poll takes its first stat", async () => {
+    // watchFile compares against the stat it takes after it starts; a write
+    // in between is its baseline, never a change (the CI race).
+    fsWatch.silent = true;
+    const { manager, stop } = start();
+    const unwatch = stop.watch(20);
+    try {
+      setPluginCodeAllowed(stateDir, "demo", false);
+      await vi.waitFor(() => expect(manager.listServerNames()).toEqual(["demo-remote"]), { timeout: 1000, interval: 20 });
+    } finally {
+      unwatch();
+      fsWatch.silent = false;
     }
   });
 

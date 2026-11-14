@@ -275,8 +275,12 @@ export function buildOsShellTool(options: OsShellToolOptions): ToolDefinition {
       targetPaths,
       workdir: ctx.workingDir,
     };
+    // After outside content (`agent.taintReview`), the directory is no
+    // longer the operator's whole promise: the command may be steered by
+    // what the worker or its orchestrator read, so the gate's hold decides.
     const scopedByFanout =
       !dangerous &&
+      !(options.approvals.holdsForOutsideContent?.(ctx.sessionId, "shell") ?? false) &&
       (options.approvals.fanoutScopes?.allows(ctx.sessionId, [cwd]) ??
         false) &&
       !(

@@ -281,22 +281,22 @@ it("never promotes deletion or modification of ignored standalone files", async 
   } finally { await next.cleanup(); }
 });
 
-it("refuses to promote changes to the project's agent state directory", async () => {
+// One candidate per case: three full candidate cycles in a single test ran
+// past the default timeout on the Windows runner.
+it.each([
+  ["a deleted rules file", (dir: string) => rm(join(dir, ".atomic-agent", "approval-rules.json"))],
+  ["a rewritten rules file", (dir: string) => writeFile(join(dir, ".atomic-agent", "approval-rules.json"), '{"rules":[{"allow":"*"}]}')],
+  ["a new state file", (dir: string) => writeFile(join(dir, ".atomic-agent", "new-state.json"), "{}")],
+] as const)("refuses to promote changes to the project's agent state directory (%s)", async (_label, change) => {
   const root = await ignoreRepo();
-  for (const change of [
-    (dir: string) => rm(join(dir, ".atomic-agent", "approval-rules.json")),
-    (dir: string) => writeFile(join(dir, ".atomic-agent", "approval-rules.json"), '{"rules":[{"allow":"*"}]}'),
-    (dir: string) => writeFile(join(dir, ".atomic-agent", "new-state.json"), "{}"),
-  ]) {
-    const candidate = await createCandidateIntegration(root);
-    try {
-      await change(candidate.dir); await writeFile(join(candidate.dir, "a.txt"), "a2\n");
-      const report = await candidate.finish({ rows, contract, signal, runChecks: pass });
-      expect(report.status).toBe("rejected"); expect(report.reason).toContain(".atomic-agent");
-      expect(await readFile(join(root, ".atomic-agent", "approval-rules.json"), "utf8")).toBe('{"rules":[]}');
-      expect(await readFile(join(root, "a.txt"), "utf8")).toBe("a\n");
-    } finally { await candidate.cleanup(); }
-  }
+  const candidate = await createCandidateIntegration(root);
+  try {
+    await change(candidate.dir); await writeFile(join(candidate.dir, "a.txt"), "a2\n");
+    const report = await candidate.finish({ rows, contract, signal, runChecks: pass });
+    expect(report.status).toBe("rejected"); expect(report.reason).toContain(".atomic-agent");
+    expect(await readFile(join(root, ".atomic-agent", "approval-rules.json"), "utf8")).toBe('{"rules":[]}');
+    expect(await readFile(join(root, "a.txt"), "utf8")).toBe("a\n");
+  } finally { await candidate.cleanup(); }
 });
 
 it("keeps worker writes under a shared dependency folder private to the candidate, even after rejection", async () => {

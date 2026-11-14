@@ -101,7 +101,15 @@ export function createPluginMcpLiveStop(deps: PluginMcpLiveDeps): PluginMcpLiveS
     // Polled stat, not fs.watch: the store replaces the file by rename,
     // and the poll needs nothing kept open. Not persistent: never holds the process.
     watchFile(file, { interval: intervalMs, persistent: false }, listener);
-    return () => unwatchFile(file, listener);
+    // watchFile compares against the stat it takes after starting, so a
+    // write that lands before that first stat is its baseline and never a
+    // change. One catch-up check after the first interval closes the gap.
+    const catchUp = setTimeout(listener, intervalMs);
+    catchUp.unref?.();
+    return () => {
+      clearTimeout(catchUp);
+      unwatchFile(file, listener);
+    };
   };
 
   return { check, watch };

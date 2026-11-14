@@ -10,7 +10,8 @@ import {
   neutraliseRequestMarkers,
   quotedRequestTruncationNote,
 } from "../../prompt/request-section.js";
-import type { DelegateTask } from "./delegate-args.js";
+import type { AppliedAgentProfile, DelegateTask } from "./delegate-args.js";
+import { WORKER_QUESTION_RULE } from "./worker-question.js";
 import {
   renderContractBlock,
   renderContractForTask,
@@ -172,6 +173,35 @@ function quoteContract(contract: DelegateContract, taskId: string): string[] {
 }
 
 /**
+ * A subagent profile's instructions (ATO-566): how this worker works, set
+ * apart from the TASK, which says what it does. A profile that narrowed
+ * the tools says so, so a worker that misses a tool does not hunt for it.
+ */
+/**
+ * The PROFILE block's instructions on a local leg (ATO-566). A profile
+ * may carry up to 16K chars; a local worker shares one small server
+ * context with its siblings, as for `LOCAL_ORIGINAL_REQUEST_CHAR_BUDGET`,
+ * so past this the block keeps the head and says it was clipped.
+ */
+export const LOCAL_PROFILE_PROMPT_CHAR_BUDGET = 2_000;
+
+function quoteProfile(profile: AppliedAgentProfile, localLeg: boolean): string[] {
+  const clip = localLeg && profile.prompt.length > LOCAL_PROFILE_PROMPT_CHAR_BUDGET;
+  const prompt = clip
+    ? `${profile.prompt.slice(0, LOCAL_PROFILE_PROMPT_CHAR_BUDGET).trimEnd()}\n[profile instructions clipped to the first ${LOCAL_PROFILE_PROMPT_CHAR_BUDGET.toLocaleString("en-US")} of ${profile.prompt.length.toLocaleString("en-US")} chars for a local worker; the TASK and RULES are what you must follow]`
+    : profile.prompt;
+  return [
+    `PROFILE ${profile.name}${profile.source === undefined ? "" : ` (${profile.source})`} — how to work on this task; the TASK above says what to do, and the RULES below still apply.`,
+    prompt,
+    profile.tools === undefined
+      ? `This profile does not limit your tools: you have a worker's usual tools.`
+      : profile.tools.length === 0
+        ? `None of this profile's tools are known here, so you have only reply and tool discovery. If the task needs a tool, say so in your reply instead of working around it.`
+        : `This profile limits your tools to: ${profile.tools.join(", ")}. If the task needs another tool, say so in your reply instead of working around it.`,
+  ];
+}
+
+/**
  * Workers of one fan-out run side by side, so a file a sibling writes
  * may not exist yet when this worker looks for it. Measured (ATO-919): a
  * worker re-read a neighbour's not-yet-written file until the loop
@@ -212,7 +242,7 @@ export const WORKER_REPLY_RULE = [
 
 /**
  * The brief, in reading order: the frame, this worker's TASK with its
- * FILES, DELIVERABLE and contract part, the RULES, then the quoted
+ * FILES, DELIVERABLE and contract part, its subagent PROFILE, the RULES, then the quoted
  * ORIGINAL REQUEST, then one line naming the task again.
  *
  * Task first because a brief is cut from the end. The request used to
@@ -252,10 +282,14 @@ export function renderWorkerBrief(
   if (options.contract) {
     lines.push(``, ...quoteContract(options.contract, task.id));
   }
+  if (task.agentProfile) {
+    lines.push(``, ...quoteProfile(task.agentProfile, options.localLeg === true));
+  }
   lines.push(
     ``,
     `RULES:`,
-    `- Work autonomously. Never ask a question and never wait for confirmation — there is no user on this session. If something is ambiguous, take the most reasonable reading and say what you assumed in your reply.`,
+    `- Work autonomously. Never ask a question mid-task and never wait for confirmation — there is no user on this session. If something is ambiguous, take the most reasonable reading and say what you assumed in your reply.`,
+    WORKER_QUESTION_RULE,
     `- \`os.fs.write\` creates any missing parent directories itself, so \`mkdir\` is never needed before a write.`,
     `- The operator authorised this fan-out to write files AND run commands in the directories the task names, so working there needs no permission: write the files, run the build, run the tests, read the output. Anything outside them is refused, not queued: a tool result carrying "${FUSION_WORKER_APPROVAL_MARKER}" means nobody can approve it here. Stop retrying it and say in your reply exactly what was blocked and where, so the orchestrator can re-send the task with that path named — it cannot run the action for you. If the refusal also says "${FUSION_WORKER_OPERATOR_ONLY_MARKER}" (a dangerous command, the agent's own config or secret files, a mail, a password or a payment), re-sending will not help: do not try another way to do the same thing, just name the exact command or file in your reply as something only the user can run or approve.`,
     `- Read files only inside ${options.workingDir} and the directories this task writes in; a read anywhere else is refused. Do not search other projects for context — ${request.length > 0 ? "your task, its FILES and the original request are" : "your task and its FILES are"} the context you have.`,

@@ -123,6 +123,12 @@ export interface AgentLoopDependencies {
    */
   forgetDeclinedApprovals?: (sessionId: string) => void;
   /**
+   * Forget the outside content the session read in its last turn
+   * (`ApprovalGate.clearUntrustedContent`, ATO-618). Called when a turn
+   * starts only: a steer leaves the outside text in the context.
+   */
+  clearUntrustedContent?: (sessionId: string) => void;
+  /**
    * Deny every approval `sessionId` is waiting on, as nobody's decision
    * (`ApprovalGate.denyPendingForSession`). The loop calls it once a
    * task's time limit passes during a step (ATO-1367).
@@ -1071,7 +1077,7 @@ export type AgentLoopEvent =
       to: string;
       reason: string;
       /** The failure's kind, read off the error (`falloverCause`). */
-      cause?: "billing" | "auth" | "other";
+      cause?: "billing" | "auth" | "spend-limit" | "other";
       /** The failure-catalog cause behind an "away" (ATO-483). */
       failure?: FailureCauseId;
       /** The fallback link's model, when its entry names one. */

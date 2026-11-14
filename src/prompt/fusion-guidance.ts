@@ -73,7 +73,7 @@ function fusionGuidanceLines(sizing: string, sees: string): string {
     // The delegate runs the contract checks and syntax-checks every green
     // row's changed files itself (`syntax-pass.ts`); its rows say so.
     "Checks and syntax run for you; add `verify.run` on what the request must do.",
-    "Rework goes out: `failed`, `cancelled`, `needs_orchestrator` or weak work is another `fusion.delegate` saying what was wrong and what good looks like.",
+    "Rework goes out: `failed`, `cancelled`, `needs_orchestrator` or weak work is another `fusion.delegate` saying what was wrong and what good looks like; `needs_input`: answer it, re-send.",
     "Hard parts, or one that failed twice, go to `model: \"orchestrator\"` (a worker turn on your model); keep the bulk on workers.",
     // F43: the status table now says `replaced the user's file sales.csv
     // (2,401 → 9 lines)` on the row; this is what to do about it.
@@ -102,7 +102,7 @@ export function localTaskSizing(maxNewLines: number): string {
 
 /** What a worker sees, when nothing says its brief quotes less. */
 const DEFAULT_WORKER_SEES =
-  "workers see the operator's request, not this chat, and cannot ask.";
+  "workers see the operator's request, not this chat.";
 
 /**
  * What a local worker sees: its brief quotes only the head of the
@@ -110,7 +110,7 @@ const DEFAULT_WORKER_SEES =
  * from past it must be in its `instructions`. One string per leg, so
  * the prefix bytes stay stable.
  */
-const LOCAL_WORKER_SEES = `workers see only the first ~${LOCAL_WORKER_REQUEST_CHAR_BUDGET.toLocaleString("en-US")} chars of the request, not this chat, and cannot ask; put what a task needs past that in \`instructions\`.`;
+const LOCAL_WORKER_SEES = `workers see only the first ~${LOCAL_WORKER_REQUEST_CHAR_BUDGET.toLocaleString("en-US")} chars of the request, not this chat; put what a task needs past that in \`instructions\`.`;
 
 export const FUSION_GUIDANCE = fusionGuidanceLines(
   DEFAULT_TASK_SIZING,

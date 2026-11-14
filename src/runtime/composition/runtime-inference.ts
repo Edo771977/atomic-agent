@@ -14,9 +14,17 @@ import { completionUsageForTurn, type TurnUsageMeter } from "../../analytics/ind
 import type { CostAccumulator } from "../../llm/provider/cost-accumulator.js";
 import type { ResolvedModel } from "../../llm/provider/model-resolver.js";
 import type { SessionUsageLedger } from "../../session/usage-meter.js";
+import {
+  effectiveDailyLimitUsd,
+  isOverDailyLimit,
+  type DailySpendStore,
+} from "../../session/daily-spend.js";
+import { DailySpendLimitError } from "../../llm/reliability/spend-limit-error.js";
 import { isLocalServerUrl } from "../../llm/provider/openai/local-server-url.js";
+import { linkSpendBilling } from "../link-spend-billing.js";
 import { resolveModelPricingFor } from "../resolve-model-pricing.js";
 import { createRequestBudgetScope } from "../request-budget.js";
+import { createDailySpendBudget } from "../daily-spend-budget.js";
 import type { FusionTurnBudget } from "../../tools/fusion/turn-budget.js";
 import { LearnedContextWindows } from "../learned-context-windows.js";
 import { isOllamaEntry, readOllamaContextWindow } from "../../llm/provider/ollama/ollama-context-window.js";
@@ -315,6 +323,8 @@ export function connectRuntimeFallback(
     turnUsageMeter: TurnUsageMeter;
     /** Session spend and account limits for the composer readout (ATO-569). */
     sessionUsage?: SessionUsageLedger;
+    /** Today's spend over every session, and the daily ceiling's source (ATO-649). */
+    dailySpend?: DailySpendStore;
     resolveModelPricing: RuntimeModelContext["resolveModelPricing"];
     resolveCatalogContextWindow?: RuntimeModelContext["resolveCatalogContextWindow"];
     turnBudget?: FusionTurnBudget;
@@ -329,7 +339,67 @@ export function connectRuntimeFallback(
     turnUsageMeter,
     resolveModelPricing,
     sessionUsage,
+    dailySpend,
   } = deps;
+  // How a link bills, for the session readout: a local server (any kind
+  // pointed at this machine) bills nothing, a subscription CLI bills by
+  // the plan, the rest per token.
+  const linkBilling = (providerId: string): { local: boolean; plan: boolean } => {
+    const entry = resolveLlmConfig(getConfig()).providers.find((p) => p.id === providerId);
+    return {
+      local:
+        entry === undefined || entry.kind === "llama-server" || isLocalServerUrl(entry.baseUrl ?? entry.url),
+      plan: entry?.kind === "subscription-cli",
+    };
+  };
+  // How a link bills for the day total and the daily ceiling: the same
+  // rule as the turn budget (`link-spend-billing.ts`). An unpriced
+  // loopback/LAN server (Ollama, LM Studio) is free; a priced one may be
+  // a forwarding gateway to a paid service and is counted and capped.
+  const spendBilling = (providerId: string): { local: boolean; plan: boolean } => {
+    const entry = resolveLlmConfig(getConfig()).providers.find((p) => p.id === providerId);
+    const billing = linkSpendBilling(entry, entry === undefined ? undefined
+      : resolveModelPricing(entry.defaultChatModel ?? entry.model ?? null, providerId)?.pricing);
+    return { local: billing === "local", plan: billing === "plan" };
+  };
+  // ATO-649: today's total is a second ledger of the per-send request
+  // budget (`request-budget.ts`), next to the turn budget: each send holds
+  // its upper bound against the daily ceiling and the reply settles it,
+  // in the link attempt's `finish`. That runs before the seam records the
+  // session's usage, so the `usage_updated` event that follows carries
+  // the new total. Nothing else adds to the day, so no call counts twice.
+  const dailyBudget = dailySpend === undefined
+    ? undefined
+    : createDailySpendBudget(dailySpend, () => getConfig().llm?.costTracking);
+  // ATO-649: refuse a paid link once today's persisted spend reached
+  // `costTracking.dailyLimitUsd`, before anything is sent: the cheap early
+  // refusal, ahead of the request budget's per-send daily hold. Thrown
+  // from the seam's per-attempt hook. `onDailyLimit: "stop"` (default): the chain
+  // does not move on, the turn ends saying so, and every later paid call
+  // today is refused here the same way. `"local"`: the chain advances
+  // past the link (to the local model when it is in the chain) and
+  // announces the switch. Local and plan links are never refused: they
+  // are not spend. Read live, so a raised limit applies at once.
+  const dailyLimitRefusal = (providerId: string): DailySpendLimitError | null => {
+    if (!dailySpend) return null;
+    const costTracking = getConfig().llm?.costTracking;
+    const limitUsd = effectiveDailyLimitUsd(costTracking?.dailyLimitUsd);
+    if (limitUsd === null) return null;
+    const billing = spendBilling(providerId);
+    if (billing.local || billing.plan) return null;
+    const today = dailySpend.today();
+    if (!isOverDailyLimit(today, limitUsd)) return null;
+    return new DailySpendLimitError({
+      spentUsd: today.usd,
+      limitUsd,
+      providerId,
+      onLimit: costTracking?.onDailyLimit === "local" ? "local" : "stop",
+    });
+  };
+  const enforceDailySpendLimit = (providerId: string): void => {
+    const refusal = dailyLimitRefusal(providerId);
+    if (refusal !== null) throw refusal;
+  };
   // Fold one completion into its session's spend and the account's
   // limit readings (ATO-569). A local link is never priced; a cloud call
   // with no usage block and no limits has nothing to say.
@@ -342,7 +412,7 @@ export function connectRuntimeFallback(
   ): void => {
     if (!sessionUsage || !sessionId) return;
     if (!metered && !result.rateLimits?.length) return;
-    const entry = resolveLlmConfig(getConfig()).providers.find((p) => p.id === servedProviderId);
+    const billing = linkBilling(servedProviderId);
     sessionUsage.record(sessionId, {
       providerId: servedProviderId,
       modelId: result.modelId,
@@ -350,10 +420,8 @@ export function connectRuntimeFallback(
       ...(model ? { model } : {}),
       // A local server under another kind (LM Studio, Ollama, a
       // llama.cpp behind the OpenAI-compatible entry) bills nothing too.
-      local:
-        metered &&
-        (entry === undefined || entry.kind === "llama-server" || isLocalServerUrl(entry.baseUrl ?? entry.url)),
-      plan: entry?.kind === "subscription-cli",
+      local: metered && billing.local,
+      plan: billing.plan,
       ...(result.rateLimits ? { rateLimits: result.rateLimits } : {}),
     });
   };
@@ -460,14 +528,24 @@ export function connectRuntimeFallback(
     // completion has not been sent, so warm it here rather than infer
     // against it. No-op on every other attempt — one boolean after the
     // first call. See `prepareLocalLink` above.
-    prepareLink: prepareLocalLink,
-    ...(deps.turnBudget === undefined ? {} : {
+    // ATO-649: the daily ceiling is checked here too, per attempt and
+    // before the request, so no paid request leaves once it is reached
+    // (`onDailyLimit` decides whether the chain moves on).
+    prepareLink: async (providerId) => {
+      enforceDailySpendLimit(providerId);
+      await prepareLocalLink(providerId);
+    },
+    ...(deps.turnBudget === undefined && dailyBudget === undefined ? {} : {
+      // The turn budget's ledger when the owning session has request
+      // limits, and the day's whenever a day total is kept (ATO-649).
       requestBudget: (providerId, request, provider) => {
         const owner = request.budgetOwnerSessionId ?? request.sessionId;
-        if (owner === undefined || deps.turnBudget?.requestLimits(owner) === undefined) return undefined;
+        const turnLimited = owner !== undefined && deps.turnBudget?.requestLimits(owner) !== undefined;
+        if (!turnLimited && dailyBudget === undefined) return undefined;
         const entry = resolveLlmConfig(getConfig()).providers.find(p => p.id === providerId);
         return createRequestBudgetScope(deps.turnBudget, request, provider, entry,
-          resolveModelPricing(provider.chatModelId ?? entry?.defaultChatModel ?? entry?.model ?? null, providerId));
+          resolveModelPricing(provider.chatModelId ?? entry?.defaultChatModel ?? entry?.model ?? null, providerId),
+          dailyBudget);
       },
     } satisfies Pick<FallbackSeamDeps, "requestBudget">),
     recordUnaryUsage,
@@ -515,6 +593,17 @@ export function connectRuntimeFallback(
     prepareLocalLink,
     llmComplete,
     llmCompleteStream,
+    /**
+     * Today's ceiling for callers outside the fallback seam (ATO-649):
+     * `refuses` for the model router, which passes over a refused target;
+     * `enforce` and the daily ledger (`budget`) for Fusion's escalation
+     * and judge calls, which go straight to their provider.
+     */
+    dailySpendLimit: {
+      refuses: (providerId: string): boolean => dailyLimitRefusal(providerId) !== null,
+      enforce: enforceDailySpendLimit,
+      budget: dailyBudget,
+    },
   };
 }
 

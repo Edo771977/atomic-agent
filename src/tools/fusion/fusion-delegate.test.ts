@@ -2367,3 +2367,119 @@ describe("fusion.delegate — the delegate's own syntax pass", () => {
     }
   });
 });
+
+describe("fusion.delegate subagent profiles (ATO-566)", () => {
+  const roles: NonNullable<ResolvedRunMode["roles"]> = {
+    byRole: { review: { providerId: "or-sonnet", model: "sonnet", local: false } },
+    mixLocalModels: false,
+    localLegProviderIds: ["local-llama"],
+  };
+
+  it("applies a built-in profile: its brief, its read-only tools and its role's model", async () => {
+    const seen: Array<{ brief: string; providerId?: string; filter?: (n: string) => boolean }> = [];
+    const result = await buildFusionDelegateTool(
+      deps({
+        resolveRunMode: () => fusionMode({ roles }),
+        workerSupportsSlotAffinity: (id) => id === "local-llama",
+        runTurn: async (_session, brief, options) => {
+          seen.push({ brief, providerId: options.providerId, ...(options.toolFilter ? { filter: options.toolFilter } : {}) });
+          return turnResult();
+        },
+      }),
+    ).run({ tasks: [{ id: "r", instructions: "review src/a.ts", profile: "review" }] }, ctx());
+    expect(result.status).toBe("ok");
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.brief).toContain("PROFILE review");
+    expect(seen[0]!.providerId).toBe("or-sonnet");
+    expect(seen[0]!.filter?.("os.fs.read")).toBe(true);
+    expect(seen[0]!.filter?.("os.fs.write")).toBe(false);
+    expect(seen[0]!.filter?.("os.shell.run")).toBe(false);
+    expect(result.details.profiles).toEqual([
+      expect.objectContaining({ task: "r", profile: "review", source: "builtin", model: "role review" }),
+    ]);
+  });
+
+  it("refuses an unknown profile before any worker starts and uses the runtime's profile set", async () => {
+    const runTurn = vi.fn(async () => turnResult());
+    const asked: string[] = [];
+    const result = await buildFusionDelegateTool(
+      deps({
+        runTurn,
+        resolveAgentProfiles: (dir) => {
+          asked.push(dir);
+          return { profiles: [], get: () => undefined, diagnostics: [], withheld: [] };
+        },
+      }),
+    ).run({ tasks: [{ id: "x", instructions: "go", profile: "explore" }] }, ctx());
+    expect(result.status).toBe("error");
+    expect(result.summary).toContain('names profile "explore"');
+    // The tool resolves the working directory natively (D:\\repo on Windows).
+    expect(asked).toEqual([resolve("/repo")]);
+    expect(runTurn).not.toHaveBeenCalled();
+  });
+
+  it("says on the row and in the brief where a profile came from and what tools it left (a shadowed built-in)", async () => {
+    // A trusted project profile named `review` with no `tools` replaces
+    // the read-only built-in and silently gave the worker full tools.
+    const review = {
+      name: "review",
+      description: "project review",
+      prompt: "PROJECT REVIEW RULES",
+      source: "project" as const,
+      file: "/repo/.atomic-agent/agents/review.md",
+    };
+    const seen: Array<{ brief: string; filter?: (n: string) => boolean }> = [];
+    const result = await buildFusionDelegateTool(
+      deps({
+        resolveAgentProfiles: () => ({
+          profiles: [review],
+          get: (n) => (n.toLowerCase() === "review" ? review : undefined),
+          diagnostics: [],
+          withheld: [],
+        }),
+        runTurn: async (_session, brief, options) => {
+          seen.push({ brief, ...(options.toolFilter ? { filter: options.toolFilter } : {}) });
+          return turnResult();
+        },
+      }),
+    ).run({ tasks: [{ id: "r", instructions: "review src/a.ts", profile: "review" }] }, ctx());
+    expect(result.status).toBe("ok");
+    expect(seen[0]!.filter?.("os.fs.write")).toBe(true);
+    const row = (result.details.tasks as WorkerTaskResult[])[0]!;
+    expect(row.profile).toEqual({ name: "review", source: "project", tools: "all" });
+    expect(row.notes?.join("\n")).toMatch(/profile review \(project\) overrides the built-in review and does not limit tools/);
+    expect(seen[0]!.brief).toContain("PROFILE review (project)");
+    expect(seen[0]!.brief).toContain("This profile does not limit your tools");
+    expect(result.details.profiles).toEqual([
+      expect.objectContaining({ task: "r", source: "project", tools: "all" }),
+    ]);
+  });
+
+  it("puts a built-in profile's source and narrowed tools on its row", async () => {
+    const result = await buildFusionDelegateTool(deps()).run(
+      { tasks: [{ id: "e", instructions: "find the parser", profile: "explore" }] },
+      ctx(),
+    );
+    const row = (result.details.tasks as WorkerTaskResult[])[0]!;
+    expect(row.profile).toMatchObject({ name: "explore", source: "builtin" });
+    expect(Array.isArray(row.profile?.tools)).toBe(true);
+  });
+
+  it("loads no profiles and changes nothing when no task names one", async () => {
+    const resolveAgentProfiles = vi.fn();
+    let filter: ((n: string) => boolean) | undefined;
+    const result = await buildFusionDelegateTool(
+      deps({
+        resolveAgentProfiles,
+        runTurn: async (_s, _b, options) => {
+          filter = options.toolFilter;
+          return turnResult();
+        },
+      }),
+    ).run({ tasks: TASKS }, ctx());
+    expect(result.status).toBe("ok");
+    expect(resolveAgentProfiles).not.toHaveBeenCalled();
+    expect(filter?.("os.fs.write")).toBe(true);
+    expect(result.details).not.toHaveProperty("profiles");
+  });
+});
