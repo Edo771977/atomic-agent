@@ -271,6 +271,13 @@ export interface WorkerTaskResult {
   /** Escalations that reached the worker (advisor hints, a re-run), for the outcome log. */
   escalations?: number;
   /**
+   * The subagent profile the task ran under (ATO-566): its name, where
+   * it came from and the tools it left the worker (`"all"`: not
+   * narrowed), so a user's or project's profile shadowing a read-only
+   * built-in is visible on the row.
+   */
+  profile?: { name: string; source: string; tools: readonly string[] | "all" };
+  /**
    * The worker's question to the orchestrator, on a `needs_input` row
    * (ATO-945); at most `MAX_WORKER_QUESTION_CHARS`.
    */

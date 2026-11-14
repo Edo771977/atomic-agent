@@ -21,7 +21,7 @@ Project files follow [project folder trust](../skills/docs/project-trust.md): ea
 
 ## Built-ins
 
-[builtin-profiles.ts](builtin-profiles.ts): `explore` (find code, role `explore`), `review` (find bugs, role `review`, keeps `verify.*`), `research` (web and local files, role `explore`). All three are read-only: no writes, no shell, no browser clicks or typing. A trusted project file or a user file of the same name replaces one.
+[builtin-profiles.ts](builtin-profiles.ts): `explore` (find code, role `explore`), `review` (find bugs, role `review`, keeps `verify.*`), `research` (web and local files, role `explore`). All three are read-only: no writes, no shell, no browser clicks or typing. A trusted project file or a user file of the same name replaces one, and with no `tools` list that replacement is not read-only: the task row's `profile` (`{ name, source, tools }`, `tools: "all"`), a row note and the brief's `PROFILE <name> (<source>)` block say so.
 
 ## Wiring
 

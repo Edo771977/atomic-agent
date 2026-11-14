@@ -3,6 +3,7 @@ import {
   type FusionRole,
 } from "../../config/llm-run-mode-config.js";
 import {
+  BUILTIN_AGENT_PROFILES,
   compileToolAllowlist,
   type AgentProfileSet,
 } from "../../agent-profiles/index.js";
@@ -32,9 +33,21 @@ export interface AppliedProfileReport {
   source: string;
   /** What the profile's `model` did, when it had one. */
   model?: string;
-  /** The allowlist patterns, when the profile narrowed the tools. */
-  tools?: readonly string[];
+  /**
+   * The tools the worker ends up with: the allowlist patterns when the
+   * profile narrowed them, `"all"` when it kept the worker's usual tools.
+   */
+  tools: readonly string[] | "all";
   notes?: string[];
+}
+
+/**
+ * The note for a user's, plugin's or project's profile that takes a
+ * built-in's name without a `tools` list: the built-in was read-only,
+ * this one is not, and nothing else would say so.
+ */
+export function shadowedBuiltinNote(name: string, source: string): string {
+  return `profile ${name} (${source}) overrides the built-in ${name} and does not limit tools: the worker had its usual tools`;
 }
 
 export type ApplyTaskProfilesResult =
@@ -87,9 +100,17 @@ export function applyTaskProfiles(
           : `unknown tools ignored: ${compiled.unknown.join(", ")}`,
       );
     }
+    if (
+      compiled.allows === undefined &&
+      profile.source !== "builtin" &&
+      BUILTIN_AGENT_PROFILES.some((b) => b.name === profile.name)
+    ) {
+      notes.push(shadowedBuiltinNote(profile.name, profile.source));
+    }
     next.agentProfile = {
       name: profile.name,
       prompt: profile.prompt,
+      source: profile.source,
       ...(compiled.allows === undefined ? {} : { tools: compiled.patterns }),
     };
     applied.push({
@@ -97,7 +118,7 @@ export function applyTaskProfiles(
       profile: profile.name,
       source: profile.source,
       ...(modelNote === undefined ? {} : { model: modelNote }),
-      ...(compiled.allows === undefined ? {} : { tools: compiled.patterns }),
+      tools: compiled.allows === undefined ? "all" : compiled.patterns,
       ...(notes.length === 0 ? {} : { notes }),
     });
     return next;

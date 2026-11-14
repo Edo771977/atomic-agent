@@ -109,7 +109,7 @@ import {
 } from "./role-models.js";
 import { provideSearchPaths, type DelegateContract } from "./contract.js";
 import { completionCostUsd, estimateUsageCostUsd } from "../../llm/provider/usage-cost.js";
-import { applyTaskProfiles, type AppliedProfileReport } from "./task-profiles.js";
+import { applyTaskProfiles, shadowedBuiltinNote, type AppliedProfileReport } from "./task-profiles.js";
 import {
   builtinAgentProfileSet,
   type AgentProfileSet,
@@ -371,7 +371,7 @@ export function buildFusionDelegateTool(
   return {
     name: FUSION_DELEGATE_TOOL,
     description:
-      "Delegate independent parts of the work to worker agents that run concurrently. You choose how many run at once with `maxWorkers`. A task that needs more room than the default can say so with `maxSteps` / `timeoutMs`; both are clamped to a multiple of the configured default and the result tells you when that happened. An optional `contract` (owners, provides, requires, checks) is prepended to every brief and checked after the fan-out. Give each `provides` entry a one-line `shape` (a signature, a return shape, what a field means): it is pasted into the brief of every worker that relies on it, and matching names is not matching meaning. A task may name a subagent `profile` (built-in: explore, review, research, all read-only; or one the user defined): the worker gets that profile's instructions and tool list. Args: { tasks: [{ id, instructions, title?, deliverable?, files?, etaSeconds?, maxSteps?, timeoutMs?, role?, model?, profile? }] (1..16), maxWorkers?, contract? }. To continue a run cut off by a restart: { resume: runId, confirm?: [taskId] } and nothing else.",
+      "Delegate independent parts of the work to worker agents that run concurrently. You choose how many run at once with `maxWorkers`. A task that needs more room than the default can say so with `maxSteps` / `timeoutMs`; both are clamped to a multiple of the configured default and the result tells you when that happened. An optional `contract` (owners, provides, requires, checks) is prepended to every brief and checked after the fan-out. Give each `provides` entry a one-line `shape` (a signature, a return shape, what a field means): it is pasted into the brief of every worker that relies on it, and matching names is not matching meaning. A task may name a subagent `profile` (built-in: explore, review, research, read-only unless a user's or project's profile of the same name overrides them; or one the user defined): the worker gets that profile's instructions and tool list. Args: { tasks: [{ id, instructions, title?, deliverable?, files?, etaSeconds?, maxSteps?, timeoutMs?, role?, model?, profile? }] (1..16), maxWorkers?, contract? }. To continue a run cut off by a restart: { resume: runId, confirm?: [taskId] } and nothing else.",
     readonly: false,
     async run(rawArgs, ctx): Promise<CompressedToolResult> {
       if (isFusionWorkerSessionId(ctx.sessionId)) {
@@ -2221,6 +2221,22 @@ export function buildFusionDelegateTool(
               ...r,
               model: leg.model,
               ...(leg.role === undefined ? {} : { modelRole: leg.role }),
+              ...(notes.length === 0 ? {} : { notes: [...(r.notes ?? []), ...notes] }),
+            };
+          });
+        }
+        // The profile each task ran under (ATO-566), with its source and
+        // the tools it left; the shadowed-built-in note rides with it.
+        if (profileReports.length > 0) {
+          const byTask = new Map(profileReports.map((p) => [p.task, p]));
+          results = results.map((r) => {
+            const report = byTask.get(r.id);
+            if (report === undefined) return r;
+            const shadow = shadowedBuiltinNote(report.profile, report.source);
+            const notes = (report.notes ?? []).filter((n) => n === shadow);
+            return {
+              ...r,
+              profile: { name: report.profile, source: report.source, tools: report.tools },
               ...(notes.length === 0 ? {} : { notes: [...(r.notes ?? []), ...notes] }),
             };
           });

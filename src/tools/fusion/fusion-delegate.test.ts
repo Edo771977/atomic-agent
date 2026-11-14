@@ -2343,6 +2343,53 @@ describe("fusion.delegate subagent profiles (ATO-566)", () => {
     expect(runTurn).not.toHaveBeenCalled();
   });
 
+  it("says on the row and in the brief where a profile came from and what tools it left (a shadowed built-in)", async () => {
+    // A trusted project profile named `review` with no `tools` replaces
+    // the read-only built-in and silently gave the worker full tools.
+    const review = {
+      name: "review",
+      description: "project review",
+      prompt: "PROJECT REVIEW RULES",
+      source: "project" as const,
+      file: "/repo/.atomic-agent/agents/review.md",
+    };
+    const seen: Array<{ brief: string; filter?: (n: string) => boolean }> = [];
+    const result = await buildFusionDelegateTool(
+      deps({
+        resolveAgentProfiles: () => ({
+          profiles: [review],
+          get: (n) => (n.toLowerCase() === "review" ? review : undefined),
+          diagnostics: [],
+          withheld: [],
+        }),
+        runTurn: async (_session, brief, options) => {
+          seen.push({ brief, ...(options.toolFilter ? { filter: options.toolFilter } : {}) });
+          return turnResult();
+        },
+      }),
+    ).run({ tasks: [{ id: "r", instructions: "review src/a.ts", profile: "review" }] }, ctx());
+    expect(result.status).toBe("ok");
+    expect(seen[0]!.filter?.("os.fs.write")).toBe(true);
+    const row = (result.details.tasks as WorkerTaskResult[])[0]!;
+    expect(row.profile).toEqual({ name: "review", source: "project", tools: "all" });
+    expect(row.notes?.join("\n")).toMatch(/profile review \(project\) overrides the built-in review and does not limit tools/);
+    expect(seen[0]!.brief).toContain("PROFILE review (project)");
+    expect(seen[0]!.brief).toContain("This profile does not limit your tools");
+    expect(result.details.profiles).toEqual([
+      expect.objectContaining({ task: "r", source: "project", tools: "all" }),
+    ]);
+  });
+
+  it("puts a built-in profile's source and narrowed tools on its row", async () => {
+    const result = await buildFusionDelegateTool(deps()).run(
+      { tasks: [{ id: "e", instructions: "find the parser", profile: "explore" }] },
+      ctx(),
+    );
+    const row = (result.details.tasks as WorkerTaskResult[])[0]!;
+    expect(row.profile).toMatchObject({ name: "explore", source: "builtin" });
+    expect(Array.isArray(row.profile?.tools)).toBe(true);
+  });
+
   it("loads no profiles and changes nothing when no task names one", async () => {
     const resolveAgentProfiles = vi.fn();
     let filter: ((n: string) => boolean) | undefined;

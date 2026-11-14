@@ -153,6 +153,8 @@ export interface AppliedAgentProfile {
   name: string;
   prompt: string;
   tools?: readonly string[];
+  /** Where it came from (`builtin`, `user`, `plugin`, `project`); named in the brief. */
+  source?: string;
 }
 
 export type ParsedDelegateArgs =

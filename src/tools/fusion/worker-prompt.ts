@@ -191,11 +191,11 @@ function quoteProfile(profile: AppliedAgentProfile, localLeg: boolean): string[]
     ? `${profile.prompt.slice(0, LOCAL_PROFILE_PROMPT_CHAR_BUDGET).trimEnd()}\n[profile instructions clipped to the first ${LOCAL_PROFILE_PROMPT_CHAR_BUDGET.toLocaleString("en-US")} of ${profile.prompt.length.toLocaleString("en-US")} chars for a local worker; the TASK and RULES are what you must follow]`
     : profile.prompt;
   return [
-    `PROFILE ${profile.name} — how to work on this task; the TASK above says what to do, and the RULES below still apply.`,
+    `PROFILE ${profile.name}${profile.source === undefined ? "" : ` (${profile.source})`} — how to work on this task; the TASK above says what to do, and the RULES below still apply.`,
     prompt,
-    ...(profile.tools === undefined
-      ? []
-      : [`This profile limits your tools to: ${profile.tools.join(", ")}. If the task needs another tool, say so in your reply instead of working around it.`]),
+    profile.tools === undefined
+      ? `This profile does not limit your tools: you have a worker's usual tools.`
+      : `This profile limits your tools to: ${profile.tools.join(", ")}. If the task needs another tool, say so in your reply instead of working around it.`,
   ];
 }
 

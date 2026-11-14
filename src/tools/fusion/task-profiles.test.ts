@@ -5,6 +5,8 @@ import type { DelegateTask } from "./delegate-args.js";
 import { applyTaskProfiles } from "./task-profiles.js";
 import { isWorkerVisibleTool, workerToolFilterFor } from "./worker-tool-policy.js";
 import { renderWorkerBrief } from "./worker-prompt.js";
+import { DEFAULT_TOOL_DESCRIPTORS_B } from "../../prompt/default-tool-descriptors-b.js";
+import { buildFusionDelegateTool, type FusionDelegateDeps } from "./fusion-delegate.js";
 
 const ALLOWED = [
   { providerId: "local", model: "qwen-worker" },
@@ -140,5 +142,16 @@ describe("renderWorkerBrief with a profile (ATO-566)", () => {
 
   it("is unchanged for a task without a profile", () => {
     expect(renderWorkerBrief(task(), { workingDir: "/w" })).not.toContain("PROFILE");
+  });
+});
+
+describe("the profile wording the planner reads (ATO-566)", () => {
+  it("never promises a built-in name is read-only: a user's or project's profile can override it", () => {
+    const descriptor = DEFAULT_TOOL_DESCRIPTORS_B.find((d) => d.name === "fusion.delegate")!;
+    const description = buildFusionDelegateTool({} as FusionDelegateDeps).description;
+    for (const text of [descriptor.argsSchema, description]) {
+      expect(text).not.toContain("all read-only");
+      expect(text).toMatch(/read-only unless (a user's or project's profile|overridden)/);
+    }
   });
 });
