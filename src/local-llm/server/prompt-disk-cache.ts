@@ -20,7 +20,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { resolvePromptCacheDir } from "../backend-paths.js";
@@ -89,7 +89,21 @@ export function statModelFile(modelPath: string): { size: number; mtimeMs: numbe
   }
 }
 
-/** The `--slot-save-path` flag for a launch with the cache on; creates the folder. */
+/** Owner-only, best effort (a no-op on Windows): the saves hold whole prompts' token ids. */
+function ownerOnly(path: string, mode: 0o700 | 0o600): void {
+  try {
+    chmodSync(path, mode);
+  } catch {
+    /* gone, or a filesystem without modes */
+  }
+}
+
+/**
+ * The `--slot-save-path` flag for a launch with the cache on. Creates the
+ * folder and, every time, makes it and the saves in it the owner's only:
+ * `mkdir`'s mode covers a fresh folder alone, and llama-server writes its
+ * state files with its umask.
+ */
 export function promptCacheLaunchArgs(dataDir: string): string[] {
   const dir = resolvePromptCacheDir(dataDir);
   try {
@@ -97,7 +111,34 @@ export function promptCacheLaunchArgs(dataDir: string): string[] {
   } catch {
     return [];
   }
+  ownerOnly(dir, 0o700);
+  try {
+    for (const name of readdirSync(dir)) ownerOnly(join(dir, name), 0o600);
+  } catch {
+    /* listed next launch */
+  }
   return ["--slot-save-path", dir];
+}
+
+/** Delete the saved prompt caches and their folder; nothing to do when absent. */
+export function purgePromptCache(dataDir: string): void {
+  try {
+    rmSync(resolvePromptCacheDir(dataDir), { recursive: true, force: true });
+  } catch {
+    /* best effort: the next launch with the cache off tries again */
+  }
+}
+
+/**
+ * The prompt cache at a launch, by `localModels.managed.promptDiskCache`:
+ * on, the `--slot-save-path` flag; off, what an earlier run saved is
+ * deleted (it holds old prompts and nothing would ever read or evict it);
+ * `null` (the setting could not be read) touches nothing.
+ */
+export function promptCacheAtLaunch(dataDir: string, enabled: boolean | null): string[] {
+  if (enabled === true) return promptCacheLaunchArgs(dataDir);
+  if (enabled === false) purgePromptCache(dataDir);
+  return [];
 }
 
 interface SavedFingerprint {
@@ -268,6 +309,9 @@ export async function savePromptCaches(opts: {
       removeSave(dir, filename);
       continue;
     }
+    // The server wrote the state with its umask.
+    ownerOnly(join(dir, filename), 0o600);
+    ownerOnly(join(dir, `${filename}.ckpt`), 0o600);
     try {
       const saved: SavedFingerprint = { fingerprint: opts.fingerprint, tokens, savedAt: now() };
       writeFileSync(join(dir, `${filename}${FINGERPRINT_SUFFIX}`), JSON.stringify(saved), { mode: 0o600 });

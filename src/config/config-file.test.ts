@@ -12,7 +12,7 @@ import { dirname, join, sep } from "node:path";
 
 import { getApprovalRulesPath } from "../approval/approval-rules-store.js";
 import { resolveSessionPath } from "../atomic-mail/atomic-mail-store.js";
-import { resolveApiKeyFilePath } from "../local-llm/backend-paths.js";
+import { resolveApiKeyFilePath, resolvePromptCacheDir } from "../local-llm/backend-paths.js";
 import { coreSessionPath } from "../local-llm/core/core-state.js";
 import { userHooksPath } from "../hooks/hook-config.js";
 import { installedPluginDir, pluginsRoot } from "../plugins/plugin-store.js";
@@ -980,6 +980,8 @@ describe("the state's secret files (ATO-877)", () => {
       coreSessionPath(paths.localModelsDataDir, "chat"),
       coreSessionPath(paths.localModelsDataDir, "embedding"),
       resolveSessionPath(stateDir),
+      // A directory entry: the saved prompt caches hold whole prompts' tokens.
+      resolvePromptCacheDir(paths.localModelsDataDir) + sep,
     ]);
     expect(getStateSecretPaths(paths)).toContain(getDotenvPath(stateDir));
     expect(getStateSecretPaths(paths)).toContain(paths.userConfigFile);
