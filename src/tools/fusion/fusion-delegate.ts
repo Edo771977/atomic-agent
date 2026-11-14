@@ -139,7 +139,7 @@ import { measuredTaskLegs, readRoutingHistory } from "./measured-routing.js";
 import { collectTaskArtifactManifests } from "./artifact-manifest-tasks.js";
 import { createCandidateIntegration, type CandidateIntegration, type CandidateIntegrationReport } from "./candidate-integration.js";
 import { readFusionWorkerMeta } from "../../session/fusion-worker-session.js";
-import { createTaskPermitPool } from "./task-permits.js";
+import { createTaskPermitPool, type TaskPermit } from "./task-permits.js";
 
 export const FUSION_DELEGATE_TOOL = "fusion.delegate";
 
@@ -663,20 +663,45 @@ export function buildFusionDelegateTool(
           leg.orchestrator === true ? ORCHESTRATOR_TASK_MAX_WIDTH : Number.POSITIVE_INFINITY));
       // The call's ceiling spans all active legs; an unused main local
       // pool cannot serialize tasks assigned exclusively to cloud roles.
-      const capacity = Math.min(legTaskCount, workerLegMaxWorkers) +
-        [...roleLegs.values()].reduce((sum, leg) => {
-          const count = parsed.tasks.filter((t) => {
-            const own = taskLegs.get(t.id);
-            return own?.isWorkerLeg === false && own.providerId === leg.providerId;
-          }).length;
-          return sum + (count === 0 ? 0 : roleLegWidth(leg, count));
-        }, 0);
+      // With no width named or pinned, every slot-affine (local) leg —
+      // the main one and any local role leg — shares the one-worker
+      // default above: they draw on the same GPU, so a local role leg
+      // beside the local main leg must not double it.
+      const shareLocalCeiling = parsed.maxWorkers === undefined && !mode.workersPinned;
+      let localWidth = slotAffine ? Math.min(legTaskCount, workerLegMaxWorkers) : 0;
+      let cloudWidth = slotAffine ? 0 : Math.min(legTaskCount, workerLegMaxWorkers);
+      for (const leg of roleLegs.values()) {
+        const count = parsed.tasks.filter((t) => {
+          const own = taskLegs.get(t.id);
+          return own?.isWorkerLeg === false && own.providerId === leg.providerId;
+        }).length;
+        if (count === 0) continue;
+        if (deps.workerSupportsSlotAffinity(leg.providerId)) localWidth += roleLegWidth(leg, count);
+        else cloudWidth += roleLegWidth(leg, count);
+      }
+      const capacity = cloudWidth + (shareLocalCeiling ? Math.min(1, localWidth) : localWidth);
       // A named `maxWorkers` is the call's explicit ceiling. A call that
       // named none is bounded by the active legs alone: the local default
       // of one worker (or `runMode.workers`) is the MAIN leg's width
       // above, never a ceiling on role-model or orchestrator legs.
       const maxWorkers = Math.max(1, Math.min(parsed.maxWorkers === undefined ? capacity : wanted, capacity));
       const permits = createTaskPermitPool(maxWorkers);
+      // The shared local ceiling: a local leg takes its local permit
+      // first, then a call-wide one, so a task waiting for the GPU never
+      // holds a call-wide permit a cloud task could use.
+      const localPermits = createTaskPermitPool(1);
+      const acquireLocalPermit = async (signal: AbortSignal): Promise<TaskPermit | undefined> => {
+        const local = await localPermits.acquire(signal);
+        if (local === undefined) return undefined;
+        const call = await permits.acquire(signal);
+        if (call === undefined) {
+          local.release();
+          return undefined;
+        }
+        return { waitMs: local.waitMs + call.waitMs, release: () => { call.release(); local.release(); } };
+      };
+      const acquirePermitFor = (local: boolean): ((signal: AbortSignal) => Promise<TaskPermit | undefined>) =>
+        shareLocalCeiling && local ? acquireLocalPermit : permits.acquire;
       // Binding is judged on the MAIN leg alone, whatever role legs run
       // beside it: its own tasks against its own width. The cloud cap
       // binds when it, not the requested width, cut that leg down…
@@ -1359,7 +1384,7 @@ export function buildFusionDelegateTool(
             tasks,
             concurrentTaskIds,
             maxWorkers: workerLegMaxWorkers,
-            acquireTaskPermit: permits.acquire,
+            acquireTaskPermit: acquirePermitFor(slotAffine),
             providerId: workerProviderId,
             workerModel,
             workerMaxSteps: mode.workerMaxSteps,
@@ -1422,7 +1447,7 @@ export function buildFusionDelegateTool(
             tasks,
             concurrentTaskIds,
             maxWorkers: Math.min(maxWorkers, roleLegWidth(leg, tasks.length)),
-            acquireTaskPermit: permits.acquire,
+            acquireTaskPermit: acquirePermitFor(local),
             providerId: leg.providerId,
             workerModel:
               onlyRole === "-" ? leg.model : `${leg.model} (${onlyRole})`,

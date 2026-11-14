@@ -36,6 +36,9 @@ function harness(over: Partial<FusionDelegateDeps> = {}, resolved = mode()) {
   const started: string[] = [];
   const pending: Array<() => void> = [];
   const perProvider = new Map<string, number>();
+  // Running turns' providers, sampled at every start.
+  const snapshots: string[][] = [];
+  const running: string[] = [];
   const peaks = new Map<string, number>();
   const deps: FusionDelegateDeps = {
     createEphemeralSession: (meta) => createEmptySessionState({ id: `__fusion_worker__${++minted}`, workingDir: dir, metadata: { fusionWorker: meta } }),
@@ -43,6 +46,8 @@ function harness(over: Partial<FusionDelegateDeps> = {}, resolved = mode()) {
       const id = (session.metadata?.fusionWorker as { taskId: string }).taskId;
       const provider = options.providerId!;
       started.push(id);
+      running.push(provider);
+      snapshots.push([...running]);
       active++;
       peak = Math.max(peak, active);
       perProvider.set(provider, (perProvider.get(provider) ?? 0) + 1);
@@ -58,6 +63,7 @@ function harness(over: Partial<FusionDelegateDeps> = {}, resolved = mode()) {
         return { session, reason: "reply", stepCount: 1 } satisfies RunTurnResult;
       } finally {
         active--;
+        running.splice(running.indexOf(provider), 1);
         perProvider.set(provider, perProvider.get(provider)! - 1);
       }
     },
@@ -72,6 +78,8 @@ function harness(over: Partial<FusionDelegateDeps> = {}, resolved = mode()) {
     start: (tasks: DelegateTask[], maxWorkers: number | undefined, signal = new AbortController().signal, sessionId = "parent") =>
       tool.run(maxWorkers === undefined ? { tasks } : { tasks, maxWorkers }, { workingDir: dir, sessionId, stepIndex: 0, signal }),
     started, pending, peaks,
+    /** The most turns on `providers` that ever ran at once. */
+    localPeak: (providers: ReadonlySet<string>) => Math.max(0, ...snapshots.map((s) => s.filter((p) => providers.has(p)).length)),
     get active() { return active; }, get peak() { return peak; }, get minted() { return minted; },
     async drain(count: number) {
       for (let i = 0; i < count; i++) {
@@ -147,6 +155,22 @@ describe("fusion.delegate call-wide concurrency", () => {
     expect(h.peaks.get("main")).toBe(1);
     expect(h.peaks.get("builder")).toBe(2);
     expect(h.peaks.get("reviewer")).toBe(1);
+  });
+
+  it("an unnamed width runs one local worker at a time across the main and local role legs", async () => {
+    const local = new Set(["main", "builder"]);
+    const h = harness({ workerSupportsSlotAffinity: (p) => local.has(p), slotManager: { poolSize: () => 4 } },
+      mode({ workersPinned: false, roles: { byRole: { build: { ...role("builder"), local: true }, review: role("reviewer") }, mixLocalModels: true, localLegProviderIds: ["builder"] } }));
+    const tasks = [main, { ...main, id: "main2" }, build, { ...build, id: "build2" }, review];
+    const running = h.start(tasks, undefined);
+    await vi.waitFor(() => expect(h.active).toBe(2));
+    await tick();
+    // The GPU's one worker plus the cloud reviewer.
+    expect(h.active).toBe(2);
+    expect(h.started).toContain("review");
+    await h.drain(tasks.length);
+    expect((await running).details.maxWorkers).toBe(2);
+    expect(h.localPeak(local)).toBe(1);
   });
 
   it("an unnamed width on a cloud main leg applies workers to that leg only", async () => {
