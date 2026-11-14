@@ -48,10 +48,17 @@ it.each([
   ["linux", "/home/u/project", "file://localhost/home/u/project/check.mjs"],
   ["win32", "C:\\Users\\u\\my project", "file:///C:/Users/u/my%20project/check.mjs"],
   ["win32", "\\\\server\\share\\project", "file://server/share/project/check.mjs"],
+  ["win32", "C:\\Users\\u\\my project", "file:/C:/Users/u/my%20project/check.mjs"],
+  ["win32", "C:\\Users\\u\\my project", "file:C:/Users/u/my%20project/check.mjs"],
+  ["linux", "/home/u/my project", "FiLe:/home/u/my%20project/check.mjs"],
+  ["linux", "/home/u/my project", "file:home/u/my%20project/check.mjs"],
 ] as const)("refuses an explicit %s source file URL with native path semantics", (platform, root, url) => {
   expect(() => rebaseVerifyWorkspaceValue(`new URL('${url}')`, root, "/private/checked", platform)).toThrow(/unsupported absolute project reference/);
 });
 it("preserves external and sibling file URLs", () => {
-  const text = "file:///backup/home/u/project/a.js file:///home/u/project-sibling/a.js";
+  const text = "file:///backup/home/u/project/a.js file:///home/u/project-sibling/a.js file:/home/u/project-sibling/a.js file:backup/home/u/project/a.js";
   expect(rebaseVerifyWorkspaceValue(text, "/home/u/project", "/private/checked", "linux")).toBe(text);
+});
+it("refuses malformed file URI plans before execution", () => {
+  expect(() => rebaseVerifyWorkspaceValue("file:///%GG/project/a.js", "/home/u/project", "/private/checked", "linux")).toThrow(/unsupported absolute project reference/);
 });

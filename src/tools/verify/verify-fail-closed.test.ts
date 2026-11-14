@@ -30,10 +30,11 @@ afterEach(async () => {
 });
 
 describe("verify refuses to execute without a private workspace", () => {
-  it("refuses a source file URL instead of passing a check that reads outside its execution copy", async () => {
+  it.each(["canonical", "single-slash", "no-slash"] as const)("refuses a %s source file URL instead of passing a check that reads outside its execution copy", async spelling => {
     const execution = join(dir, "execution"); await mkdir(execution);
     await writeFile(join(execution, "original.txt"), "execution-copy");
-    const url = pathToFileURL(join(dir, "original.txt")).href;
+    const canonical = pathToFileURL(join(dir, "original.txt")).href;
+    const url = spelling === "single-slash" ? canonical.replace(/^file:\/\/\//, "file:/") : spelling === "no-slash" ? canonical.replace(/^file:\/\/\//, "file:") : canonical;
     const runner = vi.spyOn(commands, "runCommandKind");
     const result = await runVerify({ kind: "command", cmd: process.execPath,
       args: ["-e", `process.stdout.write(require('node:fs').readFileSync(new URL(${JSON.stringify(url)}),'utf8'))`], network: true },
