@@ -25,6 +25,8 @@ const fake = vi.hoisted(() => ({
   duringTask: null as null | (() => void),
   /** `models use <id>` of this id throws (a restore that fails). */
   useThrowsFor: null as string | null,
+  /** The running chat daemon's launch record (`readLaunchRecord`). */
+  launch: null as null | { modelId: string; promptCacheFingerprint: string | null },
 }));
 
 vi.mock("./models-handlers.js", async (importOriginal) => {
@@ -70,6 +72,7 @@ vi.mock("../local-llm/index.js", async (importOriginal) => {
   return {
     ...actual,
     getDaemonStatus: vi.fn(async () => ({ running: fake.chat, pid: fake.chat ? 77 : null })),
+    readLaunchRecord: vi.fn((_dir: string, pid: number | null) => (pid === null ? null : fake.launch)),
     getEmbeddingDaemonStatus: vi.fn(async () => ({ running: fake.emb, pid: fake.emb ? 78 : null })),
     stopEmbeddingDaemon: vi.fn(async () => {
       fake.calls.push(["stop-embedding", null]);
@@ -98,6 +101,7 @@ vi.mock("../fit-test/index.js", async (importOriginal) => {
 
 import { runModelsFitTest } from "./models-fit-test-command.js";
 import { modelsCommand } from "./models-command.js";
+import { releaseSuspendedChatBeforeTui } from "./models-fit-test-restore.js";
 
 let stateDir: string;
 let tasksPath: string;
@@ -134,7 +138,7 @@ beforeEach(() => {
       ],
     }),
   );
-  Object.assign(fake, { chat: true, emb: false, embWanted: true, calls: [], duringTask: null, useThrowsFor: null });
+  Object.assign(fake, { chat: true, emb: false, embWanted: true, calls: [], duringTask: null, useThrowsFor: null, launch: null });
   stdout = "";
   stderr = "";
   vi.spyOn(process.stdout, "write").mockImplementation((chunk: string | Uint8Array) => {
@@ -174,8 +178,13 @@ describe("models fit-test and the user's prompt caches", () => {
     // Every later stop is a test model's (or the restore's): nothing saved.
     expect(stops.length).toBeGreaterThan(1);
     for (const stop of stops.slice(1)) expect(stop.savePromptCache).toBe(false);
-    // Test models start without a save path, restore or purge; the user's comes back as usual.
-    expect(callsOf("start")).toEqual([{ promptCache: "suspend" }, { promptCache: "suspend" }, { promptCache: null }]);
+    // Test models start without a save path, restore or purge. So does the
+    // user's model when it is put back: `models start` launches it with
+    // other flags than the TUI's or the desktop's launch (growing window,
+    // offload shrink), and a normal start would delete the saves the first
+    // stop just wrote as a fingerprint mismatch. Its owner's next normal
+    // launch restores them.
+    expect(callsOf("start")).toEqual([{ promptCache: "suspend" }, { promptCache: "suspend" }, { promptCache: "suspend" }]);
   });
 });
 
@@ -233,6 +242,7 @@ describe("models fit-test restore marker (killed without a signal handler, e.g. 
     expect(fake.calls.map(([name]) => name)).toEqual(["stop", "use", "start", "status"]);
     expect(callsOf("stop")[0]).toMatchObject({ chatOnly: true, savePromptCache: false });
     expect(callsOf("use")).toEqual(["qwen-3.5-4b"]);
+    expect(callsOf("start")).toEqual([{ promptCache: "suspend" }]);
     expect(existsSync(markerPath())).toBe(false);
   });
 
@@ -302,5 +312,45 @@ describe("models fit-test when putting the user's model back fails", () => {
     expect(run.kind).toBe("atomic-agent.fit-test-run");
     expect(stderr).toMatch(/putting your model back failed: config is read-only/);
     expect(existsSync(join(stateDir, "fit-test-restore.json"))).toBe(true);
+  });
+});
+
+describe("a TUI starting beside a model fit-test put back with its cache suspended", () => {
+  function cacheOn(on: boolean): void {
+    writeFileSync(
+      join(stateDir, "config.json"),
+      JSON.stringify({
+        version: USER_CONFIG_VERSION,
+        localModels: { mode: "managed", managed: { modelId: "qwen-3.5-4b", promptDiskCache: on } },
+      }),
+    );
+    resetConfigCache();
+  }
+
+  it("stops the suspended daemon so the TUI launches it with its own window and its saves", async () => {
+    cacheOn(true);
+    fake.launch = { modelId: "qwen-3.5-4b", promptCacheFingerprint: null };
+    expect(await releaseSuspendedChatBeforeTui()).toBe(true);
+    expect(callsOf("stop")).toEqual([{ chatOnly: true, savePromptCache: false }]);
+  });
+
+  it("adopts a daemon that saves its caches, or any daemon when the cache is off", async () => {
+    cacheOn(true);
+    fake.launch = { modelId: "qwen-3.5-4b", promptCacheFingerprint: "fp" };
+    expect(await releaseSuspendedChatBeforeTui()).toBe(false);
+    cacheOn(false);
+    fake.launch = { modelId: "qwen-3.5-4b", promptCacheFingerprint: null };
+    expect(await releaseSuspendedChatBeforeTui()).toBe(false);
+    expect(callsOf("stop")).toEqual([]);
+  });
+
+  it("leaves it to a desktop or another TUI that holds it", async () => {
+    cacheOn(true);
+    fake.launch = { modelId: "qwen-3.5-4b", promptCacheFingerprint: null };
+    const sessions = join(getConfig().paths.localModelsDataDir, "sessions");
+    mkdirSync(sessions, { recursive: true });
+    writeFileSync(join(sessions, String(process.ppid)), String(process.ppid));
+    expect(await releaseSuspendedChatBeforeTui()).toBe(false);
+    expect(callsOf("stop")).toEqual([]);
   });
 });

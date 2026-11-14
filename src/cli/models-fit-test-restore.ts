@@ -16,7 +16,8 @@ import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { getConfig, resetConfigCache } from "../config/index.js";
 import type { LoadedFitModel } from "../fit-test/index.js";
-import { getDaemonStatus, getEmbeddingDaemonStatus, stopEmbeddingDaemon } from "../local-llm/index.js";
+import { getDaemonStatus, getEmbeddingDaemonStatus, readLaunchRecord, stopEmbeddingDaemon } from "../local-llm/index.js";
+import { hasOtherLiveSessions } from "../local-llm/server/session-registry.js";
 import {
   runLocalModelsStart,
   runLocalModelsStartEmbedding,
@@ -83,6 +84,14 @@ export async function readFitModelSnapshot(): Promise<FitModelSnapshot> {
  * path, and none of the restore-time cleanup that deletes saves from
  * another launch, so the user's saves are still there when their model
  * starts again. Their stops save nothing (`savePromptCache: false`).
+ *
+ * The user's model is put back suspended too: `models start` launches it
+ * with this command's flags, not the TUI's or the desktop's (a growing
+ * window, a fixed one, an offload shrink), and `--ctx-size` / `--parallel`
+ * are in the cache fingerprint, so a normal start would delete the saves
+ * the first stop just wrote. Its owner's next normal launch restores
+ * them; a TUI starting beside it relaunches it for that
+ * ({@link releaseSuspendedChatBeforeTui}).
  */
 export function createFitModelSwitcher(snapshot: FitModelSnapshot, opts: { userCachesSaved?: boolean } = {}) {
   // A holder: the first stop saves the user's caches, no later one does.
@@ -122,7 +131,7 @@ export function createFitModelSwitcher(snapshot: FitModelSnapshot, opts: { userC
       if (stopped) await stopChat();
       if (snapshot.previous !== null) {
         await use(snapshot.previous);
-        if (snapshot.chatRunning && restoreOpts.restart !== false) await start({});
+        if (snapshot.chatRunning && restoreOpts.restart !== false) await start({ promptCache: "suspend" });
       }
       const embeddingNow = (await embeddingDaemonStatus().catch(() => ({ running: snapshot.embeddingRunning }))).running;
       if (snapshot.embeddingRunning && !embeddingNow) {
@@ -218,5 +227,30 @@ export async function recoverInterruptedFitTest(opts: { stateDir?: string; resta
   process.stderr.write("an interrupted models fit-test left a test model active; putting your model back\n");
   await createFitModelSwitcher(marker, { userCachesSaved: true }).restore(true, { restart: opts.restart !== false });
   clearFitRestoreMarker(stateDir);
+  return true;
+}
+
+/**
+ * Before the TUI adopts a running chat daemon: one launched with the
+ * prompt disk cache suspended (a model `models fit-test` put back) while
+ * the cache is on would serve the whole TUI session without saving its
+ * conversations at the stop. It is stopped (nothing to save) so the TUI
+ * launches it with its own window and restores the saves. Left alone
+ * when the TUI would not use it (another provider, not managed), when
+ * another session (the desktop, another TUI) holds it, or when it
+ * already saves. Returns whether it was stopped.
+ */
+export async function releaseSuspendedChatBeforeTui(): Promise<boolean> {
+  const cfg = getConfig();
+  const active = cfg.llm?.activeTextProvider;
+  if (cfg.localModels.mode !== "managed" || cfg.localModels.managed.promptDiskCache !== true) return false;
+  if (active && active !== "local-llama") return false;
+  const status = await chatDaemonStatus();
+  if (!status.running) return false;
+  const record = readLaunchRecord(cfg.paths.localModelsDataDir, status.pid);
+  if (record === null || record.promptCacheFingerprint) return false;
+  if (hasOtherLiveSessions(cfg.paths.localModelsDataDir)) return false;
+  process.stderr.write("local model was started without its prompt cache (models fit-test); restarting it for this session\n");
+  await stop({ chatOnly: true, savePromptCache: false });
   return true;
 }
