@@ -109,11 +109,42 @@ async function staleRoot(root: string): Promise<boolean> {
 }
 
 /**
+ * Make git forget the worktrees at or under `removed`, whose folders
+ * Node's `rm` already deleted: `git worktree prune`, then, only for a
+ * registration prune left (a locked one) whose folder is really gone,
+ * `git worktree remove --force`. Git never walks a live workspace
+ * tree: one that holds a generated junction could lead a Git for
+ * Windows recursive delete into the original's dependency directory,
+ * while Node's `rm` removes a link (symlink or junction) without
+ * following it. Never throws.
+ */
+async function forgetRemovedWorktrees(git: GitExec, top: string, removed: readonly string[]): Promise<void> {
+  if (removed.length === 0) return;
+  try {
+    await git(["worktree", "prune"], top);
+    const listed = await git(["worktree", "list", "--porcelain", "-z"], top);
+    if (!ok(listed)) return;
+    let left = false;
+    for (const line of zList(listed.stdout)) {
+      if (!line.startsWith("worktree ")) continue;
+      const path = line.slice("worktree ".length);
+      if (!removed.some((root) => path === root || path.startsWith(`${root}${sep}`))) continue;
+      if (await lstat(path).then(() => true, () => false)) continue;
+      await git(["worktree", "remove", "--force", "--force", path], top);
+      left = true;
+    }
+    if (left) await git(["worktree", "prune"], top);
+  } catch {
+    // Housekeeping: a leftover registration is pruned by a later run.
+  }
+}
+
+/**
  * Remove what a fusion run that died (a crash, a kill, a throw nobody
  * cleaned up after) left behind: its run roots under `tmpRoot` whose
  * owner process is gone, and the git worktrees `repoTop` still records
- * inside them. A root another live process owns is never touched.
- * Never throws.
+ * inside them (folders first, with Node; see `forgetRemovedWorktrees`).
+ * A root another live process owns is never touched. Never throws.
  */
 export async function sweepStaleBranchSets(
   tmpRoot: string,
@@ -127,22 +158,8 @@ export async function sweepStaleBranchSets(
       const root = join(tmpRoot, entry.name);
       if (await staleRoot(root)) stale.push(await realpath(root).catch(() => root));
     }
-    if (repoTop !== undefined) {
-      const listed = await git(["worktree", "list", "--porcelain", "-z"], repoTop);
-      if (ok(listed)) {
-        for (const line of zList(listed.stdout)) {
-          if (!line.startsWith("worktree ")) continue;
-          const path = line.slice("worktree ".length);
-          if (stale.some((root) => path === root || path.startsWith(`${root}${sep}`))) {
-            await git(["worktree", "remove", "--force", path], repoTop).catch(() => null);
-          }
-        }
-      }
-    }
     for (const root of stale) await rm(root, { recursive: true, force: true }).catch(() => undefined);
-    if (repoTop !== undefined && stale.length > 0) {
-      await git(["worktree", "prune"], repoTop).catch(() => null);
-    }
+    if (repoTop !== undefined) await forgetRemovedWorktrees(git, repoTop, stale);
   } catch {
     // Housekeeping; never a reason to fail a fan-out.
   }
@@ -888,14 +905,9 @@ export async function createBranchSet(
   catch (err) { await rm(runRoot, { recursive: true, force: true }); throw err; }
   await sweepStaleBranchSets(dirname(runRoot), snapshot?.top, git);
   const roots: string[] = [];
-  const removeRoot = async (root: string): Promise<void> => {
-    if (snapshot !== null) {
-      await cleanupGit(["worktree", "remove", "--force", root], snapshot.top).catch(
-        () => null,
-      );
-    }
-  };
   const workspaceRoots = new Map<string, string>();
+  // Node's `rm` first (it removes a link, symlink or junction, without
+  // following it), then git forgets the worktrees (`forgetRemovedWorktrees`).
   const cleanup = async (keep: readonly string[] = []): Promise<void> => {
     if (keep.length > 0) {
       const kept = new Set(
@@ -905,24 +917,20 @@ export async function createBranchSet(
         }),
       );
       const base = roots[0];
+      const removed: string[] = [];
       for (const root of roots.splice(0)) {
         if (kept.has(root) || root === base) {
           roots.push(root);
           continue;
         }
-        await removeRoot(root);
         await rm(root, { recursive: true, force: true }).catch(() => undefined);
+        removed.push(root);
       }
-      if (snapshot !== null) {
-        await cleanupGit(["worktree", "prune"], snapshot.top).catch(() => null);
-      }
+      if (snapshot !== null) await forgetRemovedWorktrees(cleanupGit, snapshot.top, removed);
       return;
     }
-    for (const root of roots) await removeRoot(root);
     await rm(runRoot, { recursive: true, force: true }).catch(() => undefined);
-    if (snapshot !== null) {
-      await cleanupGit(["worktree", "prune"], snapshot.top).catch(() => null);
-    }
+    if (snapshot !== null) await forgetRemovedWorktrees(cleanupGit, snapshot.top, [runRoot]);
   };
   const limit = options.maxCopyBytes ?? VERIFY_COPY_MAX_BYTES;
   const budget: PrivateCopyBudget = { left: limit, generatedDirectoryLinks: new Map(), dependencyBytes: { unlinked: 0, private: 0 }, ...(options.privateDependencyDirectories === true ? { privateIgnoredDirectories: true } : {}), ...(options.signal === undefined ? {} : { signal: options.signal }) };

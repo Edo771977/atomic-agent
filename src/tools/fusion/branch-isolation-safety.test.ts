@@ -168,6 +168,66 @@ describe("work the ignore rules keep out of a direct merge", () => {
   });
 });
 
+describe("workspace removal never lets git walk a generated link", () => {
+  async function linkedRepo(): Promise<string> {
+    const repo = await makeGitRepo("atag-cleanup-links-");
+    cleanup.push(repo);
+    await writeRepoFile(repo, ".gitignore", "node_modules/\nvenv/\n");
+    await writeRepoFile(repo, "tracked.txt", "tracked\n");
+    await runGitRaw(repo, ["add", "-A"]);
+    await runGitRaw(repo, ["commit", "-q", "-m", "init"]);
+    await writeRepoFile(repo, "node_modules/dep/index.js", "dependency\n");
+    await writeRepoFile(repo, "venv/lib.py", "venv\n");
+    return repo;
+  }
+  /** Git, recording each `worktree remove` whose target still existed. */
+  function recordingGit(removedWhileThere: string[]) {
+    return async (args: readonly string[], cwd: string) => {
+      if (args[0] === "worktree" && args[1] === "remove") {
+        const target = args[args.length - 1]!;
+        if (await lstat(target).then(() => true, () => false)) removedWhileThere.push(target);
+      }
+      return defaultGitExec(args, cwd);
+    };
+  }
+
+  it("removes the workspace folders with Node before git forgets the worktrees", async () => {
+    const repo = await linkedRepo();
+    const { root } = await fixture();
+    const removedWhileThere: string[] = [];
+    const set = await createBranchSet(repo, ["a", "b"], { tmpRoot: root, git: recordingGit(removedWhileThere) });
+    expect(set).not.toBeNull();
+    const kept = set!.workspaces.get("a")!.dir;
+    await set!.cleanup(["a"]);
+    expect(await lstat(set!.workspaces.get("b")!.dir).then(() => true, () => false)).toBe(false);
+    expect(await readFile(join(kept, "node_modules/dep/index.js"), "utf8")).toBe("dependency\n");
+    await set!.cleanup();
+    expect(removedWhileThere).toEqual([]);
+    expect(await readFile(join(repo, "node_modules/dep/index.js"), "utf8")).toBe("dependency\n");
+    expect(await readFile(join(repo, "venv/lib.py"), "utf8")).toBe("venv\n");
+    expect((await runGitRaw(repo, ["worktree", "list", "--porcelain"])).stdout.match(/^worktree /gm)).toHaveLength(1);
+  });
+
+  it("sweeps a dead run's worktrees the same way", async () => {
+    const repo = await linkedRepo();
+    const { root } = await fixture();
+    const dead = await createBranchSet(repo, ["a"], { tmpRoot: root });
+    expect(dead).not.toBeNull();
+    // A run whose process is gone: its owner record names no live pid.
+    const runRoot = join(dead!.baseDir, "..");
+    await writeFile(join(runRoot, "owner.json"), JSON.stringify({ pid: 2 ** 22 + 12345 }));
+    const removedWhileThere: string[] = [];
+    const next = await createBranchSet(repo, ["b"], { tmpRoot: root, git: recordingGit(removedWhileThere) });
+    try {
+      expect(await lstat(runRoot).then(() => true, () => false)).toBe(false);
+      expect(removedWhileThere).toEqual([]);
+      expect(await readFile(join(repo, "node_modules/dep/index.js"), "utf8")).toBe("dependency\n");
+      expect((await runGitRaw(repo, ["worktree", "list", "--porcelain"])).stdout.match(/^worktree /gm)).toHaveLength(3);
+    } finally { await next?.cleanup(); }
+    expect((await runGitRaw(repo, ["worktree", "list", "--porcelain"])).stdout.match(/^worktree /gm)).toHaveLength(1);
+  });
+});
+
 describe("tracked paths under excluded directory names", () => {
   it("merges a tracked change under a directory named build and never merges ignored dist, which is linked", async () => {
     const repo = await makeGitRepo("atag-tracked-build-");
