@@ -80,10 +80,18 @@ export class DailySpendStore {
   /** Fold one completion's price in. Local, plan and usage-less calls change nothing. */
   record(price: CompletionPrice): DailySpendReading {
     if (price.kind !== "priced" && price.kind !== "unpriced") return this.peek();
+    return this.add(price.kind === "priced" ? price.usd : undefined);
+  }
+
+  /**
+   * Add one paid call: `usd` when its price is known, otherwise one
+   * unpriced call. The request budget's daily hold settles through here.
+   */
+  add(usd: number | undefined): DailySpendReading {
     const base = this.today();
     const next: DailySpendReading =
-      price.kind === "priced"
-        ? { ...base, usd: base.usd + price.usd, pricedCalls: base.pricedCalls + 1 }
+      usd !== undefined
+        ? { ...base, usd: base.usd + usd, pricedCalls: base.pricedCalls + 1 }
         : { ...base, unpricedCalls: base.unpricedCalls + 1 };
     this.cached = next;
     this.write(next);

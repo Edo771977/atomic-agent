@@ -13,7 +13,7 @@ import { sanitizeModelAlias } from "../../analytics/index.js";
 import { completionUsageForTurn, type TurnUsageMeter } from "../../analytics/index.js";
 import type { CostAccumulator } from "../../llm/provider/cost-accumulator.js";
 import type { ResolvedModel } from "../../llm/provider/model-resolver.js";
-import { priceCompletion, type SessionUsageLedger } from "../../session/usage-meter.js";
+import type { SessionUsageLedger } from "../../session/usage-meter.js";
 import {
   effectiveDailyLimitUsd,
   isOverDailyLimit,
@@ -23,6 +23,7 @@ import { DailySpendLimitError } from "../../llm/reliability/spend-limit-error.js
 import { isLocalServerUrl } from "../../llm/provider/openai/local-server-url.js";
 import { resolveModelPricingFor } from "../resolve-model-pricing.js";
 import { createRequestBudgetScope } from "../request-budget.js";
+import { createDailySpendBudget } from "../daily-spend-budget.js";
 import type { FusionTurnBudget } from "../../tools/fusion/turn-budget.js";
 import { LearnedContextWindows } from "../learned-context-windows.js";
 import { isOllamaEntry, readOllamaContextWindow } from "../../llm/provider/ollama/ollama-context-window.js";
@@ -359,21 +360,19 @@ export function connectRuntimeFallback(
     const entry = resolveLlmConfig(getConfig()).providers.find((p) => p.id === providerId);
     return { local: entry?.kind === "llama-server", plan: entry?.kind === "subscription-cli" };
   };
-  // ATO-649: fold a metered completion into today's total. Before the
-  // session record, so the `usage_updated` event that follows carries it.
-  const recordDailySpend = (
-    result: CompletionResult,
-    servedProviderId: string,
-    model: ResolvedModel | undefined,
-  ): void => {
-    if (!dailySpend || !result.usage) return;
-    dailySpend.record(
-      priceCompletion({ usage: result.usage, ...(model ? { model } : {}), ...spendBilling(servedProviderId) }),
-    );
-  };
-  // ATO-649: refuse a paid link once today's spend reached
-  // `costTracking.dailyLimitUsd`, before anything is sent. Thrown from the
-  // seam's per-attempt hook. `onDailyLimit: "stop"` (default): the chain
+  // ATO-649: today's total is a second ledger of the per-send request
+  // budget (`request-budget.ts`), next to the turn budget: each send holds
+  // its upper bound against the daily ceiling and the reply settles it,
+  // in the link attempt's `finish`. That runs before the seam records the
+  // session's usage, so the `usage_updated` event that follows carries
+  // the new total. Nothing else adds to the day, so no call counts twice.
+  const dailyBudget = dailySpend === undefined
+    ? undefined
+    : createDailySpendBudget(dailySpend, () => getConfig().llm?.costTracking);
+  // ATO-649: refuse a paid link once today's persisted spend reached
+  // `costTracking.dailyLimitUsd`, before anything is sent: the cheap early
+  // refusal, ahead of the request budget's per-send daily hold. Thrown
+  // from the seam's per-attempt hook. `onDailyLimit: "stop"` (default): the chain
   // does not move on, the turn ends saying so, and every later paid call
   // today is refused here the same way. `"local"`: the chain advances
   // past the link (to the local model when it is in the chain) and
@@ -443,7 +442,6 @@ export function connectRuntimeFallback(
       return;
     }
     const model = result.usage ? resolveModelPricing(result.modelId, servedProviderId) : undefined;
-    recordDailySpend(result, servedProviderId, model);
     recordSessionUsage(params.sessionId, result, servedProviderId, true, model);
     if (costAccumulator && result.usage) {
       costAccumulator.recordTurn({
@@ -473,7 +471,6 @@ export function connectRuntimeFallback(
       return;
     }
     const model = result.usage ? resolveModelPricing(result.modelId, servedProviderId) : undefined;
-    recordDailySpend(result, servedProviderId, model);
     // ATO-1289: most chat turns stream, so the cost accumulator must see
     // a streamed completion exactly as it sees a unary one (same gate,
     // no session required) — otherwise `costTracking` only ever counts
@@ -533,13 +530,17 @@ export function connectRuntimeFallback(
       enforceDailySpendLimit(providerId);
       await prepareLocalLink(providerId);
     },
-    ...(deps.turnBudget === undefined ? {} : {
+    ...(deps.turnBudget === undefined && dailyBudget === undefined ? {} : {
+      // The turn budget's ledger when the owning session has request
+      // limits, and the day's whenever a day total is kept (ATO-649).
       requestBudget: (providerId, request, provider) => {
         const owner = request.budgetOwnerSessionId ?? request.sessionId;
-        if (owner === undefined || deps.turnBudget?.requestLimits(owner) === undefined) return undefined;
+        const turnLimited = owner !== undefined && deps.turnBudget?.requestLimits(owner) !== undefined;
+        if (!turnLimited && dailyBudget === undefined) return undefined;
         const entry = resolveLlmConfig(getConfig()).providers.find(p => p.id === providerId);
         return createRequestBudgetScope(deps.turnBudget, request, provider, entry,
-          resolveModelPricing(provider.chatModelId ?? entry?.defaultChatModel ?? entry?.model ?? null, providerId));
+          resolveModelPricing(provider.chatModelId ?? entry?.defaultChatModel ?? entry?.model ?? null, providerId),
+          dailyBudget);
       },
     } satisfies Pick<FallbackSeamDeps, "requestBudget">),
     recordUnaryUsage,

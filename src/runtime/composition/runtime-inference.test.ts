@@ -440,6 +440,23 @@ describe("runtime provider/context/fallback/reload phases", () => {
       expect(notices).toEqual(["cloud->local:spend-limit"]);
     });
 
+    it("reserves a daily limit alone in the request budget and counts the call once", async () => {
+      const fixture = withDailySpend(5);
+      const served = providers.providerRegistry.getProvider("served");
+      if (!served) throw new Error("served fixture missing");
+      const budgets: unknown[] = [];
+      vi.spyOn(served, "complete").mockImplementation(async (request) => {
+        budgets.push(request.requestBudget);
+        request.requestBudget?.beforeSend({ model: "priced-model", messages: [{ role: "user", content: "hi" }], max_tokens: 64 });
+        return completion();
+      });
+      const wired = connectRuntimeFallback({}, fixture.deps);
+      await wired.llmComplete({ ...params, providerId: "served" });
+      expect(budgets[0]).toBeDefined();
+      expect(fixture.dailySpend.today().pricedCalls).toBe(1);
+      expect(fixture.dailySpend.today().usd).toBeCloseTo(0.00002, 9);
+    });
+
     it("lets paid links through below the limit and with no limit set", async () => {
       for (const limit of [5, undefined]) {
         const fixture = withDailySpend(limit);

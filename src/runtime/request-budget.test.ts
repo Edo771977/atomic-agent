@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createRequestBudgetScope } from "./request-budget.js";
+import { createDailySpendBudget } from "./daily-spend-budget.js";
+import { DailySpendStore } from "../session/daily-spend.js";
+import { DailySpendLimitError } from "../llm/reliability/spend-limit-error.js";
 import { FusionTurnBudget } from "../tools/fusion/turn-budget.js";
 import { OpenAiProvider } from "../llm/provider/openai/openai-provider.js";
 import { OpenAiHttpError } from "../llm/provider/openai/openai-http.js";
@@ -419,6 +425,105 @@ describe("request budget scope", () => {
       expect(() => scoped(0.9, priced).scope().beforeSend(body())).not.toThrow();
       // Below the threshold the base rates still apply.
       expect(() => scoped(0.1, priced).scope().beforeSend({ model: "m", messages: [] })).not.toThrow();
+    });
+  });
+
+  describe("the daily spend limit as a second hold in the same scope (ATO-649)", () => {
+    function day(limitUsd?: number) {
+      const store = new DailySpendStore({ path: join(mkdtempSync(join(tmpdir(), "daily-budget-")), "daily-spend.json") });
+      const daily = createDailySpendBudget(store, () => (limitUsd === undefined ? undefined : { dailyLimitUsd: limitUsd }));
+      return { store, daily };
+    }
+    // No session: no turn budget, only the day's ledger.
+    const request = () => ({ prompt: "hi", maxOutputTokens: 4096 } as CompletionRequest);
+    const body = () => ({ model: "m", messages: [{ role: "user", content: "hi" }] });
+    const usage = { promptTokens: 1_000, completionTokens: 1_000, totalTokens: 2_000 };
+    const estimate = (1_000 * 3 + 1_000 * 15) / 1_000_000;
+
+    it("lets only one of two parallel sends through when the remaining allowance covers one", () => {
+      // One 4096-token send holds about $0.0646; the smallest clamped
+      // (1024-token) reply about $0.0185, more than what is left.
+      const { store, daily } = day(0.07);
+      const a = createRequestBudgetScope(undefined, request(), provider, entry, model, daily);
+      const b = createRequestBudgetScope(undefined, request(), provider, entry, model, daily);
+      expect(a).toBeDefined();
+      a!.beforeSend(body());
+      expect(() => b!.beforeSend(body())).toThrow(DailySpendLimitError);
+      a!.finish({ usage } as never);
+      expect(store.today().usd).toBeCloseTo(estimate, 9);
+      // The hold is gone once settled: the next send fits again.
+      const c = createRequestBudgetScope(undefined, request(), provider, entry, model, daily)!;
+      expect(() => c.beforeSend(body())).not.toThrow();
+    });
+
+    it("charges a send retried after a 5xx, which may have been billed", () => {
+      const { store, daily } = day(10);
+      const s = createRequestBudgetScope(undefined, request(), provider, entry, model, daily)!;
+      s.beforeSend(body());
+      s.onResponse(500);
+      s.beforeSend(body());
+      s.onResponse(200);
+      s.finish({ usage } as never);
+      expect(store.today().pricedCalls).toBe(2);
+      expect(store.today().usd).toBeGreaterThan(estimate + 0.06);
+    });
+
+    it("releases a send refused with ECONNREFUSED", () => {
+      const { store, daily } = day(10);
+      const s = createRequestBudgetScope(undefined, request(), provider, entry, model, daily)!;
+      s.beforeSend(body());
+      s.onSendFailed?.(refused("ECONNREFUSED"));
+      s.finish(undefined);
+      expect(store.today()).toMatchObject({ usd: 0, pricedCalls: 0, unpricedCalls: 0 });
+    });
+
+    it("settles the day with the turn budget's settled amount, once", () => {
+      const { store, daily } = day(10);
+      const budget = new FusionTurnBudget();
+      budget.begin("p", 0, { usd: 5 });
+      const s = createRequestBudgetScope(budget, { ...request(), sessionId: "p" }, provider, entry, model, daily)!;
+      s.beforeSend(body());
+      s.finish({ usage } as never);
+      s.finish({ usage } as never);
+      expect(spent(budget)).toBeCloseTo(estimate, 9);
+      expect(store.today().usd).toBeCloseTo(spent(budget), 9);
+      expect(store.today().pricedCalls).toBe(1);
+    });
+
+    it("counts the day even without a ceiling, charging nothing ahead", () => {
+      const { store, daily } = day();
+      const s = createRequestBudgetScope(undefined, request(), provider, entry, model, daily)!;
+      const sent = body();
+      s.beforeSend(sent);
+      expect(sent).toEqual(body());
+      s.finish({ usage } as never);
+      expect(store.today()).toMatchObject({ pricedCalls: 1 });
+      expect(store.today().usd).toBeCloseTo(estimate, 9);
+    });
+
+    it("meters a link without a price under a ceiling: no refusal, a hint, reported cost or an unpriced call", () => {
+      const { store, daily } = day(1);
+      const unpriced = { ...model, pricing: undefined };
+      const s = createRequestBudgetScope(undefined, request(), provider, entry, unpriced, daily)!;
+      expect(() => s.beforeSend(body())).not.toThrow();
+      expect(s.hint).toMatch(/daily/);
+      s.finish({ usage: { ...usage, costUsd: 0.25 } } as never);
+      const t = createRequestBudgetScope(undefined, request(), provider, entry, unpriced, daily)!;
+      t.beforeSend(body());
+      t.finish({ usage } as never);
+      expect(store.today()).toMatchObject({ usd: 0.25, pricedCalls: 1, unpricedCalls: 1 });
+    });
+
+    it("refuses a metered link once today's total is at the ceiling", () => {
+      const { store, daily } = day(1);
+      store.record({ kind: "priced", usd: 1, source: "provider" });
+      expect(() => createRequestBudgetScope(undefined, request(), provider, entry, { ...model, pricing: undefined }, daily))
+        .toThrow(DailySpendLimitError);
+    });
+
+    it.each(["llama-server", "subscription-cli"])("leaves a %s link out of the day", kind => {
+      const { daily } = day(1);
+      expect(createRequestBudgetScope(undefined, request(), provider, { id: "x", kind } as LlmProviderConfigEntry, model, daily)).toBeUndefined();
     });
   });
 });
