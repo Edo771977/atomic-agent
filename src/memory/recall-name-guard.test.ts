@@ -122,6 +122,23 @@ describe("createRecallNameGuard (ATO-321)", () => {
       expect(guard.allows("The user is Alex.")).toBe(true);
     });
 
+    it("notes a message re-noted every step once, so it cannot evict earlier ones", async () => {
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      const slow: GroundingConversationSource = async function* walk() {
+        await gate;
+        yield { updatedAt: 1, texts: ["nothing here"] };
+      };
+      const guard = createRecallNameGuard({ source: slow });
+      const pending = guard.prefetch(["The user is Alex."]);
+      guard.noteUserMessage("my name is Alex");
+      // The next turn's message, handed to the guard again at every step's recall.
+      for (let step = 0; step < 70; step += 1) guard.noteUserMessage("run the tests");
+      release();
+      await pending;
+      expect(guard.allows("The user is Alex.")).toBe(true);
+    });
+
     it("retries a failed check after a new user message", async () => {
       let fail = true;
       const flaky: GroundingConversationSource = async function* walk() {
