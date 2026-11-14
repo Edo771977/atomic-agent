@@ -126,6 +126,48 @@ describe("direct-mode copy budget", () => {
   });
 });
 
+describe("work the ignore rules keep out of a direct merge", () => {
+  async function generatedWave(files?: string[], provides?: { task: string; kind: "file"; name: string }[]) {
+    const repo = await makeGitRepo("atag-direct-generated-");
+    cleanup.push(repo);
+    await writeRepoFile(repo, ".gitignore", "src/generated/\n");
+    await writeRepoFile(repo, "src/a.ts", "x\n");
+    await runGitRaw(repo, ["add", "-A"]);
+    await runGitRaw(repo, ["commit", "-q", "-m", "init"]);
+    const { root } = await fixture();
+    const result = await runIsolatedWave({
+      realDir: repo, tasks: [{ ...task("one"), ...(files === undefined ? {} : { files }) }], writeScope: [repo], inputs: [],
+      ...(provides === undefined ? {} : { provides }),
+      options: { tmpRoot: root },
+      run: async (_tasks, workspace) => {
+        const dir = workspace!("one")!.workingDir;
+        await writeRepoFile(dir, "src/generated/api.ts", "export const api = 1;\n");
+        await writeFile(join(dir, "src/a.ts"), "y\n");
+        return [row("one")];
+      },
+    });
+    return { repo, result };
+  }
+
+  it("reports a file created in a new ignored directory instead of dropping it silently", async () => {
+    const { repo, result } = await generatedWave();
+    expect(result.outcomes[0]!.applied).toEqual([join("src", "a.ts")]);
+    expect(result.outcomes[0]!.ignoredChanges).toEqual([join("src", "generated", "api.ts")]);
+    expect(result.results[0]!.status).toBe("ok");
+    expect(result.results[0]!.notes?.join("\n")).toContain("src/generated/api.ts");
+    expect(await readdir(join(repo, "src"))).not.toContain("generated");
+  });
+
+  it.each([
+    ["declared files", ["src/generated/api.ts"], undefined],
+    ["a file provide", undefined, [{ task: "one", kind: "file" as const, name: "src/generated/api.ts" }]],
+  ])("needs the orchestrator when %s lie under an ignored path", async (_label, files, provides) => {
+    const { result } = await generatedWave(files, provides);
+    expect(result.results[0]!.status).toBe("needs_orchestrator");
+    expect(result.results[0]!.error).toContain("src/generated/api.ts");
+  });
+});
+
 describe("tracked paths under excluded directory names", () => {
   it("merges a tracked change under a directory named build and never merges ignored dist, which is linked", async () => {
     const repo = await makeGitRepo("atag-tracked-build-");

@@ -1310,6 +1310,7 @@ export function buildFusionDelegateTool(
           writeScope,
           options: { maxCopyBytes: copyLimitBytes },
           inputs: contract?.inputs ?? [],
+          ...(contract?.provides === undefined ? {} : { provides: contract.provides }),
           run: (rebased, taskWorkspace) =>
             runAcrossLegs(rebased, contract, briefSuffix, taskWorkspace, allowSplit),
           gate: buildMergeGate({

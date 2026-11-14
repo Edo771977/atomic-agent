@@ -177,6 +177,12 @@ export interface BranchWorkspace {
   readonly directoryIgnorePolicy?: DirectoryIgnorePolicy;
   /** Tracked files and their ancestor directories: never excluded by name or ignore rule. */
   readonly trackedPaths?: ReadonlySet<string>;
+  /**
+   * Files under directories the frozen ignore rules classify as ignored
+   * (not linked, not excluded by name) at creation: what a merge leaves
+   * out, so a new or changed one can be reported instead of dropped silently.
+   */
+  readonly ignoredManifest?: ReadonlyMap<string, FileStamp>;
 }
 
 export interface BranchSet {
@@ -289,7 +295,8 @@ function isUnderMergeDir(rel: string): boolean {
  * `node_modules`, …) and the merge folder are skipped: none of it is
  * merged back. A path in `trackedPaths` (a tracked file or one of its
  * ancestors, e.g. `scripts/build`) is kept despite its name or an ignore
- * rule: a tracked change there is a deliverable.
+ * rule: a tracked change there is a deliverable. Files left out because
+ * an ignore rule classifies one of their directories go to `dropped`.
  */
 export async function stampTree(
   root: string,
@@ -297,6 +304,7 @@ export async function stampTree(
   directoryIgnorePolicy?: DirectoryIgnorePolicy,
   signal?: AbortSignal,
   trackedPaths: ReadonlySet<string> = new Set(),
+  dropped?: Map<string, FileStamp>,
 ): Promise<Map<string, FileStamp>> {
   signal?.throwIfAborted();
   const out = new Map<string, FileStamp>();
@@ -348,7 +356,7 @@ export async function stampTree(
       signal?.throwIfAborted();
       if (trackedPaths.has(rel)) continue;
       for (let dir = dirname(rel); dir !== "."; dir = dirname(dir)) {
-        if (ignored.has(dir)) { out.delete(rel); break; }
+        if (ignored.has(dir)) { dropped?.set(rel, out.get(rel)!); out.delete(rel); break; }
       }
     }
   }
@@ -933,13 +941,15 @@ export async function createBranchSet(
       const name = workspaceName(index, taskId);
       workspaceRoots.set(taskId, join(runRoot, name));
       const dir = await make(name, baseDir);
+      const ignoredManifest = new Map<string, FileStamp>();
       workspaces.set(taskId, {
         taskId,
         name,
         dir,
-        manifest: await stampTree(dir, excludedDirectories, directoryIgnorePolicy, options.signal, trackedPaths),
+        manifest: await stampTree(dir, excludedDirectories, directoryIgnorePolicy, options.signal, trackedPaths, ignoredManifest),
         excludedDirectories,
         trackedPaths,
+        ignoredManifest,
         ...(directoryIgnorePolicy === undefined ? {} : { directoryIgnorePolicy }),
       });
     }
@@ -963,26 +973,48 @@ export async function touchedPaths(
   workspace: BranchWorkspace,
   signal?: AbortSignal,
 ): Promise<string[]> {
-  const now = await stampTree(workspace.dir, workspace.excludedDirectories, workspace.directoryIgnorePolicy, signal, workspace.trackedPaths);
+  return (await workspaceTouches(workspace, signal)).touched;
+}
+
+function stampMoved(before: FileStamp | undefined, now: FileStamp): boolean {
+  return (
+    before === undefined ||
+    before.size !== now.size ||
+    before.mtimeMs !== now.mtimeMs ||
+    before.link !== now.link ||
+    before.mode !== now.mode
+  );
+}
+
+/** Paths added, changed or removed relative to `before`, sorted. */
+function movedPaths(before: ReadonlyMap<string, FileStamp>, now: ReadonlyMap<string, FileStamp>, signal?: AbortSignal): string[] {
   const out: string[] = [];
   for (const [rel, stamp] of now) {
     signal?.throwIfAborted();
-    const before = workspace.manifest.get(rel);
-    if (
-      before === undefined ||
-      before.size !== stamp.size ||
-      before.mtimeMs !== stamp.mtimeMs ||
-      before.link !== stamp.link ||
-      before.mode !== stamp.mode
-    ) {
-      out.push(rel);
-    }
+    if (stampMoved(before.get(rel), stamp)) out.push(rel);
   }
-  for (const rel of workspace.manifest.keys()) {
+  for (const rel of before.keys()) {
     signal?.throwIfAborted();
     if (!now.has(rel)) out.push(rel);
   }
   return out.sort();
+}
+
+/**
+ * `touchedPaths`, plus `ignored`: files the task added, changed or
+ * removed under a directory the frozen ignore rules classify as ignored
+ * (one it created, say `src/generated/`), which are never merged.
+ */
+export async function workspaceTouches(
+  workspace: BranchWorkspace,
+  signal?: AbortSignal,
+): Promise<{ touched: string[]; ignored: string[] }> {
+  const dropped = new Map<string, FileStamp>();
+  const now = await stampTree(workspace.dir, workspace.excludedDirectories, workspace.directoryIgnorePolicy, signal, workspace.trackedPaths, dropped);
+  return {
+    touched: movedPaths(workspace.manifest, now, signal),
+    ignored: movedPaths(workspace.ignoredManifest ?? new Map(), dropped, signal),
+  };
 }
 
 /**
