@@ -68,6 +68,7 @@ export const deferredFiles = [
   'src/tools/fusion/worker-budgets.test.ts',
   'src/tools/fusion/worker-changes.test.ts',
   'src/tools/fusion/worker-needs-input.test.ts',
+  'src/tools/fusion/fusion-taint.test.ts',
   'src/tools/fusion/worker-prompt.test.ts',
   'src/tools/fusion/worker-queue-clock.test.ts',
   'src/tools/fusion/worker-reply-cap.test.ts',
