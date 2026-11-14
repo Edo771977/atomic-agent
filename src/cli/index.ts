@@ -28,7 +28,7 @@ import { dataCommand } from "./data-command.js";
 import { providersCommand } from "./providers-command.js";
 import { setupCommand } from "./setup-command.js";
 import { tuiCommand } from "../tui/index.js";
-import { recoverInterruptedFitTest, releaseSuspendedChatBeforeTui } from "./models-fit-test-restore.js";
+import { recoverInterruptedFitTest, releaseSuspendedChatBeforeTui, warnLiveFitTestBeforeTui } from "./models-fit-test-restore.js";
 import { installTransportDeadlines } from "../llm/transport-deadlines.js";
 import { getAppVersion } from "../version.js";
 import { USER_CONFIG_DEFAULTS } from "../config/index.js";
@@ -82,7 +82,8 @@ async function runTui(args: string[]): Promise<number> {
     await recoverInterruptedFitTest({ restart: false });
     // A model fit-test put back runs with its prompt cache suspended:
     // relaunched by the TUI rather than adopted, so its saves are restored.
-    await releaseSuspendedChatBeforeTui();
+    // One still running is only warned about.
+    if (!warnLiveFitTestBeforeTui()) await releaseSuspendedChatBeforeTui();
   } catch (err) {
     process.stderr.write(`could not put back the model an interrupted fit-test left: ${err instanceof Error ? err.message : String(err)}\n`);
   }

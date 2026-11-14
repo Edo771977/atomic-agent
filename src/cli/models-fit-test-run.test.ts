@@ -106,6 +106,7 @@ import {
   processStartToken,
   recoverInterruptedFitTest,
   releaseSuspendedChatBeforeTui,
+  warnLiveFitTestBeforeTui,
 } from "./models-fit-test-restore.js";
 
 let stateDir: string;
@@ -498,5 +499,30 @@ describe("two commands recovering the same killed fit-test at once", () => {
     await expect(recoverInterruptedFitTest({ restart: false })).rejects.toThrow(/read-only/);
     expect(existsSync(markerFile())).toBe(true);
     expect(readdirSync(getConfig().paths.localModelsDataDir).filter((n) => n.endsWith(".claim"))).toEqual([]);
+  });
+});
+
+describe("a TUI starting while a models fit-test runs", () => {
+  it("warns that the local model is being swapped and leaves the test model alone", async () => {
+    writeFileSync(
+      join(stateDir, "config.json"),
+      JSON.stringify({
+        version: USER_CONFIG_VERSION,
+        localModels: { mode: "managed", managed: { modelId: "qwen-3.5-2b", promptDiskCache: true } },
+      }),
+    );
+    resetConfigCache();
+    writeMarker({ pid: process.ppid, startedAt: Date.now(), previous: "qwen-3.5-4b", chatRunning: true, embeddingRunning: false, swapped: true });
+    // The test model runs suspended, like a model the fit-test put back.
+    fake.launch = { modelId: "qwen-3.5-2b", promptCacheFingerprint: null };
+    expect(warnLiveFitTestBeforeTui()).toBe(true);
+    expect(stderr).toMatch(new RegExp(`models fit-test is running \\(pid ${process.ppid}\\)`));
+    expect(await releaseSuspendedChatBeforeTui()).toBe(false);
+    expect(callsOf("stop")).toEqual([]);
+  });
+
+  it("says nothing when no fit-test runs", () => {
+    expect(warnLiveFitTestBeforeTui()).toBe(false);
+    expect(stderr).toBe("");
   });
 });

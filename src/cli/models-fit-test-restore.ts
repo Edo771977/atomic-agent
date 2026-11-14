@@ -428,7 +428,24 @@ export async function releaseSuspendedChatBeforeTui(): Promise<boolean> {
   const record = readLaunchRecord(cfg.paths.localModelsDataDir, status.pid);
   if (record === null || record.promptCacheFingerprint) return false;
   if (hasOtherLiveSessions(cfg.paths.localModelsDataDir)) return false;
+  // A running fit-test's test model is suspended too, and is not ours to stop.
+  const live = readFitRestoreMarker(cfg.paths.localModelsDataDir);
+  if (live !== null && fitRestoreMarkerLive(live)) return false;
   process.stderr.write("local model was started without its prompt cache (models fit-test); restarting it for this session\n");
   await stop({ chatOnly: true, savePromptCache: false });
+  return true;
+}
+
+/**
+ * At TUI start: a fit-test still running swaps and stops the local model
+ * under the TUI. Warns (the TUI still starts, on whatever the run has
+ * loaded) and returns whether one runs.
+ */
+export function warnLiveFitTestBeforeTui(): boolean {
+  const marker = readFitRestoreMarker(getConfig().paths.localModelsDataDir);
+  if (marker === null || !fitRestoreMarkerLive(marker)) return false;
+  process.stderr.write(
+    `warning: a models fit-test is running (pid ${marker.pid}); it stops and swaps the local model under this session, so local replies may fail or come from a test model until it ends\n`,
+  );
   return true;
 }
