@@ -14,6 +14,8 @@ export interface TaskArtifactManifestContext {
   contract?: DelegateContract;
   checkOutcomes: readonly (ContractCheckOutcome | undefined)[];
   findings: readonly ContractFinding[];
+  /** Actual dependency verifier release fact; never inferred from the worker's row or reply. */
+  verifiedNoChangesProviders?: ReadonlySet<string>;
 }
 
 /** Final facts, not worker claims. One bounded read budget for the entire fan-out. */
@@ -83,8 +85,11 @@ export async function collectTaskArtifactManifests(
             if (findings.some(f => !f.present)) missing = true;
             if (findings.length < count) unknown = true;
           }
+          const noChanges = result?.status === "no_changes";
+          const released = noChanges && ctx.verifiedNoChangesProviders?.has(providerId) === true;
           dependencies.push({ provider: providerId, requirementIndex: index,
-            status: result === undefined ? "unknown" : result.status !== "ok" || missing ? "blocked" : unknown ? "unknown" : "ready" });
+            status: result === undefined ? "unknown" : missing ? "blocked" :
+              noChanges ? unknown || !released ? "unknown" : "ready" : result.status !== "ok" ? "blocked" : unknown ? "unknown" : "ready" });
         }
       });
       const incomplete: ArtifactManifestReason[] = [];
