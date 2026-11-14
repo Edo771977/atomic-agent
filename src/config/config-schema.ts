@@ -1087,7 +1087,7 @@ export interface UserConfigFile {
 // `os.screen.capture` on macOS; an older file has no field and gets them.
 // Unversioned, additive: `tools.verify.maxCopyBytes` (default 2 GiB). The
 // byte ceiling for `verify.run`'s workspace copy off macOS; a bigger tree
-// is refused. An older file has no field and keeps the 2 GiB limit.
+// is refused. At most 1 TiB. An older file has no field and keeps the 2 GiB limit.
 // Unversioned, additive: `localModels.managed.coreBackendVariant`
 // (`auto` | `cpu`, default `auto`, ATO-372/373) — the build Atomic Core
 // installs on Windows x64. Its own key, not `backendVariant`: the

@@ -1,4 +1,4 @@
-import { parseBool, parseNonNegativeInt, parsePositiveInt } from "./config-primitives.js";
+import { parseBool, parseBoundedPositiveInt, parseNonNegativeInt, parsePositiveInt } from "./config-primitives.js";
 import { parseStringArrayOrNull } from "./config-values.js";
 
 export interface RuntimeProjectsConfig {
@@ -121,7 +121,7 @@ export interface UserToolsConfig {
      * Largest tree, in bytes, `verify.run` copies into its throwaway
      * workspace off macOS (the linked build/dependency directories do
      * not count). A bigger tree is refused, never run in place. Default
-     * 2 GiB. A positive integer.
+     * 2 GiB. A positive integer, at most 1 TiB.
      */
     maxCopyBytes: number;
   };
@@ -129,6 +129,9 @@ export interface UserToolsConfig {
 
 /** `tools.verify.maxCopyBytes` default; the one definition (`VERIFY_COPY_MAX_BYTES` re-exports it). */
 export const DEFAULT_VERIFY_MAX_COPY_BYTES = 2 * 1024 * 1024 * 1024;
+
+/** Upper bound for `tools.verify.maxCopyBytes`: 1 TiB, past any tree worth copying per run. */
+export const MAX_VERIFY_MAX_COPY_BYTES = 1024 ** 4;
 
 export function createToolsDefaults(): UserToolsConfig {
   return {
@@ -207,9 +210,11 @@ export function parseToolsConfig(
       ),
     },
     verify: {
-      maxCopyBytes: parsePositiveInt(
+      maxCopyBytes: parseBoundedPositiveInt(
         rawVerify.maxCopyBytes ?? readDefaults().verify.maxCopyBytes,
         "tools.verify.maxCopyBytes",
+        1,
+        MAX_VERIFY_MAX_COPY_BYTES,
       ),
     },
   };

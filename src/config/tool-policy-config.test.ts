@@ -124,6 +124,14 @@ describe("outbound HTTP and tool configuration ownership", () => {
     expect(() => schema.parseUserConfigFile({ tools: { verify: { maxCopyBytes: "lots" } } })).toThrow(/tools\.verify\.maxCopyBytes/);
   });
 
+  it("bounds tools.verify.maxCopyBytes at 1 TiB", () => {
+    const tib = 1024 ** 4;
+    expect(schema.parseUserConfigFile({ tools: { verify: { maxCopyBytes: tib } } }).tools.verify.maxCopyBytes).toBe(tib);
+    expect(() => schema.parseUserConfigFile({ tools: { verify: { maxCopyBytes: tib + 1 } } }))
+      .toThrow(/tools\.verify\.maxCopyBytes.*\[1, 1099511627776\]/);
+    expect(() => schema.parseUserConfigFile({ tools: { verify: { maxCopyBytes: Number.MAX_SAFE_INTEGER } } })).toThrow(/tools\.verify\.maxCopyBytes/);
+  });
+
   it("short-circuits explicit scalar defaults in all four owners", () => {
     const noDefaults = () => { throw new Error("explicit fields must not read defaults"); };
     const http = { enabled: false, approvalMode: "never", hostAllowlist: [], maxResponseBytes: 1, defaultTimeoutMs: 1 };
