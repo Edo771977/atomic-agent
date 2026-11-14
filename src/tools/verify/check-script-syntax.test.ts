@@ -31,6 +31,37 @@ async function file(name: string, content: string): Promise<string> {
 }
 
 describe("runChecker", () => {
+  it("preserves checker argv through a Windows batch shim", async () => {
+    const script = await file("argv.cjs", "console.log(JSON.stringify(process.argv.slice(2)))");
+    const cmd = process.platform === "win32"
+      ? await file("checker.cmd", `@"${process.execPath}" "${script}" %*\r\n`)
+      : process.execPath;
+    const values = ['a "quote" & echo injected', "spaces and unicode è", "%PATH%", "a^b", "", "trailing\\"];
+    const run = await runChecker(cmd, process.platform === "win32" ? values : [script, ...values]);
+    expect(run.exitCode).toBe(0);
+    expect(JSON.parse(run.stdout)).toEqual(values);
+    expect(run.stderr).toBe("");
+  });
+
+  it("reports synchronous spawn argument errors without rejecting", async () => {
+    const run = await runChecker(process.execPath, ["\u0000"]);
+    expect(run).toMatchObject({ exitCode: null, missing: false, timedOut: false });
+    expect(run.stderr.length).toBeGreaterThan(0);
+  });
+
+  it("kills an owned checker process on cancellation and starts none after cancellation", async () => {
+    const controller = new AbortController();
+    const script = await file("wait.cjs", "setInterval(()=>{},1000)");
+    const cmd = process.platform === "win32"
+      ? await file("wait.cmd", `@"${process.execPath}" "${script}" %*\r\n`)
+      : process.execPath;
+    const args = process.platform === "win32" ? [] : [script];
+    const pending = runChecker(cmd, args, { signal: controller.signal });
+    setTimeout(() => controller.abort(), 200);
+    expect(await pending).toMatchObject({ aborted: true, timedOut: true, missing: false });
+    expect(await runChecker(cmd, args, { signal: controller.signal })).toMatchObject({ aborted: true, exitCode: null });
+  });
+
   it("reports a missing binary instead of throwing", async () => {
     const run = await runChecker("atag-no-such-binary-xyz", ["--version"]);
     expect(run.missing).toBe(true);

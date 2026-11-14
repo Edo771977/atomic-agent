@@ -14,20 +14,20 @@
  * tool's to fix, not verification's.
  */
 import { createHash } from "node:crypto";
-import { existsSync, realpathSync } from "node:fs";
-import { lstat, mkdir, mkdtemp, readdir, readFile, readlink, rm, symlink, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { lstat, mkdir, mkdtemp, readdir, readFile, readlink, rm, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { tmpdir } from "node:os";
-import { join, relative, resolve } from "node:path";
+import { join, relative } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import type { AtomicAgentConfig } from "../../config/index.js";
 import { runVerify } from "./run-verify.js";
 import { verifySyntax } from "./verify-syntax.js";
 import { createVerifyWorkspace, type VerifyWorkspace } from "./verify-workspace-copy.js";
+import { installTestTypeScriptCompiler } from "./typescript-test-helpers.js";
 
 const NODE = process.execPath;
-const REAL_TSC = realpathSync(resolve(process.cwd(), "node_modules/.bin/tsc"));
 const CONFIG: Pick<AtomicAgentConfig, "browser"> = {
   browser: { enabled: false, channel: "chrome", headless: true, cdpUrl: null, connect: "agent", userChromeDataDir: null, executablePath: null, noSandbox: false, launchTimeoutMs: 1_000, blockedDomains: [], allowedDomains: [] },
 };
@@ -44,8 +44,7 @@ beforeEach(async () => {
   await writeFile(join(work, "src", "style.css"), ".a { color: red; }\n");
   await writeFile(join(work, "src", "lib.ts"), "export const n: number = 1;\n");
   await writeFile(join(work, "tsconfig.json"), JSON.stringify({ compilerOptions: { strict: true, incremental: true, types: [] }, include: ["src/**/*.ts"] }));
-  await mkdir(join(work, "node_modules", ".bin"), { recursive: true });
-  await symlink(REAL_TSC, join(work, "node_modules", ".bin", "tsc"));
+  installTestTypeScriptCompiler(work);
 });
 
 afterEach(async () => {

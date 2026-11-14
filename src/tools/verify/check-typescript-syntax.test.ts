@@ -1,7 +1,6 @@
-import { realpathSync } from "node:fs";
-import { mkdir, mkdtemp, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
@@ -12,8 +11,7 @@ import {
   TS_CHECKER,
 } from "./check-typescript-syntax.js";
 
-/** This repository's own tsc, resolved through the `.bin` symlink. */
-const REAL_TSC = realpathSync(resolve(process.cwd(), "node_modules/.bin/tsc"));
+import { installTestTypeScriptCompiler } from "./typescript-test-helpers.js";
 
 let dir: string;
 
@@ -34,8 +32,7 @@ async function project(): Promise<string> {
     }),
   );
   await mkdir(join(dir, "src"));
-  await mkdir(join(dir, "node_modules", ".bin"), { recursive: true });
-  await symlink(REAL_TSC, join(dir, "node_modules", ".bin", "tsc"));
+  installTestTypeScriptCompiler(dir);
   return dir;
 }
 
@@ -44,7 +41,7 @@ describe("findTsconfig / findTscBinary", () => {
     await project();
     await mkdir(join(dir, "src", "deep"));
     expect(findTsconfig(join(dir, "src", "deep"))).toBe(join(dir, "tsconfig.json"));
-    expect(findTscBinary(join(dir, "src"))).toBe(join(dir, "node_modules", ".bin", "tsc"));
+    expect(findTscBinary(join(dir, "src"))).toBe(join(dir, "node_modules", ".bin", process.platform === "win32" ? "tsc.cmd" : "tsc"));
   });
 });
 
