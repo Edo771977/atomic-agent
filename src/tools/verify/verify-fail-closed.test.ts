@@ -1,6 +1,7 @@
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Browser } from "playwright-core";
 
@@ -29,6 +30,19 @@ afterEach(async () => {
 });
 
 describe("verify refuses to execute without a private workspace", () => {
+  it("refuses a source file URL instead of passing a check that reads outside its execution copy", async () => {
+    const execution = join(dir, "execution"); await mkdir(execution);
+    await writeFile(join(execution, "original.txt"), "execution-copy");
+    const url = pathToFileURL(join(dir, "original.txt")).href;
+    const runner = vi.spyOn(commands, "runCommandKind");
+    const result = await runVerify({ kind: "command", cmd: process.execPath,
+      args: ["-e", `process.stdout.write(require('node:fs').readFileSync(new URL(${JSON.stringify(url)}),'utf8'))`], network: true },
+      { workingDir: dir, workspace: async () => ({ dir: execution, isolated: true, method: "copy", cleanup: async () => {} }) });
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("unsupported absolute project reference");
+    expect(runner).not.toHaveBeenCalled();
+    expect(await readFile(join(dir, "original.txt"), "utf8")).toBe("original");
+  });
   it.each(["dist", "node_modules"])("charges a protected %s directory to the existing execution-copy cap", async folder => {
     await mkdir(join(dir, folder)); await writeFile(join(dir, folder, "check.mjs"), "x".repeat(6_000));
     const begin = vi.fn(async () => async () => {});

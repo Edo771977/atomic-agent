@@ -1,5 +1,6 @@
 import { homedir } from "node:os";
 import { posix, win32 } from "node:path";
+import { fileURLToPath } from "node:url";
 
 /** Rebase explicit project references into the workspace that actually executes a guarded check. */
 export function rebaseVerifyWorkspaceValue<T>(value: T, from: string, to: string, platform: NodeJS.Platform = process.platform, home = homedir()): T {
@@ -30,6 +31,12 @@ export function rebaseVerifyWorkspaceValue<T>(value: T, from: string, to: string
     const tokens = [...text.matchAll(/[^\s"'`()=;,\[\]]+/g)].map(match => match[0]);
     tokens.push(...[...text.matchAll(/["'`]([^"'`]+)["'`]/g)].map(match => match[1]!));
     for (let token of tokens) {
+      if (/^file:\/\//i.test(token)) {
+        // URL parsing handles encoded spaces, dot segments, local hosts and
+        // Windows drives/UNC without treating the URI as an arbitrary script.
+        try { token = fileURLToPath(new URL(token), { windows: platform === "win32" }); }
+        catch { continue; }
+      }
       token = token.replace(/^(?:~|\$HOME|\$\{HOME\}|%USERPROFILE%|\$env:USERPROFILE)(?=[\/\\]|$)/i, home);
       if (!paths.isAbsolute(token)) continue;
       const normalized = identity(token);

@@ -43,3 +43,15 @@ it("rebases multiple independent project arguments while preserving embedded occ
   const value = "node /backup/tmp/project/tmp/project/a.js '/tmp/project/a.js' /tmp/project/b.js";
   expect(rebaseVerifyWorkspaceValue(value, "/tmp/project", "/private/checked", "linux")).toBe("node /backup/tmp/project/tmp/project/a.js '/private/checked/a.js' /private/checked/b.js");
 });
+it.each([
+  ["linux", "/home/u/my project", "file:///home/u/my%20project/check.mjs"],
+  ["linux", "/home/u/project", "file://localhost/home/u/project/check.mjs"],
+  ["win32", "C:\\Users\\u\\my project", "file:///C:/Users/u/my%20project/check.mjs"],
+  ["win32", "\\\\server\\share\\project", "file://server/share/project/check.mjs"],
+] as const)("refuses an explicit %s source file URL with native path semantics", (platform, root, url) => {
+  expect(() => rebaseVerifyWorkspaceValue(`new URL('${url}')`, root, "/private/checked", platform)).toThrow(/unsupported absolute project reference/);
+});
+it("preserves external and sibling file URLs", () => {
+  const text = "file:///backup/home/u/project/a.js file:///home/u/project-sibling/a.js";
+  expect(rebaseVerifyWorkspaceValue(text, "/home/u/project", "/private/checked", "linux")).toBe(text);
+});
