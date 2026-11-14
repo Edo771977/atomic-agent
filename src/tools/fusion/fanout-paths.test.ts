@@ -139,4 +139,23 @@ describe("collapseScope", () => {
       expect(collapseScope([toNamespacedPath(join(homedir(), "review-safe"))])).toEqual([join(homedir(), "review-safe")]);
     }
   });
+
+  it("compares a namespaced home environment and refuses grants when home cannot be compared", () => {
+    const variable = process.platform === "win32" ? "USERPROFILE" : "HOME";
+    const previous = process.env[variable];
+    const normalHome = process.cwd();
+    try {
+      process.env[variable] = toNamespacedPath(normalHome);
+      expect(homedir()).toBe(toNamespacedPath(normalHome));
+      expect(collapseScope([normalHome, toNamespacedPath(normalHome), dirname(normalHome)])).toEqual([]);
+      expect(collapseScope([join(normalHome, "safe-child")])).toEqual([join(normalHome, "safe-child")]);
+      if (process.platform === "win32") {
+        process.env[variable] = "\\\\.\\C:\\profile";
+        expect(collapseScope([normalHome, join(normalHome, "safe-child")])).toEqual([]);
+      }
+    } finally {
+      if (previous === undefined) delete process.env[variable];
+      else process.env[variable] = previous;
+    }
+  });
 });

@@ -48,7 +48,8 @@ const WINDOWS_PATH_IN_PROSE =
 
 /** Roots too broad to hand to a fan-out, however the brief was written. */
 function isTooBroad(dir: string): boolean {
-  const home = homedir();
+  const home = comparableScopePath(homedir());
+  if (home === null) return true;
   const absolute = resolve(dir);
   // Native path equality also covers Windows drive/UNC roots, separator
   // aliases and case differences. A textual comparison with `sep` only
