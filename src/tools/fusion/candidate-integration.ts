@@ -17,6 +17,7 @@ import type { WorkerTaskResult } from "./worker-result.js";
 import { attachCandidateArtifactReceipt, collectArtifactManifest } from "./artifact-manifest.js";
 import type { ArtifactManifest, ArtifactManifestDependency, ArtifactObservation } from "./artifact-manifest-types.js";
 import { freezeCheckInputs } from "./candidate-check-inputs.js";
+import { rebaseVerifyWorkspaceValue } from "../verify/rebase-verify-workspace.js";
 import type { CandidateAcceptanceReceipt, CandidateRejectionReason } from "./candidate-acceptance.js";
 
 interface Entry { kind: "file" | "symlink" | "directory"; mode: number; hash?: string }
@@ -545,34 +546,7 @@ export async function createCandidateIntegration(
         checkedDir = checkedSet.workspaces.get("checked-source")!.dir;
         if (differences(beforeChecks, await snapshot(checkedDir, freezeSignal)).length > 0) return await rejectFinal("candidate changed while freezing its checked payload");
         await verifyProtectedInputs(checkedDir, input.signal);
-        const rebaseChecked = <T,>(value: T): T => {
-          if (typeof value === "string") {
-            let text: string = value;
-            for (const root of [workspace.dir, set.realDir]) for (const from of [root, root.replace(/\\/g, "/")]) {
-              // Match root boundaries, retaining sibling paths and unrelated executables.
-              let rest: string = text, rewritten = "";
-              const next = (): number => process.platform === "win32" ? rest.toLowerCase().indexOf(from.toLowerCase()) : rest.indexOf(from);
-              for (let index = next(); index >= 0; index = next()) {
-                const end = index + from.length;
-                if (rest[end] !== undefined && !/[\/\\\s"']/.test(rest[end]!)) {
-                  rewritten += rest.slice(0, end); rest = rest.slice(end); continue;
-                }
-                rewritten += rest.slice(0, index) + checkedDir; rest = rest.slice(index + from.length);
-              }
-              text = rewritten + rest;
-            }
-            const normalized = text.replace(/\\+/g, "/").toLowerCase();
-            for (const root of [workspace.dir, set.realDir]) {
-              const from = root.replace(/\\+/g, "/").toLowerCase();
-              const at = normalized.indexOf(from), after = normalized[at + from.length];
-              if (at >= 0 && (after === undefined || /[\/\s"']/.test(after))) throw new Error("final check plan has an unsupported absolute project reference");
-            }
-            return text as T;
-          }
-          if (Array.isArray(value)) return value.map(item => rebaseChecked(item)) as T;
-          if (value !== null && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, rebaseChecked(item)])) as T;
-          return value;
-        };
+        const rebaseChecked = <T,>(value: T): T => rebaseVerifyWorkspaceValue(rebaseVerifyWorkspaceValue(value, workspace.dir, checkedDir), set.realDir, checkedDir);
         checkedPayloadDigest = createHash("sha256").update(JSON.stringify([...beforeChecks].sort(([a], [b]) => a.localeCompare(b)))).digest("hex");
         checkPlanDigest = createHash("sha256").update(JSON.stringify(checks)).digest("hex");
         // Always rerun ALL declared checks on the final candidate, even when

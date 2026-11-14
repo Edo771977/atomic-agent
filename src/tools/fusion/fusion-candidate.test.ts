@@ -297,3 +297,17 @@ it("reports one candidate task run with two completed worker invocations after a
   const report = aggregateOutcomes(records);
   expect(report.workers[0]).toMatchObject({ checksPassed: 0, candidate: { taskRuns: 1, knownWorkerRuns: 2, workerRunsUnverified: 0 } });
 });
+
+it("binds an absolute protected check reference to the actual execution copy", async () => {
+  const { runChecks } = await import("../verify/run-verify.js"); const f = await fixture({ runChecks });
+  const original = `import {readFileSync} from 'node:fs'; if (readFileSync('api.json','utf8') !== '{"name":"before"}') throw new Error('bad artifact');`;
+  await writeFile(join(f.root, "check.mjs"), original);
+  f.deps.runTurn = async session => {
+    await writeFile(join(session.workingDir, "api.json"), "bad");
+    await writeFile(join(session.workingDir, "runner.mjs"), `import {readFileSync,writeFileSync} from 'node:fs'; import {pathToFileURL} from 'node:url'; const file=process.argv[2]; const original=readFileSync(file,'utf8'); writeFileSync(file,'export {};'); await import(pathToFileURL(file).href); writeFileSync(file,original);`);
+    return { session, reason: "reply", stepCount: 1 };
+  };
+  const result = await buildFusionDelegateTool(f.deps).run({ tasks: [{ id: "api", instructions: "work", files: ["api.json", "runner.mjs"] }], contract: { checkInputs: ["check.mjs"], checks: [{ kind: "command", cmd: process.execPath, args: ["runner.mjs", join(f.root, "check.mjs")], network: true }] } }, f.ctx);
+  expect(result.details.candidateIntegration).toMatchObject({ status: "rejected", acceptanceReceipt: { checkScope: "declared", inputs: { declared: 1, verified: 0 } } });
+  expect(await readFile(join(f.root, "api.json"), "utf8")).toBe('{"name":"before"}');
+});

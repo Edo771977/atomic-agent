@@ -20,6 +20,7 @@ import { renderVerifyRunSummary } from "./verify-run-summary.js";
 import { terminalAppHint } from "./terminal-app-hint.js";
 import { createVerifyWorkspace, type VerifyWorkspace } from "./verify-workspace-copy.js";
 import type { VerificationInputIntegrity } from "./verify-input-integrity.js";
+import { rebaseVerifyWorkspaceValue } from "./rebase-verify-workspace.js";
 
 export interface VerifyRunResult {
   readonly ok: boolean;
@@ -191,7 +192,8 @@ export async function runVerify(
       result = failed(`verification not started: ${workspace.error ?? "a private workspace copy is unavailable"}`, "workspace-unavailable");
     } else {
       const completeIntegrity = await ctx.inputIntegrity?.begin(workspace.dir, ctx.signal ?? new AbortController().signal);
-      result = await runInWorkspace(args, workspace.dir, true, ctx, started);
+      const executionArgs = ctx.inputIntegrity === undefined ? args : rebaseVerifyWorkspaceValue(args, ctx.workingDir, workspace.dir);
+      result = await runInWorkspace(executionArgs, workspace.dir, true, ctx, started);
       await completeIntegrity?.();
       // Executors may settle normally after an abort (a page can skip
       // remaining script steps). Such an incomplete run cannot pass.

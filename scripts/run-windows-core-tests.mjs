@@ -11,6 +11,8 @@ const criticalFiles = [
   'src/tools/fusion/candidate-integration.test.ts',
   'src/tools/fusion/candidate-evidence.test.ts',
   'src/tools/fusion/candidate-check-inputs.test.ts',
+  'src/tools/verify/rebase-verify-workspace.test.ts',
+  'src/runtime/composition/runtime-tool-catalog.test.ts',
   'src/tools/fusion/fusion-candidate.test.ts',
   'src/tools/fusion/delegate-descriptor.test.ts',
   'src/tools/fusion/dependency-readiness.test.ts',
