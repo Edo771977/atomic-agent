@@ -44,9 +44,12 @@ function loadRows() {
   const limit = process.env.ATOMIC_AGENT_GAIA_LIMIT
     ? Number(process.env.ATOMIC_AGENT_GAIA_LIMIT)
     : null;
-  const taskIds = process.env.ATOMIC_AGENT_GAIA_TASK_IDS
-    ? process.env.ATOMIC_AGENT_GAIA_TASK_IDS.split(",").map((s) => s.trim()).filter(Boolean)
-    : null;
+  // Like the agent filter: absent selects every row, an explicitly empty or
+  // comma-only list selects none (and the campaign fails as empty).
+  const rawTaskIds = process.env.ATOMIC_AGENT_GAIA_TASK_IDS;
+  const taskIds = rawTaskIds === undefined
+    ? null
+    : rawTaskIds.split(",").map((s) => s.trim()).filter(Boolean);
   return loadGaiaRows({ source, level, limit, taskIds });
 }
 

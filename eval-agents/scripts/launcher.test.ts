@@ -1,8 +1,8 @@
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterAll, describe, expect, it } from "vitest";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
@@ -26,7 +26,7 @@ describe("eval launcher actual Node children", () => {
   for (const signal of ["SIGINT", "SIGTERM"]) {
     it(`lets the real installed ${signal} handler await child close and caller teardown`, () => {
       const result = launch(`handler-${signal}`, { LAUNCHER_MODE: "cancel", LAUNCHER_SIGNAL: signal }, "signal-orchestrator.fixture.mjs");
-      expect(result.status, result.diagnostic).toBe(130);
+      expect(result.status, result.diagnostic).toBe(signal === "SIGTERM" ? 143 : 130);
       const events = readFileSync(`${result.output}.events.jsonl`, "utf8").trim().split("\n").map((line) => JSON.parse(line).event);
       expect(events).toEqual(["child-ready", "after-child-close", "teardown-finished", "returning"]);
       const child = JSON.parse(readFileSync(result.output, "utf8")) as { pid: number };
@@ -65,6 +65,19 @@ describe("eval launcher actual Node children", () => {
     expect(JSON.parse(readFileSync(join(scratch, "relative-report", "campaign.json"), "utf8"))).toMatchObject({ executed: 1 });
   });
 
+  it("treats an empty report directory as unset instead of the working directory", () => {
+    const result = launch("empty-report", { LAUNCHER_MODE: "campaign", LAUNCHER_REQUIRE_CAMPAIGN: "1",
+      ATOMIC_AGENT_GAIA_REPORT_DIR: "" });
+    expect(result.status, result.diagnostic).toBe(0);
+    const child = JSON.parse(readFileSync(result.output, "utf8"));
+    try {
+      expect(child.reportDir).not.toBe(scratch);
+      expect(child.reportDir.startsWith(join(root, "eval-agents", "reports", "run-"))).toBe(true);
+    } finally {
+      if (child.reportDir !== scratch) rmSync(child.reportDir, { recursive: true, force: true });
+    }
+  });
+
   it("settles a spawn error with a diagnostic instead of an unhandled error", () => {
     const result = launch("spawn-error", { LAUNCHER_CWD: join(scratch, "nonexistent") });
     expect(result.status).toBe(1);
@@ -77,5 +90,97 @@ describe("eval launcher actual Node children", () => {
     expect(result.status, result.diagnostic).toBe(130);
     const child = JSON.parse(readFileSync(result.output, "utf8")) as { pid: number };
     expect(() => process.kill(child.pid, 0)).toThrow();
+  });
+});
+
+// A zombie awaiting reaping by the container init is already dead.
+function processAlive(pid: number): boolean {
+  try { process.kill(pid, 0); } catch { return false; }
+  try { return readFileSync(`/proc/${pid}/stat`, "utf8").replace(/^.*\)\s+/, "")[0] !== "Z"; } catch { return true; }
+}
+
+describe.skipIf(process.platform === "win32")("eval launcher process tree", () => {
+  it("terminates grandchildren of the cancelled test child, not only its main process", () => {
+    const result = launch("tree", { LAUNCHER_MODE: "tree" });
+    const child = JSON.parse(readFileSync(result.output, "utf8")) as { pid: number; grandchildPid: number };
+    try {
+      expect(result.status, result.diagnostic).toBe(130);
+      expect(processAlive(child.pid)).toBe(false);
+      expect(processAlive(child.grandchildPid)).toBe(false);
+    } finally {
+      try { process.kill(child.grandchildPid, "SIGKILL"); } catch { /* already gone */ }
+    }
+  });
+
+  it("escalates to SIGKILL when the tree ignores the termination signal", () => {
+    const started = Date.now();
+    const result = launch("stubborn", { LAUNCHER_MODE: "stubborn", LAUNCHER_KILL_TIMEOUT_MS: "500" });
+    const child = JSON.parse(readFileSync(result.output, "utf8")) as { pid: number; grandchildPid: number };
+    try {
+      expect(result.status, result.diagnostic).toBe(130);
+      expect(Date.now() - started).toBeLessThan(8000);
+      expect(processAlive(child.pid)).toBe(false);
+      expect(processAlive(child.grandchildPid)).toBe(false);
+    } finally {
+      for (const pid of [child.pid, child.grandchildPid]) try { process.kill(pid, "SIGKILL"); } catch { /* gone */ }
+    }
+  });
+
+  it("does not leave the test child's process group running after a normal exit", () => {
+    const result = launch("leak", { LAUNCHER_MODE: "leak", LAUNCHER_KILL_TIMEOUT_MS: "500" });
+    const child = JSON.parse(readFileSync(result.output, "utf8")) as { pid: number; grandchildPid: number };
+    try {
+      expect(result.status, result.diagnostic).toBe(0);
+      expect(processAlive(child.grandchildPid)).toBe(false);
+    } finally {
+      try { process.kill(child.grandchildPid, "SIGKILL"); } catch { /* already gone */ }
+    }
+  });
+});
+
+describe.skipIf(process.platform === "win32")("eval launcher repeated signals", () => {
+  for (const [first, second, code] of [["SIGINT", "SIGTERM", 143], ["SIGTERM", "SIGINT", 130]] as const) {
+    it(`a second signal (${first} then ${second}) kills the tree and exits immediately with ${code}`, () => {
+      const started = Date.now();
+      const result = launch(`twice-${first}`, { LAUNCHER_MODE: "stubborn", LAUNCHER_SIGNAL: first,
+        LAUNCHER_SECOND_SIGNAL: second, LAUNCHER_KILL_TIMEOUT_MS: "60000" }, "signal-orchestrator.fixture.mjs");
+      const child = JSON.parse(readFileSync(result.output, "utf8")) as { pid: number; grandchildPid: number };
+      try {
+        expect(result.status, result.diagnostic).toBe(code);
+        expect(Date.now() - started).toBeLessThan(8000);
+        const events = readFileSync(`${result.output}.events.jsonl`, "utf8").trim().split("\n").map((line) => JSON.parse(line).event);
+        expect(events).toEqual(["child-ready"]);
+        const deadline = Date.now() + 2000;
+        while ((processAlive(child.pid) || processAlive(child.grandchildPid)) && Date.now() < deadline) { /* SIGKILL delivery */ }
+        expect(processAlive(child.pid)).toBe(false);
+        expect(processAlive(child.grandchildPid)).toBe(false);
+      } finally {
+        for (const pid of [child.pid, child.grandchildPid]) try { process.kill(pid, "SIGKILL"); } catch { /* gone */ }
+      }
+    });
+  }
+});
+
+describe("eval launcher without an installed Vitest", () => {
+  it("still imports the shared helpers and fails runVitest with a clear diagnostic", () => {
+    // A copy outside the repository cannot resolve the vitest package.
+    const isolated = mkdtempSync(join(tmpdir(), "eval-lib-no-vitest-"));
+    try {
+      mkdirSync(join(isolated, "eval-agents", "scripts"), { recursive: true });
+      const lib = join(isolated, "eval-agents", "scripts", "_lib.mjs");
+      copyFileSync(join(root, "eval-agents/scripts/_lib.mjs"), lib);
+      const script = `const lib = await import(${JSON.stringify(pathToFileURL(lib).href)});
+        lib.makeLog("probe")("imported");
+        process.exitCode = await lib.runVitest();`;
+      const result = spawnSync(process.execPath, ["--input-type=module", "-e", script],
+        { cwd: isolated, encoding: "utf8", timeout: 10_000 });
+      const diagnostic = `${result.stdout}\n${result.stderr}`;
+      expect(result.stderr, diagnostic).toContain("[eval-agents:probe] imported");
+      expect(result.status, diagnostic).toBe(1);
+      expect(result.stderr).toContain("vitest is not installed");
+      expect(result.stderr).not.toContain("ERR_MODULE_NOT_FOUND");
+    } finally {
+      rmSync(isolated, { recursive: true, force: true });
+    }
   });
 });

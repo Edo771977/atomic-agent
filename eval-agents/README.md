@@ -83,9 +83,12 @@ The campaign config runs only `gaia.eval.ts`; its runner checks completion
 outside test hooks, so a title filter matching nothing fails too. The
 orchestrator independently validates its fresh completion report after Vitest
 closes. An absent agent filter selects defaults; an explicitly empty string
-or comma-only filter selects no agents and fails.
+or comma-only filter selects no agents and fails. `ATOMIC_AGENT_GAIA_TASK_IDS`
+follows the same rule: absent selects every row, an explicitly empty or
+comma-only list selects no rows and the campaign fails as empty.
 Set `ATOMIC_AGENT_GAIA_REPORT_DIR` to place a campaign's reports in a chosen
-directory (the default remains a timestamped directory under `reports/`).
+directory (the default remains a timestamped directory under `reports/`;
+an empty value counts as unset, in the launcher and in `gaia.eval.ts`).
 The launcher resolves a relative report directory against the test child's
 working directory (normally the repository root), then passes the same
 absolute path to the child and completion validator.
@@ -93,10 +96,19 @@ absolute path to the child and completion validator.
 Orchestrators launch the installed Vitest JavaScript entry with the current
 Node executable, including on Windows; forwarded arguments stay separate
 argv entries. Spawn errors fail the run, and cancellation waits for the
-test child to close before returning.
+test child to close before returning. On POSIX the test child leads its own
+process group (stdin is not inherited): cancellation signals the whole group,
+so Vitest's forked workers and the agents they started stop too, and the
+launcher waits until the group is gone, escalating to SIGKILL after a timeout
+(10 s by default). A group left behind after a normal exit is stopped the
+same way. On Windows cancellation runs `taskkill /T`, then `/T /F` after the
+timeout; it reaches descendants only while the Vitest process is alive.
 Installed SIGINT/SIGTERM handlers request cancellation through the signal
 passed by smoke/level1; they do not exit or stop daemons inline. The caller
-awaits child close, then its managed-daemon teardown, before exiting 130.
+awaits child close, then its managed-daemon teardown, before exiting 130
+(SIGINT) or 143 (SIGTERM). A second signal does not wait: it SIGKILLs the
+running test process tree and exits at once with the second signal's code,
+skipping daemon teardown.
 Health waits honor the same signal, and handlers are removed after teardown.
 
 ## Methodology

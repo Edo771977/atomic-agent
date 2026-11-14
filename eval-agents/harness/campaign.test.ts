@@ -73,6 +73,14 @@ describe("actual GAIA campaign wiring (hermetic child Vitest)", () => {
     expect(result.output).toContain("no GAIA rows selected");
   });
 
+  for (const [label, value] of [["empty string", ""], ["comma-only", " , "]] as const) {
+    it(`does not expand an explicitly ${label} task-id filter into every row`, () => {
+      const result = campaign(`empty-task-ids-${label.replace(/\W/g, "-")}`, { ATOMIC_AGENT_GAIA_TASK_IDS: value });
+      expect(result.status, result.output).toBe(1);
+      expect(result.output).toContain("no GAIA rows selected");
+    });
+  }
+
   it("fails an intended campaign selecting no adapters", () => {
     const result = campaign("no-adapters", { ATOMIC_AGENT_EVAL_AGENTS: "does-not-exist" });
     expect(result.status, result.output).toBe(1);
