@@ -92,7 +92,7 @@ it("checks candidate module bytes through a rebased file URL in the actual execu
   } finally { await candidate.cleanup(); }
 });
 
-it.runIf(process.platform === "win32")("checks a protected PowerShell path-list import from the execution copy", async () => {
+async function checkProtectedPathList(assignment: string): Promise<void> {
   const root = await mkdtemp(join(tmpdir(), "atag-protected-list-")); roots.push(root);
   await mkdir(join(root, "lib"));
   await writeFile(join(root, "lib", "literal-check.js"), 'module.exports="hello";');
@@ -101,7 +101,7 @@ it.runIf(process.platform === "win32")("checks a protected PowerShell path-list 
   const candidate = await createCandidateIntegration(root, { git: async () => null, maxCopyBytes: 1024 * 1024, checkInputs: ["check.cjs"] });
   try {
     await writeFile(join(candidate.dir, "lib", "literal-check.js"), 'module.exports="changed";');
-    const cmd = `powershell.exe -NoProfile -NonInteractive -Command "$env:NODE_PATH='C:\\external;${join(root, "lib")}'; & '${process.execPath}' check.cjs"`;
+    const cmd = `powershell.exe -NoProfile -NonInteractive -Command "$env:NODE_PATH${assignment}'C:\\external;${join(root, "lib")}'; & '${process.execPath}' check.cjs"`;
     const executions: VerifyRunResult[] = [];
     const runner: ContractCheckRunner = Object.assign(async (specs: readonly Record<string, unknown>[], ctx: Parameters<ContractCheckRunner>[1]) => {
       const result = await runChecks(specs, ctx); executions.push(...result.results); return result;
@@ -115,4 +115,7 @@ it.runIf(process.platform === "win32")("checks a protected PowerShell path-list 
     expect(await readFile(join(root, "lib", "literal-check.js"), "utf8")).toContain('"hello"');
     expect(await readFile(join(root, "check.cjs"), "utf8")).toBe(check);
   } finally { await candidate.cleanup(); }
-});
+}
+
+it.runIf(process.platform === "win32")("checks a protected PowerShell path-list import from the execution copy", () => checkProtectedPathList("="));
+it.runIf(process.platform === "win32")("checks a protected PowerShell import with whitespace around the path-list assignment", () => checkProtectedPathList(" = "));

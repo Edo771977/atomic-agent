@@ -128,7 +128,7 @@ export function rebaseVerifyWorkspaceValue<T>(value: T, from: string, to: string
     let result = "";
     for (let index = 0; index < text.length;) {
       const char = text[index]!;
-      const assignment = /^([a-z_][a-z\d_]*)=/i.exec(text.slice(index));
+      const assignment = /^([a-z_][a-z\d_]*)\s*=\s*/i.exec(text.slice(index));
       if (assignment !== null && pathListNames.has(assignment[1]!.toUpperCase())) {
         const prefix = assignment[0], start = index + prefix.length;
         if (quote(text[start] ?? "")) {

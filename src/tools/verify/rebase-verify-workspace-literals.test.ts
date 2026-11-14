@@ -120,3 +120,8 @@ it("preserves literal semicolons in quoted URLs, argv URLs and non-list environm
   const value = { cmd: `echo '${file}' "${http}"`, args: [file, http], env: { LINK: http } };
   expect(rebase(value, "/project", "/checked", "linux")).toEqual(value);
 });
+
+it("preserves PowerShell assignment whitespace while rebasing the complete named list", () => {
+  const cmd = String.raw`  $env:NODE_PATH  =  'C:\external;C:\project\lib'; & node check.cjs`;
+  expect(rebase({ cmd }, String.raw`C:\project`, String.raw`E:\checked`, "win32")).toEqual({ cmd: String.raw`  $env:NODE_PATH  =  'C:\external;E:\checked\lib'; & node check.cjs` });
+});
