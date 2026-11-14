@@ -295,6 +295,7 @@ export function loadConfig(): AtomicAgentConfig {
       thinking: user.localModels.thinking,
       reasoningBudgetTokens: user.localModels.reasoningBudgetTokens,
       drySampler: user.localModels.drySampler,
+      strictToolArgs: user.localModels.strictToolArgs,
       valueSources: localModelsValueSources(user.localModels),
       managed: { ...user.localModels.managed },
       embeddings: { ...user.localModels.embeddings },
@@ -323,6 +324,7 @@ export function loadConfig(): AtomicAgentConfig {
       approvalLevel: user.agent.approvalLevel,
       smartApproval: user.agent.smartApproval,
       smartApprovalModel: user.agent.smartApprovalModel,
+      taintReview: user.agent.taintReview,
       stablePrefixHashSalt:
         readEnv("ATOMIC_AGENT_STABLE_PREFIX_SALT") ??
         ENV_DEFAULTS.STABLE_PREFIX_SALT,

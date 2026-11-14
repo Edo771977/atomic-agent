@@ -131,6 +131,9 @@ describe("the ### fusion prefix section", () => {
   it("says the call is solo and that results must be verified", () => {
     expect(FUSION_GUIDANCE).toMatch(/on its own, never alongside/i);
     expect(FUSION_GUIDANCE).toContain("needs_orchestrator");
+    // ATO-945: a worker's question is answered by the orchestrator and the task re-sent.
+    expect(FUSION_GUIDANCE).toContain("`needs_input`: answer it, re-send.");
+    expect(FUSION_GUIDANCE).not.toContain("cannot ask");
   });
 
   it("says a task that replaced a user's file is not done until it is restored or the replacement was wanted (F43)", () => {
@@ -293,14 +296,14 @@ describe("task sizing per worker leg", () => {
     // A local brief quotes the first 6,000 chars (`worker-prompt.ts`):
     // what the task needs past them has to ride in `instructions`.
     const note =
-      "workers see only the first ~6,000 chars of the request, not this chat, and cannot ask; put what a task needs past that in `instructions`.";
+      "workers see only the first ~6,000 chars of the request, not this chat; put what a task needs past that in `instructions`.";
     expect(buildFusionGuidance({ ...FACTS, workerMaxNewLines: 300 })).toContain(note);
     expect(buildFusionGuidance(FACTS)).toContain(note);
     // A cloud leg and an unknown one keep the line byte for byte.
     const cloud = buildFusionGuidance(facts({ workerLeg: "cloud", workerModel: "gpt-x" }));
     expect(cloud).not.toContain("6,000");
     expect(cloud).toContain(
-      "workers see the operator's request, not this chat, and cannot ask.",
+      "workers see the operator's request, not this chat.",
     );
     expect(FUSION_GUIDANCE).not.toContain("6,000");
   });

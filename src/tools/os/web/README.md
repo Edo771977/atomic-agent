@@ -15,12 +15,13 @@ This area owns `os.web.fetch` page retrieval and `os.http.request` raw GET/POST 
 
 ## Approval and credentials (ATO-1182)
 
+- A GET asks as `http` (quiet from approval level 3); a POST, or any method other than GET / HEAD / OPTIONS, asks as `http_write`, quiet only from level 4 (ATO-1462). An `http` session grant or a saved `http` "Allow always" never answers an `http_write` prompt; a deny or ask rule on `http` still covers it.
 - "Allow for this session" on an `os.http.request` prompt covers the target's origin (scheme, host, port) only: the request carries `grantKey` and the gate keys the grant by it. A POST to another host asks again.
 - A redirect that would carry the method and body to another origin (a 307/308 after a POST) is not followed. The result names the `Location` (`details.redirectNotFollowed`) and the model has to make a new request there, which is gated like any other. Same-origin redirects and bodyless GET hops are still followed.
 - `http.hostAllowlist` applies to every redirect hop, not only the first URL: a `Location` on a host outside it is not followed and the request fails with an error naming that host.
 - Any hop on another origin is sent without credential headers (`Authorization`, `Proxy-Authorization`, `Cookie`, `X-Api-Key` and any name containing token, secret, key, auth, password, session, cookie, credential or signature).
 - The approval preview masks the values of those headers (`Authorization: Bearer ****`), since it is shown in the terminal, the desktop app and Telegram.
-- Known limitation: with the default `http.approvalMode: "writes"` a GET runs without a prompt, and a GET can still carry data out in its URL (query string, path) and headers. Use `approvalMode: "always"` or `http.hostAllowlist` where that matters.
+- Known limitation: with the default `http.approvalMode: "writes"` a GET runs without a prompt, and a GET can still carry data out in its URL (query string, path) and headers. Use `approvalMode: "always"` or `http.hostAllowlist` where that matters. With `agent.taintReview` on, a GET (and every `os.web.fetch`) on a session that read outside content this turn goes to the approval gate anyway, as an `http` request the taint hold settles (ATO-618); `approvalMode: "never"` and a set `hostAllowlist` keep answering for `os.http.request`.
 
 Callers inject command execution, DNS lookup and, where supported, sleep for deterministic tests. Request-local state owns redirect/retry progress and abortable backoff; there is no new persistent store here. Sandbox owns command processes, approval owns grants, and config owns HTTP/fetch defaults. Response bounds, abort checks, marker parsing and SSRF posture must survive mechanical moves unchanged.
 

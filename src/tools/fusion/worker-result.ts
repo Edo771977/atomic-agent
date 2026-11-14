@@ -27,6 +27,7 @@ import { CHECK_OUTPUT_CHARS, tailClip } from "./contract-checks.js";
 import { describeChanges, FileChangeLog, type FileChange } from "./worker-changes.js";
 import { describeSyntax, type TaskSyntaxSummary } from "./syntax-pass.js";
 import type { ArtifactManifest } from "./artifact-manifest-types.js";
+import { MAX_WORKER_QUESTION_CHARS } from "./worker-question.js";
 
 /**
  * The note on a task a worker could not finish because a step needs the
@@ -54,6 +55,12 @@ export type WorkerTaskStatus =
   | "failed"
   | "cancelled"
   | "needs_orchestrator"
+  /**
+   * The worker stopped to ask the orchestrator a question it could not
+   * answer itself (`worker-question.ts`, ATO-945); `question` carries it.
+   * Not a failure: the remedy is an answer in the next brief.
+   */
+  | "needs_input"
   | "max_steps"
   /**
    * The worker ran out of WALL TIME rather than steps. Set by
@@ -84,6 +91,7 @@ export const WORKER_STATUS_ORDER: readonly WorkerTaskStatus[] = [
   "ok",
   "no_changes",
   "needs_orchestrator",
+  "needs_input",
   "max_steps",
   "timeout",
   "queued",
@@ -98,7 +106,7 @@ export interface WorkerToolStats {
   calls: number;
   errors: number;
   /**
-   * Successful write / edit / patch calls. A task that declared `files`
+   * Successful write / edit / patch calls (a dry-run patch is not one). A task that declared `files`
    * and made none is `no_changes` (`declared-files.ts`), whatever its
    * reply says.
    */
@@ -113,6 +121,17 @@ export const FILE_WRITING_TOOLS: ReadonlySet<string> = new Set([
   "os.fs.patch",
   "os.fs.restore",
 ]);
+
+/**
+ * `os.fs.patch` without `apply: true` only previews: it comes back `ok`
+ * with `details.mode: "dry-run"` and the file untouched (ATO-1491).
+ */
+function isDryRunPatch(
+  tool: string,
+  details: Record<string, unknown>,
+): boolean {
+  return tool === "os.fs.patch" && details.mode === "dry-run";
+}
 
 /**
  * How the call as a whole went, for `details.outcome` and the tool
@@ -251,6 +270,18 @@ export interface WorkerTaskResult {
   selfCheckNotice?: true;
   /** Escalations that reached the worker (advisor hints, a re-run), for the outcome log. */
   escalations?: number;
+  /**
+   * The subagent profile the task ran under (ATO-566): its name, where
+   * it came from and the tools it left the worker (`"all"`: not
+   * narrowed), so a user's or project's profile shadowing a read-only
+   * built-in is visible on the row.
+   */
+  profile?: { name: string; source: string; tools: readonly string[] | "all" };
+  /**
+   * The worker's question to the orchestrator, on a `needs_input` row
+   * (ATO-945); at most `MAX_WORKER_QUESTION_CHARS`.
+   */
+  question?: string;
 }
 
 export interface TaskCheckSummary {
@@ -374,7 +405,12 @@ export class WorkerRunCollector {
       this.calls += 1;
       this.byTool[result.tool] = (this.byTool[result.tool] ?? 0) + 1;
       if (result.status === "error") this.errors += 1;
-      else if (FILE_WRITING_TOOLS.has(result.tool)) this.writes += 1;
+      else if (
+        FILE_WRITING_TOOLS.has(result.tool) &&
+        !isDryRunPatch(result.tool, result.details)
+      ) {
+        this.writes += 1;
+      }
       this.changes.observe(result);
       if (resultCarriesApprovalRefusal(result.summary, result.details)) {
         this.approvalRefused = true;
@@ -1224,6 +1260,9 @@ function renderStatusTable(
         oneLine(describeReplacedInput(input), TABLE_DETAIL_CHARS),
       ),
       ...(r.error ? [`error: ${oneLine(r.error, TABLE_DETAIL_CHARS)}`] : []),
+      // The question in full (it is already bounded): the orchestrator
+      // answers it from this line, so a clipped one is a worse brief.
+      ...(r.question ? [`question: ${oneLine(r.question, MAX_WORKER_QUESTION_CHARS)}`] : []),
       ...(r.checks
         ? [describeChecks(r.checks, TABLE_DETAIL_CHARS, r.error)]
         : []),
@@ -1279,6 +1318,7 @@ function renderBlock(
     ]),
     ...(result.replacedInputs ?? []).map(describeReplacedInput),
     ...(result.hint ? [`hint: ${result.hint}`] : []),
+    ...(result.question ? [`question: ${result.question}`] : []),
     ...(result.checks
       ? [describeChecks(result.checks, ERROR_HEAD_CHARS, result.error)]
       : []),

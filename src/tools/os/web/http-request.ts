@@ -72,13 +72,16 @@ export function buildOsHttpRequestTool(
           `os.http.request: host ${args.urlObj.hostname} is not in config.http.hostAllowlist`,
         );
       }
-      if (needsApproval(httpCfg.approvalMode, args.method)) {
+      if (
+        needsApproval(httpCfg.approvalMode, args.method) ||
+        heldForOutsideContent(options, httpCfg, ctx.sessionId)
+      ) {
         await requireApproval(
           options,
           {
             sessionId: ctx.sessionId,
             tool: "os.http.request",
-            category: "http",
+            category: httpApprovalCategory(args.method),
             reason: `${args.method} ${args.url}`,
             preview: buildApprovalPreview(args),
             affectedResources: [args.url],
@@ -319,10 +322,39 @@ function hasHeader(headers: Record<string, string>, name: string): boolean {
  * means anything that is not a pure read (GET/HEAD) asks. We only support
  * GET + POST today, so in practice `writes` == "POST asks".
  */
+/**
+ * A GET under `approvalMode: "writes"` skips the gate, but after outside
+ * content its URL alone can carry data out (`GET https://x/?d=<secret>`).
+ * So on a tainted session with `agent.taintReview` on it asks, and the
+ * gate's hold settles it (ATO-618). `"never"` and a host allowlist are the
+ * person's own choices and keep answering.
+ */
+function heldForOutsideContent(
+  options: OsHttpRequestOptions,
+  httpCfg: AtomicAgentConfig["http"],
+  sessionId: string,
+): boolean {
+  if (httpCfg.approvalMode === "never" || httpCfg.hostAllowlist !== null) return false;
+  return options.approvals.holdsForOutsideContent(sessionId, "http");
+}
+
 function needsApproval(mode: HttpApprovalMode, method: HttpMethod): boolean {
   if (mode === "always") return true;
   if (mode === "never") return false;
   return method !== "GET";
+}
+
+/** Methods that only read; any other one sends data out. */
+const READ_ONLY_METHODS: ReadonlySet<string> = new Set(["GET", "HEAD", "OPTIONS"]);
+
+/**
+ * The approval category a request asks under: a read stays `http`
+ * (silent from level 3), anything that sends data asks as `http_write`
+ * (silent from level 4, never answered by an `http` grant or rule).
+ * Exported for tests (ATO-1462).
+ */
+export function httpApprovalCategory(method: string): "http" | "http_write" {
+  return READ_ONLY_METHODS.has(method.toUpperCase()) ? "http" : "http_write";
 }
 
 /**

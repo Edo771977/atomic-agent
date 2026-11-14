@@ -559,4 +559,77 @@ describe("fusion.delegate end to end", () => {
       await runtime.shutdown();
     }
   }, 30_000);
+
+  it("refuses a hidden tool called by name: a review-profile worker cannot write (ATO-566)", async () => {
+    // The fake answers with text JSON past any grammar, which is what a
+    // native-tool model does when it names a tool its payload never
+    // carried: only the dispatch gate stands between it and the write.
+    const events: AgentLoopEvent[] = [];
+    const workerPrompts: string[] = [];
+    const steps = new Map<string, number>();
+    const target = join(workingDir, "out.txt");
+    const runtime = await createAgentRuntime({
+      workingDir,
+      approvalLevel: 5,
+      handlers: { onAgentEvent: (event) => events.push(event) },
+      overrides: {
+        browserBackend: backend,
+        skipLlamaHealthCheck: true,
+        llamaComplete: async (params: LlmStreamParams) => {
+          const step = (steps.get(params.sessionId) ?? 0) + 1;
+          steps.set(params.sessionId, step);
+          if (params.providerId === LOCAL) {
+            workerPrompts.push(params.prompt);
+            if (step === 1) {
+              return completion(
+                JSON.stringify([
+                  { tool: "os.fs.write", args: { path: "out.txt", content: "written anyway" } },
+                  { tool: "os.shell.run", args: { cmd: "touch shell.txt" } },
+                ]),
+              );
+            }
+            return completion(replyCall("reviewed"));
+          }
+          return completion(
+            step === 1
+              ? delegateCall([
+                  {
+                    id: "r1",
+                    title: "Review",
+                    instructions: "Review notes.txt and fix out.txt",
+                    files: ["out.txt", "notes.txt"],
+                    profile: "review",
+                  },
+                ])
+              : replyCall("merged"),
+          );
+        },
+      },
+    });
+    try {
+      const parent = runtime.createSession();
+      await runtime.runTurn(parent, "review the notes", { maxSteps: 4 });
+      expect(existsSync(target)).toBe(false);
+      expect(existsSync(join(workingDir, "shell.txt"))).toBe(false);
+      expect(workerPrompts[0]).toContain("PROFILE review");
+      expect(
+        workerPrompts.slice(1).some((p) => p.includes("is not available in this turn; the call was not run")),
+      ).toBe(true);
+      const delegateResults = events.flatMap((event) =>
+        event.type === "llm_event" &&
+        event.event.type === "tool_call_executed" &&
+        event.event.result.tool === "fusion.delegate"
+          ? [event.event.result]
+          : [],
+      );
+      expect(delegateResults).toHaveLength(1);
+      const rows = delegateResults[0]!.details.tasks as WorkerTaskResult[];
+      // Our batch split drops the second, approval-gated call before
+      // dispatch (the notice names it, refused by the tool filter), so
+      // only the write reaches the gate and is refused there.
+      expect(rows[0]!.tools.errors).toBe(1);
+    } finally {
+      await runtime.shutdown();
+    }
+  }, 30_000);
 });

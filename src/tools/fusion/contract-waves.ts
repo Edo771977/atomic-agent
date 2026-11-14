@@ -120,6 +120,8 @@ export const UNDELIVERED_STATUSES: ReadonlySet<WorkerTaskStatus> = new Set([
   "max_steps",
   "timeout",
   "queued",
+  // Stopped to ask the orchestrator (ATO-945): what it was to provide is not there yet.
+  "needs_input",
 ]);
 
 /**
