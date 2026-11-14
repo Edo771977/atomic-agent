@@ -48,6 +48,7 @@ import type { AnalyticsClient } from "../../analytics/analytics-client.js";
 import { buildFusionDelegateTool, readSlotOccupancy, type ContractCheckRunner, type FusionDelegateDeps } from "../../tools/fusion/index.js";
 import {
   confineReads,
+  createCommandReadCheck,
   localPageCheck,
   type ConfineReadsOptions,
 } from "../../tools/read-scope/index.js";
@@ -1010,8 +1011,11 @@ export function registerRuntimeFusionAndReadScope(input: {
           workingDir: ctx.workingDir,
           signal: ctx.signal,
           config,
+          shellPolicy: { isGitRemoteSyncEnabled: () => getConfig().git.remoteSync },
           ...(ctx.inputIntegrity === undefined ? {} : { inputIntegrity: ctx.inputIntegrity }),
         }), { supportsInputIntegrity: true as const }),
+      shellPolicy: { isGitRemoteSyncEnabled: () => getConfig().git.remoteSync },
+      checkCommandReads: createCommandReadCheck(runtimeReadConfinement(config, dangerous)),
       // `verify.syntax`'s own checker: the delegate syntax-checks every
       // green row's changed files itself, so the orchestrator does not
       // spend a step (and its context) on it after each fan-out.

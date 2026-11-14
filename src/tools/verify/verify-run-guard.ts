@@ -90,7 +90,13 @@ export function guardVerifyRun(
 ): VerifyGuardResult {
   const dangerous: VerifyGuardedCommand[] = [];
   for (const command of verifyRunCommands(args)) {
-    const verdict = guardVerifyCommand(command.cmd, command.args, cwd, policy);
+    const direct = guardVerifyCommand(command.cmd, command.args, cwd, policy);
+    // Explicit environment assignments are part of this invocation too (for
+    // example GIT_CONFIG_* can turn an innocent git verb into arbitrary code).
+    const assignments = Object.entries(args.env ?? {}).map(([name, value]) => `${name}=${value}`);
+    const environment = assignments.length === 0 ? direct : guardVerifyCommand("env", [...assignments, command.cmd, ...command.args], cwd, policy);
+    const verdict = direct.action === "block" ? direct : environment.action === "block" ? environment :
+      environment.action === "approval_required" && isDangerousGuardRule(environment.rule) ? environment : direct;
     const guarded = { ...command, verdict };
     if (verdict.action === "block") return { blocked: guarded, dangerous };
     if (verdict.action === "approval_required" && isDangerousGuardRule(verdict.rule)) {

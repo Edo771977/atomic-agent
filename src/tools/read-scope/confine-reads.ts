@@ -64,6 +64,80 @@ export interface ConfineReadsOptions {
   stateSecrets?: StateSecrets;
 }
 
+export type CommandReadCheck = (tool: string, args: Record<string, unknown>, ctx: ToolContext) => Promise<CompressedToolResult | null>;
+
+/** The same pre-exec read/secret boundary for registry tools and programmatic checks. */
+export function createCommandReadCheck(options: ConfineReadsOptions): CommandReadCheck {
+  if (options.approvals === undefined) {
+    if (options.readScope !== undefined || options.stateSecrets !== undefined) throw new Error("command read checks require an approval gate");
+    return async () => null;
+}
+const asker = new ReadOutsideApprover(options.approvals);
+const secrets = options.stateSecrets ?? null;
+const scoped = () => options.readScope?.() === "working-dir";
+return async (
+    tool: string,
+    args: Record<string, unknown>,
+    ctx: Parameters<ToolDefinition["run"]>[1],
+  ): Promise<CompressedToolResult | null> => {
+    // A command naming a secret file asks at every level below full
+    // trust, though the shell itself runs unasked from level 4 and a
+    // fan-out's directory scope would let it through: neither a level
+    // nor a `shell` grant speaks for the agent's keys (ATO-877,
+    // ATO-760). A fusion worker's question is refused by its session
+    // policy, like any other it cannot have answered.
+    const secretPaths =
+      secrets === null
+        ? []
+        : findShellStateSecrets(args, ctx, secrets, options.shellEnv);
+    if (secretPaths.length > 0) {
+      const commandLine = shellCommandLine(args);
+      await asker.confirmStateSecret(
+        tool,
+        ctx,
+        {
+          reason: stateSecretShellPrompt(commandLine, secretPaths),
+          preview: commandLine,
+        },
+        secretPaths,
+      );
+    }
+    if (!scoped()) return null;
+    if (isFusionWorkerSessionId(ctx.sessionId)) {
+      // A worker's world is its task's directories, and there is
+      // nobody to ask: the refusal, as for its reads.
+      const granted = options.grantedDirs(ctx.sessionId);
+      const outside = findShellPathOutsideScope(
+        args,
+        ctx,
+        [ctx.workingDir, ...granted, ...secretPaths],
+        options.shellEnv,
+      );
+      return outside === null
+        ? null
+        : workerReadRefusal(tool, outside, ctx, granted);
+    }
+    return asker.admit(
+      tool,
+      ctx,
+      (roots) =>
+        findShellPathOutsideScope(
+          args,
+          ctx,
+          [...roots, ...secretPaths],
+          options.shellEnv,
+        ),
+      (path, root) =>
+        shellReadOutsidePrompt(
+          shellCommandLine(args),
+          path,
+          ctx.workingDir,
+          root,
+        ),
+    );
+  };
+}
+
 /** Definitions this module produced, so a second install does not wrap twice. */
 const CONFINED = new WeakSet<ToolDefinition>();
 
@@ -157,68 +231,7 @@ export function confineReads(
   }
 
   if (asker !== null) {
-    // Checked per command before the tool runs; `null` lets the command by.
-    const checkCommand = async (
-      tool: string,
-      args: Record<string, unknown>,
-      ctx: Parameters<ToolDefinition["run"]>[1],
-    ): Promise<CompressedToolResult | null> => {
-      // A command naming a secret file asks at every level below full
-      // trust, though the shell itself runs unasked from level 4 and a
-      // fan-out's directory scope would let it through: neither a level
-      // nor a `shell` grant speaks for the agent's keys (ATO-877,
-      // ATO-760). A fusion worker's question is refused by its session
-      // policy, like any other it cannot have answered.
-      const secretPaths =
-        secrets === null
-          ? []
-          : findShellStateSecrets(args, ctx, secrets, options.shellEnv);
-      if (secretPaths.length > 0) {
-        const commandLine = shellCommandLine(args);
-        await asker.confirmStateSecret(
-          tool,
-          ctx,
-          {
-            reason: stateSecretShellPrompt(commandLine, secretPaths),
-            preview: commandLine,
-          },
-          secretPaths,
-        );
-      }
-      if (!scoped()) return null;
-      if (isFusionWorkerSessionId(ctx.sessionId)) {
-        // A worker's world is its task's directories, and there is
-        // nobody to ask: the refusal, as for its reads.
-        const granted = options.grantedDirs(ctx.sessionId);
-        const outside = findShellPathOutsideScope(
-          args,
-          ctx,
-          [ctx.workingDir, ...granted, ...secretPaths],
-          options.shellEnv,
-        );
-        return outside === null
-          ? null
-          : workerReadRefusal(tool, outside, ctx, granted);
-      }
-      return asker.admit(
-        tool,
-        ctx,
-        (roots) =>
-          findShellPathOutsideScope(
-            args,
-            ctx,
-            [...roots, ...secretPaths],
-            options.shellEnv,
-          ),
-        (path, root) =>
-          shellReadOutsidePrompt(
-            shellCommandLine(args),
-            path,
-            ctx.workingDir,
-            root,
-          ),
-      );
-    };
+    const checkCommand = createCommandReadCheck(options);
     const commandTools: [string, (args: Record<string, unknown>) => Record<string, unknown>[]][] = [
       [SHELL_TOOL, (args) => [args]],
       // Its copy of the workspace takes the writes, not the reads: `cat`

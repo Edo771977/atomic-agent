@@ -2146,6 +2146,34 @@ describe("fusion.delegate — task tree (ATO-940)", () => {
     expect(result.summary).toContain("Task tree: 1 task split by their workers");
   });
 
+  it("authorizes all proposed child checks before any child worker or check can execute", async () => {
+    const { ApprovalGate } = await import("../../approval/approval-gate.js");
+    const starts: string[] = [];
+    const checkRunner = vi.fn(async (specs: readonly Record<string, unknown>[]) => ({ ok: true, results: specs.map(() => ({ ok: true })) }));
+    const gate: ApprovalGate = new ApprovalGate({ level: 1, emit: req => {
+      queueMicrotask(() => gate.resolve({ approvalId: req.approvalId, approved: !req.preview?.includes("child-b-check.js") }));
+    } });
+    const proposal = "```split_proposal\n" + JSON.stringify({ tasks: [
+      { id: "a", instructions: "Write part A" }, { id: "b", instructions: "Write part B" },
+    ], contract: { checks: [
+      { task: "a", kind: "command", cmd: "node", args: ["child-a-check.js"] },
+      { task: "b", kind: "command", cmd: "node", args: ["child-b-check.js"] },
+    ] } }) + "\n```";
+    const tool = buildFusionDelegateTool(deps({
+      approvals: gate, approvalRequired: true, runChecks: checkRunner,
+      resolveRunMode: () => fusionMode({ taskTree: { maxDepth: 2, maxNodes: 24 } }),
+      runTurn: async (_session, brief, options) => {
+        starts.push(brief);
+        options.eventHook?.({ type: "llm_event", event: { type: "assistant_reply", text: proposal } });
+        return turnResult();
+      },
+    }));
+    await tool.run({ tasks: [TASKS[0]] }, ctx());
+    expect(starts).toHaveLength(1);
+    expect(checkRunner).not.toHaveBeenCalled();
+    expect(gate.pendingCount()).toBe(0);
+  });
+
   it("runs the children on the model their parent ran on", async () => {
     const pins = new Map<string, string | undefined>();
     const roles: NonNullable<ResolvedRunMode["roles"]> = {

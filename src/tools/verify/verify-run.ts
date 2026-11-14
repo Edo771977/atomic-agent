@@ -15,24 +15,14 @@
  * before anything runs, at every level; a `dangerous.*` match asks as
  * `shell_dangerous`, which no fan-out scope and no `shell` grant covers.
  */
-import {
-  requireApproval,
-  savedRuleOverridesScope,
-  type DangerousToolOptions,
-} from "../../approval/dangerous-tool.js";
+import type { DangerousToolOptions } from "../../approval/dangerous-tool.js";
+import { authorizeVerifyBatch, VerifyGuardRefusal } from "./verify-authorization.js";
 import type { CompressedToolResult } from "../../compressor/result-compressor.js";
 import type { ShellGuardPolicy } from "../os/shell-command-guard/index.js";
 import type { ToolDefinition } from "../tool-registry.js";
 import type { BrowserLauncher } from "./run-page-kind.js";
 import { runVerify, type VerifyRunConfig, type VerifyRunContext } from "./run-verify.js";
 import { parseVerifyRunArgs, type VerifyRunArgs } from "./verify-run-args.js";
-import { needsShellInterpretation } from "../os/shell/shell-interpretation.js";
-import {
-  shellRuleSegments,
-  shellRunsUnreadableScript,
-} from "../os/shell/shell-command-argv.js";
-import { guardVerifyRun, verifyRunCommands } from "./verify-run-guard.js";
-
 export const VERIFY_RUN_TOOL = "verify.run";
 
 export interface VerifyRunToolOptions extends DangerousToolOptions {
@@ -77,80 +67,21 @@ export function buildVerifyRunTool(options: VerifyRunToolOptions): ToolDefinitio
         return { tool: VERIFY_RUN_TOOL, status: "error", summary: message, details: { error: message }, truncated: false };
       }
       const description = describeVerifyRun(args);
-      // Same pre-exec guard as `os.shell.run` (ATO-1266): the copy takes
-      // the writes inside it, not `rm -rf ~` or `sudo`.
-      const guard = guardVerifyRun(args, ctx.workingDir, options.shellPolicy);
-      if (guard.blocked !== null) {
-        const { verdict } = guard.blocked;
-        const message = `verify.run: blocked by shell guard: ${verdict.rule} - ${verdict.reason}`;
-        return {
-          tool: VERIFY_RUN_TOOL,
-          status: "error",
-          summary: message,
-          details: {
-            error: message,
-            description,
-            guardVerdict: verdict.action,
-            guardRule: verdict.rule,
-            guardReason: verdict.reason,
-          },
-          truncated: false,
-        };
-      }
-      const dangerous = guard.dangerous.length > 0;
-      // A fan-out's directory covers ordinary checks, never a dangerous
-      // command: the operator approved a directory of work, not those.
-      const commandSegments = verifyRunCommands(args).flatMap((command) =>
-        shellRuleSegments(
-          command.cmd,
-          command.args,
-          needsShellInterpretation(command.cmd, command.args),
-        ),
-      );
-      const commandUnreadable = verifyRunCommands(args).some((command) =>
-        shellRunsUnreadableScript(
-          command.cmd,
-          command.args,
-          needsShellInterpretation(command.cmd, command.args),
-        ),
-      );
-      // Not after outside content either (`agent.taintReview`), as in os.shell.run.
-      const scopedByFanout =
-        !dangerous &&
-        !(options.approvals.holdsForOutsideContent?.(ctx.sessionId, "shell") ?? false) &&
-        (options.approvals.fanoutScopes?.allows(ctx.sessionId, [ctx.workingDir]) ?? false) &&
-        !savedRuleOverridesScope(options.approvals, {
-          sessionId: ctx.sessionId,
-          tool: VERIFY_RUN_TOOL,
-          category: "shell",
-          commandSegments,
-          ...(commandUnreadable ? { commandUnreadable } : {}),
-          affectedResources: [ctx.workingDir],
-          workdir: ctx.workingDir,
-        });
-      if (!scopedByFanout) {
-        const reason = dangerous
-          ? `${guard.dangerous.map((c) => c.verdict.reason).join("; ")} — verify (${args.kind}) in a throwaway copy of ${ctx.workingDir}; the copy is not a sandbox`
-          : `verify (${args.kind}) in a throwaway copy of ${ctx.workingDir}`;
-        await requireApproval(
-          options,
-          {
-            sessionId: ctx.sessionId,
-            tool: VERIFY_RUN_TOOL,
-            category: dangerous ? "shell_dangerous" : "shell",
-            reason,
-            preview: description,
-            affectedResources: [ctx.workingDir],
-            commandSegments,
-            ...(commandUnreadable ? { commandUnreadable } : {}),
-          },
-          ctx.signal,
-        );
+      try {
+        const approved = await authorizeVerifyBatch([rawArgs], { ...options, allowFanoutScope: true }, ctx);
+        args = parseVerifyRunArgs(approved[0]!);
+      } catch (error) {
+        // Approval denials retain their existing dispatch semantics. Hard
+        // policy refusals remain ordinary tool results and never reach IO.
+        if (error instanceof Error && error.name === "ApprovalDeniedError") throw error;
+        const message = error instanceof Error ? error.message : String(error);
+        return { tool: VERIFY_RUN_TOOL, status: "error", summary: message, details: { error: message, description, ...(error instanceof VerifyGuardRefusal ? { guardVerdict: "block", guardRule: error.guardRule, guardReason: error.guardReason } : {}) }, truncated: false };
       }
       const result = await runVerify(args, {
         workingDir: ctx.workingDir,
         config: options.config,
         signal: ctx.signal,
+        ...(options.shellPolicy === undefined ? {} : { shellPolicy: options.shellPolicy }),
         ...(options.launchBrowser === undefined ? {} : { launchBrowser: options.launchBrowser }),
         ...(options.workspace === undefined ? {} : { workspace: options.workspace }),
       });

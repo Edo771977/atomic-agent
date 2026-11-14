@@ -134,7 +134,7 @@ describe("verify.run behind the shell guard", () => {
     expect(request.mock.calls[0]?.[0]).toMatchObject({
       tool: "verify.run",
       category: "shell_dangerous",
-      preview: "rm -rf ./build",
+      preview: expect.stringContaining("rm -rf ./build"),
     });
     expect(String(request.mock.calls[0]?.[0]?.reason)).toContain("recursive remove");
     expect(request.mock.calls[0]?.[0]?.commandShape).toBeUndefined();
