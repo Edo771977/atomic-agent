@@ -118,11 +118,18 @@ describe("a call the user declined is not asked again in the same turn", () => {
   it("refuses a shell command that redirects into the declined file, whatever the route", async () => {
     await expect(write("test10.txt", "привет")).rejects.toThrow();
     const target = join(dir, "test10.txt");
+    // The nested body is POSIX syntax even when the host is Windows.
+    const posixTarget = `'${target.replaceAll("\\", "/").replaceAll("'", "'\\''")}'`;
+    gate.setLevel(5);
     for (const args of [
       { cmd: "printf %s привет > test10.txt" },
       { cmd: 'echo "привет" > test10.txt' },
-      { cmd: "sh", args: ["-c", `echo привет > ${target}`] },
+      { cmd: "sh", args: ["-c", `echo привет > ${posixTarget}`] },
       { cmd: `cd .. && touch ${basename(dir)}/test10.txt` },
+      ...(process.platform === "win32" ? [
+        { cmd: "cmd", args: ["/c", `echo привет > "${target}"`] },
+        { cmd: "powershell", args: ["-NoProfile", "-Command", `Set-Content -LiteralPath '${target.replaceAll("'", "''")}' -Value привет`] },
+      ] : []),
     ]) {
       const refused = shell(args);
       await expect(refused).rejects.toMatchObject({
