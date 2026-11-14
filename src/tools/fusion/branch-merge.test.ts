@@ -277,7 +277,7 @@ describe("runIsolatedWave", () => {
     expect(await readFile(join(repo, "docs"), "utf8")).toBe("a file named docs\n");
     expect(await readFile(join(repo, "b.txt"), "utf8")).toBe("b from two\n");
     expect(wave.results.map((r) => r.status)).toEqual(["ok", "needs_orchestrator"]);
-    expect(wave.results[1]!.error).toContain("merge conflict in docs/a.md");
+    expect(wave.results[1]!.error).toContain(`merge conflict in ${join("docs", "a.md")}`);
     expect(wave.merges.map((m) => m.id)).toEqual(["merge-two"]);
     const saved = join(repo, BRANCH_MERGE_DIR, (await readdir(join(repo, BRANCH_MERGE_DIR))).filter((n) => n !== ".gitignore")[0]!);
     expect(await readFile(join(saved, "docs", "a.md.task"), "utf8")).toBe("under docs\n");
@@ -389,7 +389,7 @@ describe("rebaseTask / rebaseScope", () => {
     expect(t.instructions).toContain("edit /ws/t0/a.ts and /ws/t0/b.ts, not /var/plan.md");
     expect(t.files).toEqual(["/ws/t0/a.ts", "rel.ts", "/elsewhere/c.ts"]);
     expect(rebaseScope(["/var/p/src", "/other"], roots, "/ws/t0")).toEqual([
-      "/ws/t0/src",
+      join("/ws/t0", "src"),
       "/other",
       "/ws/t0",
     ]);

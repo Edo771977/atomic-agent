@@ -14,15 +14,16 @@ function task(patch: Partial<DelegateTask> = {}): DelegateTask {
   };
 }
 
-const CWD = "/repo";
+const CWD = join(process.cwd(), "review-project");
+const OUTPUT = join(process.cwd(), "review-output");
 
 describe("resolveFanoutScope", () => {
   it("takes the directories a brief names in `files`", () => {
     const scope = resolveFanoutScope(
-      [task({ files: ["/tmp/rel-2/cart.js", "/tmp/rel-2/cart.test.js"] })],
+      [task({ files: [join(OUTPUT, "cart.js"), join(OUTPUT, "cart.test.js")] })],
       CWD,
     );
-    expect(scope).toContain("/tmp/rel-2");
+    expect(scope).toContain(OUTPUT);
   });
 
   it("reads paths out of the prose when `files` is empty", () => {
@@ -33,14 +34,14 @@ describe("resolveFanoutScope", () => {
       [
         task({
           instructions:
-            "Create directory /tmp/rel-2 if needed. Write two files:\n" +
-            "1. /tmp/rel-2/cart.js — export function addItem(cart, item).\n" +
-            "2. /tmp/rel-2/cart.test.js — use node:test.",
+            `Create directory ${OUTPUT} if needed. Write two files:\n` +
+            `1. ${join(OUTPUT, "cart.js")} — export function addItem(cart, item).\n` +
+            `2. ${join(OUTPUT, "cart.test.js")} — use node:test.`,
         }),
       ],
       CWD,
     );
-    expect(scope).toContain("/tmp/rel-2");
+    expect(scope).toContain(OUTPUT);
   });
 
   it("does not mistake prose for paths", () => {
@@ -67,7 +68,7 @@ describe("resolveFanoutScope", () => {
     expect(scope).toContain(outside);
     expect(resolveFanoutScope([task({ instructions: "Use v1.2.3, https://example.org/file.ts and C:notes.ts." })], cwd)).toEqual([cwd]);
     if (process.platform === "win32") {
-      expect(resolveFanoutScope([task({ instructions: "Write C:/review-output/result.ts" })], cwd)).toContain("C:\\review-output");
+      expect(resolveFanoutScope([task({ instructions: "Write C:/review-output/result.ts" })], cwd)).toContain("C:/review-output");
       expect(resolveFanoutScope([task({ deliverable: "Save \\\\server\\share\\output\\result.ts" })], cwd)).toContain("\\\\server\\share\\output");
       // File names at the drive/share root must never widen a fan-out to it.
       expect(resolveFanoutScope([task({ instructions: "Write C:\\result.ts and \\\\server\\share\\result.ts" })], cwd)).toEqual([cwd]);
@@ -80,7 +81,7 @@ describe("resolveFanoutScope", () => {
 
   it("resolves a relative path against the working directory", () => {
     const scope = resolveFanoutScope([task({ files: ["./src/a.ts"] })], CWD);
-    expect(scope).toEqual(["/repo"]);
+    expect(scope).toEqual([CWD]);
   });
 });
 

@@ -1,7 +1,8 @@
 import { describe, it, expect } from "vitest";
+import { join, resolve } from "node:path";
 import { classifyTestCommand } from "./test-command-key.js";
 
-const WD = "/work/project";
+const WD = resolve("review-project");
 
 function classify(args: unknown, workingDir = WD) {
   return classifyTestCommand("os.shell.run", args, workingDir);
@@ -61,7 +62,7 @@ describe("classifyTestCommand", () => {
   it("keeps changed cwd distinct and resolves relative cwd against workingDir", () => {
     const root = classify({ cmd: "pytest" });
     const sub = classify({ cmd: "pytest", cwd: "packages/api" });
-    expect(sub!.cwd).toBe(`${WD}/packages/api`);
+    expect(sub!.cwd).toBe(join(WD, "packages", "api"));
     expect(sub!.key).not.toBe(root!.key);
     // Explicit cwd equal to the working dir matches the implicit one.
     expect(classify({ cmd: "pytest", cwd: WD })!.key).toBe(root!.key);

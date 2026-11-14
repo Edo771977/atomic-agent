@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import type { AgentLoopEvent } from "../../agent/agent-loop.js";
@@ -79,7 +80,7 @@ describe("changed paths from the worker's tool events", () => {
     c.observe(executed("os.fs.edit", { path: "/elsewhere/x.ts", addedLines: 1, removedLines: 0 }));
     const r = c.finish({ id: "t1", title: "T", reason: "reply", stepCount: 4, durationMs: 10 });
     expect(describeChanges(r.changes)).toBe(
-      "changed: src/new.ts (new, +12), a.ts (+40/-3), b.ts (+4/-4), lib/moved.ts (moved from old.ts), /elsewhere/x.ts (+1/-0)",
+      `changed: ${join("src", "new.ts")} (new, +12), a.ts (+40/-3), b.ts (+4/-4), ${join("lib", "moved.ts")} (moved from old.ts), /elsewhere/x.ts (+1/-0)`,
     );
   });
 
@@ -106,7 +107,7 @@ describe("changed paths from the worker's tool events", () => {
     log.observe({ tool: "os.fs.move", status: "ok", summary: "", truncated: false, details: { moves: [{ from: "/w/lib", to: "/w/src" }] } });
     const changes = log.list();
     expect(describeChanges(changes)).toBe(
-      "changed: library.ts (+1/-1), src/a.ts (new, +2), src/b.ts (+1/-0, moved from lib/b.ts), src (moved from lib)",
+      `changed: library.ts (+1/-1), ${join("src", "a.ts")} (new, +2), ${join("src", "b.ts")} (+1/-0, moved from ${join("lib", "b.ts")}), src (moved from lib)`,
     );
     expect(presentChangedPaths(changes)).not.toContain("lib/a.ts");
   });
