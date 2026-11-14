@@ -39,6 +39,13 @@ export interface ArtifactManifestDependency {
   status: "ready" | "blocked" | "unknown";
 }
 
+/** Runtime receipt scope is separate from inventory coverage and worker task status. */
+export type ArtifactManifestBinding =
+  | { scope: "final-project-observation"; disposition: "observed" }
+  | { scope: "candidate-snapshot"; receiptId: string; disposition: "promoted" | "rejected" | "unchanged";
+      checkScope: "declared" | "protected-declared"; checkStatus: "passed" | "failed" | "unverified";
+      checkedPayloadDigest?: string; checkPlanDigest?: string };
+
 export interface ArtifactManifest {
   version: 1;
   coverage: { source: "observed" | "snapshot"; complete: boolean; reasons: ArtifactManifestReason[] };
@@ -47,6 +54,8 @@ export interface ArtifactManifest {
   dependencies: ArtifactManifestDependency[];
   bytesHashed: number;
   omitted: number;
+  /** Optional v1 extension. Legacy manifests have no acceptance/delivery binding. */
+  binding?: ArtifactManifestBinding;
 }
 
 export interface CollectArtifactManifestInput {

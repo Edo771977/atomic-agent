@@ -10,7 +10,7 @@ import { buildFusionDelegateTool, type FusionDelegateDeps } from "./fusion-deleg
 import type { WorkerTaskResult } from "./worker-result.js";
 import { FusionRunStore } from "./run-checkpoint.js";
 import { planResume } from "./run-resume.js";
-import { collectArtifactManifest } from "./artifact-manifest.js";
+import { attachCandidateArtifactReceipt, collectArtifactManifest } from "./artifact-manifest.js";
 
 describe("artifact evidence through Fusion results and checkpoints", () => {
   let dir: string;
@@ -77,6 +77,24 @@ describe("artifact evidence through Fusion results and checkpoints", () => {
     const current = (result.details.tasks as WorkerTaskResult[])[0]!.artifactManifest!;
     expect(current.artifacts[0]!.sha256).toBe(createHash("sha256").update("tampered after checkpoint").digest("hex"));
     expect(current.artifacts[0]!.sha256).not.toBe(manifest.artifacts[0]!.sha256);
+  });
+
+  it("stores candidate binding in v1 but never carries promoted proof into freshly observed resume evidence", async () => {
+    writeFileSync(join(dir, "artifact.txt"), "original");
+    const raw = await collectArtifactManifest({ workingDir: dir, roots: [dir], artifacts: [{ path: "artifact.txt", change: "new", source: "snapshot" }], coverage: "snapshot", signal: new AbortController().signal });
+    const manifest = attachCandidateArtifactReceipt(raw, { version: 1, id: "a".repeat(24), disposition: "promoted", checkScope: "declared", checkStatus: "passed", checkedPayloadDigest: "b".repeat(64), checkPlanDigest: "c".repeat(64) });
+    const store = new FusionRunStore({ dir: join(dir, "checkpoints") });
+    const tasks = [{ id: "core", title: "Core", instructions: "write artifact.txt" }];
+    const run = store.start({ sessionId: "s-parent", workingDir: dir, args: { tasks }, tasks, waveCount: 1 });
+    run.recordTask({ id: "core", title: "Core", status: "ok", reply: "done", stepCount: 1, durationMs: 1, tools: { calls: 0, errors: 0, writes: 0, byTool: {} }, artifactManifest: manifest });
+    run.finish("interrupted");
+    expect(store.load(run.runId)!.tasks[0]!.result!.artifactManifest!.binding).toEqual(manifest.binding);
+    const d = deps(); d.runCheckpoints = store;
+    d.runTurn = async () => { throw new Error("settled task must not execute again"); };
+    const result = await buildFusionDelegateTool(d).run({ resume: run.runId }, { workingDir: dir, sessionId: "s-parent", stepIndex: 0, signal: new AbortController().signal });
+    const current = (result.details.tasks as WorkerTaskResult[])[0]!.artifactManifest!;
+    expect(current.binding).toEqual({ scope: "final-project-observation", disposition: "observed" });
+    expect(current.binding).not.toHaveProperty("receiptId");
   });
 
   it.each(["empty", "null-path"])("does not republish a historical %s complete snapshot as current evidence on checkpoint resume", async variant => {

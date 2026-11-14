@@ -3,9 +3,10 @@ import { constants, type BigIntStats } from "node:fs";
 import { lstat, open, readlink, realpath } from "node:fs/promises";
 import { basename, dirname, isAbsolute, posix, relative, resolve, sep, win32 } from "node:path";
 import { isInside } from "../../approval/fanout-scope.js";
+import type { CandidateAcceptanceReceipt } from "./candidate-acceptance.js";
 import type {
   ArtifactManifest, ArtifactManifestEntry, ArtifactManifestReason,
-  CollectArtifactManifestInput,
+  ArtifactManifestBinding, CollectArtifactManifestInput,
 } from "./artifact-manifest-types.js";
 
 export type * from "./artifact-manifest-types.js";
@@ -24,7 +25,8 @@ function ceiling(value: number | undefined, max: number): number {
 function empty(input: Pick<CollectArtifactManifestInput, "coverage" | "incomplete">): ArtifactManifest {
   return { version: 1, coverage: { source: input.coverage ?? "observed", complete: false,
     reasons: [...new Set([...(input.coverage === "snapshot" ? [] : ["observed_scope" as const]), ...(input.incomplete ?? [])])] },
-    artifacts: [], checks: [], dependencies: [], bytesHashed: 0, omitted: 0 };
+    artifacts: [], checks: [], dependencies: [], bytesHashed: 0, omitted: 0,
+    ...(input.coverage === "snapshot" ? {} : { binding: { scope: "final-project-observation", disposition: "observed" } }) };
 }
 
 function same(a: BigIntStats, b: BigIntStats): boolean {
@@ -200,6 +202,37 @@ const STATUSES = ["pass", "fail", "unknown"];
 const record = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 const number = (v: unknown): v is number => typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
 const member = (values: readonly string[], value: unknown): boolean => typeof value === "string" && values.includes(value);
+const digest = (value: unknown): value is string => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+
+function parseBinding(value: unknown, source: unknown): ArtifactManifestBinding | undefined {
+  if (!record(value)) return undefined;
+  if (value.scope === "final-project-observation") return source === "observed" && value.disposition === "observed" &&
+    value.receiptId === undefined && value.checkStatus === undefined && value.checkedPayloadDigest === undefined && value.checkPlanDigest === undefined
+    ? { scope: "final-project-observation", disposition: "observed" } : undefined;
+  if (value.scope !== "candidate-snapshot" || source !== "snapshot" || typeof value.receiptId !== "string" || !/^[a-f0-9]{24}$/.test(value.receiptId) ||
+      !member(["promoted", "rejected", "unchanged"], value.disposition) || !member(["declared", "protected-declared"], value.checkScope) ||
+      !member(["passed", "failed", "unverified"], value.checkStatus) ||
+      (value.checkedPayloadDigest !== undefined && !digest(value.checkedPayloadDigest)) ||
+      (value.checkPlanDigest !== undefined && !digest(value.checkPlanDigest)) ||
+      (value.disposition !== "rejected" && (value.checkStatus !== "passed" || !digest(value.checkedPayloadDigest) || !digest(value.checkPlanDigest)))) return undefined;
+  return { scope: "candidate-snapshot", receiptId: value.receiptId, disposition: value.disposition as "promoted" | "rejected" | "unchanged",
+    checkScope: value.checkScope as "declared" | "protected-declared", checkStatus: value.checkStatus as "passed" | "failed" | "unverified",
+    ...(value.checkedPayloadDigest === undefined ? {} : { checkedPayloadDigest: value.checkedPayloadDigest }),
+    ...(value.checkPlanDigest === undefined ? {} : { checkPlanDigest: value.checkPlanDigest }) };
+}
+
+/** Structural subset of the neutral candidate receipt; no outcome or candidate dependency. */
+export type CandidateArtifactReceipt = Pick<CandidateAcceptanceReceipt,
+  "version" | "id" | "disposition" | "checkScope" | "checkStatus" | "checkedPayloadDigest" | "checkPlanDigest">;
+
+/** Only final authoritative candidate inventory may carry final delivery proof. */
+export function attachCandidateArtifactReceipt(manifest: ArtifactManifest, receipt: CandidateArtifactReceipt): ArtifactManifest {
+  const clean = parseArtifactManifest(manifest) ?? incompleteArtifactManifest();
+  if (clean.coverage.source !== "snapshot" || receipt.version !== 1) return clean;
+  const binding = parseBinding({ scope: "candidate-snapshot", receiptId: receipt.id, disposition: receipt.disposition,
+    checkScope: receipt.checkScope, checkStatus: receipt.checkStatus, checkedPayloadDigest: receipt.checkedPayloadDigest, checkPlanDigest: receipt.checkPlanDigest }, "snapshot");
+  return binding === undefined ? clean : boundArtifactManifest({ ...clean, binding });
+}
 
 /** Strict, whitelist-only v1 persistence boundary; extra contents/args/output fields are never copied. */
 export function parseArtifactManifest(value: unknown): ArtifactManifest | undefined {
@@ -212,6 +245,8 @@ export function parseArtifactManifest(value: unknown): ArtifactManifest | undefi
         !Array.isArray(value.checks) || value.checks.length > 64 ||
         !Array.isArray(value.dependencies) || value.dependencies.length > 128 ||
         Buffer.byteLength(JSON.stringify(value), "utf8") > ARTIFACT_MANIFEST_MAX_JSON_BYTES) return undefined;
+    const binding = value.binding === undefined ? undefined : parseBinding(value.binding, value.coverage.source);
+    if (value.binding !== undefined && binding === undefined) return undefined;
     const artifacts: ArtifactManifestEntry[] = [];
     for (const e of value.artifacts) {
       if (!record(e) || !(e.path === null || (typeof e.path === "string" && e.path.length > 0 && e.path.length <= MAX_PATH &&
@@ -255,7 +290,7 @@ export function parseArtifactManifest(value: unknown): ArtifactManifest | undefi
       if (e.state === "too_large") reasons.add("file_limit");
       if (e.kind === "missing") reasons.add("missing_artifact");
     }
-    return { version: 1, coverage: { source: value.coverage.source as "observed" | "snapshot", complete: value.coverage.complete && reasons.size === 0, reasons: [...reasons] }, artifacts, checks, dependencies, bytesHashed: value.bytesHashed, omitted: value.omitted };
+    return { version: 1, coverage: { source: value.coverage.source as "observed" | "snapshot", complete: value.coverage.complete && reasons.size === 0, reasons: [...reasons] }, artifacts, checks, dependencies, bytesHashed: value.bytesHashed, omitted: value.omitted, ...(binding === undefined ? {} : { binding }) };
   } catch { return undefined; }
 }
 
