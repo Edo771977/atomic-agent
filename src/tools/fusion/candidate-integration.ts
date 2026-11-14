@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import { createReadStream, type Stats } from "node:fs";
-import { chmod, copyFile, lstat, mkdir, open, opendir, readlink, rename, rm, rmdir, symlink } from "node:fs/promises";
+import { chmod, copyFile, lstat, mkdir, open, opendir, readlink, rename, rm, rmdir, stat, symlink } from "node:fs/promises";
 import { dirname, join, relative, sep } from "node:path";
 import { isInside } from "../../approval/fanout-scope.js";
 import { renameWithRetrySync, syncDirectoryBestEffort, writeFileSyncedSync } from "../../config/durable-write.js";
@@ -65,12 +65,15 @@ async function trackedPaths(set: BranchSet, git: GitExec): Promise<ReadonlySet<s
 /** The project's own agent state (approval rules, merge artifacts): never promoted from a candidate. */
 const AGENT_STATE_DIR = dirname(BRANCH_MERGE_DIR);
 /**
- * Conservative on every platform: the first component is compared as a
+ * Conservative on every platform: every component is compared as a
  * case-insensitive (macOS, Windows) Win32 open reads it, trailing dots,
  * spaces and `:stream` dropped, so `.ATOMIC-AGENT/` or `.atomic-agent./`
- * cannot deliver state the runtime later loads as `.atomic-agent/`.
+ * cannot deliver state the runtime later loads as `.atomic-agent/`, and
+ * neither can `pkg/.atomic-agent/`, which a session working in `pkg/`
+ * would load. The root merge folder never reaches this check (the
+ * inventory skips it).
  */
-const isAgentState = (rel: string): boolean => windowsComponentIdentity(rel.split(sep)[0] ?? "").toLowerCase() === AGENT_STATE_DIR.toLowerCase();
+const isAgentState = (rel: string): boolean => rel.split(sep).some(component => windowsComponentIdentity(component).toLowerCase() === AGENT_STATE_DIR.toLowerCase());
 /**
  * An untracked path the inventory leaves out (ignore rules, dependency and
  * build folder names): a top-level stamp only, never walked or hashed.
@@ -341,7 +344,7 @@ export async function createCandidateIntegration(
       bounds.signal?.throwIfAborted(); if (--bounds.entries < 0) throw new Error("held artifact entry limit exceeded");
       const entry = await lstat(from);
       if (entry.isDirectory()) { await mkdir(to); for await (const child of await opendir(from)) await copy(join(from, child.name), join(to, child.name)); }
-      else if (entry.isSymbolicLink()) await symlink(await readlink(from), to);
+      else if (entry.isSymbolicLink()) await symlink(await readlink(from), to, await stat(from).then((found) => found.isDirectory() ? "dir" : "file", () => undefined));
       else if (entry.isFile()) { bounds.bytes -= entry.size; if (bounds.bytes < 0) throw new Error("held artifact byte limit exceeded"); await copyFile(from, to); await chmod(to, entry.mode & 0o777); }
       else throw new Error("unsupported held artifact kind");
     };

@@ -129,9 +129,12 @@ describe("physical completion reservations", () => {
   });
 
   it.each(["http://localhost:4000", "http://192.168.1.2:4000", "http://gateway:4000"])("does not infer free inference from compatible gateway %s", async baseUrl => {
-    const f = fixture({ baseUrl, cap: 0.01, unpriced: true });
-    await expect(f.wired.llmComplete(f.request)).rejects.toThrow(/pric/i);
-    expect(f.sent).toEqual([]);
+    // Unpriced, so meter-only: the reply's reported cost is still charged.
+    const f = fixture({ baseUrl, cap: 0.01, unpriced: true, fetch: async () => new Response(JSON.stringify({ model: "priced", choices: [{ message: { content: "done" }, finish_reason: "stop" }], usage: { cost: 5 } }), { headers: { "content-type": "application/json" } }) });
+    await f.wired.llmComplete(f.request);
+    expect(f.budget.check("parent", { usd: 0.01 })).toMatchObject({ spentUsd: 5 });
+    await expect(f.wired.llmComplete(f.request)).rejects.toThrow(/budget|cap/i);
+    expect(f.sent).toHaveLength(1);
   });
 
   it.each(["llama-server", "subscription-cli"])("counts reported dollar charges even from explicitly unbilled %s", async kind => {
@@ -179,10 +182,13 @@ describe("physical completion reservations", () => {
     expect(f.sent[0]?.max_tokens).toBe(3);
   });
 
-  it("refuses paid requests without verified pricing before sending", async () => {
+  it("meters paid requests without verified pricing instead of refusing them", async () => {
     const f = fixture({ unpriced: true });
-    await expect(f.wired.llmComplete(f.request)).rejects.toThrow(/pric/i);
-    expect(f.sent).toEqual([]);
+    await f.wired.llmComplete(f.request);
+    await f.wired.llmComplete(f.request);
+    expect(f.sent).toHaveLength(2);
+    // The body keeps its own shape: no ceiling is enforced without pricing.
+    expect(f.sent[0]?.max_tokens).toBe(999);
   });
 
   it("reserves final messages and tools without assuming a cache discount", async () => {
@@ -381,12 +387,15 @@ describe("physical completion reservations", () => {
     expect(backupCalls).toBe(1);
   });
 
-  it("rejects a priced adapter that cannot authorize each physical send", () => {
+  it("meters a priced adapter that cannot authorize each physical send", () => {
     const f = fixture();
     const adapter = Object.create(f.provider) as OpenAiProvider;
     Object.defineProperty(adapter, "supportsRequestBudget", { value: false });
-    expect(() => createRequestBudgetScope(f.budget, f.request, adapter, f.llm.providers[0],
-      { id: "priced", source: "user", contextWindow: 32000, pricing: f.pricing } as ResolvedModel)).toThrow(/physical requests/);
+    const scope = createRequestBudgetScope(f.budget, f.request, adapter, f.llm.providers[0],
+      { id: "priced", source: "user", contextWindow: 32000, pricing: f.pricing } as ResolvedModel)!;
+    expect(scope).toMatchObject({ mode: "meter", hint: expect.stringMatching(/physical send/) });
+    scope.finish({ usage: { promptTokens: 1, completionTokens: 2, totalTokens: 3 } } as never);
+    expect(f.budget.check("parent", { usd: 0 })).toMatchObject({ spentUsd: 0.5 });
     expect(f.sent).toEqual([]);
   });
 

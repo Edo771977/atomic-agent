@@ -189,6 +189,11 @@ const SHARED_COMPAT_KEY_VARS = [
   "ATOMIC_AGENT_OPENAI_API_KEY",
 ] as const;
 
+/** Whether `name` is one of the shared compat variables (`SHARED_COMPAT_KEY_VARS`). */
+export function isSharedCompatKeyVar(name: string): boolean {
+  return (SHARED_COMPAT_KEY_VARS as readonly string[]).includes(name);
+}
+
 /**
  * ATO-1066: why an endpoint gets no key although a shared compat
  * variable is set (a server on another computer, or plain http:// off

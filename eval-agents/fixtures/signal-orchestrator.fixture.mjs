@@ -9,7 +9,12 @@ const record = (event) => fs.appendFileSync(events, `${JSON.stringify({ event })
 // must never start or stop a real daemon, even when checking the old behavior.
 const exists = fs.existsSync;
 fs.existsSync = (path) => /dist[\\/]cli[\\/]index\.js$/.test(String(path)) || exists(path);
-childProcess.spawnSync = () => {
+// Only the daemon calls are faked: the launcher's own process-tree kill on
+// Windows (taskkill) also goes through spawnSync and must really run, or
+// the cancelled child would never be stopped there.
+const realSpawnSync = childProcess.spawnSync;
+childProcess.spawnSync = (command, args = [], options) => {
+  if (/taskkill(\.exe)?$/i.test(String(command))) return realSpawnSync(command, args, options);
   record("legacy-inline-stop");
   return { status: 0, stdout: "", stderr: "" };
 };

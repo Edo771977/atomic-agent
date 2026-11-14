@@ -3,7 +3,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { resolve } from "node:path";
+import { resolve, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 
@@ -312,9 +312,19 @@ function forceExit(name) {
 
 const defaultTreeDeps = {
   platform: process.platform,
-  run: (command, args) => { spawnSync(command, args, { stdio: "ignore", windowsHide: true }); },
+  env: process.env,
+  /** True when the command ran and exited 0 (taskkill found and killed the tree). */
+  run: (command, args) => {
+    const result = spawnSync(command, args, { stdio: "ignore", windowsHide: true });
+    return result.error === undefined && result.status === 0;
+  },
   kill: (pid, name) => { process.kill(pid, name); },
 };
+
+/** `taskkill.exe` by absolute path: the launcher can run with an empty PATH. */
+function taskkillPath(env) {
+  return win32.join(env.SystemRoot ?? env.windir ?? "C:\\Windows", "System32", "taskkill.exe");
+}
 
 /**
  * Signal the test child's whole tree. POSIX: its process group. Windows:
@@ -322,12 +332,21 @@ const defaultTreeDeps = {
  * windows to close, which a console Node process never receives, so a
  * graceful request would be ignored. /T walks the tree from the live
  * root; once the root has exited its orphaned descendants are not found.
+ * taskkill is run by absolute path (System32), since a launcher may run
+ * with an empty PATH; if it cannot run, the root alone is killed.
  * `deps` is a test seam.
  */
 export function signalTree(child, name, deps = defaultTreeDeps) {
   if (!child.pid) return;
   if (deps.platform === "win32") {
-    deps.run("taskkill", ["/pid", String(child.pid), "/T", "/F"]);
+    if (deps.run(taskkillPath(deps.env ?? {}), ["/pid", String(child.pid), "/T", "/F"])) return;
+    // taskkill missing or refused (or the root already gone): at least
+    // stop the root itself, as before the tree kill existed.
+    try {
+      child.kill?.("SIGKILL");
+    } catch {
+      // already gone
+    }
     return;
   }
   try {

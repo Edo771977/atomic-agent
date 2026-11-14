@@ -189,6 +189,22 @@ it.each([
   } finally { await candidate.cleanup(); }
 });
 
+it("recreates a candidate's directory dependency links with an explicit dir type", async () => {
+  // Windows guesses an untyped link's type from its target, and the target
+  // rewritten into the candidate may not be copied yet: the link would be a
+  // broken file link (realpath EPERM on a real Windows runner).
+  const root = await workspaceProject();
+  const candidate = await createCandidateIntegration(root, { git: async () => null });
+  try {
+    for (const name of ["pkg", "rel"]) {
+      const path = join(candidate.dir, "node_modules", "@s", name);
+      const made = links.calls.filter((call) => call.path === path);
+      expect(made.length, name).toBeGreaterThan(0);
+      expect(made.every((call) => call.type === "dir"), name).toBe(true);
+    }
+  } finally { await candidate.cleanup(); }
+});
+
 it("keeps a candidate's dependency link outside the project pointing where it did", async () => {
   const root = await project();
   const outside = await realpath(await mkdtemp(join(tmpdir(), "atag-dep-outside-"))); roots.push(outside);

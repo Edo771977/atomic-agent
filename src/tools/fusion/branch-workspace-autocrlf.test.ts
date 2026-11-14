@@ -56,12 +56,15 @@ describe("actual tracked working-tree snapshot", () => {
     const repo = await makeGitRepo("atag-overlay-limit-");
     const root = await mkdtemp(join(tmpdir(), "atag-overlay-limit-tmp-"));
     cleanup.push(repo, root);
-    await writeFile(join(repo, "a.txt"), "1234567890");
+    // The checkout writes CRLF, so the original's LF bytes are overlaid
+    // (an identical checkout costs nothing); .gitattributes is identical.
+    await writeFile(join(repo, ".gitattributes"), "*.txt text eol=crlf\n");
+    await writeFile(join(repo, "a.txt"), "12345\n7890");
     const globalIgnore = join(root, "empty-ignore");
     await writeFile(globalIgnore, "");
     await runGitRaw(repo, ["config", "core.excludesFile", globalIgnore]);
     await writeFile(join(repo, ".git", "info", "exclude"), "");
-    await runGitRaw(repo, ["add", "a.txt"]);
+    await runGitRaw(repo, ["add", "a.txt", ".gitattributes"]);
     await runGitRaw(repo, ["commit", "-q", "-m", "init"]);
     const refused = await createBranchSet(repo, ["one", "two"], { tmpRoot: root, maxCopyBytes: 29 });
     if (refused !== null) await refused.cleanup();

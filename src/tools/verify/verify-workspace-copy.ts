@@ -251,8 +251,12 @@ async function copyDirectory(src: string, dest: string, context: CopyContext): P
     const to = join(dest, entry.name);
     if (entry.isSymbolicLink()) {
       const target = await readlink(from);
+      // Typed from what the original points at: Windows otherwise guesses
+      // from the target, which may not be copied yet (a directory link
+      // would become a broken file link).
+      const type = await stat(from).then((found) => found.isDirectory() ? "dir" as const : "file" as const, () => undefined);
       try {
-        await link(target, to);
+        await link(target, to, type);
       } catch (err) {
         if (!isLinkRefused(err) || platform !== "win32") throw err;
         await recreateRefusedLink(from, to, target, context, err);
