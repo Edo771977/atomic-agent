@@ -56,10 +56,25 @@ it.each([
   ["win32", "C:\\Users\\u\\my project", "file:C:/Users/u/my%20project/check.mjs"],
   ["linux", "/home/u/my project", "FiLe:/home/u/my%20project/check.mjs"],
   ["linux", "/home/u/my project", "file:home/u/my%20project/check.mjs"],
-  ["linux", "/home/u/my project", "fi\nle:/home/u/my%20project/check.mjs"],
-  ["linux", "/home/u/my project", "\u0001file:/home/u/my%20project/check.mjs"],
-] as const)("refuses an explicit %s source file URL with native path semantics", (platform, root, url) => {
-  expect(() => rebaseVerifyWorkspaceValue(`new URL('${url}')`, root, "/private/checked", platform)).toThrow(/unsupported absolute project reference/);
+] as const)("rebases an explicit %s source file URL with native path semantics", (platform, root, url) => {
+  const target = platform === "win32" ? String.raw`D:\private\checked` : "/private/checked";
+  const expected = platform === "win32" ? "file:///D:/private/checked/check.mjs" : "file:///private/checked/check.mjs";
+  expect(rebaseVerifyWorkspaceValue(`new URL('${url}')`, root, target, platform)).toBe(`new URL('${expected}')`);
+});
+it.each(["fi\nle:/home/u/my%20project/check.mjs", "\u0001file:/home/u/my%20project/check.mjs"])("refuses a source file URL whose scheme relies on literal control normalization", url => {
+  expect(() => rebaseVerifyWorkspaceValue(url, "/home/u/my project", "/private/checked", "linux")).toThrow(/unsupported absolute project reference/);
+});
+it("rebases file URL pathnames while preserving encoded suffixes, queries and fragments", () => {
+  const url = "file:///home/u/my%20project/%66ile%20%23%25.mjs?input=%2Fhome%2Fu%2Fmy%20project#same%20tag";
+  expect(rebaseVerifyWorkspaceValue(`import('${url}')`, "/home/u/my project", "/checked space", "linux")).toBe("import('file:///checked%20space/%66ile%20%23%25.mjs?input=%2Fhome%2Fu%2Fmy%20project#same%20tag')");
+});
+it("compares file URL identity with native platform case rules", () => {
+  expect(rebaseVerifyWorkspaceValue("file:///C:/PROJECT/a.mjs", String.raw`C:\project`, String.raw`D:\checked`, "win32")).toBe("file:///D:/checked/a.mjs");
+  expect(rebaseVerifyWorkspaceValue("file:///PROJECT/a.mjs", "/project", "/checked", "darwin")).toBe("file:///checked/a.mjs");
+  expect(rebaseVerifyWorkspaceValue("file:///PROJECT/a.mjs", "/project", "/checked", "linux")).toBe("file:///PROJECT/a.mjs");
+});
+it("constructs UNC destination file URLs and preserves encoded suffixes", () => {
+  expect(rebaseVerifyWorkspaceValue("file://server/share/project/a%20b.mjs?q=1#part", String.raw`\\server\share\project`, String.raw`\\target\private share\checked`, "win32")).toBe("file://target/private%20share/checked/a%20b.mjs?q=1#part");
 });
 it("preserves external and sibling file URLs", () => {
   const text = "file:///backup/home/u/project/a.js file:///home/u/project-sibling/a.js file:/home/u/project-sibling/a.js file:backup/home/u/project/a.js";

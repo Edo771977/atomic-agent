@@ -1,6 +1,6 @@
 import { homedir } from "node:os";
 import { posix, win32 } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const unsupported = (): never => { throw new Error("verification check plan has an unsupported absolute project reference"); };
 
@@ -64,8 +64,26 @@ export function rebaseVerifyWorkspaceValue<T>(value: T, from: string, to: string
       // must not become a filesystem substring search through its query.
       return text;
     }
-    if (namesSource(filename)) unsupported();
-    return text;
+    if (!namesSource(filename)) return text;
+    // WHATWG can remove literal controls from a scheme/path. Do not certify
+    // such an ambiguous spelling even though it identifies a source file.
+    if (/[\u0000-\u001f\u007f]/.test(text)) unsupported();
+    // Find the URL pathname boundary corresponding to the native root. Keep
+    // the encoded suffix verbatim instead of decoding/re-encoding filenames;
+    // query and fragment are URL data and never filesystem substitutions.
+    let suffix: string | undefined = root === "/" ? url.pathname : undefined;
+    for (let end = 1; suffix === undefined && end <= url.pathname.length; end++) {
+      if (end !== url.pathname.length && url.pathname[end] !== "/") continue;
+      const prefix = new URL(url); prefix.pathname = url.pathname.slice(0, end);
+      let nativePrefix: string;
+      try { nativePrefix = fileURLToPath(prefix, { windows: platform === "win32" }); } catch { continue; }
+      if (identity(nativePrefix) === root) suffix = url.pathname.slice(end);
+    }
+    if (suffix === undefined) unsupported();
+    const target = pathToFileURL(to, { windows: platform === "win32" });
+    target.pathname = target.pathname.replace(/\/$/, "") + suffix;
+    target.search = url.search; target.hash = url.hash;
+    return target.href;
   };
 
   const literal = (text: string): string | undefined => uri(text) ?? native(text);
