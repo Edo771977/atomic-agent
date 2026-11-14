@@ -123,6 +123,16 @@ export function routeTurn(input: RouteTurnInput): RouteDecision {
   return { routed: false, reason: "no-match" };
 }
 
+/**
+ * How much of the message a `matches` rule is tested against: the first
+ * 32 Ki characters. The message can come from an untrusted channel
+ * (Telegram, a webhook) at any length, and an operator's pattern can
+ * backtrack badly on a long input; the router runs before every turn, so
+ * a bounded input keeps a bad pattern from stalling it. A pattern that
+ * needs the end of a very long message does not see it.
+ */
+export const ROUTER_MATCH_MAX_CHARS = 32 * 1024;
+
 export function ruleMatches(
   when: UserLlmRouterConditions | undefined,
   features: RouteFeatures,
@@ -138,7 +148,10 @@ export function ruleMatches(
     const text = request.message.toLowerCase();
     if (!when.contains.some((word) => text.includes(word.toLowerCase()))) return false;
   }
-  if (when.matches !== undefined && !compiled(when.matches).test(request.message)) {
+  if (
+    when.matches !== undefined &&
+    !compiled(when.matches).test(request.message.slice(0, ROUTER_MATCH_MAX_CHARS))
+  ) {
     return false;
   }
   if (

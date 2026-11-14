@@ -3,7 +3,7 @@
 Status: current (step 1 of ATO-483)
 Owner: src/llm/router/
 
-`llm.router` holds opt-in rules that send a turn to a configured provider by what the request looks like: estimated message tokens (`minTokens`, `maxTokens`, about four characters per token), an image in the message (`hasImage`: an image file name or a `data:image/` URL), words (`contains`, any, case-insensitive), a regular expression (`matches`, case-insensitive), whether the turn offers tools (`needsTools`), and the session's working folder (`workingDir`, the folder or inside it, `~` allowed). All conditions of a rule must hold; the first matching rule wins, so order is precedence. A rule without `when` matches every turn.
+`llm.router` holds opt-in rules that send a turn to a configured provider by what the request looks like: estimated message tokens (`minTokens`, `maxTokens`, about four characters per token), an image in the message (`hasImage`: an image file name or a `data:image/` URL), words (`contains`, any, case-insensitive), a regular expression (`matches`, case-insensitive, tested against the message's first 32 Ki characters only, so a long message from an untrusted channel cannot stall the router on a backtracking pattern), whether the turn offers tools (`needsTools`), and the session's working folder (`workingDir`, the folder or inside it, `~` allowed). All conditions of a rule must hold; the first matching rule wins, so order is precedence. A rule without `when` matches every turn.
 
 ```json
 "router": {
