@@ -7,6 +7,7 @@ import { createWorkspaceLoader } from "./session-workspace.js";
 import { prepareRuntimeSkills } from "./composition/runtime-skills.js";
 import { createRuntimeToolRegistry, registerRuntimeCoreTools, registerRuntimeVisionTools, registerRuntimeImageTools, registerRuntimeVideoTools, connectRuntimeMcpCatalog, mcpGrammarHookFor, registerRuntimeFusionAndReadScope } from "./composition/runtime-tool-catalog.js";
 import { prepareRuntimeSessionStore, installRuntimeSessionDelete, createRuntimeSessionFactories } from "./composition/runtime-session-services.js";
+import { createInterruptedTurns } from "./interrupted-turns.js";
 import { prepareRuntimeTurnState, createRuntimeTurnService } from "./composition/runtime-turn-service.js";
 import { createRuntimeTaskStores, createRuntimeTaskRunner, createRuntimeScheduler } from "./composition/runtime-task-services.js";
 import { connectRuntimeChannels } from "./composition/runtime-channels.js";
@@ -21,6 +22,7 @@ import { connectRuntimeProviders, createRuntimeModelContext, connectRuntimeFallb
 import { createRuntimeMemoryStores } from "./composition/runtime-memory-stores.js";
 import { createMemoryEmbeddingSwitch } from "./composition/runtime-memory-embedding-switch.js";
 import { createRuntimeMemoryServices, createRuntimeMemoryConsolidator } from "./composition/runtime-memory-services.js";
+import { sessionGroundingSource } from "../memory/name-grounding.js";
 import { createRuntimeLifecycle } from "./composition/runtime-lifecycle.js";
 import { join, resolve } from "node:path";
 
@@ -484,6 +486,7 @@ export async function createAgentRuntime(
   const { reflectionRunner, memoryContextProvider } = createRuntimeMemoryServices({
     config, profileStore, notesStore, linkStore, lessonStore, procedureStore, voteStore, embeddingClient,
     slotManager, llmComplete, toolTransport: bootstrapLlmSlice.transport, logger, metrics, touchRecorder, memoryHealth,
+    nameGroundingSource: sessionGroundingSource(sessionStore),
   });
 
   const promptPreviewDeps = {
@@ -861,6 +864,34 @@ export async function createAgentRuntime(
   });
   consolidatorJob?.start();
 
+  // ATO-617 / ATO-448: fusion runs a restart cut off, for `/fusion resume`
+  // and for `/resume` of a cut-off orchestrator turn.
+  const fusionRunsApi = {
+    listResumable: (sessionId?: string) =>
+      fusionRuns.listResumable(sessionId).map((run) => ({
+        runId: run.runId,
+        sessionId: run.sessionId,
+        updatedAt: run.updatedAt,
+        summary: describeResumableRun(run),
+      })),
+    resumeMessage: (sessionId: string, runId?: string) => {
+      const run =
+        runId === undefined
+          ? fusionRuns.listResumable(sessionId)[0]
+          : fusionRuns.listResumable(sessionId).find((r) => r.runId === runId);
+      return run === undefined ? null : renderResumeRequest(run);
+    },
+    discard: (sessionId: string, runId?: string) => {
+      const run =
+        runId === undefined
+          ? fusionRuns.listResumable(sessionId)[0]
+          : fusionRuns.listResumable(sessionId).find((r) => r.runId === runId);
+      return run !== undefined && fusionRuns.discard(run.runId)
+        ? run.runId
+        : null;
+    },
+  };
+
   const runtime = {
     getSessionWorkspace(input: SessionState | string) {
       const session = typeof input === "string" ? sessionStore.load(input) : input;
@@ -887,31 +918,9 @@ export async function createAgentRuntime(
       steer: (parentSessionId: string, taskId: string, text: string) =>
         fusionLiveWorkers.steer(parentSessionId, taskId, text),
     },
-    fusionRuns: {
-      listResumable: (sessionId?: string) =>
-        fusionRuns.listResumable(sessionId).map((run) => ({
-          runId: run.runId,
-          sessionId: run.sessionId,
-          updatedAt: run.updatedAt,
-          summary: describeResumableRun(run),
-        })),
-      resumeMessage: (sessionId: string, runId?: string) => {
-        const run =
-          runId === undefined
-            ? fusionRuns.listResumable(sessionId)[0]
-            : fusionRuns.listResumable(sessionId).find((r) => r.runId === runId);
-        return run === undefined ? null : renderResumeRequest(run);
-      },
-      discard: (sessionId: string, runId?: string) => {
-        const run =
-          runId === undefined
-            ? fusionRuns.listResumable(sessionId)[0]
-            : fusionRuns.listResumable(sessionId).find((r) => r.runId === runId);
-        return run !== undefined && fusionRuns.discard(run.runId)
-          ? run.runId
-          : null;
-      },
-    },
+    fusionRuns: fusionRunsApi,
+    // A chat turn a restart cut off: offered, never continued on its own (ATO-448).
+    interruptedTurns: createInterruptedTurns(sessionStore, fusionRunsApi),
     profileStore,
     notesStore,
     lessonStore,
