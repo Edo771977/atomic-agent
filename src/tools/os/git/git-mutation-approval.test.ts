@@ -138,9 +138,9 @@ describe("git write tools ride the fs approval ladder", () => {
     const workspace = await mkdtemp(join(tmpdir(), "atomic-git-ws-"));
     try {
       const prompts: ApprovalRequest[] = [];
-      const target = join(workspace, "fresh");
+      const target = join(workspace, "fresh repo");
       const result = await buildOsGitInitTool(recording(prompts)).run(
-        { path: "fresh" },
+        { path: "fresh repo" },
         makeCtx(workspace),
       );
       expect(result.status).toBe("ok");
@@ -149,10 +149,12 @@ describe("git write tools ride the fs approval ladder", () => {
       expect(prompts[0]).toMatchObject({
         tool: "os.git.init",
         category: "fs_write_workspace",
-
       });
       expect(prompts[0]!.reason).toBe(`git init in ${target}`);
-      expect(prompts[0]!.preview).toBe(formatGitCommandLine(["init", "--initial-branch=main", "--", target]));
+      // The space forces quoting on every platform. Keep the expected
+      // command independent of the formatter used by the producer.
+      const quotedTarget = `'${target.replaceAll("'", "'\\''")}'`;
+      expect(prompts[0]!.preview).toBe(`git init --initial-branch=main -- ${quotedTarget}`);
       expect(prompts[0]!.affectedResources?.map(path => resolve(path))).toEqual([target]);
     } finally {
       await rm(workspace, { recursive: true, force: true });
