@@ -14,6 +14,7 @@ import { makeGitRepo, runGitRaw, writeRepoFile } from "../os/git/test-helpers.js
 const links = vi.hoisted(() => ({
   deny: (_target: string, _type: string | undefined): string | undefined => undefined,
   calls: [] as { target: string; path: string; type: string | undefined }[],
+  copies: [] as { from: string; to: string }[],
 }));
 vi.mock("node:fs/promises", async importOriginal => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
@@ -23,12 +24,17 @@ vi.mock("node:fs/promises", async importOriginal => {
     links.calls.push({ target: String(target), path: String(path), type: type ?? undefined });
     return actual.symlink(target, path, process.platform === "win32" ? type as never : undefined);
   }) as typeof actual.symlink;
-  return { ...actual, symlink, default: { ...actual, symlink } };
+  const copyFile = (async (...args: Parameters<typeof actual.copyFile>) => {
+    links.copies.push({ from: String(args[0]), to: String(args[1]) });
+    return actual.copyFile(...args);
+  }) as typeof actual.copyFile;
+  return { ...actual, symlink, copyFile, default: { ...actual, symlink, copyFile } };
 });
 
 const roots: string[] = [];
 afterEach(async () => {
   links.deny = () => undefined; links.calls.length = 0;
+  links.copies.length = 0;
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
 const DEP_BYTES = 1000;
@@ -130,9 +136,12 @@ it("names the candidate's private dependency copy when only it overflows the lim
 it("copies a candidate's dependency directory from the original only once when nothing can be linked", async () => {
   links.deny = () => "EPERM";
   const root = await project();
-  // One dependency copy plus the project's own files, twice (base and candidate).
-  const candidate = await createCandidateIntegration(root, { git: async () => null, maxCopyBytes: DEP_BYTES + 100 });
+  // One staged dependency copy, one minimum final-copy allowance, and
+  // 100 bytes for the project's own base/candidate files. Copying the
+  // original dependency twice would leave too little for that allowance.
+  const candidate = await createCandidateIntegration(root, { git: async () => null, maxCopyBytes: 2 * DEP_BYTES + 100 });
   try {
+    expect(links.copies.filter(copy => copy.from === join(root, "node_modules", "dep", "index.js"))).toHaveLength(1);
     expect((await lstat(join(candidate.dir, "node_modules"))).isSymbolicLink()).toBe(false);
     expect(await readFile(join(candidate.dir, "node_modules", "dep", "index.js"), "utf8")).toBe("d".repeat(DEP_BYTES));
     await writeFile(join(candidate.dir, "node_modules", "dep", "index.js"), "private rebuild");
