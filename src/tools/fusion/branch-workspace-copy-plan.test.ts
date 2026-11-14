@@ -34,7 +34,7 @@ it.each([false, true])("measures exactly the complete unchanged future branch-se
 it("preserves the Git method for an empty exit-one stash only after both tracked diffs prove clean", async () => {
   const f = await fixture(true); const probes: string[][] = [];
   const git: GitExec = async (args, cwd) => {
-    if (args[0] === "stash") return { command: "git", args: [...args], exitCode: 1, stdout: "", stderr: "", signal: null, durationMs: 0, timedOut: false, truncated: false };
+    if (args[0] === "stash") return { command: "git", args: [...args], exitCode: 1, stdout: "", stderr: "", signal: null, durationMs: 0, timedOut: false, truncated: false, inputTruncated: false };
     if (args[0] === "diff") probes.push([...args]);
     return defaultGitExec(args, cwd);
   };
@@ -47,7 +47,7 @@ it.each(["dirty", "error"])("does not accept a %s stash failure as a verified cl
   const f = await fixture(true);
   if (kind === "dirty") await writeFile(join(f.project, "a.txt"), "changed");
   const git: GitExec = async (args, cwd) => args[0] === "stash"
-    ? { command: "git", args: [...args], exitCode: 1, stdout: "", stderr: kind === "error" ? "real stash error" : "", signal: null, durationMs: 0, timedOut: false, truncated: false }
+    ? { command: "git", args: [...args], exitCode: 1, stdout: "", stderr: kind === "error" ? "real stash error" : "", signal: null, durationMs: 0, timedOut: false, truncated: false, inputTruncated: false }
     : defaultGitExec(args, cwd);
   const set = await createBranchSet(f.project, ["a"], { tmpRoot: f.copies, git });
   try { expect(set?.method).toBe("copy"); }
