@@ -24,6 +24,26 @@ import {
   runLocalModelsUse,
 } from "./models-handlers.js";
 
+/**
+ * Runs a model handler with what it prints on stdout sent to stderr:
+ * fit-test's stdout carries the report (`--json`), and a recovery runs
+ * before another command's own output.
+ */
+export async function withStdoutOnStderr<T>(fn: () => Promise<T>): Promise<T> {
+  const original = process.stdout.write;
+  process.stdout.write = process.stderr.write.bind(process.stderr) as typeof process.stdout.write;
+  try {
+    return await fn();
+  } finally {
+    process.stdout.write = original;
+  }
+}
+
+const stop = (opts: Parameters<typeof runLocalModelsStop>[0]) => withStdoutOnStderr(() => runLocalModelsStop(opts));
+const use = (id: string) => withStdoutOnStderr(() => runLocalModelsUse(id));
+const start = (opts: Parameters<typeof runLocalModelsStart>[0]) => withStdoutOnStderr(() => runLocalModelsStart(opts));
+const startEmbedding = () => withStdoutOnStderr(() => runLocalModelsStartEmbedding());
+
 async function chatDaemonStatus() {
   const cfg = getConfig();
   return getDaemonStatus(cfg.paths.localModelsDataDir, cfg.localModels.managed.port);
@@ -70,15 +90,15 @@ export function createFitModelSwitcher(snapshot: FitModelSnapshot, opts: { userC
   const stopChat = async (): Promise<void> => {
     const savePromptCache = !state.userCachesSaved;
     state.userCachesSaved = true;
-    await runLocalModelsStop(savePromptCache ? { chatOnly: true } : { chatOnly: true, savePromptCache: false });
+    await stop(savePromptCache ? { chatOnly: true } : { chatOnly: true, savePromptCache: false });
   };
   return {
     /** Makes `modelId` the active managed model and starts it. */
     async load(modelId: string, signal: AbortSignal): Promise<LoadedFitModel> {
       if (signal.aborted) throw new Error("stopped");
       await stopChat();
-      if ((await runLocalModelsUse(modelId)) !== 0) throw new Error("unknown model id");
-      if ((await runLocalModelsStart({ signal, promptCache: "suspend" })) !== 0) {
+      if ((await use(modelId)) !== 0) throw new Error("unknown model id");
+      if ((await start({ signal, promptCache: "suspend" })) !== 0) {
         throw new Error("the model did not start (is it downloaded?)");
       }
       resetConfigCache();
@@ -101,17 +121,17 @@ export function createFitModelSwitcher(snapshot: FitModelSnapshot, opts: { userC
     async restore(stopped: boolean, restoreOpts: { restart?: boolean } = {}): Promise<void> {
       if (stopped) await stopChat();
       if (snapshot.previous !== null) {
-        await runLocalModelsUse(snapshot.previous);
-        if (snapshot.chatRunning && restoreOpts.restart !== false) await runLocalModelsStart({});
+        await use(snapshot.previous);
+        if (snapshot.chatRunning && restoreOpts.restart !== false) await start({});
       }
       const embeddingNow = (await embeddingDaemonStatus().catch(() => ({ running: snapshot.embeddingRunning }))).running;
       if (snapshot.embeddingRunning && !embeddingNow) {
-        await runLocalModelsStartEmbedding();
+        await startEmbedding();
       } else if (!snapshot.embeddingRunning && embeddingNow) {
         // A test model's start brought it up. With no chat model to keep,
         // the full stop also lets an idle Atomic Core exit.
         if (snapshot.chatRunning) await stopEmbeddingDaemon(getConfig().paths.localModelsDataDir);
-        else await runLocalModelsStop({ savePromptCache: false });
+        else await stop({ savePromptCache: false });
       }
     },
   };

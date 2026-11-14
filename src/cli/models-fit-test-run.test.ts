@@ -255,3 +255,14 @@ describe("models fit-test restore marker (killed without a signal handler, e.g. 
     expect(existsSync(markerPath())).toBe(true);
   });
 });
+
+describe("models fit-test --json", () => {
+  it("prints the run alone on stdout: the model handlers' lines go to stderr", async () => {
+    expect(await runModelsFitTest(fitArgs("--json"))).toBe(0);
+    const run = JSON.parse(stdout) as { kind: string; models: Array<{ modelId: string }> };
+    expect(run.kind).toBe("atomic-agent.fit-test-run");
+    expect(run.models.map((m) => m.modelId)).toEqual(["qwen-3.5-2b", "qwen-3.5-9b"]);
+    expect(stderr).toContain("stopped");
+    expect(stderr).toContain("active model: qwen-3.5-4b");
+  });
+});
