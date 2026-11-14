@@ -432,10 +432,14 @@ describe("rail session list — pinned block", () => {
   });
 
   it("pinning writes the config only — the session store is not touched", () => {
-    const stored = [spokenTo("s-2", "second"), spokenTo("s-1", "first")];
+    const stored = [
+      { ...spokenTo("s-2", "second"), updatedAt: 2_000 },
+      { ...spokenTo("s-1", "first"), updatedAt: 1_000 },
+    ];
     const before = stored.map((s) => ({ ...s }));
     const { orchestrator, rail } = harness(stored);
     orchestrator.refreshRecentSessions();
+    expect(rail().map((e) => e.sessionId)).toEqual(["s-2", "s-1"]);
     const updatedAt = rail().map((e) => e.updatedAt);
     orchestrator.togglePinned("s-1");
     expect(stored).toEqual(before);
@@ -443,5 +447,6 @@ describe("rail session list — pinned block", () => {
       updatedAt[1],
       updatedAt[0],
     ]);
+    expect(Object.fromEntries(rail().map((e) => [e.sessionId, e.updatedAt]))).toEqual({ "s-1": 1_000, "s-2": 2_000 });
   });
 });
