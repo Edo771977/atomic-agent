@@ -52,6 +52,8 @@ it.each([
   ["win32", "C:\\Users\\u\\my project", "file:C:/Users/u/my%20project/check.mjs"],
   ["linux", "/home/u/my project", "FiLe:/home/u/my%20project/check.mjs"],
   ["linux", "/home/u/my project", "file:home/u/my%20project/check.mjs"],
+  ["linux", "/home/u/my project", "fi\nle:/home/u/my%20project/check.mjs"],
+  ["linux", "/home/u/my project", "\u0001file:/home/u/my%20project/check.mjs"],
 ] as const)("refuses an explicit %s source file URL with native path semantics", (platform, root, url) => {
   expect(() => rebaseVerifyWorkspaceValue(`new URL('${url}')`, root, "/private/checked", platform)).toThrow(/unsupported absolute project reference/);
 });
@@ -61,4 +63,12 @@ it("preserves external and sibling file URLs", () => {
 });
 it("refuses malformed file URI plans before execution", () => {
   expect(() => rebaseVerifyWorkspaceValue("file:///%GG/project/a.js", "/home/u/project", "/private/checked", "linux")).toThrow(/unsupported absolute project reference/);
+});
+it("preserves an external literal file URI with WHATWG scheme whitespace", () => {
+  const uri = "fi\nle:/backup/home/u/project/a.js";
+  expect(rebaseVerifyWorkspaceValue(uri, "/home/u/project", "/private/checked", "linux")).toBe(uri);
+});
+it("preserves benign multiline code and file labels", () => {
+  const code = "console.log('file: ready');\nconsole.log('file:');\nprocess.exit(0);";
+  expect(rebaseVerifyWorkspaceValue(code, source, execution)).toBe(code);
 });

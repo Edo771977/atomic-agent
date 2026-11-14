@@ -30,12 +30,22 @@ export function rebaseVerifyWorkspaceValue<T>(value: T, from: string, to: string
     const root = identity(from);
     const tokens = [...text.matchAll(/[^\s"'`()=;,\[\]]+/g)].map(match => match[0]);
     tokens.push(...[...text.matchAll(/["'`]([^"'`]+)["'`]/g)].map(match => match[1]!));
+    // A whole argv value may contain literal controls that WHATWG removes
+    // from a scheme; token splitting alone loses that explicit URI.
+    tokens.push(text);
     for (let token of tokens) {
-      if (/^file:/i.test(token)) {
-        // URL parsing handles encoded spaces, dot segments, local hosts and
-        // Windows drives/UNC without treating the URI as an arbitrary script.
-        try { token = fileURLToPath(new URL(token), { windows: platform === "win32" }); }
-        catch { throw new Error("verification check plan has an unsupported absolute project reference"); }
+      let fileUri: URL | undefined;
+      try { const uri = new URL(token); if (uri.protocol === "file:") fileUri = uri; } catch { /* Not a literal URL. */ }
+      if (fileUri !== undefined) {
+        // Use WHATWG protocol recognition, including its literal control
+        // normalization, instead of enumerating file scheme spellings.
+        try { token = fileURLToPath(fileUri, { windows: platform === "win32" }); }
+        catch (error) {
+          if (error instanceof URIError) throw new Error("verification check plan has an unsupported absolute project reference");
+          // Non-native file URLs and labels (e.g. `file:`) cannot name a
+          // native source file; do not reject benign logging text.
+          continue;
+        }
       }
       token = token.replace(/^(?:~|\$HOME|\$\{HOME\}|%USERPROFILE%|\$env:USERPROFILE)(?=[\/\\]|$)/i, home);
       if (!paths.isAbsolute(token)) continue;

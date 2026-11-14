@@ -30,14 +30,14 @@ afterEach(async () => {
 });
 
 describe("verify refuses to execute without a private workspace", () => {
-  it.each(["canonical", "single-slash", "no-slash"] as const)("refuses a %s source file URL instead of passing a check that reads outside its execution copy", async spelling => {
+  it.each(["canonical", "single-slash", "no-slash", "scheme-newline"] as const)("refuses a %s source file URL instead of passing a check that reads outside its execution copy", async spelling => {
     const execution = join(dir, "execution"); await mkdir(execution);
     await writeFile(join(execution, "original.txt"), "execution-copy");
     const canonical = pathToFileURL(join(dir, "original.txt")).href;
-    const url = spelling === "single-slash" ? canonical.replace(/^file:\/\/\//, "file:/") : spelling === "no-slash" ? canonical.replace(/^file:\/\/\//, "file:") : canonical;
+    const url = spelling === "single-slash" ? canonical.replace(/^file:\/\/\//, "file:/") : spelling === "no-slash" ? canonical.replace(/^file:\/\/\//, "file:") : spelling === "scheme-newline" ? canonical.replace(/^file:/, "fi\nle:") : canonical;
     const runner = vi.spyOn(commands, "runCommandKind");
     const result = await runVerify({ kind: "command", cmd: process.execPath,
-      args: ["-e", `process.stdout.write(require('node:fs').readFileSync(new URL(${JSON.stringify(url)}),'utf8'))`], network: true },
+      args: ["-e", "process.stdout.write(require('node:fs').readFileSync(new URL(process.argv[1]),'utf8'))", url], network: true },
       { workingDir: dir, workspace: async () => ({ dir: execution, isolated: true, method: "copy", cleanup: async () => {} }) });
     expect(result.ok).toBe(false);
     expect(result.error).toContain("unsupported absolute project reference");
