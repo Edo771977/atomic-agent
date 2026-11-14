@@ -14,14 +14,17 @@
  * snapshot commit: `git stash create` captures the tracked files'
  * uncommitted state without touching the working tree or the stash
  * list (HEAD when there is nothing uncommitted). The commit supplies
- * Git metadata only: tracked paths are overlaid from the original's
- * actual bytes into the base, then from that frozen base into each
- * task, bypassing clean/smudge filters and Git's stat cache. Untracked files are
- * copied in; ignored directories and ignored files are copied privately
- * so a test run still finds them, except the shared dependency
- * directories (`node_modules`, `target`, `.venv`), which are normally symlinked
- * to the original's and cost no copy budget (with
- * `privateDependencyDirectories`, tasks copy them privately instead). A
+ * Git metadata only: a tracked path whose checkout differs from the
+ * original's actual bytes is overlaid from them into the base, then from
+ * that frozen base into each task, bypassing clean/smudge filters and
+ * Git's stat cache; an identical checkout is kept (only its mode and
+ * times are the source's) and costs no copy budget. Untracked files and
+ * ignored files are copied in. Ignored directories (a virtualenv, `dist/`,
+ * a cache) are normally symlinked to the original's like the shared
+ * dependency directories (`node_modules`, `target`, `.venv`) and cost no
+ * copy budget; with `privateDependencyDirectories` (a candidate) ignored
+ * directories are copied privately and tasks copy the dependency
+ * directories privately too. A
  * denied generated symlink becomes a junction; only with no link at all
  * does it become a bounded private copy, made once in the base and
  * linked from there by the tasks when they can.
@@ -44,6 +47,7 @@ import {
   lstat,
   mkdir,
   mkdtemp,
+  open,
   readdir,
   readFile,
   readlink,
@@ -54,6 +58,7 @@ import {
   utimes,
   writeFile,
 } from "node:fs/promises";
+import type { Stats } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { runCommand, type CommandResult } from "../../sandbox/command-runner.js";
@@ -212,8 +217,10 @@ export interface CreateBranchSetOptions {
   /**
    * Give each task workspace a private copy of the shared dependency
    * directories (charged to the copy budget) instead of a link to the
-   * original's. Candidate integration sets this: nothing may reach the
-   * original before promotion. The base, which nobody writes to, still links.
+   * original's, and copy every ignored directory privately (into the base
+   * too) instead of linking it. Candidate integration sets this: nothing
+   * may reach the original before promotion. The base, which nobody writes
+   * to, still links the dependency directories.
    */
   privateDependencyDirectories?: boolean;
   /** Told why `createBranchSet` returned `null` (the copy limit), in words for the user. */
@@ -434,6 +441,8 @@ interface PrivateCopyBudget {
   dependencyBytes: Record<DependencyCopyKind, number>;
   /** Set while a dependency directory's copy is being charged. */
   chargingDependency?: boolean;
+  /** A candidate's set: ignored directories are copied privately, not linked to the original. */
+  privateIgnoredDirectories?: boolean;
 }
 
 /**
@@ -654,6 +663,42 @@ async function recreateLink(from: string, to: string, budget: PrivateCopyBudget,
   throw new Error(`cannot recreate the link ${rel || "."} in a private workspace: ${why}`);
 }
 
+/** Whether two regular files of the same size hold the same bytes. */
+async function sameBytes(a: string, b: string): Promise<boolean> {
+  const [left, right] = await Promise.all([open(a, "r"), open(b, "r")]);
+  try {
+    const one = Buffer.alloc(64 * 1024);
+    const two = Buffer.alloc(64 * 1024);
+    for (;;) {
+      const [x, y] = await Promise.all([left.read(one, 0, one.length, null), right.read(two, 0, two.length, null)]);
+      if (x.bytesRead !== y.bytesRead) return false;
+      if (x.bytesRead === 0) return true;
+      if (!one.subarray(0, x.bytesRead).equals(two.subarray(0, y.bytesRead))) return false;
+    }
+  } finally {
+    await Promise.all([left.close(), right.close()]);
+  }
+}
+
+/**
+ * Keep a checked-out tracked entry that already holds the source's
+ * bytes (or a symlink's target), giving a file the source's permission
+ * bits and times; `false` when it differs and must be replaced.
+ */
+async function adoptCheckoutEntry(from: string, info: Stats, to: string): Promise<boolean> {
+  const there = await lstat(to).catch(() => null);
+  if (there === null) return false;
+  if (info.isSymbolicLink()) {
+    return there.isSymbolicLink() && await readlink(from) === await readlink(to);
+  }
+  if (!info.isFile() || !there.isFile() || there.size !== info.size) return false;
+  if (!await sameBytes(from, to)) return false;
+  if ((there.mode & 0o777) !== (info.mode & 0o777)) await chmod(to, info.mode & 0o777);
+  // Source times, as for a copy (`copyFileKeepingMode`).
+  await utimes(to, info.atime, info.mtime);
+  return true;
+}
+
 /** What a git snapshot needs: the commit, and what lives outside it. */
 interface GitSnapshot {
   top: string;
@@ -739,6 +784,10 @@ async function addWorktree(
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
     }
     const to = join(dir, path);
+    // The checkout already holds the source's bytes (the common case):
+    // only its mode and times are made the source's, nothing is copied
+    // or charged to the copy limit.
+    if (info !== undefined && await adoptCheckoutEntry(from, info, to)) continue;
     // Checkout filters and a cached-clean index may disagree with the
     // working tree. Replace, never normalize, the actual source entry.
     await rm(to, { recursive: true, force: true });
@@ -756,9 +805,15 @@ async function addWorktree(
   for (const entry of snapshot.ignored) {
     const isDir = entry.endsWith("/");
     const path = (isDir ? entry.slice(0, -1) : entry).split("/").join(sep);
-    // Git lists ignored children (`node_modules/big/`) when a tracked
-    // placeholder keeps the dependency directory itself unignored.
-    await copyPrivateEntry(join(realDir, path), join(dir, path), budget, path, isDir && underSharedDependencyDirectory(path));
+    // Outside a candidate an ignored directory (a virtualenv, `.next/`,
+    // `dist/`, a cache) is linked to the original's, as a dependency
+    // directory is: direct mode is not a sandbox, and copying them into
+    // the base and every task refused isolation for ordinary repos. A
+    // candidate keeps private copies (dependency names aside). Git lists
+    // ignored children (`node_modules/big/`) when a tracked placeholder
+    // keeps the dependency directory itself unignored.
+    const shared = isDir && (budget.privateIgnoredDirectories !== true || underSharedDependencyDirectory(path));
+    await copyPrivateEntry(join(realDir, path), join(dir, path), budget, path, shared);
   }
   return dir;
 }
@@ -834,7 +889,7 @@ export async function createBranchSet(
     }
   };
   const limit = options.maxCopyBytes ?? VERIFY_COPY_MAX_BYTES;
-  const budget: PrivateCopyBudget = { left: limit, generatedDirectoryLinks: new Map(), dependencyBytes: { unlinked: 0, private: 0 }, ...(options.signal === undefined ? {} : { signal: options.signal }) };
+  const budget: PrivateCopyBudget = { left: limit, generatedDirectoryLinks: new Map(), dependencyBytes: { unlinked: 0, private: 0 }, ...(options.privateDependencyDirectories === true ? { privateIgnoredDirectories: true } : {}), ...(options.signal === undefined ? {} : { signal: options.signal }) };
   try {
     const method: BranchMethod = snapshot === null ? "copy" : "worktree";
     const make = async (name: string, source: string): Promise<string> => {
