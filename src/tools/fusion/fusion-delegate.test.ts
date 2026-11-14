@@ -2341,7 +2341,8 @@ describe("fusion.delegate subagent profiles (ATO-566)", () => {
     ).run({ tasks: [{ id: "x", instructions: "go", profile: "explore" }] }, ctx());
     expect(result.status).toBe("error");
     expect(result.summary).toContain('names profile "explore"');
-    expect(asked).toEqual(["/repo"]);
+    // The tool resolves the working directory natively (D:\\repo on Windows).
+    expect(asked).toEqual([resolve("/repo")]);
     expect(runTurn).not.toHaveBeenCalled();
   });
 
