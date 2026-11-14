@@ -14,6 +14,7 @@ import type { EscalationComplete } from "./escalation.js";
 import { buildFusionDelegateTool, type FusionDelegateDeps } from "./fusion-delegate.js";
 import { applyPostMergeChecks, gatedChecks } from "./merge-gate.js";
 import type { WorkerTaskResult } from "./worker-result.js";
+import { NEEDS_INPUT_MARKER } from "./worker-question.js";
 
 const cleanup: string[] = [];
 afterEach(async () => {
@@ -400,6 +401,94 @@ describe("merge only green tasks (isolation)", () => {
     expect(post).toEqual(["a.txt", "two.txt"]);
     expect(rows[0]!.status).toBe("failed");
     expect(rows[0]!.checks).toMatchObject({ total: 1, failed: 1 });
+  });
+
+  /** Like `deps`, but task "two" ends its turn on a question after writing. */
+  function askingDeps(
+    repo: string,
+    write: (taskId: string, dir: string) => Promise<void>,
+    over: Partial<FusionDelegateDeps> = {},
+  ): FusionDelegateDeps {
+    const base = deps(repo, async () => {}, over);
+    return {
+      ...base,
+      runTurn: async (session, _message, options) => {
+        const taskId = (session.metadata as { fusionWorker: { taskId: string } }).fusionWorker.taskId;
+        await write(taskId, session.workingDir);
+        options.eventHook?.({
+          type: "llm_event",
+          event: {
+            type: "assistant_reply",
+            text: taskId === "two" ? `${NEEDS_INPUT_MARKER} Which unit should two use?` : "done",
+          },
+        });
+        return { session, reason: "reply", stepCount: 1 } as RunTurnResult;
+      },
+    };
+  }
+
+  it("holds back a needs_input task whose own check fails, keeping its question", async () => {
+    const repo = await gitRepo({ "a.txt": "a\n" });
+    const seen: Array<{ file: string; dir: string; ok: boolean }> = [];
+    const d = askingDeps(
+      repo,
+      (id, dir) => writeFile(join(dir, `${id}.txt`), id === "two" ? "bad\n" : "good\n"),
+      { runChecks: fileChecks(seen) },
+    );
+    const result = await buildFusionDelegateTool(d).run(
+      {
+        tasks: TASKS,
+        contract: {
+          checks: [
+            { task: "one", kind: "command", file: "one.txt" },
+            { task: "two", kind: "command", file: "two.txt" },
+          ],
+        },
+      },
+      ctx(repo),
+    );
+    const rows = result.details.tasks as WorkerTaskResult[];
+    expect(rows[1]).toMatchObject({ id: "two", status: "needs_input", question: "Which unit should two use?" });
+    expect(await readFile(join(repo, "one.txt"), "utf8")).toBe("good\n");
+    await expect(readFile(join(repo, "two.txt"), "utf8")).rejects.toThrow();
+    expect(await readFile(join(repo, taskPatchPath("two")), "utf8")).toContain("+bad");
+    expect(rows[1]!.notes?.join(" ")).toContain("not merged (its own checks failed");
+  });
+
+  it("holds back a needs_input task whose changed file fails the syntax pass", async () => {
+    const repo = await gitRepo({ "a.txt": "a\n" });
+    const syntaxCheck: FusionDelegateDeps["syntaxCheck"] = async (files) => {
+      const results = [];
+      for (const file of files) {
+        const body = await readFile(file, "utf8").catch(() => "");
+        results.push(
+          body.includes("SYNTAX")
+            ? { file, ok: false, checker: "fake", error: "Unexpected token" }
+            : { file, ok: true, checker: "fake" },
+        );
+      }
+      return { results };
+    };
+    const d = askingDeps(
+      repo,
+      (id, dir) => writeFile(join(dir, `${id}.js`), id === "two" ? "SYNTAX(\n" : "ok()\n"),
+      { syntaxCheck },
+    );
+    const result = await buildFusionDelegateTool(d).run(
+      {
+        tasks: [
+          { id: "one", title: "One", instructions: "write one.js", files: ["one.js"] },
+          { id: "two", title: "Two", instructions: "write two.js", files: ["two.js"] },
+        ],
+      },
+      ctx(repo),
+    );
+    const rows = result.details.tasks as WorkerTaskResult[];
+    expect(rows[1]).toMatchObject({ id: "two", status: "needs_input", question: "Which unit should two use?" });
+    expect(rows[1]!.syntax).toMatchObject({ failedFiles: ["two.js"] });
+    expect(rows[1]!.notes?.join(" ")).toContain("not merged (syntax: 1 file failed (two.js))");
+    expect(await readFile(join(repo, "one.js"), "utf8")).toBe("ok()\n");
+    await expect(readFile(join(repo, "two.js"), "utf8")).rejects.toThrow();
   });
 
   it("off: a task whose check fails still wrote into the folder, as before", async () => {
