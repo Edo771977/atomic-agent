@@ -25,6 +25,7 @@ export interface CheckpointedRunOptions {
   taskMaxDurationMs?: number;
   providerId?: string;
   interactive?: boolean;
+  origin?: string;
   checkpoint?: TurnCheckpointOptions;
 }
 
@@ -53,6 +54,7 @@ export function turnProgressFor(
       ? { providerId: runOptions.providerId }
       : {}),
     ...(runOptions.interactive === true ? { interactive: true } : {}),
+    ...(runOptions.origin !== undefined ? { origin: runOptions.origin } : {}),
   };
   const base = {
     request: checkpoint.request ?? userMessage,

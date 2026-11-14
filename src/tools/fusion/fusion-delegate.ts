@@ -204,6 +204,16 @@ export interface FusionDelegateDeps extends WorkerRunnerDeps {
     modelId: string,
   ) => WorkerPricing | undefined;
   /**
+   * The same pricing as `resolveWorkerPricing` minus any that came only
+   * from the bundled models.dev snapshot (`verifiedAdmissionPricing`).
+   * Only this gates the escalation's worst-case refusal and its re-run;
+   * absent, `resolveWorkerPricing` is taken as verified.
+   */
+  resolveWorkerAdmissionPricing?: (
+    providerId: string,
+    modelId: string,
+  ) => WorkerPricing | undefined;
+  /**
    * The local leg's measured generation speed
    * (`LlamaServerClient.measuredTokensPerSecond`), read per fan-out so a
    * worker's time limit follows the machine's current load. Only
@@ -1089,14 +1099,19 @@ export function buildFusionDelegateTool(
           : {};
       // Escalation (ATO-942): only to the configured target, priced with
       // the same resolver as the workers, and counted in the turn's cap.
+      // A snapshot-only price estimates its spend but admits nothing.
       const escalationTarget = mode.escalation ?? null;
+      const escalationModel = escalationTarget?.model ?? escalationTarget?.providerId;
       const escalationPricing =
-        escalationTarget === null
+        escalationTarget === null || escalationModel === undefined
           ? undefined
-          : deps.resolveWorkerPricing?.(
-              escalationTarget.providerId,
-              escalationTarget.model ?? escalationTarget.providerId,
-            );
+          : deps.resolveWorkerPricing?.(escalationTarget.providerId, escalationModel);
+      const escalationEstimateOnly =
+        escalationPricing !== undefined &&
+        escalationTarget !== null &&
+        escalationModel !== undefined &&
+        deps.resolveWorkerAdmissionPricing !== undefined &&
+        deps.resolveWorkerAdmissionPricing(escalationTarget.providerId, escalationModel) === undefined;
       let escalationSpendUsd = 0;
       const escalationOptions =
         escalationTarget === null || deps.escalationComplete === undefined
@@ -1107,6 +1122,7 @@ export function buildFusionDelegateTool(
                 ...(escalationPricing === undefined
                   ? {}
                   : { pricing: escalationPricing }),
+                ...(escalationEstimateOnly ? { estimateOnly: true } : {}),
               },
               onEscalationSpend: (_taskId: string, usd: number): void => {
                 escalationSpendUsd += usd;

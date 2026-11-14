@@ -109,12 +109,14 @@ export type AdviceOutcome =
 export async function requestAdvice(input: {
   target: FusionEscalationTarget;
   pricing: WorkerPricing | undefined;
+  /** A snapshot-only price: it estimates the cost, never refuses the call. */
+  estimateOnly?: boolean;
   prompt: string;
   complete: EscalationComplete;
   signal: AbortSignal;
 }): Promise<AdviceOutcome> {
   const { target, pricing } = input;
-  if (pricing !== undefined) {
+  if (pricing !== undefined && input.estimateOnly !== true) {
     const worst = worstCaseCostUsd(
       input.prompt.length,
       ADVISOR_MAX_OUTPUT_TOKENS,

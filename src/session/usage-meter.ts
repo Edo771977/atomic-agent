@@ -2,6 +2,7 @@ import type { CompletionUsage } from "../llm/provider/completion-types.js";
 import type { ResolvedModel } from "../llm/provider/model-resolver.js";
 import type { RateLimitWindow } from "../llm/provider/rate-limits.js";
 import { estimateUsageCostUsd } from "../llm/provider/usage-cost.js";
+import { MODELS_DEV_SNAPSHOT_DATE } from "../llm/provider/models-dev/models-dev-snapshot.js";
 import type { DailySpendView } from "./daily-spend.js";
 
 /**
@@ -60,7 +61,7 @@ export interface SessionUsageState {
  * a price the operator configured (`userModels[].pricing`), the bundled
  * catalog, the provider's live model list. Nothing else is guessed.
  */
-export type CostSource = "provider" | "user" | "catalog" | "live";
+export type CostSource = "provider" | "user" | "catalog" | "snapshot" | "live";
 
 export interface LimitReading extends RateLimitWindow {
   /** The provider link (account) the reading came from. */
@@ -126,7 +127,7 @@ export function priceCompletion(
   return {
     kind: "priced",
     usd: estimateUsageCostUsd(usage, pricing),
-    source: source === "user" ? "user" : source === "live" ? "live" : "catalog",
+    source: source === "user" ? "user" : source === "live" ? "live" : source === "snapshot" ? "snapshot" : "catalog",
   };
 }
 
@@ -463,6 +464,9 @@ function sourceLabel(source: CostSource): string {
       return "your configured prices";
     case "catalog":
       return "the built-in price list";
+    case "snapshot":
+      // A dated community list (ATO-647): say how old it is.
+      return `the bundled models.dev snapshot of ${MODELS_DEV_SNAPSHOT_DATE}, an estimate`;
     case "live":
       return "the provider's live price list";
   }

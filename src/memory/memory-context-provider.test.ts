@@ -194,4 +194,65 @@ describe("createDefaultMemoryContextProvider", () => {
     expect(ids).toContain(a.id);
     expect(ids).not.toContain(b.id);
   });
+
+  it("keeps notes that claim an ungrounded user name out of recalled and index (ATO-321)", async () => {
+    store.store({ content: "I am Alex and I prefer rust tooling" });
+    store.store({ content: "rust tooling: use cargo nextest" });
+    const nameGuard = { allows: (text: string) => !text.includes("Alex") };
+    const provider = createDefaultMemoryContextProvider({
+      store,
+      recall: { enabled: true, k: 5 },
+      index: { enabled: true, limit: 20, previewChars: 40 },
+      nameGuard,
+    });
+    const ctx = (await provider.buildMemoryContext(
+      input("rust tooling"),
+    )) as unknown as {
+      recalled: Array<{ content: string }>;
+      index: Array<{ preview: string }>;
+    };
+    expect(ctx.recalled.map((e) => e.content)).toEqual([
+      "rust tooling: use cargo nextest",
+    ]);
+    expect(ctx.index.some((e) => e.preview.includes("Alex"))).toBe(false);
+  });
+
+  it("checks the whole note for the index, not only the preview (ATO-321)", async () => {
+    store.store({ content: "project notes\nThe user is Alex." });
+    const provider = createDefaultMemoryContextProvider({
+      store,
+      recall: { enabled: false, k: 0 },
+      index: { enabled: true, limit: 20, previewChars: 40 },
+      nameGuard: { allows: (text: string) => !text.includes("Alex") },
+    });
+    const ctx = (await provider.buildMemoryContext(input(null))) as unknown as {
+      index: unknown[];
+    };
+    expect(ctx.index).toEqual([]);
+  });
+
+  it("filters a held-out note's link neighbours on their own content only (ATO-321)", async () => {
+    // A is held out; B is a plain note linked from it; C (linked from
+    // B) claims the same name. A neighbour carries only its own content
+    // (links add no text), so B may be recalled and C is held out too.
+    const a = store.store({ content: "lisbon trip: the user is Alex" });
+    const b = store.store({ content: "ticket from porto to faro" });
+    const c = store.store({ content: "hostel in sintra; I am Alex" });
+    const linkStore = new LinkStore({ db: store.getDatabaseHandleForEmbeddings() });
+    linkStore.add({ fromId: a.id, toId: b.id, kind: "RELATES_TO" });
+    linkStore.add({ fromId: b.id, toId: c.id, kind: "REFERENCES" });
+    const provider = createDefaultMemoryContextProvider({
+      store,
+      recall: { enabled: true, k: 5 },
+      index: { enabled: true, limit: 20, previewChars: 80 },
+      links: { enabled: true, store: linkStore, depth: 2, maxExpanded: 10 },
+      nameGuard: { allows: (text: string) => !text.includes("Alex") },
+    });
+    const ctx = (await provider.buildMemoryContext(input("lisbon"))) as unknown as {
+      recalled: Array<{ id: number; content: string }>;
+      index: Array<{ id: number; preview: string }>;
+    };
+    expect(ctx.recalled.map((e) => e.id)).toEqual([b.id]);
+    expect(JSON.stringify(ctx)).not.toContain("Alex");
+  });
 });

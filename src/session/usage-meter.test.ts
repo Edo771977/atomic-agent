@@ -16,6 +16,7 @@ import {
   type LimitReading,
   type SessionUsageState,
 } from "./usage-meter.js";
+import { MODELS_DEV_SNAPSHOT_DATE } from "../llm/provider/models-dev/models-dev-snapshot.js";
 
 const NOW = new Date(2026, 10, 6, 12, 0, 0).getTime();
 const usage = { promptTokens: 1_000_000, completionTokens: 100_000, totalTokens: 1_100_000 };
@@ -240,6 +241,18 @@ describe("formatResetTime", () => {
 });
 
 describe("formatUsageReport", () => {
+  it("names a models.dev snapshot price as a dated estimate (ATO-647 review)", () => {
+    const price = priceCompletion({
+      usage: { promptTokens: 1_000_000, completionTokens: 0, totalTokens: 1_000_000 },
+      local: false,
+      model: { pricing: { input: 1, output: 5 }, source: "snapshot" },
+    });
+    expect(price).toEqual({ kind: "priced", usd: 1, source: "snapshot" });
+    const text = formatUsageReport({ ...EMPTY_SESSION_USAGE, costUsd: 1, pricedCalls: 1, costSources: ["snapshot"] }, NOW);
+    expect(text).toContain(`prices from the bundled models.dev snapshot of ${MODELS_DEV_SNAPSHOT_DATE}, an estimate`);
+  });
+
+
   it("says plainly when there is no limit reading", () => {
     const text = formatUsageReport(undefined, NOW);
     expect(text).toContain("nothing recorded yet");

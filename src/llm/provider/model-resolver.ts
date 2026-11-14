@@ -7,13 +7,25 @@ export type ResolvedModel = {
   id: string;
   kind: "chat" | "embedding";
   contextWindow: number;
+  /**
+   * The model's own output ceiling, when a catalog publishes one
+   * (models.dev, ATO-647). Informational: requests still take their cap
+   * from the provider entry's `maxOutputTokens`.
+   */
+  maxOutputTokens?: number;
   dim?: number;
   supportsVision: boolean;
   supportsTools: "none" | "basic" | "parallel" | "strict";
   supportsPromptCache: boolean;
   reasoningFormat: UserModelConfigEntry["reasoningFormat"];
   pricing?: UserModelConfigEntry["pricing"];
-  source: "user" | "catalog" | "live" | "default";
+  /**
+   * Where the row came from. `snapshot` is the bundled models.dev
+   * snapshot (ATO-647): its prices are a frozen community list, used to
+   * estimate spend but never to refuse a request ahead of sending it
+   * (`verifiedAdmissionPricing`), and its context window is display-only.
+   */
+  source: "user" | "catalog" | "snapshot" | "live" | "default";
 };
 
 export type ModelCatalogEntry = Omit<ResolvedModel, "source"> & {

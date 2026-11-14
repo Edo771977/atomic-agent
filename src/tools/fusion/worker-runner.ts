@@ -690,9 +690,12 @@ export interface RunWorkerTasksOptions {
   onWorkerUsage?: (taskId: string, usage: CompletionUsage) => void;
   /**
    * Where a stuck worker may be escalated, and that model's price when
-   * known (ATO-942). Absent: no escalation of any kind.
+   * known (ATO-942). Absent: no escalation of any kind. `estimateOnly`
+   * marks a price from the bundled models.dev snapshot: it estimates
+   * what the advisor spent but never refuses its call by the worst case
+   * nor enables the re-run, which both need verified pricing.
    */
-  escalation?: { target: FusionEscalationTarget; pricing?: WorkerPricing };
+  escalation?: { target: FusionEscalationTarget; pricing?: WorkerPricing; estimateOnly?: boolean };
   /** What an escalation cost, as it lands, for the turn's cap. */
   onEscalationSpend?: (taskId: string, usd: number) => void;
   /** The worker model's price, for the live $ on its row. Absent: tokens only. */
@@ -1444,6 +1447,7 @@ async function runOneTask(
     const outcome = await requestAdvice({
       target,
       pricing: options.escalation?.pricing,
+      ...(options.escalation?.estimateOnly === true ? { estimateOnly: true } : {}),
       prompt: renderAdvisorPrompt({
         brief,
         trigger,
@@ -1498,6 +1502,7 @@ async function runOneTask(
       target.replace &&
       !escalating &&
       options.escalation?.pricing !== undefined &&
+      options.escalation.estimateOnly !== true &&
       options.shouldStart?.() === undefined
     ) {
       replaceRequested = true;
@@ -1920,6 +1925,7 @@ async function runOneTask(
     replaceRequested &&
     target !== undefined &&
     pricing !== undefined &&
+    options.escalation?.estimateOnly !== true &&
     !options.signal.aborted &&
     !stopByPerson.signal.aborted;
   // The local attempt's grace gave its permit to another task: the re-run

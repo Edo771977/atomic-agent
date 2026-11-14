@@ -17,6 +17,7 @@ import {
 import type { TuiAction } from "./tui-action.js";
 import { formatTuiStatus } from "./status-snapshot-tui.js";
 import { isKnownLocalModelId } from "../local-llm/index.js";
+import { NOTHING_TO_RESUME } from "./interrupted-turn-notice.js";
 import {
   isThemeName,
   setActiveTheme,
@@ -337,6 +338,9 @@ export function runSlashCommand(
         "the fusion report is not available here: run `atomic-agent fusion report`",
     });
   }
+  if (result.resumeInterruptedTurn) {
+    runResumeInterruptedTurn(state, dispatch, callbacks);
+  }
   if (result.runModeWorkers !== undefined) {
     callbacks.onFusionWorkersChangeRequested?.(result.runModeWorkers);
   }
@@ -569,7 +573,12 @@ function runFusionRunAction(
     return;
   }
   if (!canTypeMessage(state)) return;
-  const text = callbacks.prepareFusionResume?.(sessionId, request.runId) ?? null;
+  const offer = callbacks.prepareFusionResume?.(sessionId, request.runId) ?? null;
+  if (offer !== null && typeof offer === "object") {
+    dispatch({ type: "system_message", text: offer.alreadyQueued });
+    return;
+  }
+  const text = offer;
   if (text === null) {
     dispatch({
       type: "system_message",
@@ -578,6 +587,41 @@ function runFusionRunAction(
           ? "no unfinished fusion run in this session"
           : `no unfinished fusion run ${request.runId} in this session`,
     });
+    return;
+  }
+  dispatch({ type: "slash_palette_closed" });
+  if (canAcceptMessage(state)) {
+    dispatch({ type: "message_submitted" });
+    callbacks.onMessageSubmitted(text);
+  } else {
+    submitWhileBusy(text, "queue", dispatch, callbacks);
+  }
+}
+
+/**
+ * `/resume` (ATO-448): continue the last turn of this session when a
+ * restart cut it off. Sent as the person's own turn, like a fusion
+ * resume; the runtime records it as resumed, so a second `/resume` says
+ * there is nothing to resume.
+ */
+function runResumeInterruptedTurn(
+  state: TuiState,
+  dispatch: Dispatch,
+  callbacks: TuiAppCallbacks,
+): void {
+  const sessionId = state.session.sessionId;
+  if (!canTypeMessage(state)) return;
+  const offer =
+    sessionId === null
+      ? null
+      : (callbacks.prepareInterruptedTurnResume?.(sessionId) ?? null);
+  if (offer !== null && typeof offer === "object") {
+    dispatch({ type: "system_message", text: offer.alreadyQueued });
+    return;
+  }
+  const text = offer;
+  if (text === null) {
+    dispatch({ type: "system_message", text: NOTHING_TO_RESUME });
     return;
   }
   dispatch({ type: "slash_palette_closed" });

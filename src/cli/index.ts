@@ -28,6 +28,7 @@ import { dataCommand } from "./data-command.js";
 import { providersCommand } from "./providers-command.js";
 import { setupCommand } from "./setup-command.js";
 import { tuiCommand } from "../tui/index.js";
+import { recoverInterruptedFitTest, releaseSuspendedChatBeforeTui, warnLiveFitTestBeforeTui } from "./models-fit-test-restore.js";
 import { installTransportDeadlines } from "../llm/transport-deadlines.js";
 import { getAppVersion } from "../version.js";
 import { USER_CONFIG_DEFAULTS } from "../config/index.js";
@@ -69,6 +70,26 @@ interface CommandDescriptor {
   hidden?: boolean;
 }
 
+/**
+ * The TUI, after putting back the models a killed `models fit-test` left
+ * switched (`models-fit-test-restore.ts`). The TUI starts the model
+ * itself, so the recovery only puts it back in config, and a model the
+ * fit-test put back with its prompt cache suspended is stopped for the
+ * TUI to launch (`releaseSuspendedChatBeforeTui`).
+ */
+async function runTui(args: string[]): Promise<number> {
+  try {
+    await recoverInterruptedFitTest({ restart: false });
+    // A model fit-test put back runs with its prompt cache suspended:
+    // relaunched by the TUI rather than adopted, so its saves are restored.
+    // One still running is only warned about.
+    if (!warnLiveFitTestBeforeTui()) await releaseSuspendedChatBeforeTui();
+  } catch (err) {
+    process.stderr.write(`could not put back the model an interrupted fit-test left: ${err instanceof Error ? err.message : String(err)}\n`);
+  }
+  return tuiCommand(args);
+}
+
 const COMMANDS: CommandDescriptor[] = [
   {
     name: "run",
@@ -101,7 +122,7 @@ const COMMANDS: CommandDescriptor[] = [
   {
     name: "tui",
     summary: "Run a full agent loop under an interactive terminal UI (ink)",
-    run: tuiCommand,
+    run: runTui,
   },
   {
     name: "serve",
@@ -130,7 +151,7 @@ const COMMANDS: CommandDescriptor[] = [
   },
   {
     name: "memory",
-    summary: "Inspect, export + reindex the cross-session memory store (export|reindex)",
+    summary: "Inspect, export, reindex + clear the cross-session memory store (export|reindex|forget)",
     run: memoryCommand,
   },
   {
@@ -274,7 +295,7 @@ async function main(): Promise<number> {
     return aliased.run(["--help"]);
   }
   if (!command) {
-    return tuiCommand([]);
+    return runTui([]);
   }
   const descriptor = COMMANDS.find((c) => c.name === command);
   if (!descriptor) {
