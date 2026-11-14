@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 import {
   ApprovalGate,
@@ -28,8 +28,8 @@ describe("a read outside the scope asks through the ladder", () => {
   let innerShells: number;
   let readScope: ReadScope;
   // Lexical and off the temp directory, which is scratch and never asked about.
-  const home = "/srv/homes/me";
-  const elsewhere = "/srv/homes/other-run/work";
+  const home = resolve("/srv/homes/me");
+  const elsewhere = resolve("/srv/homes/other-run/work");
   const solution = join(elsewhere, "solution.js");
 
   const ctx = (sessionId = "s-plain", readRoots?: readonly string[]): ToolContext => ({
@@ -79,7 +79,7 @@ describe("a read outside the scope asks through the ladder", () => {
         grantedDirs: () => [],
         readScope: () => readScope,
         approvals: { approvals: gate, approvalRequired: true },
-        shellEnv: { home, platform: "linux" },
+        shellEnv: { home, platform: process.platform },
       }),
     ).toEqual(["os.fs.read", "os.shell.run"]);
   });
@@ -299,7 +299,7 @@ describe("a read naming several outside paths asks about each", () => {
       grantedDirs: () => [],
       readScope: () => "working-dir",
       approvals: { approvals: gate, approvalRequired: true },
-      shellEnv: { home: "/srv/homes/me", platform: "linux" },
+      shellEnv: { home: resolve("/srv/homes/me"), platform: process.platform },
     });
   });
 
@@ -317,24 +317,24 @@ describe("a read naming several outside paths asks about each", () => {
   it("a yes for the first path does not let the second through unasked", async () => {
     const result = await registry.invoke(
       "os.fs.diff",
-      { aPath: "/srv/public/notes.txt", bPath: "/root/.ssh/id_rsa" },
+      { aPath: resolve("/srv/public/notes.txt"), bPath: resolve("/root/.ssh/id_rsa") },
       ctx(),
     );
     expect(result.status).toBe("ok");
     expect(prompts.map((p) => p.affectedResources)).toEqual([
-      ["/srv/public"],
-      ["/root/.ssh"],
+      [resolve("/srv/public")],
+      [resolve("/root/.ssh")],
     ]);
     expect(ran).toBe(1);
   });
 
   it("a no for a later path refuses the whole call", async () => {
     decide = (request) => ({
-      approved: !(request.affectedResources ?? []).includes("/root/.ssh"),
+      approved: !(request.affectedResources ?? []).includes(resolve("/root/.ssh")),
     });
     const result = await registry.invoke(
       "os.fs.diff",
-      { aPath: "/srv/public/notes.txt", bPath: "/root/.ssh/id_rsa" },
+      { aPath: resolve("/srv/public/notes.txt"), bPath: resolve("/root/.ssh/id_rsa") },
       ctx(),
     );
     expect(result.status).toBe("error");
@@ -345,15 +345,15 @@ describe("a read naming several outside paths asks about each", () => {
   it("checks every move source and every syntax-check file", async () => {
     await registry.invoke(
       "os.fs.move",
-      { moves: [{ from: "/srv/a/x", to: "x" }, { from: "/srv/b/y", to: "y" }] },
+      { moves: [{ from: resolve("/srv/a/x"), to: "x" }, { from: resolve("/srv/b/y"), to: "y" }] },
       ctx(),
     );
-    await registry.invoke("verify.syntax", { files: ["/srv/c/1.ts", "/srv/d/2.ts"] }, ctx());
+    await registry.invoke("verify.syntax", { files: [resolve("/srv/c/1.ts"), resolve("/srv/d/2.ts")] }, ctx());
     expect(prompts.map((p) => p.affectedResources)).toEqual([
-      ["/srv/a"],
-      ["/srv/b"],
-      ["/srv/c"],
-      ["/srv/d"],
+      [resolve("/srv/a")],
+      [resolve("/srv/b")],
+      [resolve("/srv/c")],
+      [resolve("/srv/d")],
     ]);
     expect(ran).toBe(2);
   });
@@ -361,7 +361,7 @@ describe("a read naming several outside paths asks about each", () => {
   it("paths under one approved directory are asked about once", async () => {
     await registry.invoke(
       "os.fs.diff",
-      { aPath: "/srv/public/a.txt", bPath: "/srv/public/b.txt" },
+      { aPath: resolve("/srv/public/a.txt"), bPath: resolve("/srv/public/b.txt") },
       ctx(),
     );
     expect(prompts).toHaveLength(1);

@@ -7,7 +7,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, parse } from "node:path";
 
 import { compressToolResult } from "../../compressor/result-compressor.js";
 import { DEFAULT_TOOL_DESCRIPTORS } from "../../prompt/tool-descriptors.js";
@@ -81,7 +81,7 @@ describe("worker read scope", () => {
     for (const [tool, args] of [
       ["os.fs.glob", { pattern: "**/*.js", cwd: "../.." }],
       ["os.fs.glob", { pattern: "**/*.js", path: sibling }],
-      ["os.fs.grep", { pattern: "x", path: "/" }],
+      ["os.fs.grep", { pattern: "x", path: parse(work).root }],
       ["os.fs.diff", { aPath: "js/main.js", bPath: join(sibling, "main.js") }],
       ["vision.describe", { paths: ["shot.png", join(root, "screen.png")] }],
       ["os.fs.list", { path: ".." }],
