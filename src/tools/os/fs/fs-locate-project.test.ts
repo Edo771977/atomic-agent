@@ -12,15 +12,22 @@ import { makeCtx, makeTool } from "./fs-locate-project-test-helpers.js";
 /** Verdicts (found / ambiguous / miss), fast path, and tool interface. */
 describe("os.fs.locate_project", () => {
   let base: string;
+  let temporaryRoot: string;
 
   beforeEach(async () => {
     // realpath so expectations survive symlinked tmp dirs
     // (macOS /var -> /private/var) now that candidates are canonicalized.
-    base = await realpath(await mkdtemp(join(tmpdir(), "locate-project-")));
+    temporaryRoot = await realpath(await mkdtemp(join(tmpdir(), "locate-project-api-")));
+    // A random temp basename can itself contain the searched segment
+    // (for example "api"), legitimately adding a third candidate. Keep
+    // the context's basename stable; the parent deliberately contains
+    // that segment to cover the original fixture collision every run.
+    base = join(temporaryRoot, "workspace");
+    await mkdir(base);
   });
 
   afterEach(async () => {
-    await rm(base, { recursive: true, force: true });
+    await rm(temporaryRoot, { recursive: true, force: true });
   });
 
   it("reports ambiguity instead of guessing when two dirs match equally", async () => {
