@@ -299,15 +299,23 @@ async function reapTree(child, timeoutMs) {
 export function installSignalHandlers(log) {
   const controller = new AbortController();
   const onSignal = (signal) => {
-    if (controller.signal.aborted) return;
+    if (controller.signal.aborted) {
+      // A second signal means "stop now": kill running test trees and exit.
+      log(`received ${signal} again, killing the test process tree`);
+      forceExit(signal);
+      return;
+    }
     log(`received ${signal}, cancelling campaign`);
-    controller.abort(new Error(`campaign cancelled by ${signal}`));
+    controller.abort(Object.assign(new Error(`campaign cancelled by ${signal}`), { signal }));
   };
   const onInt = () => onSignal("SIGINT");
   const onTerm = () => onSignal("SIGTERM");
   process.on("SIGINT", onInt);
   process.on("SIGTERM", onTerm);
-  return { signal: controller.signal, dispose() {
+  return { signal: controller.signal,
+    /** 130 after SIGINT, 143 after SIGTERM; meaningful once aborted. */
+    get exitCode() { return signalExitCode(controller.signal.reason?.signal); },
+    dispose() {
     process.removeListener("SIGINT", onInt);
     process.removeListener("SIGTERM", onTerm);
   } };

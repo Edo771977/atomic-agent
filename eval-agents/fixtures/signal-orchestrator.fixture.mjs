@@ -17,13 +17,15 @@ syncBuiltinESMExports();
 const { installSignalHandlers, runVitest } = await import("../scripts/_lib.mjs");
 const cancellation = installSignalHandlers(() => {});
 const running = runVitest({ entryPath: process.env.LAUNCHER_ENTRY,
-  cwd: process.env.LAUNCHER_CWD, signal: cancellation?.signal });
+  cwd: process.env.LAUNCHER_CWD, signal: cancellation?.signal,
+  ...(process.env.LAUNCHER_KILL_TIMEOUT_MS ? { killTimeoutMs: Number(process.env.LAUNCHER_KILL_TIMEOUT_MS) } : {}) });
 const deadline = Date.now() + 3000;
 while (!exists(process.env.LAUNCHER_RESULT) && Date.now() < deadline) await delay(10);
 record("child-ready");
 // Node dispatches the same installed handlers on both operating systems;
 // no interactive Windows console or actual Ctrl-C injection is required.
 process.emit(process.env.LAUNCHER_SIGNAL ?? "SIGINT");
+if (process.env.LAUNCHER_SECOND_SIGNAL) process.emit(process.env.LAUNCHER_SECOND_SIGNAL);
 let code;
 try {
   code = await running;

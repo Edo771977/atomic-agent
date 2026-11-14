@@ -26,7 +26,7 @@ describe("eval launcher actual Node children", () => {
   for (const signal of ["SIGINT", "SIGTERM"]) {
     it(`lets the real installed ${signal} handler await child close and caller teardown`, () => {
       const result = launch(`handler-${signal}`, { LAUNCHER_MODE: "cancel", LAUNCHER_SIGNAL: signal }, "signal-orchestrator.fixture.mjs");
-      expect(result.status, result.diagnostic).toBe(130);
+      expect(result.status, result.diagnostic).toBe(signal === "SIGTERM" ? 143 : 130);
       const events = readFileSync(`${result.output}.events.jsonl`, "utf8").trim().split("\n").map((line) => JSON.parse(line).event);
       expect(events).toEqual(["child-ready", "after-child-close", "teardown-finished", "returning"]);
       const child = JSON.parse(readFileSync(result.output, "utf8")) as { pid: number };
@@ -123,4 +123,27 @@ describe.skipIf(process.platform === "win32")("eval launcher process tree", () =
       try { process.kill(child.grandchildPid, "SIGKILL"); } catch { /* already gone */ }
     }
   });
+});
+
+describe.skipIf(process.platform === "win32")("eval launcher repeated signals", () => {
+  for (const [first, second, code] of [["SIGINT", "SIGTERM", 143], ["SIGTERM", "SIGINT", 130]] as const) {
+    it(`a second signal (${first} then ${second}) kills the tree and exits immediately with ${code}`, () => {
+      const started = Date.now();
+      const result = launch(`twice-${first}`, { LAUNCHER_MODE: "stubborn", LAUNCHER_SIGNAL: first,
+        LAUNCHER_SECOND_SIGNAL: second, LAUNCHER_KILL_TIMEOUT_MS: "60000" }, "signal-orchestrator.fixture.mjs");
+      const child = JSON.parse(readFileSync(result.output, "utf8")) as { pid: number; grandchildPid: number };
+      try {
+        expect(result.status, result.diagnostic).toBe(code);
+        expect(Date.now() - started).toBeLessThan(8000);
+        const events = readFileSync(`${result.output}.events.jsonl`, "utf8").trim().split("\n").map((line) => JSON.parse(line).event);
+        expect(events).toEqual(["child-ready"]);
+        const deadline = Date.now() + 2000;
+        while ((processAlive(child.pid) || processAlive(child.grandchildPid)) && Date.now() < deadline) { /* SIGKILL delivery */ }
+        expect(processAlive(child.pid)).toBe(false);
+        expect(processAlive(child.grandchildPid)).toBe(false);
+      } finally {
+        for (const pid of [child.pid, child.grandchildPid]) try { process.kill(pid, "SIGKILL"); } catch { /* gone */ }
+      }
+    });
+  }
 });

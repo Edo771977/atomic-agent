@@ -102,7 +102,10 @@ same way. On Windows cancellation runs `taskkill /T`, then `/T /F` after the
 timeout; it reaches descendants only while the Vitest process is alive.
 Installed SIGINT/SIGTERM handlers request cancellation through the signal
 passed by smoke/level1; they do not exit or stop daemons inline. The caller
-awaits child close, then its managed-daemon teardown, before exiting 130.
+awaits child close, then its managed-daemon teardown, before exiting 130
+(SIGINT) or 143 (SIGTERM). A second signal does not wait: it SIGKILLs the
+running test process tree and exits at once with the second signal's code,
+skipping daemon teardown.
 Health waits honor the same signal, and handlers are removed after teardown.
 
 ## Methodology
