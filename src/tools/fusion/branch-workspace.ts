@@ -255,6 +255,12 @@ export interface BranchSet {
   cleanup(keep?: readonly string[]): Promise<void>;
 }
 
+/** Measured baseline cost; final staging keeps the method/root, but takes a fresh Git snapshot. */
+export interface BranchCopyPlan {
+  readonly bytes: number;
+  create(options: CreateBranchSetOptions): Promise<BranchSet | null>;
+}
+
 /** Runs git; resolves `null` when git is not there to run. */
 export type GitExec = (
   args: readonly string[],
@@ -479,6 +485,8 @@ function copyLimitReason(budget: PrivateCopyBudget, limit: number, err: PrivateC
 
 interface PrivateCopyBudget {
   left: number;
+  /** A dry copy uses the same traversal and accounting, without copying payload bytes. */
+  measurement?: { entriesLeft: number };
   signal?: AbortSignal;
   /** Only links made by this copy operation may be expanded on link failure. */
   generatedDirectoryLinks: Map<string, string>;
@@ -588,6 +596,7 @@ async function copyPrivateEntry(
   shared = rel.length > 0 && SHARED_DEPENDENCY_DIRECTORIES.has(basename(rel)),
 ): Promise<void> {
   budget.signal?.throwIfAborted();
+  if (budget.measurement !== undefined && --budget.measurement.entriesLeft < 0) throw new Error("final copy measurement exceeds the 100000 entry limit");
   if (isUnderMergeDir(rel)) return;
   if (shared && budget.privateDependenciesFrom !== undefined) {
     const origin = join(budget.privateDependenciesFrom, rel);
@@ -616,6 +625,7 @@ async function copyPrivateEntry(
   } else if (info.isFile()) {
     if (info.size > budget.left) throw new PrivateCopyLimitError(info.size);
     budget.left -= info.size;
+    if (budget.measurement !== undefined) return;
     await copyFileKeepingMode(from, to);
     budget.signal?.throwIfAborted();
     // A file growing during the copy must not evade the shared limit.
@@ -751,12 +761,13 @@ async function matchDirectoryModes(source: string, dir: string, signal?: AbortSi
 }
 
 /** Whether two regular files of the same size hold the same bytes. */
-async function sameBytes(a: string, b: string): Promise<boolean> {
+async function sameBytes(a: string, b: string, signal?: AbortSignal): Promise<boolean> {
   const [left, right] = await Promise.all([open(a, "r"), open(b, "r")]);
   try {
     const one = Buffer.alloc(64 * 1024);
     const two = Buffer.alloc(64 * 1024);
     for (;;) {
+      signal?.throwIfAborted();
       const [x, y] = await Promise.all([left.read(one, 0, one.length, null), right.read(two, 0, two.length, null)]);
       if (x.bytesRead !== y.bytesRead) return false;
       if (x.bytesRead === 0) return true;
@@ -772,14 +783,14 @@ async function sameBytes(a: string, b: string): Promise<boolean> {
  * bytes (or a symlink's target), giving a file the source's permission
  * bits and times; `false` when it differs and must be replaced.
  */
-async function adoptCheckoutEntry(from: string, info: Stats, to: string): Promise<boolean> {
+async function adoptCheckoutEntry(from: string, info: Stats, to: string, signal?: AbortSignal): Promise<boolean> {
   const there = await lstat(to).catch(() => null);
   if (there === null) return false;
   if (info.isSymbolicLink()) {
     return there.isSymbolicLink() && await readlink(from) === await readlink(to);
   }
   if (!info.isFile() || !there.isFile() || there.size !== info.size) return false;
-  if (!await sameBytes(from, to)) return false;
+  if (!await sameBytes(from, to, signal)) return false;
   if ((there.mode & 0o777) !== (info.mode & 0o777)) await chmod(to, info.mode & 0o777);
   // Source times, as for a copy (`copyFileKeepingMode`).
   await utimes(to, info.atime, info.mtime);
@@ -813,8 +824,14 @@ async function gitSnapshot(
   // A commit object of the tracked files' current state; the working
   // tree, the index and the stash list are left exactly as they were.
   const stash = await git(["stash", "create"], realDir);
-  if (!ok(stash)) return null;
-  const commit = stash.stdout.trim() || head.stdout.trim();
+  // Read before `ok` narrows its false branch to null.
+  const emptyStash = stash !== null && stash.exitCode === 1 && !stash.timedOut && !stash.truncated && stash.stdout.trim() === "" && stash.stderr.trim() === "";
+  if (!ok(stash)) {
+    // Git for Windows can return an empty exit 1 for a clean linked worktree.
+    // Establish both working-tree and index cleanliness before using HEAD.
+    if (!emptyStash || !ok(await git(["diff", "--quiet"], realDir)) || !ok(await git(["diff", "--cached", "--quiet"], realDir))) return null;
+  }
+  const commit = stash?.stdout.trim() || head.stdout.trim();
   const tracked = await git(["ls-files", "--cached", "-z"], realDir);
   const untracked = await git(
     ["ls-files", "--others", "--exclude-standard", "-z"],
@@ -863,6 +880,8 @@ async function addWorktree(
   const dir = snapshot.rel.length === 0 ? root : join(root, snapshot.rel);
   await mkdir(dir, { recursive: true });
   for (const path of snapshot.tracked) {
+    budget.signal?.throwIfAborted();
+    if (budget.measurement !== undefined && --budget.measurement.entriesLeft < 0) throw new Error("final copy measurement exceeds the 100000 entry limit");
     const from = join(realDir, path);
     let info;
     try {
@@ -874,7 +893,7 @@ async function addWorktree(
     // The checkout already holds the source's bytes (the common case):
     // only its mode and times are made the source's, nothing is copied
     // or charged to the copy limit.
-    if (info !== undefined && await adoptCheckoutEntry(from, info, to)) continue;
+    if (info !== undefined && await adoptCheckoutEntry(from, info, to, budget.signal)) continue;
     // Checkout filters and a cached-clean index may disagree with the
     // working tree. Replace, never normalize, the actual source entry.
     await rm(to, { recursive: true, force: true });
@@ -916,6 +935,17 @@ export async function createBranchSet(
   taskIds: readonly string[],
   options: CreateBranchSetOptions = {},
 ): Promise<BranchSet | null> {
+  return buildBranchSet(realDir, taskIds, options);
+}
+
+interface CopyMode { measure?: boolean; expected?: { method: BranchMethod; top?: string } }
+interface PlannedBranchSet extends BranchSet { readonly snapshotTop?: string }
+async function buildBranchSet(
+  realDir: string,
+  taskIds: readonly string[],
+  options: CreateBranchSetOptions,
+  mode: CopyMode = {},
+): Promise<PlannedBranchSet | null> {
   options.signal?.throwIfAborted();
   const git = options.git ?? ((args, cwd) => executeGit(args, cwd, options.signal));
   const cleanupGit = options.git ?? defaultGitExec;
@@ -935,7 +965,12 @@ export async function createBranchSet(
     JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }),
   ).catch(() => undefined);
   let snapshot: GitSnapshot | null;
-  try { snapshot = await gitSnapshot(real, git); }
+  try {
+    snapshot = mode.expected?.method === "copy" ? null : await gitSnapshot(real, git);
+    if (mode.expected?.method === "worktree" && (snapshot === null || snapshot.top !== mode.expected.top)) {
+      throw new Error("planned final Git workspace method or root changed; refusing an unreserved folder copy");
+    }
+  }
   catch (err) { await removeWorkspaceTree(runRoot); throw err; }
   await sweepStaleBranchSets(dirname(runRoot), snapshot?.top, git);
   const roots: string[] = [];
@@ -967,7 +1002,7 @@ export async function createBranchSet(
     if (snapshot !== null) await forgetRemovedWorktrees(cleanupGit, snapshot.top, [runRoot]);
   };
   const limit = options.maxCopyBytes ?? VERIFY_COPY_MAX_BYTES;
-  const budget: PrivateCopyBudget = { left: limit, generatedDirectoryLinks: new Map(), dependencyBytes: { unlinked: 0, private: 0 }, ...(options.privateDependencyDirectories === true ? { privateIgnoredDirectories: true } : {}), ...(options.signal === undefined ? {} : { signal: options.signal }) };
+  const budget: PrivateCopyBudget = { left: limit, ...(mode.measure === true ? { measurement: { entriesLeft: 100_000 } } : {}), generatedDirectoryLinks: new Map(), dependencyBytes: { unlinked: 0, private: 0 }, ...(options.privateDependencyDirectories === true ? { privateIgnoredDirectories: true } : {}), ...(options.signal === undefined ? {} : { signal: options.signal }) };
   try {
     const method: BranchMethod = snapshot === null ? "copy" : "worktree";
     const make = async (name: string, source: string): Promise<string> => {
@@ -975,7 +1010,7 @@ export async function createBranchSet(
       roots.push(root);
       const dir = snapshot !== null ? await addWorktree(snapshot, source, root, git, budget) : root;
       if (snapshot === null) await copyPrivateEntry(source, root, budget);
-      await matchDirectoryModes(source, dir, options.signal);
+      if (mode.measure !== true) await matchDirectoryModes(source, dir, options.signal);
       return dir;
     };
     // Tasks copy what the base only links; the base itself stays link-only.
@@ -993,7 +1028,7 @@ export async function createBranchSet(
       }
     }
     const directoryIgnorePolicy = await createDirectoryIgnorePolicy({
-      originalDir: real, baseDir, probeDir: join(runRoot, "ignore-policy"),
+      originalDir: real, baseDir: mode.measure === true ? real : baseDir, probeDir: join(runRoot, "ignore-policy"),
       ...(options.signal === undefined ? {} : { signal: options.signal }),
       copy: (from, to) => copyPrivateEntry(from, to, budget),
       ...(options.ignoreGit === undefined ? {} : { git: options.ignoreGit }),
@@ -1011,20 +1046,20 @@ export async function createBranchSet(
     for (const [index, taskId] of taskIds.entries()) {
       const name = workspaceName(index, taskId);
       workspaceRoots.set(taskId, join(runRoot, name));
-      const dir = await make(name, baseDir);
+      const dir = await make(name, mode.measure === true ? real : baseDir);
       const ignoredManifest = new Map<string, FileStamp>();
       workspaces.set(taskId, {
         taskId,
         name,
         dir,
-        manifest: await stampTree(dir, excludedDirectories, directoryIgnorePolicy, options.signal, trackedPaths, ignoredManifest),
+        manifest: mode.measure === true ? new Map() : await stampTree(dir, excludedDirectories, directoryIgnorePolicy, options.signal, trackedPaths, ignoredManifest),
         excludedDirectories,
         trackedPaths,
         ignoredManifest,
         ...(directoryIgnorePolicy === undefined ? {} : { directoryIgnorePolicy }),
       });
     }
-    return { method, realDir: real, baseDir, workspaces, cleanup, remainingCopyBytes: () => budget.left,
+    return { method, ...(snapshot === null ? {} : { snapshotTop: snapshot.top }), realDir: real, baseDir, workspaces, cleanup, remainingCopyBytes: () => budget.left,
       minimumPrivateDependencyCopyBytes: () => taskIds.length === 0 ? 0 : Math.floor(budget.dependencyBytes.private / taskIds.length),
       retainForRecovery: () => writeFile(join(runRoot, OWNER_FILE), JSON.stringify({ pid: process.pid, recovery: true, createdAt: new Date().toISOString() })) };
   } catch (err) {
@@ -1035,6 +1070,26 @@ export async function createBranchSet(
     }
     throw err;
   }
+}
+
+/**
+ * Run the actual copier dry, including byte overlays, private dependencies and
+ * frozen ignore rules. Only Git checkout materializations and empty metadata
+ * are created; payload copyFile calls are skipped, so no copied bytes are refunded.
+ */
+export async function planBranchSetCopy(realDir: string, taskIds: readonly string[], options: CreateBranchSetOptions = {}): Promise<BranchCopyPlan | null> {
+  const signal = options.signal === undefined ? AbortSignal.timeout(30_000) : AbortSignal.any([options.signal, AbortSignal.timeout(30_000)]);
+  const measured = await buildBranchSet(realDir, taskIds, { ...options, signal }, { measure: true });
+  if (measured === null) return null;
+  try {
+    const bytes = (options.maxCopyBytes ?? VERIFY_COPY_MAX_BYTES) - measured.remainingCopyBytes!();
+    const source = measured.realDir;
+    const expected = { method: measured.method, ...(measured.snapshotTop === undefined ? {} : { top: measured.snapshotTop }) };
+    return { bytes, async create(finalOptions) {
+      if (await realpath(realDir) !== source) throw new Error("planned final workspace source root changed");
+      return buildBranchSet(source, taskIds, finalOptions, { expected });
+    } };
+  } finally { await measured.cleanup(); }
 }
 
 /**

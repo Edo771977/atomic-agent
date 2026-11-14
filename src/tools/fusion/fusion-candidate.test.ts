@@ -406,28 +406,44 @@ describe("the configured copy limit (`tools.verify.maxCopyBytes`)", () => {
     expect((result.details.tasks as Array<{ error?: string }>)[0]!.error).toBe("not started: could not create a private workspace: the folder is too large to copy");
   });
 
-  it("charges final frozen-check staging to the configured candidate budget that remains", async () => {
+  it("charges post-worker payload growth to the configured candidate budget that remains", async () => {
     const f = await fixture();
     const bytes = Buffer.byteLength(await readFile(join(f.root, "api.json"), "utf8")) + Buffer.byteLength(await readFile(join(f.root, "personal.txt"), "utf8"));
-    await writeFile(join(stateDir, "config.json"), JSON.stringify({ version: USER_CONFIG_VERSION, tools: { verify: { maxCopyBytes: bytes * 3 } } }));
+    await writeFile(join(stateDir, "config.json"), JSON.stringify({ version: USER_CONFIG_VERSION, tools: { verify: { maxCopyBytes: bytes * 4 } } }));
     resetConfigCache();
-    f.deps.runTurn = async session => { await writeFile(join(session.workingDir, "api.json"), '{"name":"after!"}'); return { session, reason: "reply", stepCount: 1 }; };
+    f.deps.runTurn = async session => { await writeFile(join(session.workingDir, "api.json"), '{"name":"after growing"}'); return { session, reason: "reply", stepCount: 1 }; };
     f.deps.runChecks = async specs => ({ ok: true, results: specs.map(() => ({ ok: true })) });
     const result = await buildFusionDelegateTool(f.deps).run({ tasks: [{ id: "api", instructions: "work", files: ["api.json"] }], contract }, f.ctx);
     expect(result.details.candidateIntegration).toMatchObject({ status: "rejected", reason: expect.stringMatching(/remaining candidate copy budget/) });
     expect(await readFile(join(f.root, "api.json"), "utf8")).toBe('{"name":"before"}');
   });
 
-  it("retains the dependency-copy refusal cause when final checked staging exhausts its remaining budget", async () => {
+  it("retains the dependency-copy refusal cause when worker dependency growth exhausts final staging", async () => {
     const f = await fixture();
     const bytes = Buffer.byteLength(await readFile(join(f.root, "api.json"), "utf8")) + Buffer.byteLength(await readFile(join(f.root, "personal.txt"), "utf8"));
     await mkdir(join(f.root, "node_modules")); await writeFile(join(f.root, "node_modules", "dependency.js"), "x".repeat(100));
-    await writeFile(join(stateDir, "config.json"), JSON.stringify({ version: USER_CONFIG_VERSION, tools: { verify: { maxCopyBytes: bytes * 4 + 150 } } }));
+    await writeFile(join(stateDir, "config.json"), JSON.stringify({ version: USER_CONFIG_VERSION, tools: { verify: { maxCopyBytes: bytes * 4 + 250 } } }));
     resetConfigCache();
-    f.deps.runTurn = async session => { await writeFile(join(session.workingDir, "api.json"), '{"name":"after!"}'); return { session, reason: "reply", stepCount: 1 }; };
+    f.deps.runTurn = async session => {
+      await writeFile(join(session.workingDir, "api.json"), '{"name":"after!"}');
+      await writeFile(join(session.workingDir, "node_modules", "dependency.js"), "y".repeat(200));
+      return { session, reason: "reply", stepCount: 1 };
+    };
     f.deps.runChecks = async specs => ({ ok: true, results: specs.map(() => ({ ok: true })) });
     const result = await buildFusionDelegateTool(f.deps).run({ tasks: [{ id: "api", instructions: "work", files: ["api.json"] }], contract }, f.ctx);
     expect(result.details.candidateIntegration).toMatchObject({ status: "rejected", reason: expect.stringMatching(/remaining candidate copy budget.*private copy of the dependency folders/) });
+    expect(await readFile(join(f.root, "node_modules", "dependency.js"), "utf8")).toBe("x".repeat(100));
+  });
+  it("refuses a known whole final payload copy before dispatching workers", async () => {
+    const runTurn = vi.fn(async (session: SessionState): Promise<RunTurnResult> => ({ session, reason: "reply", stepCount: 1 }));
+    const f = await fixture({ runTurn });
+    await writeFile(join(f.root, "payload.bin"), Buffer.alloc(400 * 1024));
+    await writeFile(join(stateDir, "config.json"), JSON.stringify({ version: USER_CONFIG_VERSION, tools: { verify: { maxCopyBytes: 1024 * 1024 } } }));
+    resetConfigCache();
+    const result = await buildFusionDelegateTool(f.deps).run({ tasks: [{ id: "api", instructions: "work" }], contract }, f.ctx);
+    expect(result.details.reason).toBe("candidate-staging-failed");
+    expect(result.summary).toMatch(/measured final copy exceeds the remaining candidate copy budget/);
+    expect(runTurn).not.toHaveBeenCalled();
   });
   it("refuses a known minimum final dependency-copy cost before workers with honest budget context", async () => {
     const runTurn = vi.fn(async (session: SessionState): Promise<RunTurnResult> => ({ session, reason: "reply", stepCount: 1 }));

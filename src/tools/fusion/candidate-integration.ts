@@ -7,7 +7,7 @@ import { renameWithRetrySync, syncDirectoryBestEffort, writeFileSyncedSync } fro
 import { resolveUserPath } from "../os/expand-home.js";
 import { inputPathIdentity, windowsComponentIdentity } from "../os/fs/fs-input-path-identity.js";
 import { VERIFY_COPY_EXCLUDED, VERIFY_COPY_MAX_BYTES } from "../verify/verify-workspace-copy.js";
-import { createBranchSet, defaultGitExec, BRANCH_MERGE_DIR, ensureMergeDir, type BranchSet, type BranchWorkspace, type CreateBranchSetOptions, type GitExec } from "./branch-workspace.js";
+import { createBranchSet, planBranchSetCopy, defaultGitExec, BRANCH_MERGE_DIR, ensureMergeDir, type BranchCopyPlan, type BranchSet, type BranchWorkspace, type CreateBranchSetOptions, type GitExec } from "./branch-workspace.js";
 import { workspaceChanges, writeTaskPatch, type SavedTaskPatch } from "./branch-diff.js";
 import { resolveContractInputs } from "./contract-inputs.js";
 import { inspectContractProvides, runContractChecks, type ContractCheckRunner, type ContractReport } from "./contract-checks.js";
@@ -322,15 +322,26 @@ export async function createCandidateIntegration(
     onRefusal: (reason) => { refusal = reason; options.onRefusal?.(reason); },
   });
   if (set === null) throw new Error(`candidate workspace unavailable: ${refusal ?? "private copies exceed the copy limit"}`);
+  let additionalCopyBytes = set.minimumPrivateDependencyCopyBytes?.() ?? 0;
   const budgetContext = (): string => {
     const remaining = set.remainingCopyBytes?.() ?? 0;
-    return `configured ${copyLimit} bytes; spent ${copyLimit - remaining} bytes; remaining ${remaining} bytes; minimum additional ${set.minimumPrivateDependencyCopyBytes?.() ?? 0} bytes`;
+    return `configured ${copyLimit} bytes; spent ${copyLimit - remaining} bytes; remaining ${remaining} bytes; minimum additional ${additionalCopyBytes} bytes`;
   };
   if ((set.minimumPrivateDependencyCopyBytes?.() ?? 0) > (set.remainingCopyBytes?.() ?? 0)) {
     await set.cleanup();
     throw new Error(`candidate workspace unavailable: minimum final private dependency copy exceeds the remaining candidate copy budget (${budgetContext()})`);
   }
   const workspace = set.workspaces.get(id)!;
+  let checkedPlan: BranchCopyPlan;
+  try {
+    let measuredRefusal: string | undefined;
+    const plan = await planBranchSetCopy(workspace.dir, ["checked-source"], { ...options, signal: setupSignal, privateDependencyDirectories: true,
+      onRefusal: reason => { measuredRefusal = reason; } });
+    if (plan === null) throw new Error(`candidate workspace unavailable: measured final copy exceeds the remaining candidate copy budget (${budgetContext()}): ${measuredRefusal ?? "final copy exceeds the configured limit"}`);
+    additionalCopyBytes = plan.bytes;
+    if (plan.bytes > (set.remainingCopyBytes?.() ?? 0)) throw new Error(`candidate workspace unavailable: measured final copy exceeds the remaining candidate copy budget (${budgetContext()})`);
+    checkedPlan = plan;
+  } catch (err) { await set.cleanup(); throw err; }
   let tracked: ReadonlySet<string>;
   try { tracked = await trackedPaths(set, options.git ?? defaultGitExec); } catch (err) { await set.cleanup(); throw err; }
   const snapshot = (root: string, signal?: AbortSignal, dropped?: Dropped): Promise<Inventory> => inventory(root, workspace, tracked, { bytes: options.maxInventoryBytes ?? copyLimit, entries: options.maxInventoryEntries ?? 100_000, signal: signal === undefined ? AbortSignal.timeout(options.maxInventoryMs ?? 30_000) : AbortSignal.any([signal, AbortSignal.timeout(options.maxInventoryMs ?? 30_000)]) }, dropped);
@@ -558,7 +569,7 @@ export async function createCandidateIntegration(
         const beforeChecks = await snapshot(workspace.dir, input.signal);
         const freezeSignal = AbortSignal.any([input.signal, AbortSignal.timeout(120_000)]);
         let checkedRefusal: string | undefined;
-        checkedSet = await createBranchSet(workspace.dir, ["checked-source"], { ...options, signal: freezeSignal,
+        checkedSet = await checkedPlan.create({ ...options, signal: freezeSignal,
           maxCopyBytes: set.remainingCopyBytes?.() ?? 0, privateDependencyDirectories: true,
           onRefusal: reason => { checkedRefusal = reason; options.onRefusal?.(reason); } });
         if (checkedSet === null) return await rejectFinal(`candidate not promoted: checked source copy exceeds the remaining candidate copy budget (${budgetContext()})${checkedRefusal === undefined ? "" : `: ${checkedRefusal.replace(/copy limit/g, "remaining copy allowance")}`}`);
