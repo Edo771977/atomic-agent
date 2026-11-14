@@ -25,7 +25,7 @@ import type { AtomicAgentConfig } from "../../config/index.js";
 import { runVerify } from "./run-verify.js";
 import { verifySyntax } from "./verify-syntax.js";
 import { createVerifyWorkspace, type VerifyWorkspace } from "./verify-workspace-copy.js";
-import { installTestTypeScriptCompiler } from "./typescript-test-helpers.js";
+import { installTestTypeScriptCompiler } from "../../../test/helpers/typescript-compiler.js";
 
 const NODE = process.execPath;
 const CONFIG: Pick<AtomicAgentConfig, "browser"> = {

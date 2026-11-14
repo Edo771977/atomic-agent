@@ -1,7 +1,7 @@
 import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
-/** A real compiler launcher without the file-symlink privilege Windows lacks. */
+/** Test-only compiler launcher without the file-symlink privilege Windows lacks. */
 export function installTestTypeScriptCompiler(project: string): string {
   const compiler = resolve("node_modules/typescript/bin/tsc");
   const windows = process.platform === "win32";

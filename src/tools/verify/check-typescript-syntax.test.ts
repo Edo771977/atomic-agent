@@ -11,7 +11,7 @@ import {
   TS_CHECKER,
 } from "./check-typescript-syntax.js";
 
-import { installTestTypeScriptCompiler } from "./typescript-test-helpers.js";
+import { installTestTypeScriptCompiler } from "../../../test/helpers/typescript-compiler.js";
 
 let dir: string;
 

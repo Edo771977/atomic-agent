@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { verifySyntax } from "../verify/verify-syntax.js";
-import { installTestTypeScriptCompiler } from "../verify/typescript-test-helpers.js";
+import { installTestTypeScriptCompiler } from "../../../test/helpers/typescript-compiler.js";
 import {
   describeSyntax,
   runSyntaxPass,
