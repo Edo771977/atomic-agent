@@ -129,12 +129,19 @@ describe("request budget scope", () => {
     expect(body).not.toHaveProperty("max_tokens");
   });
 
-  it("refuses a paid send without any explicit output ceiling instead of reserving the context window", () => {
+  it("admits a paid send without any explicit output ceiling on a soft bound, leaving the body unchanged", () => {
     const { budget, scope } = setup(10, { maxOutputTokens: undefined });
     const body: Record<string, unknown> = { model: "openai/gpt-5.1", messages: [] };
-    expect(() => scope().beforeSend(body)).toThrow(/set `maxOutputTokens` on provider entry cloud/);
-    expect(body).not.toHaveProperty("max_completion_tokens");
-    expect(spent(budget)).toBe(0);
+    const s = scope();
+    s.beforeSend(body);
+    expect(body).toEqual({ model: "openai/gpt-5.1", messages: [] });
+    expect(s.softBound).toBe(true);
+    expect(s.hint).toMatch(/maxOutputTokens/);
+    // The hold covers the assumed 8192-token reply at the output rate.
+    expect(() => budget.reserveRequest("p", 10 - 8192 * 15 / 1_000_000 + 0.001).release()).toThrow(/cannot cover/);
+    s.finish({ usage: { promptTokens: 1_000, completionTokens: 20_000, totalTokens: 21_000 } } as never);
+    // Settlement charges the real usage even beyond the assumed output.
+    expect(spent(budget)).toBeCloseTo((1_000 * 3 + 20_000 * 15) / 1_000_000, 9);
   });
 
   it("accepts a cap field already in the body as the explicit ceiling", () => {
@@ -158,12 +165,75 @@ describe("request budget scope", () => {
     expect(body).toEqual({ model: "claude-sonnet-4.5", messages: [], max_tokens: 4096 });
   });
 
-  it("refuses a paid request with no verified output ceiling", () => {
+  it("assumes no more output than a known context window on a soft bound", () => {
     const budget = new FusionTurnBudget();
     budget.begin("p", 0, { usd: 10 });
     const req = { sessionId: "p", prompt: "hi" } as CompletionRequest;
-    const s = createRequestBudgetScope(budget, req, provider, entry, { ...model, source: "default" })!;
-    expect(() => s.beforeSend({ model: "m", messages: [] })).toThrow(/output ceiling/);
+    const s = createRequestBudgetScope(budget, req, provider, entry, { ...model, contextWindow: 2_000 })!;
+    s.beforeSend({ model: "m", messages: [] });
+    expect(s.softBound).toBe(true);
+    s.finish(undefined);
+    // Lost usage settles the whole soft hold: body bytes + framing + 2000 output tokens.
+    expect(spent(budget)).toBeLessThan(((2_000 + 1_200) * 3.75 + 2_000 * 15) / 1_000_000);
+    expect(spent(budget)).toBeGreaterThan(2_000 * 15 / 1_000_000);
+  });
+
+  it("keeps the hard bound and no hint when an explicit ceiling exists", () => {
+    const { scope } = setup(10);
+    const s = scope();
+    s.beforeSend({ model: "m", messages: [] });
+    expect(s.softBound).toBe(false);
+    expect(s.hint).toBeUndefined();
+  });
+
+  describe("meter-only fallback when the cap cannot be enforced before sending", () => {
+    // Reviewer probe p1: an `openai` entry from presets, no maxOutputTokens, catalog pricing, $1 cap.
+    it("admits a default fusion setup request (p1) with the body unchanged", () => {
+      const budget = new FusionTurnBudget();
+      budget.begin("s1", 0, { usd: 1 });
+      const p = { id: "openai", supportsRequestBudget: true } as LlmProvider;
+      const e = { id: "openai", kind: "openai" } as LlmProviderConfigEntry;
+      const m = { pricing: { input: 2.5, output: 10 }, contextWindow: 128_000, source: "catalog" } as ResolvedModel;
+      const s = createRequestBudgetScope(budget, { sessionId: "s1" } as CompletionRequest, p, e, m)!;
+      const body = { model: "gpt-4o", messages: [{ role: "user", content: "hi" }] };
+      expect(() => s.beforeSend(body)).not.toThrow();
+      expect(body).toEqual({ model: "gpt-4o", messages: [{ role: "user", content: "hi" }] });
+    });
+
+    it("admits a paid provider without verified pricing and charges only reported cost", () => {
+      const budget = new FusionTurnBudget();
+      budget.begin("p", 0, { usd: 1 });
+      const s = createRequestBudgetScope(budget, { sessionId: "p", prompt: "hi" } as CompletionRequest, provider, entry, { ...model, pricing: undefined })!;
+      const body = { model: "m", messages: [] };
+      expect(() => s.beforeSend(body)).not.toThrow();
+      expect(body).toEqual({ model: "m", messages: [] });
+      expect(s.hint).toMatch(/pricing/);
+      s.finish({ usage: { promptTokens: 10, completionTokens: 10, totalTokens: 20, costUsd: 0.4 } } as never);
+      expect(spent(budget)).toBeCloseTo(0.4, 9);
+      // Without a reported cost or pricing nothing can be charged.
+      const t = createRequestBudgetScope(budget, { sessionId: "p", prompt: "hi" } as CompletionRequest, provider, entry, { ...model, pricing: undefined })!;
+      t.beforeSend({ model: "m", messages: [] });
+      t.finish({ usage: { promptTokens: 10, completionTokens: 10, totalTokens: 20 } } as never);
+      expect(spent(budget)).toBeCloseTo(0.4, 9);
+    });
+
+    it("meters a priced provider that cannot authorize physical sends with its usage estimate", () => {
+      const budget = new FusionTurnBudget();
+      budget.begin("p", 0, { usd: 1 });
+      const unsupported = { id: "cloud" } as LlmProvider;
+      const s = createRequestBudgetScope(budget, { sessionId: "p", prompt: "hi", maxOutputTokens: 4096 } as CompletionRequest, unsupported, entry, model)!;
+      expect(s.hint).toMatch(/physical send/);
+      s.finish({ usage: { promptTokens: 1_000, completionTokens: 1_000, totalTokens: 2_000 } } as never);
+      expect(spent(budget)).toBeCloseTo((1_000 * 3 + 1_000 * 15) / 1_000_000, 9);
+    });
+
+    it("still refuses a metered request once the cap is reached", () => {
+      const budget = new FusionTurnBudget();
+      budget.begin("p", 0, { usd: 1 });
+      const make = () => createRequestBudgetScope(budget, { sessionId: "p", prompt: "hi" } as CompletionRequest, provider, entry, { ...model, pricing: undefined });
+      make()!.finish({ usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2, costUsd: 1.5 } } as never);
+      expect(make).toThrow(/budget|cap/i);
+    });
   });
 
   describe("price modifiers carried by the request", () => {

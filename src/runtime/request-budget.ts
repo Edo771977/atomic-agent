@@ -5,7 +5,7 @@ import type { ResolvedModel } from "../llm/provider/model-resolver.js";
 import { completionCostUsd, longContextRates, reportedCostUsd } from "../llm/provider/usage-cost.js";
 import { readErrnoCode } from "../llm/errno-code.js";
 import { modelParamProfile } from "../llm/provider/openai/model-params.js";
-import type { FusionTurnBudget } from "../tools/fusion/turn-budget.js";
+import { formatUsd, type FusionTurnBudget } from "../tools/fusion/turn-budget.js";
 
 // Explicit rejections before generation. 529 is Anthropic's overload answer
 // returned instead of generating. 503 stays charged like 500/502/504:
@@ -100,8 +100,35 @@ function servedTierMultiplier(served: string | undefined, requested: number, pri
   return BASE_SERVICE_TIERS.has(served.toLowerCase()) ? 1 : undefined;
 }
 
+/**
+ * Assumed reply size of a send with no explicit output ceiling (no request,
+ * provider-entry or body cap). The hold is soft: settlement charges real
+ * usage, so the cap can be exceeded by at most one reply's output beyond it.
+ */
+export const SOFT_OUTPUT_RESERVE_TOKENS = 8192;
+
+/**
+ * How a USD cap is enforced for one request: `hard` reserves an explicit
+ * output ceiling written into the body, `soft` reserves an assumed reply
+ * without writing a ceiling, `meter` reserves nothing and charges reported
+ * cost (or a usage estimate when pricing is known) after the reply, and
+ * `unbilled` is an explicit local runner or subscription plan.
+ */
+export type RequestBudgetMode = "hard" | "soft" | "meter" | "unbilled";
+
 export interface RequestBudgetScope extends CompletionRequestBudget {
   signal?: AbortSignal;
+  /** Enforcement of the USD cap; `undefined` without one. `hard` may become `soft` at the first send. */
+  mode?: RequestBudgetMode;
+  /** True once a send reserved an assumed reply instead of an explicit ceiling. */
+  softBound: boolean;
+  /**
+   * One-line advice when the cap is not hard-enforced (`soft` or `meter`).
+   * The scope does no logging; a caller that reports it should do so once
+   * per `hintKey` (session and provider).
+   */
+  hint?: string;
+  hintKey?: string;
   finish(result?: CompletionResult): void;
 }
 
@@ -120,12 +147,20 @@ export function createRequestBudgetScope(
   // A loopback/private URL can be a forwarding gateway to a paid service.
   // Only an explicit runner/plan kind is free without configured zero rates.
   const unbilled = entry?.kind === "subscription-cli" || entry?.kind === "llama-server";
-  const priceRequired = limits.usd !== undefined && !unbilled;
   const pricing = model?.pricing;
-  if (priceRequired && !verifiablePricing(pricing)) {
-    throw new Error(`turn budget cannot verify pricing for paid provider ${provider.id}; configure model pricing before sending`);
-  }
-  if (priceRequired && provider.supportsRequestBudget !== true) throw new Error(`turn budget cannot authorize physical requests for provider ${provider.id}`);
+  const priced = verifiablePricing(pricing);
+  const entryId = entry?.id ?? provider.id;
+  const capText = limits.usd === undefined ? "" : formatUsd(limits.usd);
+  // Without verified pricing or per-send authorization the cap cannot be
+  // enforced ahead of time: meter the reply instead of refusing every request.
+  let mode: RequestBudgetMode | undefined = limits.usd === undefined ? undefined
+    : unbilled ? "unbilled"
+    : !priced || provider.supportsRequestBudget !== true ? "meter"
+    : "hard";
+  let hint = mode !== "meter" ? undefined : !priced
+    ? `turn budget: no verified pricing for provider ${provider.id}; the ${capText} cap is only checked after each reply (configure model pricing to enforce it before sending)`
+    : `turn budget: provider ${provider.id} cannot authorize each physical send; the ${capText} cap is only checked after each reply`;
+  const priceRequired = mode === "hard";
   const caps = [request.maxTokens, request.maxOutputTokens, entry?.maxOutputTokens].filter((value): value is number => typeof value === "number" && Number.isFinite(value) && value > 0);
   // No context-window fallback: providers reject a window-sized output
   // limit, and reserving one would hold dollars per request.
@@ -140,8 +175,11 @@ export function createRequestBudgetScope(
   let done = false;
   // Multiplier of the most recent physical send; settlement prices usage with it.
   let tierMultiplier = 1;
-  return {
+  const scope: RequestBudgetScope = {
     signal,
+    ...(mode === undefined ? {} : { mode }),
+    softBound: false,
+    ...(hint === undefined ? {} : { hint, hintKey: `${sessionId}:${provider.id}` }),
     beforeSend(body) {
       if (done) throw new Error("request budget scope is already closed");
       if (signal.aborted) throw signal.reason;
@@ -152,18 +190,33 @@ export function createRequestBudgetScope(
       if (request.signal?.aborted) throw request.signal.reason;
       const wireCaps = [body.max_tokens, body.max_completion_tokens].filter((value): value is number => typeof value === "number" && Number.isFinite(value) && value > 0);
       const explicitCaps = outputCap === undefined ? wireCaps : [outputCap, ...wireCaps];
-      if (explicitCaps.length === 0) {
-        throw new Error(`turn budget needs a verified output ceiling before sending; set \`maxOutputTokens\` on provider entry ${entry?.id ?? provider.id}`);
+      const soft = explicitCaps.length === 0;
+      let ceiling: number;
+      if (soft) {
+        // No explicit ceiling: assume a bounded reply, leave the body alone
+        // and settle on real usage afterwards.
+        const window = model?.contextWindow;
+        ceiling = typeof window === "number" && Number.isFinite(window) && window > 0
+          ? Math.min(SOFT_OUTPUT_RESERVE_TOKENS, Math.floor(window)) : SOFT_OUTPUT_RESERVE_TOKENS;
+        if (!scope.softBound) {
+          scope.softBound = true;
+          mode = "soft";
+          scope.mode = mode;
+          hint = `turn budget: provider entry ${entryId} has no maxOutputTokens; each request reserves an assumed ${ceiling}-token reply, so the ${capText} cap can be exceeded by one reply's extra output (set maxOutputTokens for a hard cap)`;
+          scope.hint = hint;
+          scope.hintKey = `${sessionId}:${provider.id}`;
+        }
+      } else {
+        ceiling = Math.floor(Math.min(...explicitCaps));
+        // Runs after extraBody/model-parameter conversion, immediately before
+        // serialization. Those overrides cannot raise this enforced ceiling.
+        // Clamp the field(s) the body already uses. With neither, write the
+        // field the wire model's profile expects: OpenAI reasoning models
+        // reject `max_tokens`.
+        const present = (["max_tokens", "max_completion_tokens"] as const).filter(field => body[field] !== undefined);
+        const fields = present.length > 0 ? present : [typeof body.model === "string" ? modelParamProfile(body.model).capField : "max_tokens"];
+        for (const field of fields) body[field] = ceiling;
       }
-      const ceiling = Math.floor(Math.min(...explicitCaps));
-      // Runs after extraBody/model-parameter conversion, immediately before
-      // serialization. Those overrides cannot raise this enforced ceiling.
-      // Clamp the field(s) the body already uses. With neither, write the
-      // field the wire model's profile expects: OpenAI reasoning models
-      // reject `max_tokens`.
-      const present = (["max_tokens", "max_completion_tokens"] as const).filter(field => body[field] !== undefined);
-      const fields = present.length > 0 ? present : [typeof body.model === "string" ? modelParamProfile(body.model).capField : "max_tokens"];
-      for (const field of fields) body[field] = ceiling;
       // Every tokenizer emits at most one token per UTF-8 byte of text, so
       // the serialized body bounds the prompt; JSON keys/escaping and a fixed
       // framing allowance deliberately overestimate the server's template.
@@ -215,7 +268,8 @@ export function createRequestBudgetScope(
       // one (an `auto` request can be served at a project's priority tier).
       // A served tier with no known price settles at the whole hold.
       const estimatedCostUsd = (usage: CompletionUsage): number | undefined => {
-        const multiplier = servedTierMultiplier(usage.serviceTier, tierMultiplier, pricing!);
+        if (!priced) return undefined;
+        const multiplier = servedTierMultiplier(usage.serviceTier, tierMultiplier, pricing);
         const usd = completionCostUsd(usage, pricing);
         return usd === undefined || multiplier === undefined ? undefined : usd * multiplier;
       };
@@ -223,9 +277,11 @@ export function createRequestBudgetScope(
       done = true;
       if (timer !== undefined) clearTimeout(timer);
       const usage = result?.usage;
+      // A metered request holds nothing, so a missing estimate charges zero.
       held?.settle(usage === undefined ? (priceRequired ? undefined : 0) : reportedCostUsd(usage) ??
-        (!priceRequired ? 0 : usage.incomplete === true ? undefined : estimatedCostUsd(usage)));
+        (mode === "unbilled" ? 0 : usage.incomplete === true ? undefined : estimatedCostUsd(usage)));
       held = undefined;
     },
   };
+  return scope;
 }
