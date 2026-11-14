@@ -1,5 +1,5 @@
 import { homedir } from "node:os";
-import { dirname, join, parse } from "node:path";
+import { dirname, join, parse, toNamespacedPath } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { collapseScope, resolveFanoutScope } from "./fanout-paths.js";
@@ -123,6 +123,20 @@ describe("collapseScope", () => {
     if (process.platform === "win32") {
       expect(collapseScope(["C:\\", "c:/", "C:\\folder\\..", "\\\\server\\share\\", "//server/share/"])).toEqual([]);
       expect(collapseScope([home.toUpperCase().replaceAll("\\", "/")])).toEqual([]);
+    }
+  });
+
+  it("refuses namespaced broad roots and unsupported device scope spellings", () => {
+    expect(collapseScope([toNamespacedPath(homedir()), toNamespacedPath(dirname(homedir()))])).toEqual([]);
+    if (process.platform === "win32") {
+      for (const path of [
+        "\\\\?\\C:\\", "\\\\?\\UNC\\server\\share\\", "\\\\?\\unc\\SERVER\\SHARE\\",
+        "\\\\.\\C:\\project", "//?/C:/project", "//./C:/project", "\\\\?\\GLOBALROOT\\Device\\HarddiskVolume1\\project",
+        "\\\\?\\C:\\project\\.\\src", "\\\\?\\C:\\project\\..\\src", "\\\\?\\C:\\project.\\src", "\\\\?\\C:\\project \\src",
+        "\\\\?\\C:\\project\\NUL", "\\\\?\\UNC\\server\\share.\\project",
+        `${homedir()}.`, `${homedir()} `,
+      ]) expect(collapseScope([path]), path).toEqual([]);
+      expect(collapseScope([toNamespacedPath(join(homedir(), "review-safe"))])).toEqual([join(homedir(), "review-safe")]);
     }
   });
 });

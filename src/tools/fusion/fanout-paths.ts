@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { isInside } from "../../approval/fanout-scope.js";
 import { resolveUserPath } from "../os/expand-home.js";
 import type { DelegateTask } from "./delegate-args.js";
+import { comparableScopePath } from "./scope-path.js";
 
 /**
  * Where a fan-out is about to write — the directory the operator is
@@ -80,7 +81,8 @@ function collectFromText(text: string, workingDir: string): string[] {
  * anything too broad to authorise.
  */
 export function collapseScope(dirs: readonly string[]): string[] {
-  const unique = [...new Set(dirs)].filter((dir) => !isTooBroad(dir));
+  const comparable = dirs.map(comparableScopePath).filter((dir): dir is string => dir !== null);
+  const unique = [...new Set(comparable)].filter((dir) => !isTooBroad(dir));
   const roots: string[] = [];
   for (const dir of unique.sort((a, b) => a.length - b.length)) {
     if (!roots.some((root) => isInside(root, dir))) roots.push(dir);
