@@ -21,11 +21,10 @@ import {
   type DangerousToolOptions,
 } from "../../approval/dangerous-tool.js";
 import type { CompressedToolResult } from "../../compressor/result-compressor.js";
-import type { AtomicAgentConfig } from "../../config/index.js";
 import type { ShellGuardPolicy } from "../os/shell-command-guard/index.js";
 import type { ToolDefinition } from "../tool-registry.js";
 import type { BrowserLauncher } from "./run-page-kind.js";
-import { runVerify, type VerifyRunContext } from "./run-verify.js";
+import { runVerify, type VerifyRunConfig, type VerifyRunContext } from "./run-verify.js";
 import { parseVerifyRunArgs, type VerifyRunArgs } from "./verify-run-args.js";
 import { needsShellInterpretation } from "../os/shell/shell-interpretation.js";
 import {
@@ -37,7 +36,8 @@ import { guardVerifyRun, verifyRunCommands } from "./verify-run-guard.js";
 export const VERIFY_RUN_TOOL = "verify.run";
 
 export interface VerifyRunToolOptions extends DangerousToolOptions {
-  config: Pick<AtomicAgentConfig, "browser">;
+  /** Browser settings and `tools.verify.maxCopyBytes`. */
+  config: VerifyRunConfig;
   /**
    * Operator policy for the shell guard (the git remote-sync switch),
    * the same predicates `os.shell.run` gets. Omitted by embedders and

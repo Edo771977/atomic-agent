@@ -218,7 +218,7 @@ export function registerRuntimeCoreTools(input: {
   // the review half of what they build.
   registerVerifyTools(toolRegistry, {
     ...dangerous,
-    config: { browser: config.browser },
+    config: { browser: config.browser, tools: { verify: config.tools.verify } },
     // The same guard policy as `os.shell.run`: a `git push` started by
     // verify.run obeys the remote-sync switch too (ATO-1266).
     shellPolicy: {

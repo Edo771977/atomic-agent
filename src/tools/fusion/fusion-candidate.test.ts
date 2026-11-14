@@ -1,7 +1,9 @@
 import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { resetConfigCache } from "../../config/index.js";
+import { USER_CONFIG_VERSION } from "../../config/config-schema.js";
 import { FanoutScopeRegistry } from "../../approval/fanout-scope.js";
 import { ApprovalGate } from "../../approval/approval-gate.js";
 import { ApprovalRulesStore } from "../../approval/approval-rules-store.js";
@@ -215,4 +217,40 @@ it("never releases dependents of a no_changes provider in candidate mode", async
   expect((result.details.tasks as { id: string; status: string }[])[0]!.status).toBe("no_changes");
   expect(ran).toEqual([`${FUSION_WORKER_ID_PREFIX}core`]);
   expect((result.details.candidateIntegration as { status: string }).status).toBe("rejected");
+});
+
+describe("the configured copy limit (`tools.verify.maxCopyBytes`)", () => {
+  let stateDir: string;
+  beforeEach(async () => {
+    stateDir = await mkdtemp(join(tmpdir(), "atag-fanout-copy-limit-state-"));
+    await writeFile(join(stateDir, "config.json"), JSON.stringify({ version: USER_CONFIG_VERSION, tools: { verify: { maxCopyBytes: 8 } } }));
+    process.env.ATOMIC_AGENT_STATE_DIR = stateDir;
+    resetConfigCache();
+  });
+  afterEach(async () => {
+    delete process.env.ATOMIC_AGENT_STATE_DIR;
+    resetConfigCache();
+    await rm(stateDir, { recursive: true, force: true });
+  });
+
+  it("refuses candidate staging when the project exceeds a smaller configured limit", async () => {
+    const f = await fixture();
+    const run = vi.fn(async (session: SessionState): Promise<RunTurnResult> => ({ session, reason: "reply", stepCount: 1 }));
+    f.deps.runTurn = run;
+    const result = await buildFusionDelegateTool(f.deps).run({ tasks, contract }, f.ctx);
+    expect(result.details.reason).toBe("candidate-staging-failed");
+    expect(result.summary).toContain("candidate workspace unavailable: the folder is too large to copy");
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it("refuses worktree isolation when the project exceeds a smaller configured limit", async () => {
+    const f = await fixture({}, false);
+    const mode = { ...f.deps.resolveRunMode(), isolation: "worktree" } as ResolvedRunMode;
+    f.deps.resolveRunMode = () => mode;
+    const run = vi.fn(async (session: SessionState): Promise<RunTurnResult> => ({ session, reason: "reply", stepCount: 1 }));
+    f.deps.runTurn = run;
+    const result = await buildFusionDelegateTool(f.deps).run({ tasks }, f.ctx);
+    expect(run).not.toHaveBeenCalled();
+    expect((result.details.tasks as Array<{ error?: string }>)[0]!.error).toBe("not started: could not create a private workspace: the folder is too large to copy");
+  });
 });

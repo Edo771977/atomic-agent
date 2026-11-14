@@ -30,6 +30,10 @@ on:
 # and cancelling would leave the newest main commit unchecked (ATO-400). Each
 # main push gets its own group (keyed by commit), because a shared group would
 # still keep only one pending run and silently drop the rest.
+# Tests only read the checkout; no job needs a write-scoped token.
+permissions:
+  contents: read
+
 concurrency:
   group: test-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -82,6 +86,7 @@ jobs:
           cache: npm
 
       - name: Install dependencies
+        id: install
         run: npm ci
 
       - name: Remove the optional canvas package
@@ -136,8 +141,14 @@ jobs:
       - name: Run tests
         run: node scripts/run-tests.mjs ${{ matrix.scope }}
 
+      # The eval harness checks are independent of the main suite: report them
+      # even when an earlier check failed, as long as dependencies installed.
+      - name: Check eval harness types
+        if: (success() || failure()) && steps.install.outcome == 'success' && matrix.drop_canvas == 'false'
+        run: npm run eval:agents:lint
+
       - name: Run pure eval harness tests
-        if: matrix.drop_canvas == 'false'
+        if: (success() || failure()) && steps.install.outcome == 'success' && matrix.drop_canvas == 'false'
         run: node node_modules/vitest/vitest.mjs run --config eval-agents/vitest.hermetic.config.ts --maxWorkers=1 --minWorkers=1
 
   windows-core:
@@ -149,6 +160,11 @@ jobs:
       GIT_CONFIG_COUNT: "1"
       GIT_CONFIG_KEY_0: core.autocrlf
       GIT_CONFIG_VALUE_0: "false"
+    defaults:
+      run:
+        # Every step is one command; pwsh stops on cmdlet errors, and a
+        # failing native command fails its step through its exit code.
+        shell: pwsh
     steps:
       - name: Checkout
         uses: actions/checkout@v4

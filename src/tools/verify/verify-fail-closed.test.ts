@@ -44,6 +44,19 @@ describe("verify refuses to execute without a private workspace", () => {
     expect(await readFile(join(dir, "original.txt"), "utf8")).toBe("original");
   });
 
+  it("honours tools.verify.maxCopyBytes from the config for the default workspace", async () => {
+    const runner = vi.spyOn(commands, "runCommandKind");
+    const tiny = { ...config, tools: { verify: { maxCopyBytes: 1 } } };
+    const refused = await runVerify(spec, { workingDir: dir, config: tiny });
+    expect(refused).toMatchObject({ ok: false, errorCode: "workspace-unavailable" });
+    expect(refused.summary).toContain("tools.verify.maxCopyBytes");
+    expect(runner).not.toHaveBeenCalled();
+    const roomy = { ...config, tools: { verify: { maxCopyBytes: 1_000_000 } } };
+    const ran = await runVerify(spec, { workingDir: dir, config: roomy });
+    expect(ran).toMatchObject({ ok: true, isolated: true });
+    expect(await readFile(join(dir, "original.txt"), "utf8")).toBe("original");
+  });
+
   it("copy errors return a failed check without running in the original", async () => {
     const runner = vi.spyOn(commands, "runCommandKind");
     const tmpRoot = join(dir, "not-a-directory");
@@ -115,10 +128,46 @@ describe("verify refuses to execute without a private workspace", () => {
     const runner = vi.spyOn(commands, "runCommandKind");
     const cleanup = vi.fn(async () => { throw new Error("cleanup denied"); });
     const result = await runVerify(spec, { workingDir: dir, workspace: async () => ({ dir, isolated: false, method: "in-place", cleanup }) });
-    expect(result).toMatchObject({ ok: false, isolated: false, errorCode: "workspace-cleanup-failed", checks: [{ ok: false }] });
-    expect(result.error).toContain("cleanup denied");
+    expect(result).toMatchObject({ ok: false, isolated: false, errorCode: "workspace-unavailable", checks: [{ ok: false }] });
+    expect(result.cleanupWarning).toContain("cleanup denied");
     expect(cleanup).toHaveBeenCalledOnce();
     expect(runner).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { label: "passed", code: 0, ok: true },
+    { label: "failed", code: 3, ok: false },
+  ])("a cleanup failure after a $label run keeps the run's result and only warns", async ({ code, ok }) => {
+    const busy = vi.fn(async () => { throw Object.assign(new Error("EBUSY: resource busy or locked"), { code: "EBUSY" }); });
+    const run = { kind: "command", cmd: process.execPath, args: ["-e", `console.log('ran'); process.exit(${code})`], checks: ["exit 0"] };
+    const result = await runVerify(run, { workingDir: dir, workspace: async (cwd) => {
+      const workspace = await createVerifyWorkspace(cwd);
+      busy.mockImplementation(async () => {
+        await workspace.cleanup();
+        throw Object.assign(new Error("EBUSY: resource busy or locked"), { code: "EBUSY" });
+      });
+      return { ...workspace, cleanup: busy };
+    } });
+    expect(busy).toHaveBeenCalledOnce();
+    expect(result.ok).toBe(ok);
+    expect(result.errorCode).toBeUndefined();
+    expect(result.error).toBeUndefined();
+    expect(result.exitCode).toBe(code);
+    expect(result.stdoutTail).toContain("ran");
+    expect(result.checks).toEqual([expect.objectContaining({ check: "exit 0", ok })]);
+    expect(result.cleanupWarning).toContain("EBUSY");
+    expect(result.summary.split("\n")[0]).toBe(`verify.run command: ${ok ? "ok" : "FAILED"}`);
+    expect(result.summary).toMatch(/warning: .*EBUSY/);
+  });
+
+  it("removes the copy with retries so a briefly busy file does not fail cleanup", async () => {
+    const remove = vi.fn(async () => {});
+    const workspace = await createVerifyWorkspace(dir, { remove });
+    await workspace.cleanup();
+    expect(remove).toHaveBeenCalledWith(workspace.dir, expect.objectContaining({ recursive: true, force: true, maxRetries: expect.any(Number) }));
+    expect((remove.mock.calls.at(-1) as unknown as [string, { maxRetries: number }])[1].maxRetries).toBeGreaterThan(0);
+    // The seam did nothing; remove the real copy.
+    await rm(workspace.dir, { recursive: true, force: true });
   });
 
   it("the public page tool reports cancellation when a loaded page skips its required script", async () => {
@@ -169,5 +218,19 @@ describe("verify refuses to execute without a private workspace", () => {
     const result = await runVerify(args, { workingDir: dir, config, signal: controller.signal });
     expect(result).toMatchObject({ ok: false, errorCode: "cancelled" });
     expect(result.error).toContain("cancelled");
+  });
+
+  it("keeps the executor's fields when a run that completed is cancelled, and never passes", async () => {
+    const controller = new AbortController();
+    vi.spyOn(commands, "runCommandKind").mockImplementation(async () => {
+      controller.abort();
+      return { commandLine: "node build.js", exitCode: 0, signal: null, timedOut: false, aborted: false, stdout: "built\n", stderr: "", stdoutTail: "built\n", stderrTail: "", durationMs: 5 };
+    });
+    const result = await runVerify({ kind: "command", cmd: "node", args: ["build.js"], checks: ["exit 0"] }, { workingDir: dir, config, signal: controller.signal });
+    expect(result).toMatchObject({ ok: false, errorCode: "cancelled", aborted: true, isolated: true, commandLine: "node build.js", exitCode: 0, stdoutTail: "built\n", timedOut: false });
+    expect(result.error).toContain("cancelled during execution");
+    expect(result.checks).toEqual([expect.objectContaining({ check: "exit 0", ok: false })]);
+    expect(result.summary.split("\n")[0]).toBe("verify.run command: FAILED");
+    expect(result.summary).toContain("built");
   });
 });

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { RunTurnResult } from "../../agent/agent-loop.js";
 import type { AgentLoopEvent } from "../../agent/agent-contract.js";
 import type { SessionState } from "../../session/session-state.js";
@@ -9,6 +9,8 @@ import type { FusionEscalationTarget } from "../../llm/run-mode/index.js";
 import { runWorkerTasks, type WorkerRunnerDeps } from "./worker-runner.js";
 import { FusionLiveWorkers, type EscalationComplete } from "./escalation.js";
 import type { DelegateTask } from "./delegate-args.js";
+import { createTaskPermitPool } from "./task-permits.js";
+import { TASK_PERMIT_RELEASE_GRACE_MS } from "./worker-runner.js";
 
 type TurnOptions = Parameters<WorkerRunnerDeps["runTurn"]>[2];
 
@@ -211,6 +213,96 @@ describe("advisor escalation of a stuck worker (ATO-942)", () => {
     expect(providers).toEqual(["local", "cloud"]);
     expect(row!.status).toBe("ok");
     expect(row!.notes?.join("\n")).toMatch(/re-run on big after the local worker stayed stuck/);
+  });
+});
+
+describe("the re-run holds a call-wide permit", () => {
+  const TWO: DelegateTask[] = [TASK[0]!, { id: "t1", title: "T1", instructions: "write b.txt" }];
+  const taskOf = (session: SessionState): string =>
+    (session.metadata as { fusionWorker?: { taskId?: string } } | undefined)?.fusionWorker?.taskId ?? "";
+  /** A local turn that stalls twice (so the replace is requested), then ends as `finish` says. */
+  async function stallTwice(options: TurnOptions, finish: () => Promise<void>): Promise<RunTurnResult> {
+    for (let i = 0; i < 3; i += 1) sameStep(options.eventHook, i);
+    await flush();
+    for (let i = 3; i < 6; i += 1) sameStep(options.eventHook, i);
+    await finish();
+    return { ...done(), reason: "cancelled", stepCount: 6 } as RunTurnResult;
+  }
+  async function advanceUntil(check: () => boolean): Promise<void> {
+    for (let i = 0; i < 400 && !check(); i++) await vi.advanceTimersByTimeAsync(1_000);
+    expect(check()).toBe(true);
+  }
+
+  it("takes a permit back before re-running when the grace released the local attempt's", async () => {
+    vi.useFakeTimers();
+    try {
+      const started: string[] = [];
+      let releaseLocal!: () => void;
+      let releaseT1!: () => void;
+      let localSignal: AbortSignal | undefined;
+      const h = harness(async (session, options) => {
+        const who = `${taskOf(session)}:${options.providerId}`;
+        started.push(who);
+        if (who === "t0:local") {
+          localSignal = options.signal;
+          // Ignores every abort: settles only when the test says so.
+          return stallTwice(options, () => new Promise((resolve) => { releaseLocal = resolve; }));
+        }
+        if (who === "t1:local") await new Promise<void>((resolve) => { releaseT1 = resolve; });
+        return done();
+      });
+      const run = runWorkerTasks(h.deps, {
+        ...BASE, maxWorkers: 2, workerTimeoutMs: 60_000, tasks: TWO,
+        acquireTaskPermit: createTaskPermitPool(1).acquire,
+        signal: new AbortController().signal,
+        escalation: { target: { ...TARGET, replace: true }, pricing: PRICING },
+      });
+      await advanceUntil(() => localSignal?.aborted === true && started.includes("t1:local"));
+      releaseLocal();
+      await vi.advanceTimersByTimeAsync(0);
+      // t1 holds the only permit: the re-run waits for it.
+      expect(started).not.toContain("t0:cloud");
+      releaseT1();
+      await vi.advanceTimersByTimeAsync(0);
+      const rows = await run;
+      expect(started).toEqual(["t0:local", "t1:local", "t0:cloud"]);
+      expect(rows.map((r) => r.status)).toEqual(["ok", "ok"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("frees the permit a bounded grace after a hung re-run's time limit fired", async () => {
+    vi.useFakeTimers();
+    try {
+      const started: string[] = [];
+      let releaseCloud!: () => void;
+      let cloudSignal: AbortSignal | undefined;
+      const h = harness(async (session, options) => {
+        const who = `${taskOf(session)}:${options.providerId}`;
+        started.push(who);
+        if (who === "t0:local") return stallTwice(options, async () => undefined);
+        if (who === "t0:cloud") {
+          cloudSignal = options.signal;
+          await new Promise<void>((resolve) => { releaseCloud = resolve; });
+        }
+        return done();
+      });
+      const run = runWorkerTasks(h.deps, {
+        ...BASE, maxWorkers: 2, workerTimeoutMs: 60_000, tasks: TWO,
+        acquireTaskPermit: createTaskPermitPool(1).acquire,
+        signal: new AbortController().signal,
+        escalation: { target: { ...TARGET, replace: true }, pricing: PRICING },
+      });
+      await advanceUntil(() => cloudSignal?.aborted === true);
+      expect(started).not.toContain("t1:local");
+      await vi.advanceTimersByTimeAsync(TASK_PERMIT_RELEASE_GRACE_MS);
+      expect(started).toContain("t1:local");
+      releaseCloud();
+      await run;
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

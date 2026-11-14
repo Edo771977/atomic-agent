@@ -23,8 +23,10 @@ import {
   runWorkerTasks,
   WORKER_TIMEOUT_FLOOR_MS,
   WORKER_TOOL_LINES_PER_TASK,
+  TASK_PERMIT_RELEASE_GRACE_MS,
   type WorkerRunnerDeps,
 } from "./worker-runner.js";
+import { createTaskPermitPool } from "./task-permits.js";
 
 type RunTurnCall = {
   session: SessionState;
@@ -1644,6 +1646,62 @@ describe("early hand-back when nothing is written (D4 / F19, F42)", () => {
       expect(result!.notes?.[0]).toMatch(/time limit/);
       expect(result!.reply).not.toContain("handed back");
       expect(result!.durationMs).toBe(60_000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("runWorkerTasks — call-wide permits", () => {
+  it("frees a hung task's permit a bounded grace after its time limit fired, once", async () => {
+    vi.useFakeTimers();
+    try {
+      const pool = createTaskPermitPool(1);
+      let releaseHung: (() => void) | undefined;
+      const { deps, calls } = harness(({ session }) => {
+        if (calls.length === 1) {
+          // Ignores its abort signal: settles only when the test says so.
+          return new Promise<RunTurnResult>((resolve) => {
+            releaseHung = () => resolve(turnResult({ session, reason: "cancelled", stepCount: 0 }));
+          });
+        }
+        return Promise.resolve(turnResult({ session }));
+      });
+      const run = runWorkerTasks(deps, {
+        ...BASE,
+        tasks: tasks(3),
+        maxWorkers: 3,
+        acquireTaskPermit: pool.acquire,
+        signal: new AbortController().signal,
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(calls).toHaveLength(1);
+      for (let i = 0; i < 200 && calls[0]!.options.signal?.aborted !== true; i++) {
+        await vi.advanceTimersByTimeAsync(1_000);
+      }
+      expect(calls[0]!.options.signal?.aborted).toBe(true);
+      await vi.advanceTimersByTimeAsync(TASK_PERMIT_RELEASE_GRACE_MS - 1_000);
+      expect(calls).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1_000);
+      // The two queued tasks run one after the other on the freed permit:
+      // the grace release and the final release never count twice.
+      expect(calls).toHaveLength(3);
+      let probe = false;
+      const extra = pool.acquire(new AbortController().signal).then((p) => { probe = true; return p; });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(probe).toBe(true);
+      releaseHung!();
+      const results = await run;
+      // Never served, so its first-token clock is the one that fired: the
+      // row reports that once the turn settles, as without the grace.
+      expect(results[0]!.status).toBe("queued");
+      expect(results.slice(1).map((r) => r.status)).toEqual(["ok", "ok"]);
+      // Still exactly one permit: the hung task's late settle released nothing twice.
+      let second = false;
+      void pool.acquire(new AbortController().signal).then(() => { second = true; });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(second).toBe(false);
+      (await extra)!.release();
     } finally {
       vi.useRealTimers();
     }

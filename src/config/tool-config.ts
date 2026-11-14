@@ -1,4 +1,4 @@
-import { parseBool, parseNonNegativeInt, parsePositiveInt } from "./config-primitives.js";
+import { parseBool, parseBoundedPositiveInt, parseNonNegativeInt, parsePositiveInt } from "./config-primitives.js";
 import { parseStringArrayOrNull } from "./config-values.js";
 
 export interface RuntimeProjectsConfig {
@@ -53,6 +53,10 @@ export interface RuntimeToolsConfig {
     enabled: boolean;
     /** Registers `os.screen.{capture,point}` (macOS only). Mirrors `UserToolsConfig.screen.point`. */
     point: boolean;
+  };
+  verify: {
+    /** Byte ceiling for `verify.run`'s workspace copy. Mirrors `UserToolsConfig.verify`. */
+    maxCopyBytes: number;
   };
 }
 
@@ -112,7 +116,22 @@ export interface UserToolsConfig {
      */
     point: boolean;
   };
+  verify: {
+    /**
+     * Largest tree, in bytes, `verify.run` copies into its throwaway
+     * workspace off macOS (the linked build/dependency directories do
+     * not count). A bigger tree is refused, never run in place. Default
+     * 2 GiB. A positive integer, at most 1 TiB.
+     */
+    maxCopyBytes: number;
+  };
 }
+
+/** `tools.verify.maxCopyBytes` default; the one definition (`VERIFY_COPY_MAX_BYTES` re-exports it). */
+export const DEFAULT_VERIFY_MAX_COPY_BYTES = 2 * 1024 * 1024 * 1024;
+
+/** Upper bound for `tools.verify.maxCopyBytes`: 1 TiB, past any tree worth copying per run. */
+export const MAX_VERIFY_MAX_COPY_BYTES = 1024 ** 4;
 
 export function createToolsDefaults(): UserToolsConfig {
   return {
@@ -137,18 +156,21 @@ export function createToolsDefaults(): UserToolsConfig {
     // type anywhere is not a default.
     // Pointing only draws, so it is on; clicking and typing stay off.
     screen: { enabled: false, point: true },
+    verify: { maxCopyBytes: DEFAULT_VERIFY_MAX_COPY_BYTES },
   };
 }
 
 /**
  * `raw` is the `tools.shell` block (the historical signature);
- * `rawScreen` the `tools.screen` block. A file without either takes the
- * defaults — `tools.screen` is unversioned and additive.
+ * `rawScreen` the `tools.screen` block, `rawVerify` the `tools.verify`
+ * block. A file without them takes the defaults — both are unversioned
+ * and additive.
  */
 export function parseToolsConfig(
   raw: Record<string, unknown>,
   readDefaults: () => UserToolsConfig,
   rawScreen: Record<string, unknown> = {},
+  rawVerify: Record<string, unknown> = {},
 ): UserToolsConfig {
   return {
     shell: {
@@ -185,6 +207,14 @@ export function parseToolsConfig(
       point: parseBool(
         rawScreen.point ?? readDefaults().screen.point,
         "tools.screen.point",
+      ),
+    },
+    verify: {
+      maxCopyBytes: parseBoundedPositiveInt(
+        rawVerify.maxCopyBytes ?? readDefaults().verify.maxCopyBytes,
+        "tools.verify.maxCopyBytes",
+        1,
+        MAX_VERIFY_MAX_COPY_BYTES,
       ),
     },
   };

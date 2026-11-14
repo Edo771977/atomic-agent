@@ -518,12 +518,18 @@ export async function runIsolatedWave(
   let reason = "";
   if (fresh.length > 0) {
     try {
+      reason = "the folder is too large to copy";
       set = await createBranchSet(
         input.realDir,
         fresh.map((t) => t.id),
-        input.options,
+        {
+          ...input.options,
+          onRefusal: (why) => {
+            reason = why;
+            input.options?.onRefusal?.(why);
+          },
+        },
       );
-      reason = "the folder is too large to copy";
     } catch (err) {
       set = null;
       reason = err instanceof Error ? err.message : String(err);

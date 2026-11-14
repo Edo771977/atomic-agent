@@ -44,6 +44,7 @@ import {
 import {
   notStartedResult,
   runWorkerTasks,
+  schedulerWaitNote,
   type WorkerRunnerDeps,
 } from "./worker-runner.js";
 import { describeReplan, isOpenResult, renderReplanBlock } from "./replan.js";
@@ -138,7 +139,8 @@ import { measuredTaskLegs, readRoutingHistory } from "./measured-routing.js";
 import { collectTaskArtifactManifests } from "./artifact-manifest-tasks.js";
 import { createCandidateIntegration, type CandidateIntegration, type CandidateIntegrationReport } from "./candidate-integration.js";
 import { readFusionWorkerMeta } from "../../session/fusion-worker-session.js";
-import { createTaskPermitPool } from "./task-permits.js";
+import { createTaskPermitPool, type TaskPermit } from "./task-permits.js";
+import { VERIFY_COPY_MAX_BYTES } from "../verify/verify-workspace-copy.js";
 
 export const FUSION_DELEGATE_TOOL = "fusion.delegate";
 
@@ -367,6 +369,10 @@ export function buildFusionDelegateTool(
         );
       }
       const mode = deps.resolveRunMode();
+      // The private-copy limit for worktree isolation and candidate
+      // staging: the same `tools.verify.maxCopyBytes` that bounds
+      // `verify.run`'s workspace copy.
+      const copyLimitBytes = getConfig().tools?.verify?.maxCopyBytes ?? VERIFY_COPY_MAX_BYTES;
       const workerProviderId = mode.workerProviderId;
       if (mode.effective !== "fusion" || workerProviderId === null) {
         return error(
@@ -662,23 +668,60 @@ export function buildFusionDelegateTool(
           leg.orchestrator === true ? ORCHESTRATOR_TASK_MAX_WIDTH : Number.POSITIVE_INFINITY));
       // The call's ceiling spans all active legs; an unused main local
       // pool cannot serialize tasks assigned exclusively to cloud roles.
-      const capacity = Math.min(legTaskCount, workerLegMaxWorkers) +
-        [...roleLegs.values()].reduce((sum, leg) => {
-          const count = parsed.tasks.filter((t) => {
-            const own = taskLegs.get(t.id);
-            return own?.isWorkerLeg === false && own.providerId === leg.providerId;
-          }).length;
-          return sum + (count === 0 ? 0 : roleLegWidth(leg, count));
-        }, 0);
-      const maxWorkers = Math.max(1, Math.min(wanted, capacity));
+      // With no width named or pinned, every slot-affine (local) leg —
+      // the main one and any local role leg — shares the one-worker
+      // default above: they draw on the same GPU, so a local role leg
+      // beside the local main leg must not double it.
+      const shareLocalCeiling = parsed.maxWorkers === undefined && !mode.workersPinned;
+      let localWidth = slotAffine ? Math.min(legTaskCount, workerLegMaxWorkers) : 0;
+      let cloudWidth = slotAffine ? 0 : Math.min(legTaskCount, workerLegMaxWorkers);
+      for (const leg of roleLegs.values()) {
+        const count = parsed.tasks.filter((t) => {
+          const own = taskLegs.get(t.id);
+          return own?.isWorkerLeg === false && own.providerId === leg.providerId;
+        }).length;
+        if (count === 0) continue;
+        if (deps.workerSupportsSlotAffinity(leg.providerId)) localWidth += roleLegWidth(leg, count);
+        else cloudWidth += roleLegWidth(leg, count);
+      }
+      const capacity = cloudWidth + (shareLocalCeiling ? Math.min(1, localWidth) : localWidth);
+      // A named `maxWorkers` is the call's explicit ceiling. A call that
+      // named none is bounded by the active legs alone: the local default
+      // of one worker (or `runMode.workers`) is the MAIN leg's width
+      // above, never a ceiling on role-model or orchestrator legs.
+      const maxWorkers = Math.max(1, Math.min(parsed.maxWorkers === undefined ? capacity : wanted, capacity));
       const permits = createTaskPermitPool(maxWorkers);
-      const cloudCapIsBinding = roleLegs.size === 0 && maxWorkers < wanted && maxWorkers === cloudCap;
-      // The pool held this fan-out down when it ran fewer at a time than
-      // there was work for — whether the orchestrator asked for a wider
-      // number or simply had more tasks than the machine has slots.
+      // The shared local ceiling: a local leg takes its local permit
+      // first, then a call-wide one, so a task waiting for the GPU never
+      // holds a call-wide permit a cloud task could use.
+      const localPermits = createTaskPermitPool(1);
+      const acquireLocalPermit = async (signal: AbortSignal): Promise<TaskPermit | undefined> => {
+        const local = await localPermits.acquire(signal);
+        if (local === undefined) return undefined;
+        const call = await permits.acquire(signal);
+        if (call === undefined) {
+          local.release();
+          return undefined;
+        }
+        return { waitMs: local.waitMs + call.waitMs, release: () => { call.release(); local.release(); } };
+      };
+      const acquirePermitFor = (local: boolean): ((signal: AbortSignal) => Promise<TaskPermit | undefined>) =>
+        shareLocalCeiling && local ? acquireLocalPermit : permits.acquire;
+      // Binding is judged on the MAIN leg alone, whatever role legs run
+      // beside it: its own tasks against its own width. The cloud cap
+      // binds when it, not the requested width, cut that leg down…
+      const mainWanted = Math.max(1, Math.min(requested, legTaskCount));
+      const cloudCapIsBinding =
+        legTaskCount > 0 && !Number.isFinite(poolSize) &&
+        workerLegMaxWorkers < mainWanted && workerLegMaxWorkers === cloudCap;
+      // …and the pool held it down when it ran fewer at a time than the
+      // leg had work for and the slot count is what set that width —
+      // whether the orchestrator asked for a wider number or simply had
+      // more tasks than the machine has slots. A default of one worker
+      // on a larger pool is not the pool's doing.
       const poolIsBinding =
-        roleLegs.size === 0 && !cloudCapIsBinding &&
-        (maxWorkers < wanted || maxWorkers < legTaskCount);
+        legTaskCount > 0 && Number.isFinite(poolSize) &&
+        workerLegMaxWorkers < legTaskCount && workerLegMaxWorkers === poolSize;
 
       const orchestratorModel =
         mode.orchestratorModel ??
@@ -847,7 +890,7 @@ export function buildFusionDelegateTool(
         try {
           const remaining = capped ? turnBudget.timeLeftMs(ctx.sessionId, limits) : undefined;
           const signal = remaining === undefined ? ctx.signal : AbortSignal.any([ctx.signal, AbortSignal.timeout(Math.max(0, remaining))]);
-          candidate = await createCandidateIntegration(candidateOriginalDir, { signal });
+          candidate = await createCandidateIntegration(candidateOriginalDir, { signal, maxCopyBytes: copyLimitBytes });
         } catch (err) {
           return error(`candidate integration could not stage a private workspace: ${err instanceof Error ? err.message : String(err)}`, { reason: "candidate-staging-failed", nonResumable: true });
         }
@@ -1265,6 +1308,7 @@ export function buildFusionDelegateTool(
           realDir: ctx.workingDir,
           tasks,
           writeScope,
+          options: { maxCopyBytes: copyLimitBytes },
           inputs: contract?.inputs ?? [],
           run: (rebased, taskWorkspace) =>
             runAcrossLegs(rebased, contract, briefSuffix, taskWorkspace, allowSplit),
@@ -1346,7 +1390,7 @@ export function buildFusionDelegateTool(
             tasks,
             concurrentTaskIds,
             maxWorkers: workerLegMaxWorkers,
-            acquireTaskPermit: permits.acquire,
+            acquireTaskPermit: acquirePermitFor(slotAffine),
             providerId: workerProviderId,
             workerModel,
             workerMaxSteps: mode.workerMaxSteps,
@@ -1409,7 +1453,7 @@ export function buildFusionDelegateTool(
             tasks,
             concurrentTaskIds,
             maxWorkers: Math.min(maxWorkers, roleLegWidth(leg, tasks.length)),
-            acquireTaskPermit: permits.acquire,
+            acquireTaskPermit: acquirePermitFor(local),
             providerId: leg.providerId,
             workerModel:
               onlyRole === "-" ? leg.model : `${leg.model} (${onlyRole})`,
@@ -2171,10 +2215,10 @@ export function buildFusionDelegateTool(
         // all three things it needs: what was wanted, what actually ran
         // concurrently, and the config key that changes the second number.
         const hint = poolIsBinding
-          ? `\n\nNote: ${Math.max(wanted, legTaskCount)} workers' worth of work was sent but the local server has ${poolSize} request slot${poolSize === 1 ? "" : "s"}, so only ${maxWorkers} ran at a time and the rest queued. That number comes from the machine — every slot draws on one shared llama-server context pool (\`localModels.managed.parallel\`, \`"auto"\` by default). Split into fewer, larger tasks if the queueing is costing more than the parallelism buys.`
+          ? `\n\nNote: ${legTaskCount} workers' worth of work was sent but the local server has ${poolSize} request slot${poolSize === 1 ? "" : "s"}, so only ${workerLegMaxWorkers} ran at a time and the rest queued. That number comes from the machine — every slot draws on one shared llama-server context pool (\`localModels.managed.parallel\`, \`"auto"\` by default). Split into fewer, larger tasks if the queueing is costing more than the parallelism buys.`
           : cloudCapIsBinding
-            ? `\n\nNote: maxWorkers ${wanted} was clamped to ${maxWorkers}, the cloud worker cap (\`llm.runMode.fusion.cloudWorkers\`); the rest queued behind them.`
-            : maxWorkers < wanted
+            ? `\n\nNote: ${parsed.maxWorkers === undefined ? `the default width of ${mainWanted} (\`llm.runMode.fusion.workers\`; this call named no maxWorkers)` : `maxWorkers ${mainWanted}`} was clamped to ${workerLegMaxWorkers}, the cloud worker cap (\`llm.runMode.fusion.cloudWorkers\`)${roleLegs.size === 0 ? "" : " on the main worker leg"}; the rest queued behind them.`
+            : parsed.maxWorkers !== undefined && maxWorkers < wanted
               ? `\n\nNote: maxWorkers ${wanted} was clamped to ${maxWorkers} across the active provider pools by their slot, cloud-worker and strong-model limits; the rest queued behind them.`
               : "";
         // The call's own status is the tasks' summary: a fan-out where
@@ -2294,7 +2338,7 @@ export function buildFusionDelegateTool(
                   .filter((t) => (t.files?.length ?? 0) > 0)
                   .map((t) => t.id),
               ),
-            })}${hint}${
+            })}${hint}${schedulerWaitNote(results)}${
               escalationSpendUsd > 0
                 ? `\n\nEscalations to ${escalationTarget?.model ?? escalationTarget?.providerId ?? "the escalation model"} cost ${formatUsd(escalationSpendUsd)} this fan-out (each worker's row says what for).`
                 : ""
