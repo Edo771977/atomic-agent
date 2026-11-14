@@ -36,11 +36,27 @@ describe("verify refuses to execute without a private workspace", () => {
     expect(result.ok).toBe(true);
     expect(result).toMatchObject({ stdoutTail: "file: 100% ready\n" });
   });
-  it.each(["canonical", "single-slash", "no-slash", "scheme-newline"] as const)("refuses a %s source file URL instead of passing a check that reads outside its execution copy", async spelling => {
+  it.each(["canonical", "single-slash", "no-slash"] as const)("rebases a %s source file URL into its execution copy", async spelling => {
     const execution = join(dir, "execution"); await mkdir(execution);
     await writeFile(join(execution, "original.txt"), "execution-copy");
     const canonical = pathToFileURL(join(dir, "original.txt")).href;
-    const url = spelling === "single-slash" ? canonical.replace(/^file:\/\/\//, "file:/") : spelling === "no-slash" ? canonical.replace(/^file:\/\/\//, "file:") : spelling === "scheme-newline" ? canonical.replace(/^file:/, "fi\nle:") : canonical;
+    const url = spelling === "single-slash" ? canonical.replace(/^file:\/\/\//, "file:/") : spelling === "no-slash" ? canonical.replace(/^file:\/\/\//, "file:") : canonical;
+    const runner = vi.spyOn(commands, "runCommandKind");
+    const result = await runVerify({ kind: "command", cmd: process.execPath,
+      args: ["-e", "process.stdout.write(require('node:fs').readFileSync(new URL(process.argv[1]),'utf8'))", url], network: true },
+      { workingDir: dir, workspace: async () => ({ dir: execution, isolated: true, method: "copy", cleanup: async () => {} }) });
+    expect(result).toMatchObject({ ok: true, isolated: true, exitCode: 0, stdoutTail: "execution-copy" });
+    expect(result.error).toBeUndefined();
+    expect(runner).toHaveBeenCalledOnce();
+    expect(runner.mock.calls[0]?.[0].args?.[2]).toBe(pathToFileURL(join(execution, "original.txt")).href);
+    expect(runner.mock.calls[0]?.[1].cwd).toBe(execution);
+    expect(await readFile(join(dir, "original.txt"), "utf8")).toBe("original");
+    expect(await readFile(join(execution, "original.txt"), "utf8")).toBe("execution-copy");
+  });
+  it("refuses a source file URL with a newline in its scheme before execution", async () => {
+    const execution = join(dir, "execution"); await mkdir(execution);
+    await writeFile(join(execution, "original.txt"), "execution-copy");
+    const url = pathToFileURL(join(dir, "original.txt")).href.replace(/^file:/, "fi\nle:");
     const runner = vi.spyOn(commands, "runCommandKind");
     const result = await runVerify({ kind: "command", cmd: process.execPath,
       args: ["-e", "process.stdout.write(require('node:fs').readFileSync(new URL(process.argv[1]),'utf8'))", url], network: true },
@@ -49,6 +65,7 @@ describe("verify refuses to execute without a private workspace", () => {
     expect(result.error).toContain("unsupported absolute project reference");
     expect(runner).not.toHaveBeenCalled();
     expect(await readFile(join(dir, "original.txt"), "utf8")).toBe("original");
+    expect(await readFile(join(execution, "original.txt"), "utf8")).toBe("execution-copy");
   });
   it.each(["dist", "node_modules"])("charges a protected %s directory to the existing execution-copy cap", async folder => {
     await mkdir(join(dir, folder)); await writeFile(join(dir, folder, "check.mjs"), "x".repeat(6_000));
