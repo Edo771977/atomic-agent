@@ -30,6 +30,7 @@ export const criticalFiles = [
   'src/tools/fusion/candidate-integration.test.ts',
   'src/tools/fusion/candidate-evidence.test.ts',
   'src/tools/fusion/candidate-path-references.test.ts',
+  'src/tools/fusion/candidate-path-aliases.test.ts',
   'src/tools/fusion/candidate-copy-budget.test.ts',
   'src/tools/fusion/branch-workspace-copy-plan.test.ts',
   'src/tools/fusion/candidate-check-inputs.test.ts',

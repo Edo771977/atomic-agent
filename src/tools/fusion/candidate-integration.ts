@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { createReadStream, type Stats } from "node:fs";
 import { chmod, copyFile, lstat, mkdir, open, opendir, readlink, rename, rm, rmdir, stat, symlink } from "node:fs/promises";
-import { dirname, join, relative, sep } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { isInside } from "../../approval/fanout-scope.js";
 import { renameWithRetrySync, syncDirectoryBestEffort, writeFileSyncedSync } from "../../config/durable-write.js";
 import { resolveUserPath } from "../os/expand-home.js";
@@ -311,6 +311,7 @@ export async function createCandidateIntegration(
     beforeCommit?: (path: string) => Promise<void>;
     maxInventoryBytes?: number; maxInventoryEntries?: number; maxInventoryMs?: number } = {},
 ): Promise<CandidateIntegration> {
+  const requestedDir = resolve(realDir);
   const id = `candidate-${randomBytes(6).toString("hex")}`;
   // `tools.verify.maxCopyBytes` when the caller passes it: copies, inventories and hashes share one bound.
   const copyLimit = options.maxCopyBytes ?? VERIFY_COPY_MAX_BYTES;
@@ -576,7 +577,12 @@ export async function createCandidateIntegration(
         checkedDir = checkedSet.workspaces.get("checked-source")!.dir;
         if (differences(beforeChecks, await snapshot(checkedDir, freezeSignal)).length > 0) return await rejectFinal("candidate changed while freezing its checked payload");
         await verifyProtectedInputs(checkedDir, input.signal);
-        const rebaseChecked = <T,>(value: T): T => rebaseVerifyWorkspaceValue(rebaseVerifyWorkspaceValue(value, workspace.dir, checkedDir), set.realDir, checkedDir);
+        const rebaseChecked = <T,>(value: T): T => {
+          // The opened alias can be more specific than the canonical root:
+          // preserve private-workspace priority, then match that alias first.
+          for (const source of [workspace.dir, requestedDir, set.realDir]) value = rebaseVerifyWorkspaceValue(value, source, checkedDir);
+          return value;
+        };
         checkedPayloadDigest = createHash("sha256").update(JSON.stringify([...beforeChecks].sort(([a], [b]) => a.localeCompare(b)))).digest("hex");
         checkPlanDigest = createHash("sha256").update(JSON.stringify(checks)).digest("hex");
         // Always rerun ALL declared checks on the final candidate, even when
