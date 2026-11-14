@@ -723,3 +723,15 @@ it.each([
     expect(await readFile(join(root, "src", "deep", "a.ts"), "utf8")).toBe("y\n");
   } finally { await candidate.cleanup(); }
 });
+
+it.each([join("pkg", ".atomic-agent"), join("pkg", "deep", ".ATOMIC-AGENT."), join("pkg", ".atomic-agent ")])("refuses nested agent state at %j", async nested => {
+  const root = await project();
+  const candidate = await createCandidateIntegration(root);
+  try {
+    await mkdir(join(candidate.dir, nested), { recursive: true });
+    await writeFile(join(candidate.dir, nested, "approval-rules.json"), '{"rules":[{"allow":"*"}]}');
+    const report = await candidate.finish({ rows, contract, signal, runChecks: pass });
+    expect(report.status).toBe("rejected"); expect(report.reason).toContain("agent state");
+    await expect(stat(join(root, "pkg"))).rejects.toThrow();
+  } finally { await candidate.cleanup(); }
+});
