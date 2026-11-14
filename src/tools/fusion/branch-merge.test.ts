@@ -335,6 +335,19 @@ describe("runIsolatedWave", () => {
 });
 
 describe("inputReplacement / applyMergeOutcome", () => {
+  it.each([
+    ["win32", "SRC/GENERATED/api.ts", "src/generated/api.ts", "needs_orchestrator"],
+    ["win32", "src/generated./api.ts", "src/generated/api.ts", "needs_orchestrator"],
+    ["win32", "src/generated/api.ts:stream", "src/generated/api.ts", "needs_orchestrator"],
+    ["darwin", "src/caf\u00e9/api.ts", "src/cafe\u0301/api.ts", "needs_orchestrator"],
+    ["linux", "SRC/GENERATED/api.ts", "src/generated/api.ts", "ok"],
+    ["linux", "src/caf\u00e9/api.ts", "src/cafe\u0301/api.ts", "ok"],
+  ] as const)("uses %s path identity for ignored declarations %s", (platform, declared, ignored, status) => {
+    const result = applyMergeOutcome(row("t"), { taskId: "t", applied: ["tracked.ts"], conflicts: [], refused: [], ignoredChanges: [ignored] }, [declared], platform);
+    expect(result.status).toBe(status);
+    expect(result.notes?.join("\n")).toContain("not merged: 1 file");
+    if (status === "needs_orchestrator") expect(result.error).toContain("declared paths lie under ignored directories");
+  });
   it("allows an edit in place and refuses a removal or a wipe", () => {
     const base = Buffer.from(lines(10));
     expect(inputReplacement(base, Buffer.from(lines(9)))).toBeUndefined();

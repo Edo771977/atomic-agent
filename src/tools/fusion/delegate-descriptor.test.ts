@@ -165,3 +165,12 @@ describe("fusion.delegate task model \"orchestrator\"", () => {
     expect(parsed.ok && parsed.tasks[0]!.model).toBe(ORCHESTRATOR_TASK_MODEL);
   });
 });
+
+it("teaches protected checkInputs through schema, parser and worker contract", () => {
+  const wire = { tasks: [{ id: "a", instructions: "work" }], contract: { checkInputs: ["checks/{literal}/verify.mjs"] } };
+  const schema = getDefaultArgsJsonSchema("fusion.delegate") as Schema;
+  expect(violations(wire, schema)).toEqual([]);
+  expect(schema.properties?.contract?.properties?.checkInputs?.maxItems).toBe(32);
+  expect(parseDelegateArgs(wire)).toMatchObject({ ok: true, contract: { checkInputs: ["checks/{literal}/verify.mjs"] } });
+  expect(getToolDescriptorByName("fusion.delegate")?.argsSchema).toContain("checkInputs?");
+});

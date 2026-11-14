@@ -19,6 +19,8 @@ import { parseVerifyRunArgs, type VerifyRunArgs, type VerifyRunKind } from "./ve
 import { renderVerifyRunSummary } from "./verify-run-summary.js";
 import { terminalAppHint } from "./terminal-app-hint.js";
 import { createVerifyWorkspace, type VerifyWorkspace } from "./verify-workspace-copy.js";
+import type { VerificationInputIntegrity } from "./verify-input-integrity.js";
+import { rebaseVerifyWorkspaceValue } from "./rebase-verify-workspace.js";
 
 export interface VerifyRunResult {
   readonly ok: boolean;
@@ -70,6 +72,7 @@ export type VerifyRunConfig = Pick<AtomicAgentConfig, "browser"> & {
 };
 
 export interface VerifyRunContext {
+  readonly inputIntegrity?: VerificationInputIntegrity;
   readonly workingDir: string;
   /** Browser settings and copy limit; `getConfig().browser` for page runs when omitted. */
   readonly config?: VerifyRunConfig;
@@ -189,6 +192,13 @@ function finishPage(
   );
 }
 
+/** A completed executor remains evidence even if cancellation aborts its subsequent integrity observation. */
+function cancelledExecution(result: VerifyRunResult, args: VerifyRunArgs, started: number): VerifyRunResult {
+  const { ok: _ok, summary: _summary, checks: _checks, durationMs: _durationMs, ...fields } = result;
+  const error = `verification cancelled during execution${fields.error === undefined ? "" : ` (${fields.error})`}`;
+  return finish({ ...fields, error, errorCode: "cancelled", aborted: true }, { kind: args.kind }, args.checks, false, started);
+}
+
 /** Run one spec against a throwaway copy of `ctx.workingDir`. */
 export async function runVerify(
   rawArgs: VerifyRunArgs | Record<string, unknown>,
@@ -201,28 +211,35 @@ export async function runVerify(
   if (ctx.signal?.aborted) return failed("verification cancelled before execution", "cancelled");
   let workspace: VerifyWorkspace | undefined;
   let result: VerifyRunResult;
+  let executionResult: VerifyRunResult | undefined;
   try {
     const maxBytes = ctx.config?.tools?.verify?.maxCopyBytes;
-    workspace = await (ctx.workspace ?? ((dir: string) => createVerifyWorkspace(dir, maxBytes === undefined ? {} : { maxBytes })))(ctx.workingDir);
+    workspace = await (ctx.workspace ?? ((dir: string) => createVerifyWorkspace(dir, {
+      ...(maxBytes === undefined ? {} : { maxBytes }),
+      ...(ctx.inputIntegrity?.paths === undefined ? {} : { privatePaths: ctx.inputIntegrity.paths }),
+    })))(ctx.workingDir);
     if (ctx.signal?.aborted) {
       result = failed("verification cancelled before execution", "cancelled", workspace.isolated);
     } else if (!workspace.isolated || resolve(workspace.dir) === resolve(ctx.workingDir)) {
       result = failed(`verification not started: ${workspace.error ?? "a private workspace copy is unavailable"}`, "workspace-unavailable");
     } else {
-      result = await runInWorkspace(args, workspace.dir, true, ctx, started);
+      const completeIntegrity = await ctx.inputIntegrity?.begin(workspace.dir, ctx.signal ?? new AbortController().signal);
+      const executionArgs = rebaseVerifyWorkspaceValue(args, ctx.workingDir, workspace.dir);
+      result = await runInWorkspace(executionArgs, workspace.dir, true, ctx, started);
+      executionResult = result;
+      await completeIntegrity?.();
       // Executors may settle normally after an abort (a page can skip
       // remaining script steps). Such an incomplete run cannot pass.
       // Keep what it did report: the command line, exit code and output
       // are evidence of what ran before the cancellation landed.
       if (ctx.signal?.aborted) {
-        const { ok: _ok, summary: _summary, checks: _checks, durationMs: _durationMs, ...fields } = result;
-        const error = `verification cancelled during execution${fields.error === undefined ? "" : ` (${fields.error})`}`;
-        result = finish({ ...fields, error, errorCode: "cancelled", aborted: true }, { kind: args.kind }, args.checks, false, started);
+        result = cancelledExecution(result, args, started);
       }
     }
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
-    result = failed(error, ctx.signal?.aborted ? "cancelled" : workspace === undefined ? "workspace-unavailable" : undefined, workspace?.isolated ?? false);
+    result = ctx.signal?.aborted && executionResult !== undefined ? cancelledExecution(executionResult, args, started)
+      : failed(error, ctx.signal?.aborted ? "cancelled" : workspace === undefined ? "workspace-unavailable" : undefined, workspace?.isolated ?? false);
   }
   try {
     await workspace?.cleanup();
@@ -235,7 +252,7 @@ export async function runVerify(
 }
 
 /** The fan-out contract's checks: every spec in order, `ok` when all are. */
-export async function runChecks(
+export const runChecks = Object.assign(async function runChecks(
   specs: readonly (VerifyRunArgs | Record<string, unknown>)[],
   ctx: VerifyRunContext,
 ): Promise<{ ok: boolean; results: VerifyRunResult[] }> {
@@ -251,4 +268,4 @@ export async function runChecks(
     }
   }
   return { ok: results.length === specs.length && results.every((r) => r.ok), results };
-}
+}, { supportsInputIntegrity: true as const });

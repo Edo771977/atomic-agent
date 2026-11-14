@@ -43,7 +43,7 @@ import { IMAGE_GENERATE_TOOL, openRouterImageKey, registerImageTools } from "../
 import { registerVideoTools, VIDEO_GENERATE_TOOL } from "../../tools/video/index.js";
 import { captureImageGenerated, captureVideoGenerated } from "../../analytics/analytics-events.js";
 import type { AnalyticsClient } from "../../analytics/analytics-client.js";
-import { buildFusionDelegateTool, readSlotOccupancy, type FusionDelegateDeps } from "../../tools/fusion/index.js";
+import { buildFusionDelegateTool, readSlotOccupancy, type ContractCheckRunner, type FusionDelegateDeps } from "../../tools/fusion/index.js";
 import {
   confineReads,
   localPageCheck,
@@ -65,17 +65,21 @@ const SECRET_HEADER = /authorization|api[-_]?key|token|secret|password|cookie|au
 /**
  * The exact secrets masked in tool output (ATO-1077): the agent's `.env`
  * (loaded into `process.env`) and the credentials stored in the config
- * file: provider keys and secret headers, the local server's key,
+ * file: provider keys and secret headers, explicitly configured key-env
+ * references (including ordinary names), the local server's key,
  * webhook secrets, and MCP servers' secret env values and headers. Read
  * per call, so a key added through `/providers` mid-session is covered.
  */
 export function runtimeKnownSecrets(
-  config: Partial<Pick<AtomicAgentConfig, "llm" | "localModels" | "webhooks" | "mcp">>,
+  config: Partial<Pick<AtomicAgentConfig, "llm" | "localModels" | "webhooks" | "mcp" | "web" | "composio">>,
   env: NodeJS.ProcessEnv = process.env,
 ): KnownSecret[] {
   const out = knownSecretsFromEnv(env);
   const add = (label: string, value: unknown): void => {
     if (typeof value === "string" && value.length > 0) out.push({ label, value });
+  };
+  const addEnv = (label: string, name: string | undefined): void => {
+    if (name !== undefined) add(label, env[name]);
   };
   const addHeaders = (label: string, headers: Readonly<Record<string, string>> | undefined): void => {
     for (const [name, value] of Object.entries(headers ?? {})) {
@@ -88,8 +92,14 @@ export function runtimeKnownSecrets(
   };
   for (const entry of config.llm?.providers ?? []) {
     add(`${entry.id}-key`, entry.apiKey);
+    // Explicit credential references are secrets whatever their variable name.
+    // Do not sweep unrelated environment values into the masking set.
+    addEnv(`${entry.id}-key`, entry.apiKeyEnvVar);
     addHeaders(`${entry.id}-header`, entry.headers);
   }
+  addEnv("exa-key", config.web?.search.exa.apiKeyEnv);
+  addEnv("brave-key", config.web?.search.brave.apiKeyEnv);
+  addEnv("composio-key", config.composio?.apiKeyEnv);
   add("local-models-key", config.localModels?.apiKey);
   for (const [name, hook] of Object.entries(config.webhooks ?? {})) {
     add(`webhook-${name}-secret`, hook.secret);
@@ -924,12 +934,13 @@ export function registerRuntimeFusionAndReadScope(input: {
       // A contract's declared `checks` run through the verify family,
       // each on a throwaway copy of the workspace, so a fan-out is judged
       // by what its output does, never by what a worker's reply says.
-      runChecks: (specs, ctx) =>
+      runChecks: Object.assign((specs: Parameters<ContractCheckRunner>[0], ctx: Parameters<ContractCheckRunner>[1]) =>
         runChecks(specs, {
           workingDir: ctx.workingDir,
           signal: ctx.signal,
           config,
-        }),
+          ...(ctx.inputIntegrity === undefined ? {} : { inputIntegrity: ctx.inputIntegrity }),
+        }), { supportsInputIntegrity: true as const }),
       // `verify.syntax`'s own checker: the delegate syntax-checks every
       // green row's changed files itself, so the orchestrator does not
       // spend a step (and its context) on it after each fan-out.

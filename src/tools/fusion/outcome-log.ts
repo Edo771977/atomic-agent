@@ -15,6 +15,7 @@ import { sanitizeModelAlias } from "../../analytics/sanitize-model-alias.js";
 import { reportedCostUsd } from "../../llm/provider/usage-cost.js";
 import { classifyWorkerFailure } from "./failure-breaker.js";
 import { tryAcquireOutcomeLock } from "./outcome-log-lock.js";
+import type { CandidateOutcomeEvidence } from "./candidate-outcomes.js";
 import {
   taskSpendUsd,
   type WorkerPricing,
@@ -91,6 +92,8 @@ export interface TaskOutcomeRecord {
   /** Objective declared checks only; neither judge/self-report nor full integration acceptance. */
   acceptance?: "checks-passed" | "checks-failed";
   acceptanceScope?: "task-checks";
+  /** Final candidate disposition and own-check telemetry, never direct quality evidence. */
+  candidate?: CandidateOutcomeEvidence;
   /** SHA256 of known configured request identity, stable through execution; not served-model attestation. */
   routingIdentity?: string;
   status: WorkerTaskStatus;

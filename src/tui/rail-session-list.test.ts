@@ -318,10 +318,10 @@ describe("rail session list — manual order", () => {
 describe("rail session list — pinned block", () => {
   it("keeps pinned threads on top whatever their recency, in the manual order", () => {
     const stored = [
-      spokenTo("s-4", "newest"),
-      spokenTo("s-3", "third"),
-      spokenTo("s-2", "second"),
-      spokenTo("s-1", "oldest"),
+      { ...spokenTo("s-4", "newest"), updatedAt: 4_000 },
+      { ...spokenTo("s-3", "third"), updatedAt: 3_000 },
+      { ...spokenTo("s-2", "second"), updatedAt: 2_000 },
+      { ...spokenTo("s-1", "oldest"), updatedAt: 1_000 },
     ];
     const { orchestrator, rail } = harness(stored, {
       order: ["s-1", "s-3"],
