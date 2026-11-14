@@ -193,3 +193,40 @@ it("retains an unattested partial staging file while restoring its verified targ
   expect(await readFile(join(f.project, "output.txt"), "utf8")).toBe("original\n");
   expect(await readFile(join(f.project, temp), "utf8")).toBe("partial or later user staging edit\n");
 });
+
+it.each([".git", ".atomic-agent"])("refuses canonical protected metadata reached through an NTFS short name: %s", async protectedName => {
+  const f = await fixture(); const protectedDir = join(f.project, protectedName); await mkdir(protectedDir, { recursive: true });
+  await writeFile(join(protectedDir, "config"), "promoted\n");
+  let alias = protectedName;
+  if (process.platform === "win32") {
+    alias = protectedName === ".git" ? "GIT~1" : "ATOMIC~1";
+    expect((await lstat(join(f.project, alias))).ino).toBe((await lstat(protectedDir)).ino);
+  }
+  f.value.steps[0]!.path = `${alias}/config`; await writeFile(f.journal, JSON.stringify(f.value)); const before = await readFile(f.journal);
+  const result = await run(f.project, f.journal, ["--rollback"]);
+  expect(result.code).toBe(1); expect(await readFile(join(protectedDir, "config"), "utf8")).toBe("promoted\n");
+  expect(await readFile(f.journal)).toEqual(before);
+});
+
+it("previews the same non-empty created-directory conflict that rollback preserves", async () => {
+  const f = await fixture(); await mkdir(join(f.project, "created")); await writeFile(join(f.project, "created", "user.txt"), "user bytes");
+  const value = { ...f.value, steps: [{ path: "created", action: "mkdir", status: "applied", original: null,
+    promoted: { kind: "directory", mode: (await lstat(join(f.project, "created"))).mode & 0o777 } }] };
+  await writeFile(f.journal, JSON.stringify(value));
+  const preview = await run(f.project, f.journal, ["--dry-run"]);
+  expect(preview.code).toBe(1); expect(JSON.parse(preview.stdout).conflicts).toEqual(["created"]);
+  expect(JSON.parse(preview.stdout).planned).toEqual([]);
+  expect((await run(f.project, f.journal, ["--rollback"])).code).toBe(1);
+  expect(await readFile(join(f.project, "created", "user.txt"), "utf8")).toBe("user bytes");
+});
+
+it("recreates an original directory junction using supported native link semantics", async () => {
+  const f = await fixture(), target = join(f.project, "original-target"); await mkdir(target);
+  const originalLink = join(f.project, "link"); await symlink(target, originalLink, process.platform === "win32" ? "junction" : "dir");
+  const original = { kind: "symlink", mode: (await lstat(originalLink)).mode & 0o777, linkTarget: await readlink(originalLink) };
+  await rm(originalLink); await writeFile(originalLink, "promoted\n");
+  const value = { ...f.value, steps: [{ path: "link", action: "write", status: "applied", original, promoted: f.value.steps[0]!.promoted }] };
+  await writeFile(f.journal, JSON.stringify(value));
+  const result = await run(f.project, f.journal, ["--rollback"]);
+  expect(result.code, result.stderr || result.stdout).toBe(0); expect(await readlink(originalLink)).toBe(original.linkTarget);
+});

@@ -1,7 +1,7 @@
 /** Explicit operator recovery. Loading a journal never authorizes paths outside the selected project. */
 import { createHash, randomBytes } from "node:crypto";
 import { constants, type Stats } from "node:fs";
-import { chmod, lstat, mkdir, open, readlink, realpath, rename, rmdir, symlink, unlink } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readdir, readlink, realpath, rename, rmdir, stat as followStat, symlink, unlink } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { renameWithRetrySync, syncDirectoryBestEffort, writeFileSyncedSync } from "../../config/durable-write.js";
 
@@ -96,6 +96,27 @@ async function checkParents(value: ReadonlyMap<string, Stats>): Promise<void> {
     if (!now.isDirectory() || now.isSymbolicLink() || before.dev !== now.dev || before.ino !== now.ino) return fail("ancestor changed during recovery");
   }
 }
+/** Resolve filesystem names too: NTFS short names are not lexical aliases.
+ * Do not resolve a final user symlink's target (unlink/rename acts on the
+ * link); compare its identity with protected sibling names instead. */
+async function outputScope(root: string, path: string): Promise<void> {
+  const parts = path.replaceAll("\\", "/").split("/"); let prefixPath = "";
+  for (const [index, part] of parts.entries()) {
+    prefixPath = prefixPath === "" ? part : `${prefixPath}/${part}`;
+    const absolute = join(root, prefixPath), info = await stat(absolute); if (info === undefined) return;
+    if (info.isSymbolicLink() && index === parts.length - 1) {
+      for (const protectedName of [".git", ".atomic-agent"]) {
+        const protectedInfo = await stat(join(dirname(absolute), protectedName));
+        if (protectedInfo !== undefined && info.dev === protectedInfo.dev && info.ino === protectedInfo.ino) return fail("protected symlink reached through an alias");
+      }
+      continue;
+    }
+    const canonical = relative(root, await realpath(absolute)).replaceAll("\\", "/");
+    if (!safePath(canonical)) return fail("canonical output reaches protected or outside metadata");
+    const identity = (value: string) => process.platform === "win32" || process.platform === "darwin" ? value.normalize("NFC").toLowerCase() : value;
+    if (identity(canonical) !== identity(prefixPath)) return fail("noncanonical filesystem alias in recovery output");
+  }
+}
 async function regularBytes(path: string, maximum: number): Promise<{ bytes: Buffer; info: Stats }> {
   const before = await lstat(path); if (!before.isFile() || before.isSymbolicLink() || before.size > maximum) return fail("unreadable, linked or oversized recovery file");
   const fd = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
@@ -126,6 +147,7 @@ async function fileHash(path: string, destination?: string, mode?: number, signa
   } finally { await output?.close(); await source.close(); }
 }
 async function observed(root: string, path: string, missing?: ReadonlySet<string>, signal?: AbortSignal): Promise<{ entry: JournalEntry | null; info: Stats | undefined; ancestors: Map<string, Stats> }> {
+  await outputScope(root, path);
   const ancestors = await parents(root, path, missing), absolute = join(root, path), info = await stat(absolute);
   if (info === undefined) return { entry: null, info, ancestors };
   const mode = info.mode & 0o777;
@@ -159,6 +181,7 @@ export async function recoverPromotion(input: { project: string; journal: string
   for (const step of journal.steps) {
     signal.throwIfAborted();
     if (step.status === "rolled-back" || step.status === "not-applied") continue;
+    await outputScope(root, step.path);
     await parents(root, step.path, missingDirectories);
     if (step.backup !== undefined) {
       const backup = join(dirname(file), step.backup); await parents(root, relative(root, backup));
@@ -167,6 +190,7 @@ export async function recoverPromotion(input: { project: string; journal: string
     if (step.temp !== undefined) await parents(root, step.temp, missingDirectories);
   }
   if (mode !== "rollback") {
+    const removals = new Set<string>();
     if (mode === "dry-run" && journal.state !== "committed") for (const step of [...journal.steps].reverse()) {
       if (step.status === "rolled-back" || step.status === "not-applied") continue;
       signal.throwIfAborted(); const current = await observed(root, step.path, missingDirectories, signal);
@@ -175,7 +199,12 @@ export async function recoverPromotion(input: { project: string; journal: string
         if (staged.entry !== null && !equal(staged.entry, step.tempEntry!)) result.retainedStaging.push(step.temp);
       }
       if (equal(current.entry, step.original)) continue;
-      if (equal(current.entry, step.promoted)) result.planned.push(step.path); else result.conflicts.push(step.path);
+      if (equal(current.entry, step.promoted)) {
+        if (step.original === null && current.entry?.kind === "directory" && (await readdir(join(root, step.path))).some(name => !removals.has(`${step.path}/${name}`))) {
+          result.conflicts.push(step.path); continue;
+        }
+        result.planned.push(step.path); if (step.original === null) removals.add(step.path);
+      } else result.conflicts.push(step.path);
     }
     return result;
   }
@@ -238,7 +267,10 @@ export async function recoverPromotion(input: { project: string; journal: string
             await settleTemp(step);
             step.temp = temp; step.tempEntry = original; await persist();
             const absolute = join(root, temp);
-            if (original.kind === "symlink") await symlink(original.linkTarget!, absolute);
+            if (original.kind === "symlink") {
+              const directory = process.platform === "win32" && await followStat(resolve(dirname(absolute), original.linkTarget!)).then(info => info.isDirectory(), () => false);
+              await symlink(original.linkTarget!, absolute, directory ? "junction" : undefined);
+            }
             else {
               const backup = join(dirname(file), step.backup!); await parents(root, relative(root, backup));
               if (await fileHash(backup, absolute, original.mode, signal) !== original.sha256) return fail(`backup hash mismatch: ${step.path}`);
