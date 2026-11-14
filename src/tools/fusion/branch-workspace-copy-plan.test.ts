@@ -44,8 +44,17 @@ it("preserves the Git method without mutating or refreshing source metadata", as
 
 it.each(["unmerged", "missing-head"])("retains folder fallback for a source with %s", async kind => {
   const f = await fixture(true);
-  const git: GitExec = async (args, cwd) => (kind === "unmerged" && args[0] === "ls-files" && args.includes("--unmerged")) || (kind === "missing-head" && args[0] === "rev-parse" && args.includes("HEAD"))
-    ? { command: "git", args: [...args], exitCode: kind === "unmerged" ? 0 : 1, stdout: kind === "unmerged" ? "unmerged-index-entry\0" : "", stderr: "", signal: null, durationMs: 0, timedOut: false, truncated: false, inputTruncated: false }
+  if (kind === "unmerged") {
+    const base = (await runGitRaw(f.project, ["write-tree"])).stdout.trim();
+    await writeFile(join(f.project, "a.txt"), "ours"); await runGitRaw(f.project, ["add", "a.txt"]);
+    const ours = (await runGitRaw(f.project, ["write-tree"])).stdout.trim();
+    await writeFile(join(f.project, "a.txt"), "theirs"); await runGitRaw(f.project, ["add", "a.txt"]);
+    const theirs = (await runGitRaw(f.project, ["write-tree"])).stdout.trim();
+    await runGitRaw(f.project, ["read-tree", ours]);
+    await runGitRaw(f.project, ["read-tree", "-m", "-i", base, ours, theirs]);
+  }
+  const git: GitExec = async (args, cwd) => kind === "missing-head" && args[0] === "rev-parse" && args.includes("HEAD")
+    ? { command: "git", args: [...args], exitCode: 1, stdout: "", stderr: "", signal: null, durationMs: 0, timedOut: false, truncated: false, inputTruncated: false }
     : defaultGitExec(args, cwd);
   const set = await createBranchSet(f.project, ["a"], { tmpRoot: f.copies, git });
   try { expect(set?.method).toBe("copy"); }

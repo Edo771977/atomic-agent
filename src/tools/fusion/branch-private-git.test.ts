@@ -195,6 +195,17 @@ it("preserves a linked source worktree's split index, shared indexes and common 
   expect(await metadata(linked)).toEqual(before); expect(await metadata(f.project)).toEqual(original);
 });
 
+it("never freshens aged source split-index metadata during private inventory queries", async () => {
+  const f = await fixture(); await runGitRaw(f.project, ["update-index", "--split-index"]);
+  const indexDir = join(f.project, ".git"), files = (await readdir(indexDir)).filter(file => file.startsWith("sharedindex."));
+  expect(files.length).toBeGreaterThan(0);
+  for (const file of files) await utimes(join(indexDir, file), new Date("2000-01-01"), new Date("2000-01-01"));
+  const stamps = async () => Promise.all(files.map(async file => { const info = await lstat(join(indexDir, file)); return { file, bytes: await readFile(join(indexDir, file)), mtimeMs: info.mtimeMs, ctimeMs: info.ctimeMs }; }));
+  const before = await stamps(), index = await readFile(join(indexDir, "index"));
+  const set = await createBranchSet(f.project, ["one"], { tmpRoot: f.copies, maxCopyBytes: 1024 * 1024 });
+  await set?.cleanup(); expect(await stamps()).toEqual(before); expect(await readFile(join(indexDir, "index"))).toEqual(index);
+});
+
 it("cancels a private import without writing source metadata or leaving incomplete stores", async () => {
   const f = await fixture(); const before = await metadata(f.project), controller = new AbortController();
   const signal = controller.signal;

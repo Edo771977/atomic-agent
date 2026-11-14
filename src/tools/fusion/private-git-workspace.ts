@@ -2,8 +2,8 @@
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { constants, createWriteStream, type Stats } from "node:fs";
-import { lstat, mkdir, open, readFile, readlink, realpath, rename, rm, writeFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { lstat, mkdir, open, readFile, readdir, readlink, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { dirname, join, relative, resolve } from "node:path";
 import { homedir } from "node:os";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -17,7 +17,7 @@ const MAX_OBJECTS = 100_000, MAX_OUTPUT = 32 * 1024 * 1024;
 export const DEFAULT_GIT_OBJECT_BYTES = DEFAULT_VERIFY_MAX_GIT_OBJECT_BYTES;
 export interface GitObjectBudget { left: number; signal?: AbortSignal }
 interface Ref { name: string; oid: string; symbolic?: string }
-export interface PrivateGitSnapshot { seed: string; commit: string; refs: readonly Ref[]; shallow: string; format: string; emptyConfig: string; infoExclude: Buffer; globalExclude: Buffer; trackedPaths: string[]; budget: GitObjectBudget }
+export interface PrivateGitSnapshot { seed: string; commit: string; refs: readonly Ref[]; shallow: string; format: string; emptyConfig: string; infoExclude: Buffer; globalExclude: Buffer; trackedPaths: string[]; untracked: string[]; ignored: string[]; unmerged: boolean; budget: GitObjectBudget }
 function charge(budget: GitObjectBudget, bytes: number): void {
   budget.signal?.throwIfAborted(); budget.left -= bytes;
   if (budget.left < 0) throw new Error("Git object import exceeds tools.verify.maxGitObjectBytes limit");
@@ -120,6 +120,34 @@ async function freezeRule(path: string, snapshot: PrivateGitSnapshot): Promise<B
     return bytes;
   } finally { await fd.close(); }
 }
+/** Reading a split index with Git can freshen source sharedindex mtimes even
+ * with optional locks disabled. Copy index data first; every index consumer
+ * then operates inside the private Git directory. */
+async function copyIndexFile(source: string, destination: string, snapshot: PrivateGitSnapshot): Promise<void> {
+  const before = await lstat(source);
+  if (!before.isFile() || before.isSymbolicLink()) throw new Error("source Git index metadata is not a regular file");
+  charge(snapshot.budget, before.size);
+  const input = await open(source, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  let output: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    if (!sameFile(before, await input.stat())) throw new Error("source Git index metadata changed before copying");
+    output = await open(destination, "wx", 0o600);
+    let offset = 0;
+    while (offset < before.size) {
+      snapshot.budget.signal?.throwIfAborted();
+      const chunk = Buffer.alloc(Math.min(64 * 1024, before.size - offset)), read = await input.read(chunk, 0, chunk.length, offset);
+      if (read.bytesRead === 0) throw new Error("source Git index metadata changed while copying");
+      let written = 0; while (written < read.bytesRead) written += (await output.write(chunk, written, read.bytesRead - written)).bytesWritten;
+      offset += read.bytesRead;
+    }
+    if (!sameFile(before, await input.stat()) || !sameFile(before, await lstat(source))) throw new Error("source Git index metadata changed while copying");
+  } finally { await output?.close(); await input.close(); }
+}
+function finishPreparation(snapshot: PrivateGitSnapshot, callerSignal: AbortSignal | undefined): PrivateGitSnapshot {
+  snapshot.budget.signal?.throwIfAborted();
+  if (callerSignal === undefined) delete snapshot.budget.signal; else snapshot.budget.signal = callerSignal;
+  return snapshot;
+}
 /** Git loose-object encoding, from a pinned descriptor and an exact bounded read.
  * Unlike hash-object <path>, a growing source cannot write an oversized object
  * before our byte guard observes it. There are no clean/smudge filters here. */
@@ -148,10 +176,10 @@ async function writeBlob(path: string, snapshot: PrivateGitSnapshot, before: Sta
   } finally { await descriptor.close(); await rm(temporary, { force: true }).catch(() => undefined); }
 }
 
-export async function preparePrivateGitSnapshot(input: { source: string; head: string; seed: string; maxBytes?: number; signal?: AbortSignal }): Promise<PrivateGitSnapshot> {
+export async function preparePrivateGitSnapshot(input: { source: string; selectedDir?: string; head: string; seed: string; maxBytes?: number; signal?: AbortSignal }): Promise<PrivateGitSnapshot> {
   const emptyConfig = `${input.seed}.empty-config`; await writeFile(emptyConfig, "");
   const deadline = AbortSignal.timeout(120_000), signal = input.signal === undefined ? deadline : AbortSignal.any([input.signal, deadline]);
-  const snapshot: PrivateGitSnapshot = { seed: input.seed, commit: input.head, refs: [], shallow: "", format: "sha1", emptyConfig, infoExclude: Buffer.alloc(0), globalExclude: Buffer.alloc(0), trackedPaths: [], budget: { left: input.maxBytes ?? DEFAULT_GIT_OBJECT_BYTES, signal } };
+  const snapshot: PrivateGitSnapshot = { seed: input.seed, commit: input.head, refs: [], shallow: "", format: "sha1", emptyConfig, infoExclude: Buffer.alloc(0), globalExclude: Buffer.alloc(0), trackedPaths: [], untracked: [], ignored: [], unmerged: false, budget: { left: input.maxBytes ?? DEFAULT_GIT_OBJECT_BYTES, signal } };
   if (!Number.isSafeInteger(snapshot.budget.left) || snapshot.budget.left <= 0) throw new Error("invalid Git object import byte limit");
   snapshot.format = (await git(["rev-parse", "--show-object-format"], input.source, snapshot)).trim();
   if (!["sha1", "sha256"].includes(snapshot.format)) throw new Error("unsupported Git object format");
@@ -185,11 +213,27 @@ export async function preparePrivateGitSnapshot(input: { source: string; head: s
   await initialize(snapshot.seed, snapshot, true);
   await importObjects(input.source, snapshot.seed, [input.head, ...snapshot.refs.map(ref => ref.oid)], snapshot);
   await installMetadata(snapshot.seed, snapshot, true);
-  // Reconstruct only a private index. A real source index (including a split
-  // index) is never refreshed, copied, locked or written.
-  const raw = await git(["ls-files", "--stage", "-z"], input.source, snapshot);
+  const indexPath = resolve(input.source, (await git(["rev-parse", "--git-path", "index"], input.source, snapshot)).trim());
+  let indexExists = true;
+  try { await lstat(indexPath); } catch (reason) { if ((reason as NodeJS.ErrnoException).code !== "ENOENT") throw reason; indexExists = false; }
+  if (indexExists) {
+    const shared = (await readdir(dirname(indexPath))).filter(name => /^sharedindex\.(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(name));
+    if (shared.length > MAX_OBJECTS) throw new Error("Git shared-index inventory limit exceeded");
+    for (const file of shared) await copyIndexFile(join(dirname(indexPath), file), join(snapshot.seed, file), snapshot);
+    await copyIndexFile(indexPath, join(snapshot.seed, "index"), snapshot);
+  } else {
+    // A missing source index is an empty index, not permission to create it.
+    await git(["read-tree", "--empty"], snapshot.seed, snapshot);
+  }
+  const privateIndex = ["--git-dir", snapshot.seed, "--work-tree", input.source, "-c", "core.bare=false"];
+  const raw = await git([...privateIndex, "ls-files", "--stage", "-z"], input.source, snapshot);
   const entries = raw.split("\0").filter(Boolean);
   if (entries.length > MAX_OBJECTS) throw new Error("Git tracked snapshot entry limit exceeded");
+  if (entries.some(line => /^\d{6} [a-f0-9]+ [123]\t/.test(line))) { snapshot.unmerged = true; return finishPreparation(snapshot, input.signal); }
+  const selected = relative(input.source, input.selectedDir ?? input.source).replaceAll("\\", "/") || ".";
+  const list = async (ignored: boolean): Promise<string[]> => (await git(["--literal-pathspecs", ...privateIndex, "ls-files", "--others", ...(ignored ? ["--ignored", "--directory"] : []), "--exclude-standard", "-z", "--", selected], input.source, snapshot)).split("\0").filter(path => path !== "" && !/^\.git(?:\/|$)/i.test(path));
+  snapshot.untracked = await list(false); snapshot.ignored = await list(true);
+  // Reconstruct the working-tree snapshot using only this private index.
   const index: string[] = [];
   for (const line of entries) {
     snapshot.budget.signal?.throwIfAborted();
@@ -213,10 +257,7 @@ export async function preparePrivateGitSnapshot(input: { source: string; head: s
   const baseTree = (await git(["rev-parse", `${input.head}^{tree}`], snapshot.seed, snapshot)).trim();
   if (tree !== baseTree) snapshot.commit = (await git(["commit-tree", tree, "-p", input.head], snapshot.seed, snapshot, "Fusion working-tree snapshot\n")).trim();
   await writeFile(join(snapshot.seed, "HEAD"), `${snapshot.commit}\n`);
-  signal.throwIfAborted();
-  // The completed operation's deadline must not become a lifecycle signal.
-  if (input.signal === undefined) delete snapshot.budget.signal; else snapshot.budget.signal = input.signal;
-  return snapshot;
+  return finishPreparation(snapshot, input.signal);
 }
 
 export async function materializePrivateGitWorkspace(root: string, snapshot: PrivateGitSnapshot): Promise<void> {

@@ -13,8 +13,10 @@
  * Inside Git every workspace has an independent repository and index.
  * Read-only object/ref imports preserve available history; tracked actual
  * bytes form a private snapshot whose parent is the source HEAD. Source
- * config, remotes, alternates, indexes and worktree registrations are never
- * imported or mutated. The historical method name remains "worktree".
+ * config, remotes, alternates and worktree registrations are never imported
+ * or mutated. Index bytes are copied read-only before inventory, so even
+ * Git's shared-index freshening affects only private data. The historical
+ * method name remains "worktree".
  * The snapshot supplies
  * Git metadata only: a tracked path whose checkout differs from the
  * original's actual bytes is overlaid from them into the base, then from
@@ -829,30 +831,21 @@ async function gitSnapshot(
   if (rel.startsWith("..")) return null;
   const head = await git(["rev-parse", "--verify", "-q", "HEAD"], realDir);
   if (!ok(head)) return null;
-  const unmerged = await git(["ls-files", "--unmerged", "-z"], top);
-  if (!ok(unmerged) || unmerged.stdout !== "") return null;
   const merging = await git(["rev-parse", "-q", "--verify", "MERGE_HEAD"], top);
   if (ok(merging)) return null;
-  const tracked = await git(["ls-files", "--cached", "-z"], realDir);
-  const untracked = await git(
-    ["ls-files", "--others", "--exclude-standard", "-z"],
-    realDir,
-  );
-  const ignored = await git(
-    ["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"],
-    realDir,
-  );
-  if (!ok(tracked) || !ok(untracked) || !ok(ignored)) return null;
-  const privateGit = await preparePrivateGitSnapshot({ source: top, head: head.stdout.trim(), seed: join(runRoot, "snapshot.git"),
+  const privateGit = await preparePrivateGitSnapshot({ source: top, selectedDir: realDir, head: head.stdout.trim(), seed: join(runRoot, "snapshot.git"),
     ...(options.maxGitObjectBytes === undefined ? {} : { maxBytes: options.maxGitObjectBytes }), ...(options.signal === undefined ? {} : { signal: options.signal }) });
+  if (privateGit.unmerged) return null;
+  const prefix = rel === "" ? "" : `${rel.replaceAll("\\", "/")}/`;
+  const selectedPaths = (paths: readonly string[]) => paths.filter(path => path.startsWith(prefix)).map(path => path.slice(prefix.length));
   return {
     top,
     rel,
     commit: privateGit.commit,
     privateGit,
-    tracked: zList(tracked.stdout),
-    untracked: zList(untracked.stdout),
-    ignored: zList(ignored.stdout),
+    tracked: selectedPaths(privateGit.trackedPaths),
+    untracked: selectedPaths(privateGit.untracked),
+    ignored: selectedPaths(privateGit.ignored),
   };
 }
 
