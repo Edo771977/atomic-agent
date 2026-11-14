@@ -142,7 +142,10 @@ export function createDefaultMemoryContextProvider(
         metrics: opts.metrics,
       });
       // Ids held out by the name guard are still excluded from the
-      // index below, which would hold them out too.
+      // index below, which would hold them out too. The guard runs
+      // after link expansion on purpose: a neighbour reached through a
+      // held-out note is another note with only its own content (links
+      // carry no text), so it is judged on that content like any row.
       const recalledIds = new Set(expanded.map((e) => e.id));
       const guard = opts.nameGuard;
       const recalled = guard

@@ -230,4 +230,29 @@ describe("createDefaultMemoryContextProvider", () => {
     };
     expect(ctx.index).toEqual([]);
   });
+
+  it("filters a held-out note's link neighbours on their own content only (ATO-321)", async () => {
+    // A is held out; B is a plain note linked from it; C (linked from
+    // B) claims the same name. A neighbour carries only its own content
+    // (links add no text), so B may be recalled and C is held out too.
+    const a = store.store({ content: "lisbon trip: the user is Alex" });
+    const b = store.store({ content: "ticket from porto to faro" });
+    const c = store.store({ content: "hostel in sintra; I am Alex" });
+    const linkStore = new LinkStore({ db: store.getDatabaseHandleForEmbeddings() });
+    linkStore.add({ fromId: a.id, toId: b.id, kind: "RELATES_TO" });
+    linkStore.add({ fromId: b.id, toId: c.id, kind: "REFERENCES" });
+    const provider = createDefaultMemoryContextProvider({
+      store,
+      recall: { enabled: true, k: 5 },
+      index: { enabled: true, limit: 20, previewChars: 80 },
+      links: { enabled: true, store: linkStore, depth: 2, maxExpanded: 10 },
+      nameGuard: { allows: (text: string) => !text.includes("Alex") },
+    });
+    const ctx = (await provider.buildMemoryContext(input("lisbon"))) as unknown as {
+      recalled: Array<{ id: number; content: string }>;
+      index: Array<{ id: number; preview: string }>;
+    };
+    expect(ctx.recalled.map((e) => e.id)).toEqual([b.id]);
+    expect(JSON.stringify(ctx)).not.toContain("Alex");
+  });
 });
