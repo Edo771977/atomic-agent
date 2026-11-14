@@ -82,8 +82,154 @@ describe("shared dependency directories", () => {
   });
 });
 
+describe("direct-mode copy budget", () => {
+  it("links an ignored venv/ to the original instead of copying it into the base and every task", async () => {
+    const repo = await makeGitRepo("atag-direct-venv-");
+    cleanup.push(repo);
+    await writeRepoFile(repo, ".gitignore", "venv/\n");
+    await writeRepoFile(repo, "src/a.ts", "x\n");
+    await runGitRaw(repo, ["add", "-A"]);
+    await runGitRaw(repo, ["commit", "-q", "-m", "init"]);
+    await writeRepoFile(repo, "venv/big.bin", "v".repeat(40_000));
+    const { root } = await fixture();
+    const set = await createBranchSet(repo, ["a", "b", "c"], { tmpRoot: root, maxCopyBytes: 100_000 });
+    expect(set).not.toBeNull();
+    try {
+      for (const id of ["a", "b", "c"]) {
+        const dir = set!.workspaces.get(id)!.dir;
+        expect(await realpath(join(dir, "venv"))).toBe(await realpath(join(repo, "venv")));
+        expect(await touchedPaths(set!.workspaces.get(id)!)).toEqual([]);
+      }
+    } finally { await set?.cleanup(); }
+    expect(await readFile(join(repo, "venv/big.bin"), "utf8")).toHaveLength(40_000);
+  });
+
+  it("does not charge an unchanged tracked file to the copy budget", async () => {
+    const repo = await makeGitRepo("atag-direct-tracked-");
+    cleanup.push(repo);
+    await writeRepoFile(repo, "data.bin", "d".repeat(30_000));
+    await writeRepoFile(repo, "dirty.txt", "committed\n");
+    await runGitRaw(repo, ["add", "-A"]);
+    await runGitRaw(repo, ["commit", "-q", "-m", "init"]);
+    await writeRepoFile(repo, "dirty.txt", "uncommitted edit\n");
+    const { root } = await fixture();
+    const set = await createBranchSet(repo, ["a", "b", "c"], { tmpRoot: root, maxCopyBytes: 100_000 });
+    expect(set).not.toBeNull();
+    try {
+      for (const id of ["a", "b", "c"]) {
+        const dir = set!.workspaces.get(id)!.dir;
+        expect(await readFile(join(dir, "data.bin"), "utf8")).toBe("d".repeat(30_000));
+        expect(await readFile(join(dir, "dirty.txt"), "utf8")).toBe("uncommitted edit\n");
+        expect(await touchedPaths(set!.workspaces.get(id)!)).toEqual([]);
+      }
+    } finally { await set?.cleanup(); }
+  });
+});
+
+describe("work the ignore rules keep out of a direct merge", () => {
+  async function generatedWave(files?: string[], provides?: { task: string; kind: "file"; name: string }[]) {
+    const repo = await makeGitRepo("atag-direct-generated-");
+    cleanup.push(repo);
+    await writeRepoFile(repo, ".gitignore", "src/generated/\n");
+    await writeRepoFile(repo, "src/a.ts", "x\n");
+    await runGitRaw(repo, ["add", "-A"]);
+    await runGitRaw(repo, ["commit", "-q", "-m", "init"]);
+    const { root } = await fixture();
+    const result = await runIsolatedWave({
+      realDir: repo, tasks: [{ ...task("one"), ...(files === undefined ? {} : { files }) }], writeScope: [repo], inputs: [],
+      ...(provides === undefined ? {} : { provides }),
+      options: { tmpRoot: root },
+      run: async (_tasks, workspace) => {
+        const dir = workspace!("one")!.workingDir;
+        await writeRepoFile(dir, "src/generated/api.ts", "export const api = 1;\n");
+        await writeFile(join(dir, "src/a.ts"), "y\n");
+        return [row("one")];
+      },
+    });
+    return { repo, result };
+  }
+
+  it("reports a file created in a new ignored directory instead of dropping it silently", async () => {
+    const { repo, result } = await generatedWave();
+    expect(result.outcomes[0]!.applied).toEqual([join("src", "a.ts")]);
+    expect(result.outcomes[0]!.ignoredChanges).toEqual([join("src", "generated", "api.ts")]);
+    expect(result.results[0]!.status).toBe("ok");
+    expect(result.results[0]!.notes?.join("\n")).toContain("src/generated/api.ts");
+    expect(await readdir(join(repo, "src"))).not.toContain("generated");
+  });
+
+  it.each([
+    ["declared files", ["src/generated/api.ts"], undefined],
+    ["a file provide", undefined, [{ task: "one", kind: "file" as const, name: "src/generated/api.ts" }]],
+  ])("needs the orchestrator when %s lie under an ignored path", async (_label, files, provides) => {
+    const { result } = await generatedWave(files, provides);
+    expect(result.results[0]!.status).toBe("needs_orchestrator");
+    expect(result.results[0]!.error).toContain("src/generated/api.ts");
+  });
+});
+
+describe("workspace removal never lets git walk a generated link", () => {
+  async function linkedRepo(): Promise<string> {
+    const repo = await makeGitRepo("atag-cleanup-links-");
+    cleanup.push(repo);
+    await writeRepoFile(repo, ".gitignore", "node_modules/\nvenv/\n");
+    await writeRepoFile(repo, "tracked.txt", "tracked\n");
+    await runGitRaw(repo, ["add", "-A"]);
+    await runGitRaw(repo, ["commit", "-q", "-m", "init"]);
+    await writeRepoFile(repo, "node_modules/dep/index.js", "dependency\n");
+    await writeRepoFile(repo, "venv/lib.py", "venv\n");
+    return repo;
+  }
+  /** Git, recording each `worktree remove` whose target still existed. */
+  function recordingGit(removedWhileThere: string[]) {
+    return async (args: readonly string[], cwd: string) => {
+      if (args[0] === "worktree" && args[1] === "remove") {
+        const target = args[args.length - 1]!;
+        if (await lstat(target).then(() => true, () => false)) removedWhileThere.push(target);
+      }
+      return defaultGitExec(args, cwd);
+    };
+  }
+
+  it("removes the workspace folders with Node before git forgets the worktrees", async () => {
+    const repo = await linkedRepo();
+    const { root } = await fixture();
+    const removedWhileThere: string[] = [];
+    const set = await createBranchSet(repo, ["a", "b"], { tmpRoot: root, git: recordingGit(removedWhileThere) });
+    expect(set).not.toBeNull();
+    const kept = set!.workspaces.get("a")!.dir;
+    await set!.cleanup(["a"]);
+    expect(await lstat(set!.workspaces.get("b")!.dir).then(() => true, () => false)).toBe(false);
+    expect(await readFile(join(kept, "node_modules/dep/index.js"), "utf8")).toBe("dependency\n");
+    await set!.cleanup();
+    expect(removedWhileThere).toEqual([]);
+    expect(await readFile(join(repo, "node_modules/dep/index.js"), "utf8")).toBe("dependency\n");
+    expect(await readFile(join(repo, "venv/lib.py"), "utf8")).toBe("venv\n");
+    expect((await runGitRaw(repo, ["worktree", "list", "--porcelain"])).stdout.match(/^worktree /gm)).toHaveLength(1);
+  });
+
+  it("sweeps a dead run's worktrees the same way", async () => {
+    const repo = await linkedRepo();
+    const { root } = await fixture();
+    const dead = await createBranchSet(repo, ["a"], { tmpRoot: root });
+    expect(dead).not.toBeNull();
+    // A run whose process is gone: its owner record names no live pid.
+    const runRoot = join(dead!.baseDir, "..");
+    await writeFile(join(runRoot, "owner.json"), JSON.stringify({ pid: 2 ** 22 + 12345 }));
+    const removedWhileThere: string[] = [];
+    const next = await createBranchSet(repo, ["b"], { tmpRoot: root, git: recordingGit(removedWhileThere) });
+    try {
+      expect(await lstat(runRoot).then(() => true, () => false)).toBe(false);
+      expect(removedWhileThere).toEqual([]);
+      expect(await readFile(join(repo, "node_modules/dep/index.js"), "utf8")).toBe("dependency\n");
+      expect((await runGitRaw(repo, ["worktree", "list", "--porcelain"])).stdout.match(/^worktree /gm)).toHaveLength(3);
+    } finally { await next?.cleanup(); }
+    expect((await runGitRaw(repo, ["worktree", "list", "--porcelain"])).stdout.match(/^worktree /gm)).toHaveLength(1);
+  });
+});
+
 describe("tracked paths under excluded directory names", () => {
-  it("merges a tracked change under a directory named build and still skips untracked dist", async () => {
+  it("merges a tracked change under a directory named build and never merges ignored dist, which is linked", async () => {
     const repo = await makeGitRepo("atag-tracked-build-");
     cleanup.push(repo);
     await writeRepoFile(repo, ".gitignore", "dist/\n");
@@ -105,7 +251,8 @@ describe("tracked paths under excluded directory names", () => {
     });
     expect(result.outcomes[0]!.applied).toEqual(["scripts/build/extra.sh", "scripts/build/pack.sh"]);
     expect(await readFile(join(repo, "scripts/build/pack.sh"), "utf8")).toBe("echo new\n");
-    expect(await readFile(join(repo, "dist/out.js"), "utf8")).toBe("old build\n");
+    // Direct mode is not a sandbox: the ignored build output is the original's, through a link.
+    expect(await readFile(join(repo, "dist/out.js"), "utf8")).toBe("private build\n");
   });
 
   it("reports a tracked change under a directory named build as touched for the recovery patch", async () => {
@@ -125,7 +272,7 @@ describe("tracked paths under excluded directory names", () => {
 });
 
 describe("private branch dependencies", () => {
-  it("keeps ignored caches private and dependencies readable without sharing a failed task's cache writes", async () => {
+  it("shares ignored caches and dependencies with the original by links in direct mode", async () => {
     const repo = await makeGitRepo("atag-private-ignored-");
     cleanup.push(repo);
     await writeRepoFile(repo, ".gitignore", "cache/\nnode_modules/\n");
@@ -147,13 +294,14 @@ describe("private branch dependencies", () => {
         await writeFile(join(dir, "cache/state.txt"), "bad cache\n");
         // Shared with the original by a link, never copied or merged.
         expect(await realpath(join(dir, "node_modules"))).toBe(await realpath(join(repo, "node_modules")));
-        expect(await readFile(join(repo, "cache/state.txt"), "utf8")).toBe("original cache\n");
+        expect(await realpath(join(dir, "cache"))).toBe(await realpath(join(repo, "cache")));
         return [{ ...row("failed"), status: "failed" }];
       },
     });
     expect(runs).toBe(1);
     expect(result.results[0]!.status).toBe("failed");
-    expect(await readFile(join(repo, "cache/state.txt"), "utf8")).toBe("original cache\n");
+    // A write through the link is not undone with the workspace (as on `verify.run`).
+    expect(await readFile(join(repo, "cache/state.txt"), "utf8")).toBe("bad cache\n");
     expect(await readFile(join(repo, "node_modules/dependency/index.js"), "utf8")).toBe("original dependency\n");
   });
 
@@ -176,26 +324,26 @@ describe("private branch dependencies", () => {
     } finally { await set?.cleanup(); }
   });
 
-  it("counts ignored directory data against the copy limit before any worker starts", async () => {
+  it("does not charge a linked ignored directory to the copy limit", async () => {
     const repo = await makeGitRepo("atag-private-limit-");
     cleanup.push(repo);
     await writeRepoFile(repo, ".gitignore", "cache/\n");
     await runGitRaw(repo, ["add", ".gitignore"]);
     await runGitRaw(repo, ["commit", "-q", "-m", "init"]);
-    await writeRepoFile(repo, "cache/state.bin", "large cache".repeat(10));
+    await writeRepoFile(repo, "cache/state.bin", "large cache".repeat(10_000));
     const { root } = await fixture();
     let runs = 0;
     const result = await runIsolatedWave({
-      realDir: repo, tasks: [task("one")], writeScope: [repo], inputs: [],
-      options: { tmpRoot: root, maxCopyBytes: 60 },
-      run: async () => { runs += 1; return [row("one")]; },
+      realDir: repo, tasks: [task("one"), task("two")], writeScope: [repo], inputs: [],
+      options: { tmpRoot: root, maxCopyBytes: 10_000 },
+      run: async () => { runs += 1; return [row("one"), row("two")]; },
     });
-    expect(runs).toBe(0);
-    expect(result.results[0]!.error).toMatch(/not started: could not create a private workspace/);
+    expect(runs).toBe(1);
+    expect(result.results.map((r) => r.status)).toEqual(["ok", "ok"]);
     expect((await readdir(root)).filter((name) => name.startsWith("atag-fusion-"))).toEqual([]);
   });
 
-  it("discards a green task's private cache changes while delivering ordinary outputs and ignored files", async () => {
+  it("delivers a green task's outputs and ignored files, its cache writes landing through the link", async () => {
     const repo = await makeGitRepo("atag-private-green-");
     cleanup.push(repo);
     await writeRepoFile(repo, ".gitignore", "cache/\n*.local\n");
@@ -217,7 +365,7 @@ describe("private branch dependencies", () => {
     });
     expect(result.results[0]!.status).toBe("ok");
     expect(result.outcomes[0]!.applied).toEqual(["output.txt", "settings.local"]);
-    expect(await readFile(join(repo, "cache/state.txt"), "utf8")).toBe("original cache\n");
+    expect(await readFile(join(repo, "cache/state.txt"), "utf8")).toBe("private cache\n");
     expect(await readFile(join(repo, "settings.local"), "utf8")).toBe("new settings\n");
     expect(await readFile(join(repo, "output.txt"), "utf8")).toBe("deliverable\n");
   });

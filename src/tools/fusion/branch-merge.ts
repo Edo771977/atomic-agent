@@ -34,7 +34,7 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
-import { dirname, isAbsolute, join, relative, sep } from "node:path";
+import { dirname, isAbsolute, join, normalize, relative, sep } from "node:path";
 import { runCommand } from "../../sandbox/command-runner.js";
 import { buildCommandEnv } from "../../sandbox/command-env.js";
 import {
@@ -44,6 +44,7 @@ import {
   readEntry,
   sameEntry,
   touchedPaths,
+  workspaceTouches,
   type PathEntry,
   type BranchSet,
   type BranchWorkspace,
@@ -58,6 +59,7 @@ import {
   type WorkspaceChange,
 } from "./branch-diff.js";
 import { resolveContractInputs } from "./contract-inputs.js";
+import type { ContractProvide } from "./contract.js";
 import type { DelegateTask } from "./delegate-args.js";
 import type { WorkerTaskResult, WorkerTaskStatus } from "./worker-result.js";
 
@@ -124,6 +126,12 @@ export interface BranchMergeOutcome {
   lost?: string[];
   /** Where the conflicting sides were saved, relative to the working directory. */
   savedDir?: string;
+  /**
+   * Files the task added, changed or removed under a directory the ignore
+   * rules classify as ignored (one it created, such as `src/generated/`):
+   * never merged, so reported instead of dropped silently.
+   */
+  ignoredChanges?: string[];
 }
 
 function lineCount(buf: Buffer): number {
@@ -200,7 +208,9 @@ export async function mergeBranch(
     if (base !== null) await writeBuffer(`${at}.base`, base.data);
     outcome.savedDir = savedRoot;
   };
-  for (const rel of await touchedPaths(workspace)) {
+  const touches = await workspaceTouches(workspace);
+  if (touches.ignored.length > 0) outcome.ignoredChanges = touches.ignored;
+  for (const rel of touches.touched) {
     const taskPath = join(workspace.dir, rel);
     const basePath = join(set.baseDir, rel);
     const realPath = join(set.realDir, rel);
@@ -305,10 +315,22 @@ export function mergeTaskSuggestion(
   };
 }
 
-/** The row after its merge: notes for what landed, the error for what did not. */
+/** How many ignored paths a row's note names before it says "and N more". */
+const IGNORED_NOTE_NAMES = 10;
+
+/** Whether `path` is `root` or lies under it (both relative, native separators). */
+const atOrUnder = (path: string, root: string): boolean => path === root || path.startsWith(`${root}${sep}`);
+
+/**
+ * The row after its merge: notes for what landed, the error for what did
+ * not. `declared` are the task's declared paths (its `files`, its `provides`
+ * file names and `in`), relative to the working directory: one under a
+ * path the ignore rules kept out of the merge needs the orchestrator.
+ */
 export function applyMergeOutcome(
   row: WorkerTaskResult,
   outcome: BranchMergeOutcome,
+  declared: readonly string[] = [],
 ): WorkerTaskResult {
   const notes = [...(row.notes ?? [])];
   if (outcome.applied.length > 0) {
@@ -317,6 +339,20 @@ export function applyMergeOutcome(
     );
   }
   const problems: string[] = [];
+  const ignored = outcome.ignoredChanges ?? [];
+  if (ignored.length > 0) {
+    const named = ignored.slice(0, IGNORED_NOTE_NAMES).map((p) => p.split(sep).join("/"));
+    const more = ignored.length > named.length ? ` and ${ignored.length - named.length} more` : "";
+    notes.push(
+      `not merged: ${ignored.length} file${ignored.length === 1 ? "" : "s"} under ignored directories (${named.join(", ")}${more}); git ignore rules keep them out of the folder`,
+    );
+    const hidden = declared.filter((path) => ignored.some((file) => atOrUnder(file, path)));
+    if (hidden.length > 0) {
+      problems.push(
+        `declared paths lie under ignored directories that are never merged (${hidden.map((p) => p.split(sep).join("/")).join(", ")}); deliver them in tracked or unignored paths`,
+      );
+    }
+  }
   if (outcome.conflicts.length > 0) {
     problems.push(
       `merge conflict in ${outcome.conflicts.join(", ")}: changed in the folder too while this task ran; the folder's version was kept and this task's is saved in ${outcome.savedDir ?? BRANCH_MERGE_DIR} (delegate merge-${row.id})`,
@@ -447,6 +483,8 @@ export interface IsolatedWaveInput {
   writeScope: readonly string[];
   /** The contract's declared inputs, as written. */
   inputs: readonly string[];
+  /** The contract's `provides`: a task's file names and `in` paths count as declared, like its `files`. */
+  provides?: readonly ContractProvide[];
   run: (
     tasks: readonly DelegateTask[],
     taskWorkspace:
@@ -679,8 +717,8 @@ export async function runIsolatedWave(
       outcomes.push(outcome);
       // Green now: an earlier attempt's held-back patch is stale.
       if (input.gate !== undefined) await removeTaskPatch(realDir, row.id);
-      out.push(applyMergeOutcome(row, outcome));
       const task = input.tasks.find((t) => t.id === row.id);
+      out.push(applyMergeOutcome(row, outcome, declaredPaths(task, input.provides, [input.realDir, realDir])));
       const suggestion =
         task === undefined ? undefined : mergeTaskSuggestion(task, outcome);
       if (suggestion !== undefined) merges.push(suggestion);
@@ -698,6 +736,31 @@ export async function runIsolatedWave(
       );
     }
   }
+}
+
+/**
+ * A task's declared paths (`files`, its `provides` file names and `in`)
+ * relative to the working directory; ones outside it are left out.
+ */
+function declaredPaths(
+  task: DelegateTask | undefined,
+  provides: readonly ContractProvide[] | undefined,
+  roots: readonly string[],
+): string[] {
+  if (task === undefined) return [];
+  const named = [
+    ...(task.files ?? []),
+    ...(provides ?? []).filter((p) => p.task === task.id).flatMap((p) => [...(p.kind === "file" ? [p.name] : []), ...(p.in === undefined ? [] : [p.in])]),
+  ];
+  const out = new Set<string>();
+  for (const path of named) {
+    const rel = isAbsolute(path)
+      ? roots.map((root) => relative(root, path)).find((r) => !r.startsWith("..") && !isAbsolute(r))
+      : normalize(path);
+    if (rel === undefined || rel.length === 0 || rel === "." || rel.startsWith("..")) continue;
+    out.add(rel.replace(/[\\/]+$/, ""));
+  }
+  return [...out];
 }
 
 /** The block under the status table that hands conflicts to the planner. */

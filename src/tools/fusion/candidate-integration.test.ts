@@ -701,3 +701,37 @@ it("accepted trade-off: a concurrent write to an unrelated path during delivery 
   expect(await readFile(join(root, "unrelated.txt"), "utf8")).toBe("user write mid-delivery");
   expect(await readFile(join(root, "dirty.txt"), "utf8")).toBe("user edit of an untouched path");
 });
+
+it.each([
+  ["worktree", 0o775], ["worktree", 0o700], ["folder copy", 0o775], ["folder copy", 0o700],
+] as const)("stages a %s candidate whose source directory has mode %o", async (method, mode) => {
+  const root = method === "worktree" ? await ignoreRepo() : await project();
+  if (method === "worktree") {
+    await writeRepoFile(root, "src/deep/a.ts", "x\n");
+    await runGitRaw(root, ["add", "-A"]); await runGitRaw(root, ["commit", "-qm", "src"]);
+  } else {
+    await mkdir(join(root, "src", "deep"), { recursive: true }); await writeFile(join(root, "src", "deep", "a.ts"), "x\n");
+  }
+  await chmod(join(root, "src"), mode); await chmod(join(root, "src", "deep"), mode);
+  const candidate = await createCandidateIntegration(root, method === "worktree" ? {} : { git: async () => null });
+  try {
+    expect((await stat(join(candidate.dir, "src"))).mode & 0o777).toBe(mode);
+    expect((await stat(join(candidate.dir, "src", "deep"))).mode & 0o777).toBe(mode);
+    await writeFile(join(candidate.dir, "src", "deep", "a.ts"), "y\n");
+    const report = await candidate.finish({ rows, contract, signal, runChecks: pass });
+    expect(report.status).toBe("promoted");
+    expect(await readFile(join(root, "src", "deep", "a.ts"), "utf8")).toBe("y\n");
+  } finally { await candidate.cleanup(); }
+});
+
+it.each([join("pkg", ".atomic-agent"), join("pkg", "deep", ".ATOMIC-AGENT."), join("pkg", ".atomic-agent ")])("refuses nested agent state at %j", async nested => {
+  const root = await project();
+  const candidate = await createCandidateIntegration(root);
+  try {
+    await mkdir(join(candidate.dir, nested), { recursive: true });
+    await writeFile(join(candidate.dir, nested, "approval-rules.json"), '{"rules":[{"allow":"*"}]}');
+    const report = await candidate.finish({ rows, contract, signal, runChecks: pass });
+    expect(report.status).toBe("rejected"); expect(report.reason).toContain("agent state");
+    await expect(stat(join(root, "pkg"))).rejects.toThrow();
+  } finally { await candidate.cleanup(); }
+});
