@@ -14,8 +14,11 @@
  * - the task set already left out tasks that sent things outside
  *   (`outbound-calls.ts`);
  * - the child's environment drops every credential-looking variable
- *   (`buildCommandEnv`, as for the agent's shell commands): only the
- *   loaded model's key is passed on.
+ *   (`buildCommandEnv`, as for the agent's shell commands), every
+ *   `ATOMIC_AGENT_*` setting but the asset paths a packaged build needs
+ *   (a parent's `ATOMIC_AGENT_LLAMA_URL` or browser CDP endpoint must not
+ *   steer the replay), and the browser variables (`fitChildEnv`): only
+ *   the loaded model's key is passed on, and analytics is off.
  */
 import { spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -43,6 +46,37 @@ export interface AgentTaskRunnerOptions {
   signal?: AbortSignal;
   /** Test seam for the platform the child is stopped on (`killProcessTree`). */
   platform?: NodeJS.Platform;
+}
+
+/** The `ATOMIC_AGENT_*` variables the child keeps: where a packaged build's assets are. */
+const KEPT_AGENT_VARS = new Set([
+  "ATOMIC_AGENT_GRAMMARS_DIR",
+  "ATOMIC_AGENT_RG_PATH",
+  "ATOMIC_AGENT_TREE_SITTER_DIR",
+  "ATOMIC_AGENT_STARTER_SKILLS_DIR",
+]);
+/** Browser automation settings: the replay must not drive the user's browser. */
+const BROWSER_VAR = /^(PLAYWRIGHT|PUPPETEER)_|(^|_)(CDP|BROWSER|CHROME|CHROMIUM)(_|$)/i;
+
+/**
+ * The child's environment: the parent's without credentials
+ * (`buildCommandEnv`), without `ATOMIC_AGENT_*` settings other than
+ * {@link KEPT_AGENT_VARS}, and without browser variables; then the temp
+ * state dir, the loaded model's key and analytics off.
+ */
+export function fitChildEnv(parent: NodeJS.ProcessEnv, stateDir: string, modelApiKey: string | null): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [name, value] of Object.entries(buildCommandEnv(parent))) {
+    if (name.toUpperCase().startsWith("ATOMIC_AGENT_") && !KEPT_AGENT_VARS.has(name.toUpperCase())) continue;
+    if (BROWSER_VAR.test(name)) continue;
+    env[name] = value;
+  }
+  env.ATOMIC_AGENT_STATE_DIR = stateDir;
+  env.ATOMIC_AGENT_ANALYTICS = "off";
+  env.FORCE_COLOR = "0";
+  env.NO_COLOR = "1";
+  if (modelApiKey) env.ATOMIC_AGENT_LLAMA_API_KEY = modelApiKey;
+  return env;
 }
 
 /** How long a stopped child gets to exit on SIGTERM before SIGKILL. */
@@ -109,9 +143,7 @@ export function createAgentTaskRunner(options: AgentTaskRunnerOptions): (task: F
       // The replay must not carry the user's credentials (GitHub, Composio,
       // providers, mail): the child only talks to the loaded model, whose
       // key is the one passed back in below.
-      const env: NodeJS.ProcessEnv = { ...buildCommandEnv(process.env), ATOMIC_AGENT_STATE_DIR: stateDir, FORCE_COLOR: "0", NO_COLOR: "1" };
-      if (options.modelApiKey) env.ATOMIC_AGENT_LLAMA_API_KEY = options.modelApiKey;
-      else delete env.ATOMIC_AGENT_LLAMA_API_KEY;
+      const env = fitChildEnv(process.env, stateDir, options.modelApiKey);
       const started = Date.now();
       const result = await new Promise<{ code: number | null; stdout: string; stderr: string; timedOut: boolean; stopped: boolean }>((resolve, reject) => {
         const child = spawn(self.cmd, args, { env, stdio: ["pipe", "pipe", "pipe"], ...(process.platform === "win32" ? { windowsHide: true } : {}) });
