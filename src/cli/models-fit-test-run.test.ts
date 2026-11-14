@@ -4,7 +4,7 @@
  * embedding daemon and output.
  */
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -101,7 +101,12 @@ vi.mock("../fit-test/index.js", async (importOriginal) => {
 
 import { runModelsFitTest } from "./models-fit-test-command.js";
 import { modelsCommand } from "./models-command.js";
-import { fitRestoreMarkerLive, processStartToken, releaseSuspendedChatBeforeTui } from "./models-fit-test-restore.js";
+import {
+  fitRestoreMarkerLive,
+  processStartToken,
+  recoverInterruptedFitTest,
+  releaseSuspendedChatBeforeTui,
+} from "./models-fit-test-restore.js";
 
 let stateDir: string;
 let tasksPath: string;
@@ -448,5 +453,42 @@ describe("a restore record whose pid the OS handed to another process", () => {
     const now = Date.now();
     expect(fitRestoreMarkerLive({ ...base, pid: process.ppid, startedAt: now - 7_200_000, deadline: now - 1, processStart: null }, now)).toBe(false);
     expect(fitRestoreMarkerLive({ ...base, pid: process.ppid, startedAt: now - 1000, deadline: now + 60_000, processStart: null }, now)).toBe(true);
+  });
+});
+
+describe("two commands recovering the same killed fit-test at once", () => {
+  const killed = (): Record<string, unknown> => ({
+    pid: deadPid(),
+    startedAt: Date.now(),
+    previous: "qwen-3.5-4b",
+    chatRunning: true,
+    embeddingRunning: false,
+    swapped: true,
+  });
+
+  it("only the one that claims the record puts the model back", async () => {
+    writeMarker(killed());
+    const results = await Promise.all([recoverInterruptedFitTest({ restart: false }), recoverInterruptedFitTest({ restart: false })]);
+    expect(results.filter(Boolean)).toHaveLength(1);
+    expect(callsOf("use")).toEqual(["qwen-3.5-4b"]);
+    expect(callsOf("stop")).toHaveLength(1);
+    expect(readdirSync(getConfig().paths.localModelsDataDir).filter((n) => n.startsWith("fit-test-restore"))).toEqual([]);
+  });
+
+  it("a claim left by a recovery that was itself killed is taken up again", async () => {
+    mkdirSync(getConfig().paths.localModelsDataDir, { recursive: true });
+    const dead = deadPid();
+    writeFileSync(join(getConfig().paths.localModelsDataDir, `fit-test-restore.${dead}.claim`), JSON.stringify(killed()));
+    expect(await recoverInterruptedFitTest({ restart: false })).toBe(true);
+    expect(callsOf("use")).toEqual(["qwen-3.5-4b"]);
+    expect(readdirSync(getConfig().paths.localModelsDataDir).filter((n) => n.startsWith("fit-test-restore"))).toEqual([]);
+  });
+
+  it("a failed recovery hands the record back for the next try", async () => {
+    writeMarker(killed());
+    fake.useThrowsFor = "qwen-3.5-4b";
+    await expect(recoverInterruptedFitTest({ restart: false })).rejects.toThrow(/read-only/);
+    expect(existsSync(markerFile())).toBe(true);
+    expect(readdirSync(getConfig().paths.localModelsDataDir).filter((n) => n.endsWith(".claim"))).toEqual([]);
   });
 });

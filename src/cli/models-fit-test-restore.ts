@@ -15,7 +15,7 @@
  * and removes it.
  */
 import { execFileSync } from "node:child_process";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { getConfig, resetConfigCache } from "../config/index.js";
 import type { LoadedFitModel } from "../fit-test/index.js";
@@ -253,9 +253,13 @@ export function clearFitRestoreMarker(dataDir: string): void {
 
 /** The record, or `null` when there is none or it cannot be read as one. */
 export function readFitRestoreMarker(dataDir: string): FitRestoreMarker | null {
+  return readMarkerFile(fitRestoreMarkerPath(dataDir));
+}
+
+function readMarkerFile(path: string): FitRestoreMarker | null {
   let raw: unknown;
   try {
-    raw = JSON.parse(readFileSync(fitRestoreMarkerPath(dataDir), "utf8"));
+    raw = JSON.parse(readFileSync(path, "utf8"));
   } catch {
     return null;
   }
@@ -305,31 +309,88 @@ export function fitRestoreMarkerLive(marker: FitRestoreMarker, now = Date.now())
   return now < (marker.deadline ?? marker.startedAt + LEGACY_MARKER_MAX_AGE_MS);
 }
 
+/** Where a recovery moves the record while it acts on it: one command at a time. */
+function claimPath(dataDir: string, pid = process.pid): string {
+  return join(dataDir, `fit-test-restore.${pid}.claim`);
+}
+const CLAIM_NAME = /^fit-test-restore\.(\d+)\.claim$/;
+
+/** Moves a claimed record back for the next recovery (unless a newer record took its place). */
+function handBack(dataDir: string, claim: string): void {
+  try {
+    if (existsSync(fitRestoreMarkerPath(dataDir))) rmSync(claim, { force: true });
+    else renameSync(claim, fitRestoreMarkerPath(dataDir));
+  } catch {
+    /* another recovery took it */
+  }
+}
+
+/** A claim whose recovery was itself killed goes back to being the record. */
+function releaseDeadClaims(dataDir: string): void {
+  let names: string[];
+  try {
+    names = readdirSync(dataDir);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    const pid = Number(CLAIM_NAME.exec(name)?.[1] ?? Number.NaN);
+    if (!Number.isInteger(pid) || pid === process.pid || pidAlive(pid)) continue;
+    handBack(dataDir, join(dataDir, name));
+  }
+}
+
 /**
  * Put the models back from a killed fit-test's record, if one is left:
  * the test model stopped (nothing saved), the user's model active again
  * and, unless `restart` is false, started if it was running; the
  * embedding model as it was. Returns whether a record was acted on. A
  * record of a run still going is left alone; a failed restore keeps the
- * record for the next try.
+ * record for the next try. The record is claimed first (renamed to
+ * `fit-test-restore.<pid>.claim`, atomic on one filesystem): of two
+ * commands recovering at once, only the one whose rename succeeds acts.
  */
 export async function recoverInterruptedFitTest(opts: { restart?: boolean } = {}): Promise<boolean> {
   const cfg = getConfig();
   const dataDir = cfg.paths.localModelsDataDir;
-  const marker = readFitRestoreMarker(dataDir);
-  if (marker === null) {
+  releaseDeadClaims(dataDir);
+  const seen = readFitRestoreMarker(dataDir);
+  if (seen === null) {
     // An unreadable record helps nobody: drop it.
     clearFitRestoreMarker(dataDir);
     return false;
   }
-  if (fitRestoreMarkerLive(marker)) return false;
-  if (marker.stateDir !== undefined && resolve(marker.stateDir) !== resolve(cfg.paths.stateDir)) {
+  if (fitRestoreMarkerLive(seen)) return false;
+  if (seen.stateDir !== undefined && resolve(seen.stateDir) !== resolve(cfg.paths.stateDir)) {
     // Its `previous` is another config's model: that config's next command puts it back.
     process.stderr.write(
-      `an interrupted models fit-test of ${marker.stateDir} left a test model active; run an \`atomic-agent models\` command with that state dir to put its model back\n`,
+      `an interrupted models fit-test of ${seen.stateDir} left a test model active; run an \`atomic-agent models\` command with that state dir to put its model back\n`,
     );
     return false;
   }
+  const claim = claimPath(dataDir);
+  try {
+    renameSync(fitRestoreMarkerPath(dataDir), claim);
+  } catch {
+    return false; // another command claimed it first
+  }
+  // What was claimed may be a newer run's record, written since it was read.
+  const marker = readMarkerFile(claim);
+  if (marker === null || fitRestoreMarkerLive(marker)) {
+    handBack(dataDir, claim);
+    return false;
+  }
+  try {
+    await restoreFromMarker(dataDir, marker, opts.restart !== false);
+  } catch (err) {
+    handBack(dataDir, claim);
+    throw err;
+  }
+  rmSync(claim, { force: true });
+  return true;
+}
+
+async function restoreFromMarker(dataDir: string, marker: FitRestoreMarker, restart: boolean): Promise<void> {
   // A test model may serve only once the user's was stopped (`swapped`),
   // and not if the daemon already serves the user's model again (the
   // restore ran and the run was killed before the record went).
@@ -341,12 +402,7 @@ export async function recoverInterruptedFitTest(opts: { restart?: boolean } = {}
       ? "an interrupted models fit-test left a test model active; putting your model back\n"
       : "an interrupted models fit-test left its restore record; checking your model\n",
   );
-  await createFitModelSwitcher(marker, { userCachesSaved: true }).restore(status.running, {
-    restart: opts.restart !== false,
-    swapped,
-  });
-  clearFitRestoreMarker(dataDir);
-  return true;
+  await createFitModelSwitcher(marker, { userCachesSaved: true }).restore(status.running, { restart, swapped });
 }
 
 /**
