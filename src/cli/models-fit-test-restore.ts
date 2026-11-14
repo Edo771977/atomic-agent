@@ -95,13 +95,18 @@ export async function readFitModelSnapshot(): Promise<FitModelSnapshot> {
  * them; a TUI starting beside it relaunches it for that
  * ({@link releaseSuspendedChatBeforeTui}).
  */
-export function createFitModelSwitcher(snapshot: FitModelSnapshot, opts: { userCachesSaved?: boolean } = {}) {
+export function createFitModelSwitcher(
+  snapshot: FitModelSnapshot,
+  opts: { userCachesSaved?: boolean; onSwapped?: () => void } = {},
+) {
   // A holder: the first stop saves the user's caches, no later one does.
   const state = { userCachesSaved: opts.userCachesSaved ?? false };
   const stopChat = async (): Promise<void> => {
     const savePromptCache = !state.userCachesSaved;
     state.userCachesSaved = true;
     await stop(savePromptCache ? { chatOnly: true } : { chatOnly: true, savePromptCache: false });
+    // The user's model is down: from here on a test model may serve.
+    if (savePromptCache) opts.onSwapped?.();
   };
   return {
     /** Makes `modelId` the active managed model and starts it. */
@@ -127,13 +132,19 @@ export function createFitModelSwitcher(snapshot: FitModelSnapshot, opts: { userC
      * if it was running, and the embedding model as it was. After a stop
      * the test model may still be loaded (its release did not run), so
      * it is stopped first. `restart: false` leaves the chat model stopped
-     * (a recovery before `models stop`).
+     * (a recovery before most `models` commands). `swapped: false` (a run
+     * killed before the user's model was stopped) only puts the config
+     * back if it moved; the user's model is never stopped.
      */
-    async restore(stopped: boolean, restoreOpts: { restart?: boolean } = {}): Promise<void> {
-      if (stopped) await stopChat();
+    async restore(stopped: boolean, restoreOpts: { restart?: boolean; swapped?: boolean } = {}): Promise<void> {
+      const swapped = restoreOpts.swapped !== false;
+      if (stopped && swapped) await stopChat();
       if (snapshot.previous !== null) {
-        await use(snapshot.previous);
-        if (snapshot.chatRunning && restoreOpts.restart !== false) await start({ promptCache: "suspend" });
+        resetConfigCache();
+        if (swapped || getConfig().localModels.managed.modelId !== snapshot.previous) await use(snapshot.previous);
+        if (snapshot.chatRunning && restoreOpts.restart !== false && !(await chatDaemonStatus()).running) {
+          await start({ promptCache: "suspend" });
+        }
       }
       const embeddingNow = (await embeddingDaemonStatus().catch(() => ({ running: snapshot.embeddingRunning }))).running;
       if (snapshot.embeddingRunning && !embeddingNow) {
@@ -157,6 +168,12 @@ export interface FitRestoreMarker extends FitModelSnapshot {
   startedAt: number;
   /** The state dir whose config `previous` is (absent: the reader's own). */
   stateDir?: string;
+  /**
+   * The user's model was stopped and a test model may serve. Absent or
+   * false: the run was killed before that, and the recovery must not stop
+   * the daemon (it may be the user's own, still serving).
+   */
+  swapped?: boolean;
 }
 
 /** `dataDir` is the local models data dir (`paths.localModelsDataDir`). */
@@ -172,6 +189,13 @@ export function writeFitRestoreMarker(
   const marker: FitRestoreMarker = { pid: opts.pid ?? process.pid, startedAt: Date.now(), stateDir: opts.stateDir, ...snapshot };
   mkdirSync(dataDir, { recursive: true });
   writeFileSync(fitRestoreMarkerPath(dataDir), `${JSON.stringify(marker)}\n`, { encoding: "utf8", mode: 0o600 });
+}
+
+/** Records that the user's model is down (`swapped`), keeping the rest of the record. */
+export function markFitRestoreSwapped(dataDir: string): void {
+  const marker = readFitRestoreMarker(dataDir);
+  if (marker === null) return;
+  writeFileSync(fitRestoreMarkerPath(dataDir), `${JSON.stringify({ ...marker, swapped: true })}\n`, { encoding: "utf8", mode: 0o600 });
 }
 
 export function clearFitRestoreMarker(dataDir: string): void {
@@ -195,7 +219,8 @@ export function readFitRestoreMarker(dataDir: string): FitRestoreMarker | null {
     !(m.previous === null || typeof m.previous === "string") ||
     typeof m.chatRunning !== "boolean" ||
     typeof m.embeddingRunning !== "boolean" ||
-    !(m.stateDir === undefined || typeof m.stateDir === "string")
+    !(m.stateDir === undefined || typeof m.stateDir === "string") ||
+    !(m.swapped === undefined || typeof m.swapped === "boolean")
   ) {
     return null;
   }
@@ -243,8 +268,21 @@ export async function recoverInterruptedFitTest(opts: { restart?: boolean } = {}
     );
     return false;
   }
-  process.stderr.write("an interrupted models fit-test left a test model active; putting your model back\n");
-  await createFitModelSwitcher(marker, { userCachesSaved: true }).restore(true, { restart: opts.restart !== false });
+  // A test model may serve only once the user's was stopped (`swapped`),
+  // and not if the daemon already serves the user's model again (the
+  // restore ran and the run was killed before the record went).
+  const status = await chatDaemonStatus();
+  const serving = status.running ? (readLaunchRecord(dataDir, status.pid)?.modelId ?? null) : null;
+  const swapped = marker.swapped === true && serving !== marker.previous;
+  process.stderr.write(
+    swapped
+      ? "an interrupted models fit-test left a test model active; putting your model back\n"
+      : "an interrupted models fit-test left its restore record; checking your model\n",
+  );
+  await createFitModelSwitcher(marker, { userCachesSaved: true }).restore(status.running, {
+    restart: opts.restart !== false,
+    swapped,
+  });
   clearFitRestoreMarker(dataDir);
   return true;
 }

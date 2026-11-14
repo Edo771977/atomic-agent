@@ -35,6 +35,7 @@ import {
   clearFitRestoreMarker,
   createFitModelSwitcher,
   fitRestoreMarkerLive,
+  markFitRestoreSwapped,
   readFitModelSnapshot,
   readFitRestoreMarker,
   writeFitRestoreMarker,
@@ -216,7 +217,9 @@ export async function runModelsFitTest(args: string[]): Promise<number> {
   const judgeKey = parsed.judgeKeyEnv ? (process.env[parsed.judgeKeyEnv] ?? null) : null;
   const judge = createFitJudge({ url: parsed.judgeUrl, model: parsed.judgeModel, apiKey: judgeKey });
   const snapshot = await readFitModelSnapshot();
-  const switcher = createFitModelSwitcher(snapshot);
+  const switcher = createFitModelSwitcher(snapshot, {
+    onSwapped: () => markFitRestoreSwapped(cfg.paths.localModelsDataDir),
+  });
   const depsFor = (signal: AbortSignal): FitTestDeps => ({
     loadModel: (modelId) => switcher.load(modelId, signal),
     runTask: (task, model) =>

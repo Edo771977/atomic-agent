@@ -237,12 +237,13 @@ describe("models fit-test restore marker (killed without a signal handler, e.g. 
       seen = existsSync(markerPath()) ? JSON.parse(readFileSync(markerPath(), "utf8")) : null;
     };
     expect(await runModelsFitTest(fitArgs())).toBe(0);
-    expect(seen).toMatchObject({ pid: process.pid, previous: "qwen-3.5-4b", chatRunning: true, embeddingRunning: true });
+    // `swapped`: the user's model was stopped (and its caches saved) before the task ran.
+    expect(seen).toMatchObject({ pid: process.pid, previous: "qwen-3.5-4b", chatRunning: true, embeddingRunning: true, swapped: true });
     expect(existsSync(markerPath())).toBe(false);
   });
 
   it("the next models command puts the user's model back, starts it again and clears the record", async () => {
-    writeMarker({ pid: deadPid(), startedAt: Date.now(), previous: "qwen-3.5-4b", chatRunning: true, embeddingRunning: true });
+    writeMarker({ pid: deadPid(), startedAt: Date.now(), previous: "qwen-3.5-4b", chatRunning: true, embeddingRunning: true, swapped: true });
     // The killed run left a test model serving, beside the embedding model.
     Object.assign(fake, { chat: true, emb: true });
     expect(await modelsCommand(["status"])).toBe(0);
@@ -254,7 +255,7 @@ describe("models fit-test restore marker (killed without a signal handler, e.g. 
   });
 
   it("`models stop` after a killed run puts the model back in config without starting it", async () => {
-    writeMarker({ pid: deadPid(), startedAt: Date.now(), previous: "qwen-3.5-4b", chatRunning: true, embeddingRunning: false });
+    writeMarker({ pid: deadPid(), startedAt: Date.now(), previous: "qwen-3.5-4b", chatRunning: true, embeddingRunning: false, swapped: true });
     Object.assign(fake, { chat: true, emb: false });
     await modelsCommand(["stop"]);
     expect(callsOf("use")).toEqual(["qwen-3.5-4b"]);
@@ -392,5 +393,26 @@ describe("the restore record lives beside the managed daemon", () => {
     expect(callsOf("use")).toEqual([]);
     expect(stderr).toMatch(/another-state-dir/);
     expect(existsSync(markerFile())).toBe(true);
+  });
+});
+
+describe("recovering a fit-test killed before it swapped the model", () => {
+  it("a record without `swapped` never stops the user's model, still running", async () => {
+    // Killed during the first stop: the user's own model may still serve.
+    writeMarker({ pid: deadPid(), startedAt: Date.now(), previous: "qwen-3.5-4b", chatRunning: true, embeddingRunning: false });
+    fake.launch = { modelId: "qwen-3.5-4b", promptCacheFingerprint: "fp" };
+    expect(await modelsCommand(["status"])).toBe(0);
+    expect(fake.calls.map(([name]) => name)).toEqual(["status"]);
+    expect(existsSync(markerFile())).toBe(false);
+  });
+
+  it("a swapped record whose daemon already serves the user's model leaves it running", async () => {
+    // Killed after the restore started the user's model, before the record went.
+    writeMarker({ pid: deadPid(), startedAt: Date.now(), previous: "qwen-3.5-4b", chatRunning: true, embeddingRunning: false, swapped: true });
+    fake.launch = { modelId: "qwen-3.5-4b", promptCacheFingerprint: null };
+    expect(await modelsCommand(["status"])).toBe(0);
+    expect(callsOf("stop")).toEqual([]);
+    expect(callsOf("start")).toEqual([]);
+    expect(existsSync(markerFile())).toBe(false);
   });
 });
