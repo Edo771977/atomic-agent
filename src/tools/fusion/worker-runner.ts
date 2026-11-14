@@ -801,10 +801,20 @@ export async function runWorkerTasks(
           const after = options.acquireTaskPermit === undefined ? undefined :
             stopped() ?? (permit === undefined ? "the turn was stopped" : undefined);
           // A turn that ignores its time limit's abort gives its permit
-          // back after a bounded grace (release is idempotent).
-          const held = permit;
+          // back after a bounded grace (release is idempotent); a later
+          // re-run of the task takes one again first.
+          const acquire = options.acquireTaskPermit;
+          const control: TaskPermitControl | undefined = permit === undefined || acquire === undefined ? undefined : {
+            release: () => permit?.release(),
+            reacquire: async (signal) => {
+              const next = await acquire(signal);
+              if (next === undefined) return false;
+              permit = next;
+              return true;
+            },
+          };
           results[i] = after === undefined
-            ? await runOneTask(deps, options, task, held === undefined ? undefined : () => held.release())
+            ? await runOneTask(deps, options, task, control)
             : notStartedResult(task, after);
         }
       } catch (err) {
@@ -832,11 +842,19 @@ export async function runWorkerTasks(
   return results;
 }
 
+/** A running task's hold on its call-wide permit. */
+interface TaskPermitControl {
+  /** Give the permit back early (idempotent). */
+  release(): void;
+  /** Wait for a permit again; `false` when the wait was aborted. */
+  reacquire(signal: AbortSignal): Promise<boolean>;
+}
+
 async function runOneTask(
   deps: WorkerRunnerDeps,
   options: RunWorkerTasksOptions,
   task: DelegateTask,
-  releasePermitIfHung?: () => void,
+  permitControl?: TaskPermitControl,
 ): Promise<WorkerTaskResult> {
   const startedAt = Date.now();
   // Branch isolation (ATO-946): the task's own workspace stands in for
@@ -1173,13 +1191,21 @@ async function runOneTask(
   const timeLimitController = new AbortController();
   const timeLimit = timeLimitController.signal;
   let permitGraceTimer: ReturnType<typeof setTimeout> | undefined;
+  // Set once a grace gave the permit back: a re-run must take one again.
+  let permitReleasedByGrace = false;
+  /** Give the permit back after the grace unless `isSettled()` by then. */
+  const armPermitGrace = (isSettled: () => boolean): ReturnType<typeof setTimeout> | undefined => {
+    if (permitControl === undefined || permitReleasedByGrace || isSettled()) return undefined;
+    const timer = setTimeout(() => {
+      if (isSettled()) return;
+      permitReleasedByGrace = true;
+      permitControl.release();
+    }, TASK_PERMIT_RELEASE_GRACE_MS);
+    timer.unref?.();
+    return timer;
+  };
   const abortForTime = (): void => {
-    if (releasePermitIfHung !== undefined && permitGraceTimer === undefined && !settled) {
-      permitGraceTimer = setTimeout(() => {
-        if (!settled) releasePermitIfHung();
-      }, TASK_PERMIT_RELEASE_GRACE_MS);
-      permitGraceTimer.unref?.();
-    }
+    if (permitGraceTimer === undefined) permitGraceTimer = armPermitGrace(() => settled);
     timeLimitController.abort(
       new DOMException(
         "The operation was aborted due to timeout",
@@ -1875,13 +1901,23 @@ async function runOneTask(
   // escalation model, with what the local worker found, under the
   // per-escalation cap and the turn's own (ATO-942).
   const pricing = options.escalation?.pricing;
-  if (
+  let replaceAllowed =
     replaceRequested &&
     target !== undefined &&
     pricing !== undefined &&
     !options.signal.aborted &&
-    !stopByPerson.signal.aborted
-  ) {
+    !stopByPerson.signal.aborted;
+  // The local attempt's grace gave its permit to another task: the re-run
+  // waits for one like any queued task rather than exceed the ceiling.
+  if (replaceAllowed && permitReleasedByGrace && permitControl !== undefined) {
+    if (await permitControl.reacquire(AbortSignal.any([options.signal, stopByPerson.signal]))) {
+      permitReleasedByGrace = false;
+    } else {
+      replaceAllowed = false;
+      escalationNotes.push(`re-run on ${targetLabel} not started: the turn was stopped while it waited for a worker slot`);
+    }
+  }
+  if (replaceAllowed && target !== undefined && pricing !== undefined) {
     const replaceSession = deps.createEphemeralSession(
       { parentSessionId: options.parentSessionId, taskId: task.id },
       workingDir,
@@ -1895,6 +1931,13 @@ async function runOneTask(
       timeoutMs,
     );
     replaceTimer.unref?.();
+    // A re-run that ignores its own time limit (or cap) gives its permit
+    // back after the same grace as the local attempt.
+    let replaceSettled = false;
+    let replaceGraceTimer: ReturnType<typeof setTimeout> | undefined;
+    capAbort.signal.addEventListener("abort", () => {
+      replaceGraceTimer = armPermitGrace(() => replaceSettled);
+    }, { once: true });
     let replaceSpent = 0;
     const unregisterReplace = deps.liveWorkers?.register(
       options.parentSessionId,
@@ -1999,7 +2042,9 @@ async function runOneTask(
         error: error instanceof Error ? error.message : String(error),
       });
     } finally {
+      replaceSettled = true;
       clearTimeout(replaceTimer);
+      clearTimeout(replaceGraceTimer);
       unregisterReplace?.();
       disarmWorkerSession(replaceSession.id);
     }

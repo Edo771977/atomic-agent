@@ -1,12 +1,13 @@
 import { lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, relative, sep } from "node:path";
+import { dirname, join, relative, sep } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 import { runIsolatedWave } from "./branch-merge.js";
 import { createBranchSet } from "./branch-workspace.js";
 import { createCandidateIntegration } from "./candidate-integration.js";
 import type { DelegateTask } from "./delegate-args.js";
 import type { WorkerTaskResult } from "./worker-result.js";
+import { makeGitRepo, runGitRaw, writeRepoFile } from "../os/git/test-helpers.js";
 
 // Simulated Windows link policy: `deny` names the error for one
 // (target, type) pair; a "junction" here is a plain link on POSIX.
@@ -39,7 +40,8 @@ async function project(): Promise<string> {
   return root;
 }
 const inside = (path: string, root: string): boolean => { const rel = relative(root, path); return rel === "" || (!rel.startsWith("..") && !rel.startsWith(sep)); };
-const noDirSymlinks = (_target: string, type: string | undefined): string | undefined => type === "dir" ? "EPERM" : undefined;
+// Windows without the symlink privilege: every symlink (typed or not) is denied; junctions work.
+const noDirSymlinks = (_target: string, type: string | undefined): string | undefined => type === "junction" ? undefined : "EPERM";
 const task = (id: string): DelegateTask => ({ id, title: id, instructions: "edit input.txt" });
 const row = (id: string): WorkerTaskResult => ({ id, title: id, status: "ok", reply: "done", stepCount: 1, durationMs: 1, tools: { calls: 1, errors: 0, writes: 1, byTool: {} } });
 
@@ -60,7 +62,7 @@ it("shares dependency directories through a junction when directory symlinks are
 
 it("copies dependencies once and links task directories to the base copy when the original cannot be linked", async () => {
   // Junctions cannot reach the original (e.g. a network share) but work locally.
-  links.deny = (target, type) => type === "dir" || inside(target, roots[0]!) ? "EPERM" : undefined;
+  links.deny = (target, type) => type !== "junction" || inside(target, roots[0]!) ? "EPERM" : undefined;
   const root = await project();
   const set = await createBranchSet(root, ["a", "b", "c"], { git: async () => null, maxCopyBytes: DEP_BYTES + 200 });
   expect(set).not.toBeNull();
@@ -97,6 +99,32 @@ it("keeps the plain size reason when no dependency folder had to be copied", asy
   const reasons: string[] = [];
   expect(await createBranchSet(root, ["a"], { git: async () => null, maxCopyBytes: 10, onRefusal: reason => reasons.push(reason) })).toBeNull();
   expect(reasons).toEqual(["the folder is too large to copy"]);
+});
+
+it("blames the source tree, not unlinkable dependencies, when the limit would not hold without them", async () => {
+  links.deny = () => "EPERM";
+  const root = await project();
+  await writeFile(join(root, "big.bin"), "b".repeat(5 * DEP_BYTES));
+  const reasons: string[] = [];
+  // The base fits (dependencies included); the task's copy of big.bin alone cannot.
+  expect(await createBranchSet(root, ["a"], { git: async () => null, maxCopyBytes: 8 * DEP_BYTES, onRefusal: reason => reasons.push(reason) })).toBeNull();
+  expect(reasons).toEqual(["the folder is too large to copy"]);
+});
+
+it("names the size reason when a candidate cannot be staged", async () => {
+  const root = await project();
+  await writeFile(join(root, "big.bin"), "b".repeat(5 * DEP_BYTES));
+  await expect(createCandidateIntegration(root, { git: async () => null, maxCopyBytes: 3 * DEP_BYTES })).rejects.toThrow(
+    "candidate workspace unavailable: the folder is too large to copy",
+  );
+});
+
+it("names the candidate's private dependency copy when only it overflows the limit", async () => {
+  const root = await project();
+  // The base links the dependencies; the candidate's own copy of them cannot fit.
+  await expect(createCandidateIntegration(root, { git: async () => null, maxCopyBytes: DEP_BYTES / 2 })).rejects.toThrow(
+    `candidate workspace unavailable: the candidate's private copy of the dependency folders exceeds the copy limit (${DEP_BYTES / 2} bytes)`,
+  );
 });
 
 it("copies a candidate's dependency directory from the original only once when nothing can be linked", async () => {
@@ -178,4 +206,69 @@ it("names the link a candidate cannot recreate when no link kind is available", 
     `cannot recreate the link ${join("node_modules", "@s", "pkg")} in a private workspace`,
   );
   expect(await readFile(join(root, "packages", "pkg", "index.js"), "utf8")).toBe("original package\n");
+});
+
+/** A monorepo `<top>` whose working directory is `packages/app`, linking `node_modules/lib` to the sibling package. */
+async function monorepo(link: (top: string, app: string) => string, commit = true): Promise<{ top: string; app: string }> {
+  const top = await realpath(await makeGitRepo("atag-dep-mono-")); roots.push(top);
+  await writeRepoFile(top, ".gitignore", "node_modules/\n");
+  await writeRepoFile(top, "packages/app/input.txt", "original input\n");
+  await writeRepoFile(top, "packages/lib/index.js", "original lib\n");
+  if (commit) { await runGitRaw(top, ["add", "-A"]); await runGitRaw(top, ["commit", "-qm", "fixture"]); }
+  const app = join(top, "packages", "app");
+  await mkdir(join(app, "node_modules"), { recursive: true });
+  await symlink(link(top, app), join(app, "node_modules", "lib"), "dir");
+  return { top, app };
+}
+
+it.each([
+  ["absolute", (top: string) => join(top, "packages", "lib")],
+  ["relative", () => join("..", "..", "lib")],
+] as const)("points a worktree candidate's %s dependency link into the repository at the candidate's worktree", async (_label, target) => {
+  const { top, app } = await monorepo(target);
+  const candidate = await createCandidateIntegration(app, {});
+  try {
+    const link = join(candidate.dir, "node_modules", "lib");
+    const worktreeRoot = dirname(dirname(await realpath(candidate.dir)));
+    expect(await realpath(link)).toBe(join(worktreeRoot, "packages", "lib"));
+    await writeFile(join(link, "index.js"), "candidate wrote\n");
+    expect(await readFile(join(top, "packages", "lib", "index.js"), "utf8")).toBe("original lib\n");
+    expect((await candidate.reject("test")).status).toBe("rejected");
+  } finally { await candidate.cleanup(); }
+});
+
+it("refuses a folder-copy candidate whose dependency link points into the repository outside the copied folder", async () => {
+  // No commit yet: Git cannot snapshot, so only the working directory is copied.
+  const { top, app } = await monorepo(top => join(top, "packages", "lib"), false);
+  await expect(createCandidateIntegration(app, {})).rejects.toThrow(
+    `the dependency link ${join("node_modules", "lib")} points into the repository outside the working directory`,
+  );
+  expect(await readFile(join(top, "packages", "lib", "index.js"), "utf8")).toBe("original lib\n");
+});
+
+it("recreates a relative dependency link leaving the project as its absolute original target", async () => {
+  const holder = await realpath(await mkdtemp(join(tmpdir(), "atag-dep-holder-"))); roots.push(holder);
+  const root = join(holder, "proj");
+  await mkdir(join(root, "node_modules"), { recursive: true });
+  await mkdir(join(holder, "shared-lib"));
+  await writeFile(join(holder, "shared-lib", "index.js"), "lib");
+  await writeFile(join(root, "input.txt"), "original input\n");
+  await symlink(join("..", "..", "shared-lib"), join(root, "node_modules", "lib"), "dir");
+  await symlink(join("..", "node_modules", "own"), join(root, "node_modules", "alias"), "dir");
+  await mkdir(join(root, "node_modules", "own"));
+  for (const make of [
+    async () => { const c = await createCandidateIntegration(root, { git: async () => null }); return { dir: c.dir, done: () => c.cleanup() }; },
+    // The original cannot be linked, so the base copies node_modules and the task links to that copy.
+    async () => { links.deny = (target, type) => type !== "junction" || inside(target, root) ? "EPERM" : undefined; const s = await createBranchSet(root, ["a"], { git: async () => null }); return { dir: s!.workspaces.get("a")!.dir, done: () => s!.cleanup() }; },
+  ]) {
+    const made = await make();
+    try {
+      const nm = join(made.dir, "node_modules");
+      expect(await readlink(join(nm, "lib"))).toBe(join(holder, "shared-lib"));
+      expect(await readFile(join(nm, "lib", "index.js"), "utf8")).toBe("lib");
+      expect(await realpath(join(nm, "alias"))).toBe(await realpath(join(nm, "own")));
+      // A relative link that stays inside is kept relative (a junction is always absolute).
+      if (links.calls.some((call) => call.path === join(nm, "alias") && call.type === undefined)) expect(await readlink(join(nm, "alias"))).toBe(join("..", "node_modules", "own"));
+    } finally { await made.done(); links.deny = () => undefined; }
+  }
 });
