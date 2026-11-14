@@ -261,6 +261,15 @@ export const LOCAL_WORKER_FIRST_TOKEN_FLOOR_MS = 120_000;
  */
 export const QUEUE_SLOT_PROBE_TIMEOUT_MS = 5_000;
 
+/**
+ * How long a task whose time limit fired may keep its call-wide permit
+ * while its turn has not settled. A turn that ignores its abort would
+ * otherwise hold one of the call's `maxWorkers` permits forever and
+ * starve every queued task on every leg; past this grace the permit
+ * goes to the next task, and the row still reports when the turn ends.
+ */
+export const TASK_PERMIT_RELEASE_GRACE_MS = 5_000;
+
 /** The floor of a local worker's task budget, never above the configured one. */
 export function localTaskBudgetFloorMs(configuredMs: number): number {
   return Math.min(LOCAL_WORKER_TASK_BUDGET_FLOOR_MS, configuredMs);
@@ -778,8 +787,11 @@ export async function runWorkerTasks(
           // before minting a session, arming clocks or taking any action.
           const after = options.acquireTaskPermit === undefined ? undefined :
             stopped() ?? (permit === undefined ? "the turn was stopped" : undefined);
+          // A turn that ignores its time limit's abort gives its permit
+          // back after a bounded grace (release is idempotent).
+          const held = permit;
           results[i] = after === undefined
-            ? await runOneTask(deps, options, task)
+            ? await runOneTask(deps, options, task, held === undefined ? undefined : () => held.release())
             : notStartedResult(task, after);
         }
       } catch (err) {
@@ -811,6 +823,7 @@ async function runOneTask(
   deps: WorkerRunnerDeps,
   options: RunWorkerTasksOptions,
   task: DelegateTask,
+  releasePermitIfHung?: () => void,
 ): Promise<WorkerTaskResult> {
   const startedAt = Date.now();
   // Branch isolation (ATO-946): the task's own workspace stands in for
@@ -1146,7 +1159,14 @@ async function runOneTask(
   // that token has arrived.
   const timeLimitController = new AbortController();
   const timeLimit = timeLimitController.signal;
+  let permitGraceTimer: ReturnType<typeof setTimeout> | undefined;
   const abortForTime = (): void => {
+    if (releasePermitIfHung !== undefined && permitGraceTimer === undefined && !settled) {
+      permitGraceTimer = setTimeout(() => {
+        if (!settled) releasePermitIfHung();
+      }, TASK_PERMIT_RELEASE_GRACE_MS);
+      permitGraceTimer.unref?.();
+    }
     timeLimitController.abort(
       new DOMException(
         "The operation was aborted due to timeout",
@@ -1806,6 +1826,7 @@ async function runOneTask(
     });
   } finally {
     settled = true;
+    clearTimeout(permitGraceTimer);
     unregisterLive?.();
     clearTimeout(queueTimer);
     if (wallTimer !== undefined) clearTimeout(wallTimer);
