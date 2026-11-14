@@ -167,3 +167,29 @@ it("plans and restores an original directory deleted after its child, then repea
   const repeated = await run(f.project, f.journal, ["--rollback"]); expect(repeated.code, repeated.stderr).toBe(0);
   expect(await readFile(join(f.project, "gone", "a.txt"), "utf8")).toBe("later user edit\n");
 });
+
+it.each(["rolled-back", "not-applied"])("does not revisit terminal step %s during a later conflict retry", async status => {
+  const f = await fixture();
+  const value = { ...f.value, state: "rolled-back-with-conflicts", steps: [
+    { ...f.value.steps[0], status },
+    { ...f.value.steps[0], path: "other.txt", status: "rollback-conflict" },
+  ] };
+  // The first path is a later user edit that happens to match promoted bytes.
+  await writeFile(join(f.project, "other.txt"), "user conflict\n"); await writeFile(f.journal, JSON.stringify(value));
+  const result = await run(f.project, f.journal, ["--rollback"]);
+  expect(result.code).toBe(1);
+  expect(await readFile(join(f.project, "output.txt"), "utf8")).toBe("promoted\n");
+  expect(await readFile(join(f.project, "other.txt"), "utf8")).toBe("user conflict\n");
+});
+
+it("retains an unattested partial staging file while restoring its verified target with a fresh temp", async () => {
+  const f = await fixture(), temp = ".atag-candidate-0123456789abcdef";
+  const value = { ...f.value, steps: [{ ...f.value.steps[0], temp, tempEntry: f.value.steps[0]!.promoted }] };
+  await writeFile(join(f.project, temp), "partial or later user staging edit\n"); await writeFile(f.journal, JSON.stringify(value));
+  const preview = await run(f.project, f.journal, ["--dry-run"]);
+  expect(preview.code, preview.stderr).toBe(0); expect(JSON.parse(preview.stdout).retainedStaging).toContain(temp);
+  const restored = await run(f.project, f.journal, ["--rollback"]);
+  expect(restored.code, restored.stderr).toBe(0); expect(JSON.parse(restored.stdout).retainedStaging).toContain(temp);
+  expect(await readFile(join(f.project, "output.txt"), "utf8")).toBe("original\n");
+  expect(await readFile(join(f.project, temp), "utf8")).toBe("partial or later user staging edit\n");
+});

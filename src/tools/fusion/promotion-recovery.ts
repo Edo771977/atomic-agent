@@ -14,10 +14,11 @@ export interface PromotionJournalStep {
 export interface PromotionJournal {
   version: 2; candidate: string; project: string; startedAt: string; ownerPid: number | null;
   checkedWorkspace?: string; recovery?: string;
+  retainedStaging?: string[];
   state: "promoting" | "committed" | "rolling-back" | "rolled-back-with-conflicts" | "rolled-back";
   steps: PromotionJournalStep[];
 }
-export interface RecoveryResult { state: PromotionJournal["state"]; mode: "status" | "dry-run" | "rollback"; ownerAlive: boolean; restored: string[]; planned: string[]; conflicts: string[]; steps: number }
+export interface RecoveryResult { state: PromotionJournal["state"]; mode: "status" | "dry-run" | "rollback"; ownerAlive: boolean; restored: string[]; planned: string[]; retainedStaging: string[]; conflicts: string[]; steps: number }
 const JOURNAL_BYTES = 8 * 1024 * 1024, MAX_STEPS = 100_000, MAX_FILE_BYTES = 2 * 1024 * 1024 * 1024;
 const digest = (data: Buffer | string) => createHash("sha256").update(data).digest("hex");
 const record = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
@@ -41,7 +42,7 @@ function entry(value: unknown): value is JournalEntry | null {
 export function parsePromotionJournal(raw: string): PromotionJournal {
   let value: unknown; try { value = JSON.parse(raw); } catch { return fail("invalid journal JSON"); }
   if (!record(value) || value.version !== 2) return fail("unsupported journal version (old or incomplete journals require manual inspection)");
-  if (Object.keys(value).some(key => !["version", "candidate", "project", "startedAt", "ownerPid", "checkedWorkspace", "recovery", "state", "steps"].includes(key))) return fail("unknown journal field");
+  if (Object.keys(value).some(key => !["version", "candidate", "project", "startedAt", "ownerPid", "checkedWorkspace", "recovery", "retainedStaging", "state", "steps"].includes(key))) return fail("unknown journal field");
   if (typeof value.candidate !== "string" || !/^candidate-[a-f0-9]{12}$/.test(value.candidate) || typeof value.project !== "string" || typeof value.startedAt !== "string" || !Number.isFinite(Date.parse(value.startedAt)) ||
       !(value.ownerPid === null || (Number.isSafeInteger(value.ownerPid) && (value.ownerPid as number) > 0)) ||
       !allowed(value.state, ["promoting", "committed", "rolling-back", "rolled-back-with-conflicts", "rolled-back"]) || !Array.isArray(value.steps) || value.steps.length > MAX_STEPS ||
@@ -63,6 +64,7 @@ export function parsePromotionJournal(raw: string): PromotionJournal {
       if (!safePath(step.temp) || dirname(step.temp) !== dirname(step.path) || !/^\.atag-candidate-[a-f0-9]{16}$/.test(basename(step.temp)) || !entry(step.tempEntry) || step.tempEntry === null || step.tempEntry.kind === "directory") return fail("invalid staging path or identity");
     } else if (step.tempEntry !== undefined) return fail("staging identity without path");
   }
+  if (value.retainedStaging !== undefined && (!Array.isArray(value.retainedStaging) || value.retainedStaging.length > MAX_STEPS || value.retainedStaging.some(path => !safePath(path) || !/^\.atag-candidate-[a-f0-9]{16}$/.test(basename(path)) || !value.steps.some(step => record(step) && typeof step.path === "string" && dirname(step.path) === dirname(path))))) return fail("invalid retained staging paths");
   return value as unknown as PromotionJournal;
 }
 function alive(pid: number | null): boolean {
@@ -148,7 +150,7 @@ export async function recoverPromotion(input: { project: string; journal: string
   await parents(root, rel);
   let loaded = await regularBytes(file, JOURNAL_BYTES), journal = parsePromotionJournal(loaded.bytes.toString("utf8"));
   if (journal.project !== root || basename(file) !== `${journal.candidate}.promotion.json`) return fail("journal project or name does not match selected project");
-  const result: RecoveryResult = { state: journal.state, mode, ownerAlive: alive(journal.ownerPid), restored: [], planned: [], conflicts: [], steps: journal.steps.length };
+  const result: RecoveryResult = { state: journal.state, mode, ownerAlive: alive(journal.ownerPid), restored: [], planned: [], retainedStaging: [...(journal.retainedStaging ?? [])], conflicts: [], steps: journal.steps.length };
   // A completed recovery is a receipt. Later user edits must never restart it.
   if (journal.state === "rolled-back") return result;
   const missingDirectories = new Set(journal.steps.filter(step =>
@@ -156,6 +158,7 @@ export async function recoverPromotion(input: { project: string; journal: string
   // Preflight every backup and live parent before any mutation (including lock creation).
   for (const step of journal.steps) {
     signal.throwIfAborted();
+    if (step.status === "rolled-back" || step.status === "not-applied") continue;
     await parents(root, step.path, missingDirectories);
     if (step.backup !== undefined) {
       const backup = join(dirname(file), step.backup); await parents(root, relative(root, backup));
@@ -165,7 +168,12 @@ export async function recoverPromotion(input: { project: string; journal: string
   }
   if (mode !== "rollback") {
     if (mode === "dry-run" && journal.state !== "committed") for (const step of [...journal.steps].reverse()) {
+      if (step.status === "rolled-back" || step.status === "not-applied") continue;
       signal.throwIfAborted(); const current = await observed(root, step.path, missingDirectories, signal);
+      if (step.temp !== undefined) {
+        const staged = await observed(root, step.temp, missingDirectories, signal);
+        if (staged.entry !== null && !equal(staged.entry, step.tempEntry!)) result.retainedStaging.push(step.temp);
+      }
       if (equal(current.entry, step.original)) continue;
       if (equal(current.entry, step.promoted)) result.planned.push(step.path); else result.conflicts.push(step.path);
     }
@@ -197,8 +205,19 @@ export async function recoverPromotion(input: { project: string; journal: string
       renameWithRetrySync(temporary, file); syncDirectoryBestEffort(dirname(file)); loaded = await regularBytes(file, JOURNAL_BYTES);
     };
     journal.state = "rolling-back"; journal.ownerPid = process.pid; await persist();
+    const settleTemp = async (step: PromotionJournalStep): Promise<void> => {
+      if (step.temp === undefined) return;
+      try { await cleanTemp(root, step, missingDirectories); }
+      catch {
+        // A partial copy or later user edit is not owned just because its
+        // random name appears in our journal. Preserve it and use a new temp.
+        if (!result.retainedStaging.includes(step.temp)) result.retainedStaging.push(step.temp);
+        journal.retainedStaging = [...result.retainedStaging];
+      }
+    };
     for (const step of [...journal.steps].reverse()) {
       signal.throwIfAborted();
+      if (step.status === "rolled-back" || step.status === "not-applied") continue;
       try {
         let current = await observed(root, step.path, missingDirectories, signal);
         if (equal(current.entry, step.original)) {
@@ -216,7 +235,7 @@ export async function recoverPromotion(input: { project: string; journal: string
           } else {
             const temp = join(dirname(step.path), `.atag-candidate-${randomBytes(8).toString("hex")}`).replaceAll("\\", "/");
             // Preserve a previous staging path until its identity has been checked below.
-            if (step.temp !== undefined) await cleanTemp(root, step, missingDirectories);
+            await settleTemp(step);
             step.temp = temp; step.tempEntry = original; await persist();
             const absolute = join(root, temp);
             if (original.kind === "symlink") await symlink(original.linkTarget!, absolute);
@@ -235,7 +254,7 @@ export async function recoverPromotion(input: { project: string; journal: string
           if (!equal(current.entry, original)) return fail(`restored entry changed: ${step.path}`);
           step.status = "rolled-back"; result.restored.push(step.path);
         }
-        if (step.temp !== undefined) await cleanTemp(root, step, missingDirectories);
+        await settleTemp(step);
       } catch { step.status = "rollback-conflict"; if (!result.conflicts.includes(step.path)) result.conflicts.push(step.path); }
       await persist();
     }

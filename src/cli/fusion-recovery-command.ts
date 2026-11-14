@@ -19,7 +19,7 @@ export async function fusionRecoveryCommand(args: string[], io: { stdout(text: s
   } catch (error) { io.stderr(`fusion recover: ${(error as Error).message}\n`); return 2; }
   try {
     const result = await recoverPromotion({ project: project!, journal: journal!, mode });
-    io.stdout(json ? `${JSON.stringify(result)}\n` : `Fusion recovery: ${result.state} (${mode}); ${result.restored.length} restored, ${result.conflicts.length} conflicts${result.ownerAlive ? "; owner still alive" : ""}\n${result.conflicts.map(path => `  preserved: ${path}\n`).join("")}`);
+    io.stdout(json ? `${JSON.stringify(result)}\n` : `Fusion recovery: ${result.state} (${mode}); ${result.planned.length} planned, ${result.restored.length} restored, ${result.conflicts.length} conflicts, ${result.retainedStaging.length} staging files retained${result.ownerAlive ? "; owner still alive" : ""}\n${result.conflicts.map(path => `  preserved: ${path}\n`).join("")}${result.retainedStaging.map(path => `  retained staging: ${path}\n`).join("")}`);
     return result.conflicts.length === 0 ? 0 : 1;
   } catch (error) { io.stderr(`fusion recover failed: ${error instanceof Error ? error.message : String(error)}\n`); return 1; }
 }
