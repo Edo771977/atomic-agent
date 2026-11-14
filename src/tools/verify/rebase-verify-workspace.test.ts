@@ -17,7 +17,11 @@ it("rebases a project root terminated by a shell or template delimiter", () => {
   expect(rebaseVerifyWorkspaceValue(`const root = \`${source}\`;`, source, execution)).toBe(`const root = \`${execution}\`;`);
 });
 it("refuses escaped Windows project references instead of reading the source outside the guarded copy", () => {
-  expect(() => rebaseVerifyWorkspaceValue({ args: [String.raw`C:\\project\\check.mjs`] }, String.raw`C:\project`, String.raw`C:\actual`)).toThrow(/unsupported absolute project reference/);
+  expect(() => rebaseVerifyWorkspaceValue({ args: [String.raw`C:\\project\\check.mjs`] }, String.raw`C:\project`, String.raw`C:\actual`, "win32")).toThrow(/unsupported absolute project reference/);
+});
+it("preserves a non-source Windows escaped literal under Linux path semantics", () => {
+  const value = { args: [String.raw`C:\\project\\check.mjs`] };
+  expect(rebaseVerifyWorkspaceValue(value, String.raw`C:\project`, String.raw`C:\actual`, "linux")).toEqual(value);
 });
 it("preserves case-distinct external paths on Linux", () => {
   expect(rebaseVerifyWorkspaceValue("/TMP/project/check.mjs", "/tmp/project", "/tmp/actual", "linux")).toBe("/TMP/project/check.mjs");
