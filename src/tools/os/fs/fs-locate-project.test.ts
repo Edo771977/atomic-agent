@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, mkdir, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, parse } from "node:path";
 import { resourceClassFor } from "../../../agent/tool-resource-class.js";
 import {
   getToolDescriptorByName,
@@ -18,10 +18,9 @@ describe("os.fs.locate_project", () => {
     // realpath so expectations survive symlinked tmp dirs
     // (macOS /var -> /private/var) now that candidates are canonicalized.
     temporaryRoot = await realpath(await mkdtemp(join(tmpdir(), "locate-project-api-")));
-    // A random temp basename can itself contain the searched segment
-    // (for example "api"), legitimately adding a third candidate. Keep
-    // the context's basename stable; the parent deliberately contains
-    // that segment to cover the original fixture collision every run.
+    // The parent deliberately contains "api" to cover the original
+    // random-name collision every run. Configured-root-only assertions
+    // below use a neutral cwd: the search includes every cwd ancestor.
     base = join(temporaryRoot, "workspace");
     await mkdir(base);
   });
@@ -37,7 +36,7 @@ describe("os.fs.locate_project", () => {
     await mkdir(join(rootB, "api"), { recursive: true });
 
     const tool = makeTool({ projectRoots: [rootA, rootB] });
-    const res = await tool.run({ name: "api" }, makeCtx(base));
+    const res = await tool.run({ name: "api" }, makeCtx(parse(base).root));
 
     expect(res.status).toBe("ok");
     expect(res.details?.found).toBe(false);
@@ -59,7 +58,7 @@ describe("os.fs.locate_project", () => {
     await mkdir(join(rootB, "api"), { recursive: true });
 
     const tool = makeTool({ projectRoots: [rootA, rootB] });
-    const res = await tool.run({ name: "api", limit: 1 }, makeCtx(base));
+    const res = await tool.run({ name: "api", limit: 1 }, makeCtx(parse(base).root));
 
     expect(res.details?.ambiguous).toBe(true);
     expect(res.details?.found).toBe(false);
