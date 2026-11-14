@@ -76,6 +76,8 @@ describe("createVerifyWorkspace", () => {
     expect(ws).toMatchObject({ isolated: false, method: "unavailable" });
     expect(ws.dir).not.toBe(work);
     expect(ws.error).toContain("copy limit");
+    // The refusal says how to get past it.
+    expect(ws.error).toContain("tools.verify.maxCopyBytes");
     await ws.cleanup();
     expect(await readdir(work)).toContain("index.html");
   });

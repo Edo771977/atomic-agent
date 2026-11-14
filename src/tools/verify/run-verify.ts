@@ -49,10 +49,19 @@ export interface VerifyRunResult {
   readonly summary: string;
 }
 
+/**
+ * What `verify.run` reads from the config: browser settings for page
+ * runs and the workspace copy limit (`tools.verify.maxCopyBytes`, the
+ * built-in 2 GiB when absent). A full `AtomicAgentConfig` fits.
+ */
+export type VerifyRunConfig = Pick<AtomicAgentConfig, "browser"> & {
+  readonly tools?: { readonly verify?: { readonly maxCopyBytes?: number } };
+};
+
 export interface VerifyRunContext {
   readonly workingDir: string;
-  /** Browser settings for page runs; `getConfig().browser` when omitted. */
-  readonly config?: Pick<AtomicAgentConfig, "browser">;
+  /** Browser settings and copy limit; `getConfig().browser` for page runs when omitted. */
+  readonly config?: VerifyRunConfig;
   readonly signal?: AbortSignal;
   /** Test seams. */
   readonly launchBrowser?: BrowserLauncher;
@@ -182,7 +191,8 @@ export async function runVerify(
   let workspace: VerifyWorkspace | undefined;
   let result: VerifyRunResult;
   try {
-    workspace = await (ctx.workspace ?? createVerifyWorkspace)(ctx.workingDir);
+    const maxBytes = ctx.config?.tools?.verify?.maxCopyBytes;
+    workspace = await (ctx.workspace ?? ((dir: string) => createVerifyWorkspace(dir, maxBytes === undefined ? {} : { maxBytes })))(ctx.workingDir);
     if (ctx.signal?.aborted) {
       result = failed("verification cancelled before execution", "cancelled", workspace.isolated);
     } else if (!workspace.isolated || resolve(workspace.dir) === resolve(ctx.workingDir)) {

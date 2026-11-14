@@ -9,8 +9,9 @@
  * macOS: `cp -c -R` (clonefile) — instant on APFS whatever the size, so
  * nothing is excluded. Elsewhere: a plain copy with `node_modules`,
  * `.git`, `dist`, `build`, `target`, `.venv` left out and symlinked into
- * the copy instead; a tree over 2 GB (those excluded) is not copied at
- * all — verification is refused rather than run in the original.
+ * the copy instead; a tree over the copy limit (those excluded; 2 GiB,
+ * `tools.verify.maxCopyBytes`) is not copied at all — verification is
+ * refused rather than run in the original.
  * On the copy path the symlinked `.git` is the real one: a command that
  * commits inside the copy commits for real.
  *
@@ -211,7 +212,7 @@ export async function createVerifyWorkspace(
   }
   const limit = options.maxBytes ?? VERIFY_COPY_MAX_BYTES;
   if ((await measureTree(workingDir, limit)) > limit) {
-    return { dir: dest, isolated: false, method: "unavailable", error: `workspace exceeds the ${limit}-byte copy limit`, cleanup };
+    return { dir: dest, isolated: false, method: "unavailable", error: `workspace exceeds the ${limit}-byte copy limit (${[...VERIFY_COPY_EXCLUDED].join(", ")} not counted); raise \`tools.verify.maxCopyBytes\` in the config, or move large generated files into one of those directories`, cleanup };
   }
   try {
     await copyTreeWithExclusions(workingDir, dest, { platform, ...(options.symlink === undefined ? {} : { symlink: options.symlink }) });

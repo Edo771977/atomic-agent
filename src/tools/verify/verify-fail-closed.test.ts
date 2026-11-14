@@ -44,6 +44,19 @@ describe("verify refuses to execute without a private workspace", () => {
     expect(await readFile(join(dir, "original.txt"), "utf8")).toBe("original");
   });
 
+  it("honours tools.verify.maxCopyBytes from the config for the default workspace", async () => {
+    const runner = vi.spyOn(commands, "runCommandKind");
+    const tiny = { ...config, tools: { verify: { maxCopyBytes: 1 } } };
+    const refused = await runVerify(spec, { workingDir: dir, config: tiny });
+    expect(refused).toMatchObject({ ok: false, errorCode: "workspace-unavailable" });
+    expect(refused.summary).toContain("tools.verify.maxCopyBytes");
+    expect(runner).not.toHaveBeenCalled();
+    const roomy = { ...config, tools: { verify: { maxCopyBytes: 1_000_000 } } };
+    const ran = await runVerify(spec, { workingDir: dir, config: roomy });
+    expect(ran).toMatchObject({ ok: true, isolated: true });
+    expect(await readFile(join(dir, "original.txt"), "utf8")).toBe("original");
+  });
+
   it("copy errors return a failed check without running in the original", async () => {
     const runner = vi.spyOn(commands, "runCommandKind");
     const tmpRoot = join(dir, "not-a-directory");
