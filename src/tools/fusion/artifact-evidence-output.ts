@@ -2,11 +2,15 @@ import { posix, win32 } from "node:path";
 import type { CompressedToolResult } from "../../compressor/result-compressor.js";
 import { knownSecretsFromEnv, maskSecrets, type KnownSecret } from "../../error-reporting/secret-detector.js";
 import { parseArtifactManifest } from "./artifact-manifest.js";
+import { WORKER_STATUS_ORDER } from "./worker-result.js";
 import type { ArtifactManifest } from "./artifact-manifest-types.js";
 import type { CandidateAcceptanceReceipt } from "./candidate-acceptance.js";
 import { parseCandidateAcceptanceReceipt } from "./candidate-receipt.js";
 import { frameUntrustedText } from "../untrusted-tool-output.js";
 import { neutraliseControlMarkers } from "../control-marker-guard.js";
+
+/** Every worker status the runtime can report, from the one source of truth. */
+const KNOWN_STATUSES: ReadonlySet<string> = new Set(WORKER_STATUS_ORDER);
 
 export const ARTIFACT_EVIDENCE_OUTPUT_MAX_CHARS = 4_000;
 const PREFIX = "artifact-evidence: ";
@@ -113,7 +117,7 @@ export function projectFusionArtifactEvidence(result: CompressedToolResult, maxC
     const manifest = parseArtifactManifest(row.artifactManifest);
     if (manifest === undefined || !safeName(row.id, known)) { omitted += 1; continue; }
     if (tasks.length === TASKS) { omitted += 1; continue; }
-    const status = typeof row.status === "string" && ["ok", "failed", "cancelled", "timeout", "queued", "max_steps", "needs_orchestrator", "no_changes"].includes(row.status) ? row.status : "unknown";
+    const status = typeof row.status === "string" && KNOWN_STATUSES.has(row.status) ? row.status : "unknown";
     const projected = projectManifest(manifest, false, known);
     tasks.push({ id: row.id, status, ...projected });
     omitted += projected.omitted as number;
@@ -135,7 +139,7 @@ export function projectFusionArtifactEvidence(result: CompressedToolResult, maxC
   }
   const taskCounts: Record<string, number> = {};
   for (const row of rows.slice(0, SCAN_ROWS)) {
-    const status = record(row) && typeof row.status === "string" && ["ok", "failed", "cancelled", "timeout", "queued", "max_steps", "needs_orchestrator", "no_changes"].includes(row.status) ? row.status : "unknown";
+    const status = record(row) && typeof row.status === "string" && KNOWN_STATUSES.has(row.status) ? row.status : "unknown";
     taskCounts[status] = (taskCounts[status] ?? 0) + 1;
   }
   if (rows.length > SCAN_ROWS) taskCounts.unknown = (taskCounts.unknown ?? 0) + rows.length - SCAN_ROWS;
