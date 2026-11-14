@@ -576,6 +576,11 @@ export async function runLocalModelsStart(
      * desktop's restart after the model ran out of memory (ATO-334).
      */
     contextSize?: number;
+    /**
+     * `"suspend"`: leave the prompt disk cache alone for this launch
+     * (`DaemonStartOptions.promptCache`) — `models fit-test`'s test models.
+     */
+    promptCache?: "suspend";
   } = {},
 ): Promise<number> {
   const { signal } = opts;
@@ -760,6 +765,7 @@ export async function runLocalModelsStart(
         parallel: cfg.localModels.managed.parallel,
         localLegRole,
         swaFull: cfg.localModels.managed.swaFull,
+        ...(opts.promptCache ? { promptCache: opts.promptCache } : {}),
         ...(tpl ? { chatTemplateFile: tpl } : {}),
         ...(mmprojFile ? { mmprojFile } : {}),
         ...(dev ? { device: dev } : {}),
@@ -1104,12 +1110,17 @@ function embeddingModelWanted(cfg: ReturnType<typeof getConfig>): boolean {
  * the embedding one, so memory search keeps its meaning-based half on
  * the cloud route. Neither form touches `memory.embeddings.enabled`.
  */
-export async function runLocalModelsStop(opts?: { chatOnly?: boolean }): Promise<number> {
+export async function runLocalModelsStop(opts?: {
+  chatOnly?: boolean;
+  /** `false`: do not save the chat slots' prompt caches first (`StopDaemonOptions.savePromptCache`). */
+  savePromptCache?: boolean;
+}): Promise<number> {
   const cfg = getConfig();
   const dataDir = cfg.paths.localModelsDataDir;
+  const stopOpts = opts?.savePromptCache === false ? { savePromptCache: false } : undefined;
   if (opts?.chatOnly && embeddingModelWanted(cfg)) {
     try {
-      await stopDaemon(dataDir);
+      await stopDaemon(dataDir, stopOpts);
     } catch (e) {
       process.stderr.write(`${e instanceof Error ? e.message : String(e)}\n`);
       return 1;
@@ -1119,7 +1130,7 @@ export async function runLocalModelsStop(opts?: { chatOnly?: boolean }): Promise
     return 0;
   }
   try {
-    await stopChatAndEmbeddingDaemons(dataDir);
+    await stopChatAndEmbeddingDaemons(dataDir, stopOpts);
   } catch (e) {
     process.stderr.write(`${e instanceof Error ? e.message : String(e)}\n`);
     return 1;

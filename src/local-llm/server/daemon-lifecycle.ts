@@ -243,6 +243,15 @@ export interface DaemonStartOptions {
    */
   throughputProbe?: boolean;
   /**
+   * `"suspend"`: this launch leaves the prompt disk cache (ATO-456) alone
+   * whatever `localModels.managed.promptDiskCache` says — no
+   * `--slot-save-path`, no restore (which would delete the saves of
+   * another launch) and no purge. Its stop has nothing to save. For a
+   * model that serves for a moment and then gives way to the user's own
+   * (`models fit-test`), whose saved conversations must survive it.
+   */
+  promptCache?: "suspend";
+  /**
    * The key the server requires (issue #582), handed to the child as
    * `LLAMA_API_KEY` — never argv. `startDaemon` resolves it from
    * `localModels.apiKey`, falling back to the key persisted in `dataDir`,
@@ -1419,7 +1428,8 @@ export async function startDaemon(
   );
   // ATO-456: off by default. The fingerprint is taken before the save
   // path is added, which is not part of what a saved cache depends on.
-  const promptDiskCache = readConfiguredPromptDiskCache();
+  // A suspended launch reads the setting as unknown: it touches nothing.
+  const promptDiskCache = opts.promptCache === "suspend" ? null : readConfiguredPromptDiskCache();
   const promptCacheFp = promptDiskCache === true
     ? promptCacheFingerprint({
         args,
@@ -2225,7 +2235,7 @@ export async function startChatAndEmbeddingDaemons(opts: {
  */
 export async function stopChatAndEmbeddingDaemons(
   dataDir: string,
-  opts?: { timeoutMs?: number },
+  opts?: { timeoutMs?: number; savePromptCache?: boolean },
 ): Promise<void> {
   // Stop both sides independently: a failure on one (e.g. a foreign,
   // cross-user daemon raising `ForeignDaemonError`) must not prevent the

@@ -83,35 +83,55 @@ async function chatDaemonStatus() {
   return getDaemonStatus(cfg.paths.localModelsDataDir, cfg.localModels.managed.port);
 }
 
-/** Makes `modelId` the active managed model and starts it. */
-async function loadManagedModel(modelId: string, signal: AbortSignal): Promise<LoadedFitModel> {
-  if (signal.aborted) throw new Error("stopped");
-  await runLocalModelsStop();
-  if ((await runLocalModelsUse(modelId)) !== 0) throw new Error("unknown model id");
-  if ((await runLocalModelsStart({ signal })) !== 0) throw new Error("the model did not start (is it downloaded?)");
-  resetConfigCache();
-  const cfg = getConfig();
-  const status = await chatDaemonStatus();
+/**
+ * Loads the test models in turn and puts the user's model back.
+ *
+ * Prompt disk cache (ATO-456): the first stop is the user's own model, so
+ * its conversations are saved once, as any stop saves them. Test models
+ * start with the cache suspended (`promptCache: "suspend"`): no save
+ * path, and none of the restore-time cleanup that deletes saves from
+ * another launch, so the user's saves are still there when their model
+ * starts again. Their stops save nothing (`savePromptCache: false`).
+ */
+export function createFitModelSwitcher() {
+  // A holder: the first stop saves the user's caches, no later one does.
+  const state = { userCachesSaved: false };
+  const stopChat = async (): Promise<void> => {
+    const savePromptCache = !state.userCachesSaved;
+    state.userCachesSaved = true;
+    await runLocalModelsStop(savePromptCache ? {} : { savePromptCache: false });
+  };
   return {
-    url: cfg.localModels.url,
-    apiKey: cfg.localModels.apiKey,
-    pid: status.pid,
-    release: async () => {
-      await runLocalModelsStop();
+    /** Makes `modelId` the active managed model and starts it. */
+    async load(modelId: string, signal: AbortSignal): Promise<LoadedFitModel> {
+      if (signal.aborted) throw new Error("stopped");
+      await stopChat();
+      if ((await runLocalModelsUse(modelId)) !== 0) throw new Error("unknown model id");
+      if ((await runLocalModelsStart({ signal, promptCache: "suspend" })) !== 0) {
+        throw new Error("the model did not start (is it downloaded?)");
+      }
+      resetConfigCache();
+      const cfg = getConfig();
+      const status = await chatDaemonStatus();
+      return {
+        url: cfg.localModels.url,
+        apiKey: cfg.localModels.apiKey,
+        pid: status.pid,
+        release: stopChat,
+      };
+    },
+    /**
+     * Puts back the model that was active before the run. After a stop the
+     * test model may still be loaded (its release did not run), so it is
+     * stopped first.
+     */
+    async restore(previous: string | null, wasRunning: boolean, stopped: boolean): Promise<void> {
+      if (stopped) await stopChat();
+      if (previous === null) return;
+      await runLocalModelsUse(previous);
+      if (wasRunning) await runLocalModelsStart({});
     },
   };
-}
-
-/**
- * Puts back the model that was active before the run. After a stop the
- * test model may still be loaded (its release did not run), so it is
- * stopped first.
- */
-async function restoreModel(previous: string | null, wasRunning: boolean, stopped: boolean): Promise<void> {
-  if (stopped) await runLocalModelsStop();
-  if (previous === null) return;
-  await runLocalModelsUse(previous);
-  if (wasRunning) await runLocalModelsStart({});
 }
 
 const STOP_EXIT_CODE = { SIGINT: 130, SIGTERM: 143 } as const;
@@ -233,8 +253,9 @@ export async function runModelsFitTest(args: string[]): Promise<number> {
   }
   const judgeKey = parsed.judgeKeyEnv ? (process.env[parsed.judgeKeyEnv] ?? null) : null;
   const judge = createFitJudge({ url: parsed.judgeUrl, model: parsed.judgeModel, apiKey: judgeKey });
+  const switcher = createFitModelSwitcher();
   const depsFor = (signal: AbortSignal): FitTestDeps => ({
-    loadModel: (modelId) => loadManagedModel(modelId, signal),
+    loadModel: (modelId) => switcher.load(modelId, signal),
     runTask: (task, model) =>
       createAgentTaskRunner({ modelUrl: model.url, modelApiKey: model.apiKey, timeoutMs: parsed.timeoutMs, signal })(task),
     // After a stop no reply goes to the judge.
@@ -252,7 +273,7 @@ export async function runModelsFitTest(args: string[]): Promise<number> {
     .catch(() => null);
   const outcome = await runRestoringOnStop(
     (signal) => runFitTest(set, parsed.modelIds, depsFor(signal), { gpuBudgetGb }),
-    (stopped) => restoreModel(previous, wasRunning, stopped),
+    (stopped) => switcher.restore(previous, wasRunning, stopped),
   );
   if (outcome.stoppedBy !== null) return outcome.exitCode;
   const run = outcome.result;
