@@ -280,7 +280,29 @@ describe("fusion.delegate call-wide concurrency", () => {
     const result = await running;
     const rows = result.details.tasks as WorkerTaskResult[];
     expect(rows[1]).toMatchObject({ status: "ok", durationMs: 0, schedulerQueueWaitMs: 90_000 });
-    expect(rows[1]!.notes?.join(" ")).toContain("fan-out concurrency before execution");
     expect(rows[1]!.queueWaitMs).toBeNull();
+    // One call-wide line, not a note on every queued row.
+    expect(rows[1]!.notes?.join(" ") ?? "").not.toContain("worker slot");
+    expect(result.summary).toContain("1 task waited up to 2 min for a worker slot");
+  });
+
+  it("aggregates every queued task's wait into one call-wide note", async () => {
+    let now = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const h = harness();
+    const tasks = [main, build, review, strong];
+    const running = h.start(tasks, 1);
+    for (const wait of [10_000, 20_000, 30_000, 0]) {
+      await vi.waitFor(() => expect(h.pending.length).toBe(1));
+      now += wait;
+      h.pending.shift()!();
+      await tick();
+    }
+    const result = await running;
+    const rows = result.details.tasks as WorkerTaskResult[];
+    expect(rows.map((r) => r.schedulerQueueWaitMs ?? 0).sort((a, b) => a - b)).toEqual([0, 10_000, 30_000, 60_000]);
+    expect(rows.every((r) => !(r.notes ?? []).join(" ").includes("worker slot"))).toBe(true);
+    expect(result.summary.match(/waited up to/g)).toHaveLength(1);
+    expect(result.summary).toContain("3 tasks waited up to 1 min for a worker slot");
   });
 });

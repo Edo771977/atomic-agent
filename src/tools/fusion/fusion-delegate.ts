@@ -44,6 +44,7 @@ import {
 import {
   notStartedResult,
   runWorkerTasks,
+  schedulerWaitNote,
   type WorkerRunnerDeps,
 } from "./worker-runner.js";
 import { describeReplan, isOpenResult, renderReplanBlock } from "./replan.js";
@@ -2306,7 +2307,7 @@ export function buildFusionDelegateTool(
                   .filter((t) => (t.files?.length ?? 0) > 0)
                   .map((t) => t.id),
               ),
-            })}${hint}${
+            })}${hint}${schedulerWaitNote(results)}${
               escalationSpendUsd > 0
                 ? `\n\nEscalations to ${escalationTarget?.model ?? escalationTarget?.providerId ?? "the escalation model"} cost ${formatUsd(escalationSpendUsd)} this fan-out (each worker's row says what for).`
                 : ""

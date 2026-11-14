@@ -270,6 +270,19 @@ export const QUEUE_SLOT_PROBE_TIMEOUT_MS = 5_000;
  */
 export const TASK_PERMIT_RELEASE_GRACE_MS = 5_000;
 
+/**
+ * One call-wide line for the tasks that waited for a call-wide permit
+ * (`schedulerQueueWaitMs`), or `""` when none did.
+ */
+export function schedulerWaitNote(rows: readonly WorkerTaskResult[]): string {
+  const waits = rows
+    .map((r) => r.schedulerQueueWaitMs ?? 0)
+    .filter((ms) => ms > 0);
+  if (waits.length === 0) return "";
+  const n = waits.length;
+  return `\n\nNote: ${n} task${n === 1 ? "" : "s"} waited up to ${formatWaitMs(Math.max(...waits))} for a worker slot (the fan-out's concurrency) before starting; their task clocks started after the wait.`;
+}
+
 /** The floor of a local worker's task budget, never above the configured one. */
 export function localTaskBudgetFloorMs(configuredMs: number): number {
   return Math.min(LOCAL_WORKER_TASK_BUDGET_FLOOR_MS, configuredMs);
@@ -804,9 +817,9 @@ export async function runWorkerTasks(
       }
       if (schedulerWaitMs > 0) {
         const row = results[i]!;
-        results[i] = { ...row, schedulerQueueWaitMs: schedulerWaitMs,
-          notes: [...(row.notes ?? []), `queued ${formatWaitMs(schedulerWaitMs)} for fan-out concurrency before execution`],
-        };
+        // The field only: the delegate states the call's waits in one
+        // line (`schedulerWaitNote`) rather than a note on every row.
+        results[i] = { ...row, schedulerQueueWaitMs: schedulerWaitMs };
       }
       try {
         options.onTaskFinished?.(results[i]!);
