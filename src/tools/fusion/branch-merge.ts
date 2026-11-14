@@ -59,6 +59,7 @@ import {
   type WorkspaceChange,
 } from "./branch-diff.js";
 import { resolveContractInputs } from "./contract-inputs.js";
+import { inputPathIdentity } from "../os/fs/fs-input-path-identity.js";
 import type { ContractProvide } from "./contract.js";
 import type { DelegateTask } from "./delegate-args.js";
 import type { WorkerTaskResult, WorkerTaskStatus } from "./worker-result.js";
@@ -319,7 +320,10 @@ export function mergeTaskSuggestion(
 const IGNORED_NOTE_NAMES = 10;
 
 /** Whether `path` is `root` or lies under it (both relative, native separators). */
-const atOrUnder = (path: string, root: string): boolean => path === root || path.startsWith(`${root}${sep}`);
+const atOrUnder = (path: string, root: string, platform: NodeJS.Platform): boolean => {
+  const child = inputPathIdentity(path, platform), parent = inputPathIdentity(root, platform);
+  return child === parent || child.startsWith(`${parent}${platform === "win32" ? "\\" : "/"}`);
+};
 
 /**
  * The row after its merge: notes for what landed, the error for what did
@@ -331,6 +335,7 @@ export function applyMergeOutcome(
   row: WorkerTaskResult,
   outcome: BranchMergeOutcome,
   declared: readonly string[] = [],
+  platform: NodeJS.Platform = process.platform,
 ): WorkerTaskResult {
   const notes = [...(row.notes ?? [])];
   if (outcome.applied.length > 0) {
@@ -346,7 +351,7 @@ export function applyMergeOutcome(
     notes.push(
       `not merged: ${ignored.length} file${ignored.length === 1 ? "" : "s"} under ignored directories (${named.join(", ")}${more}); git ignore rules keep them out of the folder`,
     );
-    const hidden = declared.filter((path) => ignored.some((file) => atOrUnder(file, path)));
+    const hidden = declared.filter((path) => ignored.some((file) => atOrUnder(file, path, platform)));
     if (hidden.length > 0) {
       problems.push(
         `declared paths lie under ignored directories that are never merged (${hidden.map((p) => p.split(sep).join("/")).join(", ")}); deliver them in tracked or unignored paths`,

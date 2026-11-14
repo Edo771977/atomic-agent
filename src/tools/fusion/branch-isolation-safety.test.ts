@@ -166,6 +166,15 @@ describe("work the ignore rules keep out of a direct merge", () => {
     expect(result.results[0]!.status).toBe("needs_orchestrator");
     expect(result.results[0]!.error).toContain("src/generated/api.ts");
   });
+  it.each(["files", "provides"] as const)("recognizes native case aliases in ignored %s without hiding partial delivery", async declaration => {
+    const alias = "SRC/GENERATED/api.ts";
+    const { repo, result } = await generatedWave(declaration === "files" ? [alias] : undefined,
+      declaration === "provides" ? [{ task: "one", kind: "file", name: alias }] : undefined);
+    expect(result.results[0]!.status).toBe(process.platform === "win32" || process.platform === "darwin" ? "needs_orchestrator" : "ok");
+    expect(result.outcomes[0]!.ignoredChanges).toEqual([join("src", "generated", "api.ts")]);
+    expect(await readFile(join(repo, "src/a.ts"), "utf8")).toBe("y\n");
+    await expect(stat(join(repo, "src/generated/api.ts"))).rejects.toThrow();
+  });
 });
 
 describe("workspace removal never lets git walk a generated link", () => {
