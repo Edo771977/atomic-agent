@@ -230,3 +230,17 @@ it("recreates an original directory junction using supported native link semanti
   const result = await run(f.project, f.journal, ["--rollback"]);
   expect(result.code, result.stderr || result.stdout).toBe(0); expect(await readlink(originalLink)).toBe(original.linkTarget);
 });
+
+it("uses native path identity when previewing children removed before a created directory", async () => {
+  const f = await fixture(); await mkdir(join(f.project, "dir"));
+  const child = process.platform === "win32" || process.platform === "darwin" ? "user" : "USER";
+  await writeFile(join(f.project, "dir", child), "promoted\n");
+  const value = { ...f.value, steps: [
+    { path: "dir", action: "mkdir", status: "applied", original: null, promoted: { kind: "directory", mode: (await lstat(join(f.project, "dir"))).mode & 0o777 } },
+    { path: "dir/USER", action: "write", status: "applied", original: null, promoted: f.value.steps[0]!.promoted },
+  ] };
+  await writeFile(f.journal, JSON.stringify(value));
+  const preview = await run(f.project, f.journal, ["--dry-run"]);
+  expect(preview.code, preview.stdout || preview.stderr).toBe(0); expect(JSON.parse(preview.stdout).conflicts).toEqual([]);
+  expect((await run(f.project, f.journal, ["--rollback"])).code).toBe(0); await expect(lstat(join(f.project, "dir"))).rejects.toThrow();
+});

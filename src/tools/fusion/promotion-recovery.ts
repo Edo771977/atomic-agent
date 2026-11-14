@@ -23,6 +23,7 @@ const JOURNAL_BYTES = 8 * 1024 * 1024, MAX_STEPS = 100_000, MAX_FILE_BYTES = 2 *
 const digest = (data: Buffer | string) => createHash("sha256").update(data).digest("hex");
 const record = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
 const allowed = (value: unknown, values: readonly string[]) => typeof value === "string" && values.includes(value);
+const pathIdentity = (value: string) => process.platform === "win32" || process.platform === "darwin" ? value.normalize("NFC").toLowerCase() : value;
 function fail(message: string): never { throw new Error(`fusion recovery: ${message}`); }
 function safePath(value: unknown, operatorState = false): value is string {
   if (typeof value !== "string" || value.length === 0 || value.length > 32_768 || value.includes("\\")) return false;
@@ -51,7 +52,7 @@ export function parsePromotionJournal(raw: string): PromotionJournal {
   for (const step of value.steps) {
     if (!record(step) || Object.keys(step).some(key => !["path", "action", "status", "original", "promoted", "backup", "temp", "tempEntry"].includes(key)) || !safePath(step.path) ||
         !allowed(step.action, ["write", "delete", "mkdir", "rmdir"]) || !allowed(step.status, ["intent", "applied", "not-applied", "rolled-back", "rollback-conflict"]) || !entry(step.original) || !entry(step.promoted)) return fail("invalid journal step");
-    const identity = process.platform === "win32" || process.platform === "darwin" ? step.path.normalize("NFC").toLowerCase() : step.path;
+    const identity = pathIdentity(step.path);
     if (paths.has(identity)) return fail("duplicate journal path"); paths.add(identity);
     const original = step.original as JournalEntry | null, promoted = step.promoted as JournalEntry | null;
     const action = promoted === null ? original?.kind === "directory" ? "rmdir" : "delete" : promoted.kind === "directory" ? "mkdir" : "write";
@@ -113,8 +114,7 @@ async function outputScope(root: string, path: string): Promise<void> {
     }
     const canonical = relative(root, await realpath(absolute)).replaceAll("\\", "/");
     if (!safePath(canonical)) return fail("canonical output reaches protected or outside metadata");
-    const identity = (value: string) => process.platform === "win32" || process.platform === "darwin" ? value.normalize("NFC").toLowerCase() : value;
-    if (identity(canonical) !== identity(prefixPath)) return fail("noncanonical filesystem alias in recovery output");
+    if (pathIdentity(canonical) !== pathIdentity(prefixPath)) return fail("noncanonical filesystem alias in recovery output");
   }
 }
 async function regularBytes(path: string, maximum: number): Promise<{ bytes: Buffer; info: Stats }> {
@@ -200,10 +200,10 @@ export async function recoverPromotion(input: { project: string; journal: string
       }
       if (equal(current.entry, step.original)) continue;
       if (equal(current.entry, step.promoted)) {
-        if (step.original === null && current.entry?.kind === "directory" && (await readdir(join(root, step.path))).some(name => !removals.has(`${step.path}/${name}`))) {
+        if (step.original === null && current.entry?.kind === "directory" && (await readdir(join(root, step.path))).some(name => !removals.has(pathIdentity(`${step.path}/${name}`)))) {
           result.conflicts.push(step.path); continue;
         }
-        result.planned.push(step.path); if (step.original === null) removals.add(step.path);
+        result.planned.push(step.path); if (step.original === null) removals.add(pathIdentity(step.path));
       } else result.conflicts.push(step.path);
     }
     return result;
