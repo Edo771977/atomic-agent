@@ -374,4 +374,28 @@ describe("the configured copy limit (`tools.verify.maxCopyBytes`)", () => {
     expect(run).not.toHaveBeenCalled();
     expect((result.details.tasks as Array<{ error?: string }>)[0]!.error).toBe("not started: could not create a private workspace: the folder is too large to copy");
   });
+
+  it("charges final frozen-check staging to the configured candidate budget that remains", async () => {
+    const f = await fixture();
+    const bytes = Buffer.byteLength(await readFile(join(f.root, "api.json"), "utf8")) + Buffer.byteLength(await readFile(join(f.root, "personal.txt"), "utf8"));
+    await writeFile(join(stateDir, "config.json"), JSON.stringify({ version: USER_CONFIG_VERSION, tools: { verify: { maxCopyBytes: bytes * 3 } } }));
+    resetConfigCache();
+    f.deps.runTurn = async session => { await writeFile(join(session.workingDir, "api.json"), '{"name":"after!"}'); return { session, reason: "reply", stepCount: 1 }; };
+    f.deps.runChecks = async specs => ({ ok: true, results: specs.map(() => ({ ok: true })) });
+    const result = await buildFusionDelegateTool(f.deps).run({ tasks: [{ id: "api", instructions: "work", files: ["api.json"] }], contract }, f.ctx);
+    expect(result.details.candidateIntegration).toMatchObject({ status: "rejected", reason: expect.stringMatching(/remaining candidate copy budget/) });
+    expect(await readFile(join(f.root, "api.json"), "utf8")).toBe('{"name":"before"}');
+  });
+
+  it("retains the dependency-copy refusal cause when final checked staging exhausts its remaining budget", async () => {
+    const f = await fixture();
+    const bytes = Buffer.byteLength(await readFile(join(f.root, "api.json"), "utf8")) + Buffer.byteLength(await readFile(join(f.root, "personal.txt"), "utf8"));
+    await mkdir(join(f.root, "node_modules")); await writeFile(join(f.root, "node_modules", "dependency.js"), "x".repeat(100));
+    await writeFile(join(stateDir, "config.json"), JSON.stringify({ version: USER_CONFIG_VERSION, tools: { verify: { maxCopyBytes: bytes * 4 + 150 } } }));
+    resetConfigCache();
+    f.deps.runTurn = async session => { await writeFile(join(session.workingDir, "api.json"), '{"name":"after!"}'); return { session, reason: "reply", stepCount: 1 }; };
+    f.deps.runChecks = async specs => ({ ok: true, results: specs.map(() => ({ ok: true })) });
+    const result = await buildFusionDelegateTool(f.deps).run({ tasks: [{ id: "api", instructions: "work", files: ["api.json"] }], contract }, f.ctx);
+    expect(result.details.candidateIntegration).toMatchObject({ status: "rejected", reason: expect.stringMatching(/remaining candidate copy budget.*private copy of the dependency folders/) });
+  });
 });

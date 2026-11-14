@@ -546,9 +546,11 @@ export async function createCandidateIntegration(
         // Its actual copies spend the original candidate's remaining budget.
         const beforeChecks = await snapshot(workspace.dir, input.signal);
         const freezeSignal = AbortSignal.any([input.signal, AbortSignal.timeout(120_000)]);
+        let checkedRefusal: string | undefined;
         checkedSet = await createBranchSet(workspace.dir, ["checked-source"], { ...options, signal: freezeSignal,
-          maxCopyBytes: set.remainingCopyBytes?.() ?? 0, privateDependencyDirectories: true });
-        if (checkedSet === null) return await rejectFinal("candidate not promoted: checked source copy exceeds the remaining candidate copy budget");
+          maxCopyBytes: set.remainingCopyBytes?.() ?? 0, privateDependencyDirectories: true,
+          onRefusal: reason => { checkedRefusal = reason; options.onRefusal?.(reason); } });
+        if (checkedSet === null) return await rejectFinal(`candidate not promoted: checked source copy exceeds the remaining candidate copy budget${checkedRefusal === undefined ? "" : `: ${checkedRefusal}`}`);
         checkedDir = checkedSet.workspaces.get("checked-source")!.dir;
         if (differences(beforeChecks, await snapshot(checkedDir, freezeSignal)).length > 0) return await rejectFinal("candidate changed while freezing its checked payload");
         await verifyProtectedInputs(checkedDir, input.signal);
