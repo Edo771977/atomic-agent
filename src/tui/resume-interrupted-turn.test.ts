@@ -114,7 +114,7 @@ describe("/resume while another turn is busy", () => {
     lastError: "turn interrupted: the agent stopped before it finished",
   };
 
-  function harness() {
+  function harness(fusionRuns?: Parameters<typeof createInterruptedTurns>[1]) {
     const stored = [
       { ...createEmptySessionState({ id: "s-b", workingDir: "/tmp" }), ...cutOff },
     ];
@@ -131,7 +131,7 @@ describe("/resume while another turn is busy", () => {
       load: (id: string) => stored.find((s) => s.id === id) ?? null,
       readTurnProgress: (id: string) => (id === "s-b" ? marker : null),
     };
-    const interruptedTurns = createInterruptedTurns(store);
+    const interruptedTurns = createInterruptedTurns(store, fusionRuns);
     const turns: string[] = [];
     const runtime = {
       createSession: () => createEmptySessionState({ id: "s-new", workingDir: "/tmp" }),
@@ -203,6 +203,29 @@ describe("/resume while another turn is busy", () => {
     expect(systemTexts(dispatched)).not.toContain(NOTHING_TO_RESUME);
     expect(dispatched.map((a) => a.type)).toContain("message_queued");
     // Nothing ran on its own meanwhile.
+    expect(turns).toEqual(["something else"]);
+  });
+
+  it("offers a cut-off Fusion turn again after its queued run resume is cleared", () => {
+    // The fusion branch hands back the run's own resume text, not the
+    // interrupted-turn note: release must match that exact string.
+    const fusionRuns = {
+      listResumable: () => [{ runId: "run-9", updatedAt: 1_500 }],
+      resumeMessage: (_s: string, runId?: string) => `Continue the Fusion run that was cut off by a restart (${runId}).`,
+    };
+    const { orchestrator, cbs, turns } = harness(fusionRuns);
+    orchestrator.sendMessage("something else");
+    const busy: TuiState = { ...idleState("s-b"), status: "running" };
+    const dispatched: Array<{ type: string; text?: string }> = [];
+    const dispatch = ((a: { type: string }) => dispatched.push(a)) as never;
+
+    handleEditorSubmit("/resume", busy, dispatch, cbs);
+    expect(dispatched.map((a) => a.type)).toContain("message_queued");
+    handleEditorSubmit("/queue clear", busy, dispatch, cbs);
+    dispatched.length = 0;
+    handleEditorSubmit("/resume", busy, dispatch, cbs);
+    expect(systemTexts(dispatched)).not.toContain(NOTHING_TO_RESUME);
+    expect(dispatched.map((a) => a.type)).toContain("message_queued");
     expect(turns).toEqual(["something else"]);
   });
 });

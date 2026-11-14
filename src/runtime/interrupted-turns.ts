@@ -26,8 +26,13 @@ import type { SessionStore } from "../session/session-store.js";
 export interface InterruptedTurns {
   pending(sessionId: string): InterruptedChatTurn | null;
   resumeMessage(sessionId: string): string | null;
-  /** The continuing message was dropped before its turn started: offer the turn again. */
-  release(sessionId: string): void;
+  /**
+   * The continuing message was dropped before its turn started: offer
+   * the turn again. With `dropped`, only when one of those strings is
+   * exactly the message `resumeMessage` handed out (a note-led resend or
+   * a Fusion run's resume text alike); without it, unconditionally.
+   */
+  release(sessionId: string, dropped?: readonly string[]): void;
 }
 
 /**
@@ -63,8 +68,8 @@ export function createInterruptedTurns(
       return null;
     }
   };
-  /** Session id -> `startedAt` of the cut-off turn a resume is queued for. */
-  const queued = new Map<string, number>();
+  /** Session id -> the cut-off turn a resume is queued for, and its exact text. */
+  const queued = new Map<string, { startedAt: number; text: string }>();
   const read = (sessionId: string): InterruptedChatTurn | null => {
     const state = store.load(sessionId);
     if (state === null) return null;
@@ -75,7 +80,7 @@ export function createInterruptedTurns(
     const queuedFor = queued.get(sessionId);
     if (queuedFor === undefined) return turn;
     // Still the same cut-off turn: its resume is queued, not yet started.
-    if (turn !== null && turn.startedAt === queuedFor) return null;
+    if (turn !== null && turn.startedAt === queuedFor.startedAt) return null;
     // The continuing turn started (it replaced the marker) or the row
     // changed under us: the queued mark has done its job.
     queued.delete(sessionId);
@@ -87,11 +92,13 @@ export function createInterruptedTurns(
       const turn = pending(sessionId);
       if (turn === null) return null;
       const message = fusionResumeFor(sessionId, turn) ?? interruptedTurnResumeMessage(turn);
-      queued.set(sessionId, turn.startedAt);
+      queued.set(sessionId, { startedAt: turn.startedAt, text: message });
       return message;
     },
-    release(sessionId) {
-      queued.delete(sessionId);
+    release(sessionId, dropped) {
+      const entry = queued.get(sessionId);
+      if (entry === undefined) return;
+      if (dropped === undefined || dropped.includes(entry.text)) queued.delete(sessionId);
     },
   };
 }

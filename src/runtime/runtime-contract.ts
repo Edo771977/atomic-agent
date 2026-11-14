@@ -271,7 +271,7 @@ export interface AgentRuntime {
    * request; for a cut-off Fusion orchestrator turn with a resumable run,
    * that run's `fusionRuns.resumeMessage` instead) and marks it "resume queued", so it is offered once; the
    * marker is replaced when the continuing turn starts. `release` gives
-   * it back when the caller drops that message before it runs (a cleared
+   * it back when the caller drops that exact message before it runs (a cleared
    * queue, a stop, a switch). The caller sends the message through
    * `runTurn`. Optional so embedders and test runtimes need not provide it.
    */
