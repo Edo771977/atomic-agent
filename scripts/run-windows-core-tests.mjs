@@ -113,6 +113,7 @@ export const deferredFiles = [
   'src/tools/fusion/declared-files.test.ts',
   'src/tools/fusion/delegate-args.test.ts',
   'src/tools/fusion/escalation.test.ts',
+  'src/tools/fusion/escalation-snapshot-pricing.test.ts',
   'src/tools/fusion/failure-breaker.test.ts',
   'src/tools/fusion/fusion-delegate.integration.test.ts',
   'src/tools/fusion/fusion-delegate.outcome-log.test.ts',
