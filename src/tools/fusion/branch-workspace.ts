@@ -379,6 +379,13 @@ interface PrivateCopyBudget {
    * the original they are copied from (the base only holds links to it).
    */
   privateDependenciesFrom?: string;
+  /**
+   * With `privateDependenciesFrom`: the git repository holding the
+   * original (`top`, and the working directory relative to it). `worktree`
+   * when every workspace is a worktree of the whole repository; otherwise
+   * only the working directory is copied.
+   */
+  privateDependencyRepository?: { top: string; rel: string; worktree: boolean };
   /** Set while making a private-dependency set's base: unlinkable dependencies get an empty placeholder. */
   dependencyPlaceholders?: boolean;
   /** A dependency directory was copied because no link was possible. */
@@ -521,13 +528,42 @@ async function insideRoot(target: string, root: string): Promise<string | undefi
 }
 
 /**
+ * Where a private dependency copy's link to the absolute `target` must
+ * point: the same place in this workspace when it lies inside the
+ * original (`workspaceDir`), or inside the repository a worktree holds
+ * whole; kept as it is when outside the repository. A target inside the
+ * repository but outside a folder copy cannot be made private: throws.
+ */
+async function privateDependencyTarget(target: string, workspaceDir: string, budget: PrivateCopyBudget, rel: string): Promise<string> {
+  const inside = await insideRoot(target, budget.privateDependenciesFrom!);
+  if (inside !== undefined) return join(workspaceDir, inside);
+  const repository = budget.privateDependencyRepository;
+  const inRepository = repository === undefined ? undefined : await insideRoot(target, repository.top);
+  if (repository === undefined || inRepository === undefined) return target;
+  const where = `the dependency link ${rel} points into the repository outside the working directory (${target})`;
+  if (!repository.worktree) {
+    throw new Error(`${where}; only the working directory is copied, so a write through it would reach the original`);
+  }
+  const worktreeRoot = repository.rel.length === 0 ? workspaceDir : workspaceDir.slice(0, workspaceDir.length - repository.rel.length - 1);
+  const mapped = join(worktreeRoot, inRepository);
+  const exists = (path: string): Promise<boolean> => lstat(path).then(() => true, () => false);
+  if (!await exists(mapped) && await exists(target)) {
+    throw new Error(`${where}, which the private worktree does not hold (an untracked or ignored path)`);
+  }
+  return mapped;
+}
+
+/**
  * Copy a user's symlink with its target. Inside a private dependency
  * copy (`budget.privateDependenciesFrom`), an absolute target inside the
  * original (npm workspaces on Windows, pnpm: `node_modules/@s/pkg` →
  * `<project>/packages/pkg`) is pointed at the same place in this
- * workspace instead, so a write through it stays private; relative
- * targets already resolve inside the copy, and targets outside the
- * original are kept. Where the host denies symlinks, a directory target
+ * workspace instead, so a write through it stays private; in a worktree
+ * the same holds for a target elsewhere in the repository (a monorepo's
+ * sibling package), and in a folder copy such a target refuses setup
+ * (`privateDependencyTarget`). Relative targets already resolve inside
+ * the copy, and targets outside the repository (or, without one, the
+ * original) are kept. Where the host denies symlinks, a directory target
  * under a dependency directory becomes a junction to the same resolved
  * path; otherwise the copy fails, naming the link (it is never expanded
  * into a copy).
@@ -536,8 +572,7 @@ async function recreateLink(from: string, to: string, budget: PrivateCopyBudget,
   let target = await readlink(from);
   const origin = budget.privateDependenciesFrom;
   if (origin !== undefined && isAbsolute(target) && underSharedDependencyDirectory(rel) && to.endsWith(`${sep}${rel}`)) {
-    const inside = await insideRoot(target, origin);
-    if (inside !== undefined) target = join(to.slice(0, to.length - rel.length - 1), inside);
+    target = await privateDependencyTarget(target, to.slice(0, to.length - rel.length - 1), budget, rel);
   }
   let denied: unknown;
   try {
@@ -610,6 +645,14 @@ async function gitSnapshot(
     untracked: zList(untracked.stdout),
     ignored: zList(ignored.stdout),
   };
+}
+
+/** The git repository's top holding `realDir`, even where it cannot be snapshotted. */
+async function repositoryTop(realDir: string, git: GitExec): Promise<string | undefined> {
+  const result = await git(["rev-parse", "--show-toplevel"], realDir);
+  if (!ok(result)) return undefined;
+  const top = await realpath(result.stdout.trim()).catch(() => null);
+  return top === null || relative(top, realDir).startsWith("..") ? undefined : top;
 }
 
 /** One worktree of the snapshot at `root`, with private copies of what git does not carry. */
@@ -751,7 +794,14 @@ export async function createBranchSet(
     if (options.privateDependencyDirectories === true) budget.dependencyPlaceholders = true;
     const baseDir = await make("base", real);
     delete budget.dependencyPlaceholders;
-    if (options.privateDependencyDirectories === true) budget.privateDependenciesFrom = real;
+    if (options.privateDependencyDirectories === true) {
+      budget.privateDependenciesFrom = real;
+      // A folder copy still needs the repository's bounds to refuse links into it.
+      const top = snapshot?.top ?? await repositoryTop(real, git);
+      if (top !== undefined) {
+        budget.privateDependencyRepository = { top, rel: relative(top, real), worktree: snapshot !== null };
+      }
+    }
     const directoryIgnorePolicy = await createDirectoryIgnorePolicy({
       originalDir: real, baseDir, probeDir: join(runRoot, "ignore-policy"),
       ...(options.signal === undefined ? {} : { signal: options.signal }),

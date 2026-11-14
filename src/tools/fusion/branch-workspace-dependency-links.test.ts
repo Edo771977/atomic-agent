@@ -1,12 +1,13 @@
 import { lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, relative, sep } from "node:path";
+import { dirname, join, relative, sep } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 import { runIsolatedWave } from "./branch-merge.js";
 import { createBranchSet } from "./branch-workspace.js";
 import { createCandidateIntegration } from "./candidate-integration.js";
 import type { DelegateTask } from "./delegate-args.js";
 import type { WorkerTaskResult } from "./worker-result.js";
+import { makeGitRepo, runGitRaw, writeRepoFile } from "../os/git/test-helpers.js";
 
 // Simulated Windows link policy: `deny` names the error for one
 // (target, type) pair; a "junction" here is a plain link on POSIX.
@@ -178,4 +179,42 @@ it("names the link a candidate cannot recreate when no link kind is available", 
     `cannot recreate the link ${join("node_modules", "@s", "pkg")} in a private workspace`,
   );
   expect(await readFile(join(root, "packages", "pkg", "index.js"), "utf8")).toBe("original package\n");
+});
+
+/** A monorepo `<top>` whose working directory is `packages/app`, linking `node_modules/lib` to the sibling package. */
+async function monorepo(link: (top: string, app: string) => string, commit = true): Promise<{ top: string; app: string }> {
+  const top = await realpath(await makeGitRepo("atag-dep-mono-")); roots.push(top);
+  await writeRepoFile(top, ".gitignore", "node_modules/\n");
+  await writeRepoFile(top, "packages/app/input.txt", "original input\n");
+  await writeRepoFile(top, "packages/lib/index.js", "original lib\n");
+  if (commit) { await runGitRaw(top, ["add", "-A"]); await runGitRaw(top, ["commit", "-qm", "fixture"]); }
+  const app = join(top, "packages", "app");
+  await mkdir(join(app, "node_modules"), { recursive: true });
+  await symlink(link(top, app), join(app, "node_modules", "lib"), "dir");
+  return { top, app };
+}
+
+it.each([
+  ["absolute", (top: string) => join(top, "packages", "lib")],
+  ["relative", () => join("..", "..", "lib")],
+] as const)("points a worktree candidate's %s dependency link into the repository at the candidate's worktree", async (_label, target) => {
+  const { top, app } = await monorepo(target);
+  const candidate = await createCandidateIntegration(app, {});
+  try {
+    const link = join(candidate.dir, "node_modules", "lib");
+    const worktreeRoot = dirname(dirname(await realpath(candidate.dir)));
+    expect(await realpath(link)).toBe(join(worktreeRoot, "packages", "lib"));
+    await writeFile(join(link, "index.js"), "candidate wrote\n");
+    expect(await readFile(join(top, "packages", "lib", "index.js"), "utf8")).toBe("original lib\n");
+    expect((await candidate.reject("test")).status).toBe("rejected");
+  } finally { await candidate.cleanup(); }
+});
+
+it("refuses a folder-copy candidate whose dependency link points into the repository outside the copied folder", async () => {
+  // No commit yet: Git cannot snapshot, so only the working directory is copied.
+  const { top, app } = await monorepo(top => join(top, "packages", "lib"), false);
+  await expect(createCandidateIntegration(app, {})).rejects.toThrow(
+    `the dependency link ${join("node_modules", "lib")} points into the repository outside the working directory`,
+  );
+  expect(await readFile(join(top, "packages", "lib", "index.js"), "utf8")).toBe("original lib\n");
 });
