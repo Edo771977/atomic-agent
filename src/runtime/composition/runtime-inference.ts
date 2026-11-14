@@ -21,6 +21,7 @@ import {
 } from "../../session/daily-spend.js";
 import { DailySpendLimitError } from "../../llm/reliability/spend-limit-error.js";
 import { isLocalServerUrl } from "../../llm/provider/openai/local-server-url.js";
+import { linkSpendBilling } from "../link-spend-billing.js";
 import { resolveModelPricingFor } from "../resolve-model-pricing.js";
 import { createRequestBudgetScope } from "../request-budget.js";
 import { createDailySpendBudget } from "../daily-spend-budget.js";
@@ -352,13 +353,14 @@ export function connectRuntimeFallback(
     };
   };
   // How a link bills for the day total and the daily ceiling: the same
-  // rule as the turn budget (`request-budget.ts`). A loopback or private
-  // URL can be a forwarding gateway to a paid service (LiteLLM, a team
-  // proxy on the LAN or a Tailscale address), so only the explicit
-  // runner and plan kinds are free; any other link is counted and capped.
+  // rule as the turn budget (`link-spend-billing.ts`). An unpriced
+  // loopback/LAN server (Ollama, LM Studio) is free; a priced one may be
+  // a forwarding gateway to a paid service and is counted and capped.
   const spendBilling = (providerId: string): { local: boolean; plan: boolean } => {
     const entry = resolveLlmConfig(getConfig()).providers.find((p) => p.id === providerId);
-    return { local: entry?.kind === "llama-server", plan: entry?.kind === "subscription-cli" };
+    const billing = linkSpendBilling(entry, entry === undefined ? undefined
+      : resolveModelPricing(entry.defaultChatModel ?? entry.model ?? null, providerId)?.pricing);
+    return { local: billing === "local", plan: billing === "plan" };
   };
   // ATO-649: today's total is a second ledger of the per-send request
   // budget (`request-budget.ts`), next to the turn budget: each send holds

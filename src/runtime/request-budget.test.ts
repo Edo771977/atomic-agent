@@ -622,6 +622,15 @@ describe("request budget scope", () => {
       });
     });
 
+    it("leaves an unpriced loopback/LAN server out of the day, and counts a priced one", () => {
+      const { daily } = day(1);
+      const ollama = { id: "ollama", kind: "openai-compatible", baseUrl: "http://localhost:11434/v1" } as LlmProviderConfigEntry;
+      expect(createRequestBudgetScope(undefined, request(), provider, ollama, { ...model, pricing: undefined }, daily)).toBeUndefined();
+      const gateway = { id: "gw", kind: "openai-compatible", baseUrl: "http://192.168.1.20:4000" } as LlmProviderConfigEntry;
+      expect(createRequestBudgetScope(undefined, request(), provider, gateway, model, daily)?.mode).toBeUndefined();
+      expect(createRequestBudgetScope(undefined, request(), provider, gateway, model, daily)).toBeDefined();
+    });
+
     it.each(["llama-server", "subscription-cli"])("leaves a %s link out of the day", kind => {
       const { daily } = day(1);
       expect(createRequestBudgetScope(undefined, request(), provider, { id: "x", kind } as LlmProviderConfigEntry, model, daily)).toBeUndefined();

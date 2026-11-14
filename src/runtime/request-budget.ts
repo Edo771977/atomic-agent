@@ -8,6 +8,7 @@ import { modelParamProfile } from "../llm/provider/openai/model-params.js";
 import { formatUsd, type FusionTurnBudget } from "../tools/fusion/turn-budget.js";
 import { DailySpendLimitError } from "../llm/reliability/spend-limit-error.js";
 import type { DailySpendBudget, DailySpendHold } from "./daily-spend-budget.js";
+import { linkSpendBilling, verifiablePricing, type ModelPricing } from "./link-spend-billing.js";
 
 // Explicit rejections before generation. 529 is Anthropic's overload answer
 // returned instead of generating. 503 stays charged like 500/502/504:
@@ -35,7 +36,6 @@ function addsProviderSideInput(body: Record<string, unknown>): boolean {
   return tools.some(tool => typeof tool !== "object" || tool === null || (tool as { type?: unknown }).type !== "function");
 }
 
-type ModelPricing = NonNullable<ResolvedModel["pricing"]>;
 
 /**
  * Tiers the configured base rates bound from above, lower-cased: the
@@ -54,20 +54,6 @@ function configuredTierMultiplier(tier: string, pricing: ModelPricing): number |
     if (name.toLowerCase() === wanted) return multiplier;
   }
   return undefined;
-}
-
-function validRate(rate: unknown): boolean {
-  return typeof rate === "number" && Number.isFinite(rate) && rate >= 0;
-}
-
-/** Every rate the reservation or settlement may read is finite and >= 0. */
-function verifiablePricing(pricing: ModelPricing | undefined): pricing is ModelPricing {
-  if (pricing === undefined) return false;
-  if (![pricing.input, pricing.output, pricing.cacheWrite ?? 0, pricing.cacheRead ?? 0].every(validRate)) return false;
-  const long = pricing.longContext;
-  if (long !== undefined && !(typeof long.thresholdTokens === "number" && long.thresholdTokens > 0 && [long.input, long.output, long.cacheWrite ?? 0, long.cacheRead ?? 0].every(validRate))) return false;
-  const tiers = pricing.serviceTierMultipliers;
-  return tiers === undefined || Object.values(tiers).every(validRate);
 }
 
 /**
@@ -214,9 +200,9 @@ export function createRequestBudgetScope(
 ): RequestBudgetScope | undefined {
   const sessionId = request.budgetOwnerSessionId ?? request.sessionId;
   const limits = budget === undefined || sessionId === undefined ? undefined : budget.requestLimits(sessionId);
-  // A loopback/private URL can be a forwarding gateway to a paid service.
-  // Only an explicit runner/plan kind is free without configured zero rates.
-  const unbilled = entry?.kind === "subscription-cli" || entry?.kind === "llama-server";
+  // An explicit runner or plan, or an unpriced loopback/LAN server; a
+  // priced one may be a forwarding gateway to a paid service and is billed.
+  const unbilled = linkSpendBilling(entry, model?.pricing) !== "billed";
   // Unbilled links are not spend: the day never sees them.
   const day = unbilled ? undefined : daily;
   if (limits === undefined && day === undefined) return undefined;
