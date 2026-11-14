@@ -119,7 +119,6 @@ export const deferredFiles = [
   'src/tools/verify/check-css-syntax.test.ts',
   'src/tools/verify/check-html-syntax.test.ts',
   'src/tools/verify/check-language-syntax.test.ts',
-  'src/tools/verify/run-verify.test.ts',
   'src/tools/verify/terminal-app-hint.test.ts',
   'src/tools/verify/verify-run-guard.test.ts',
   'src/tools/verify/verify-run.test.ts',
