@@ -148,7 +148,14 @@ export function saveProviderWizardToConfig(
     if (networkKeyEnvVar) entry = { ...entry, apiKeyEnvVar: networkKeyEnvVar };
   } else if (stored?.apiKey) {
     entry = { ...entry, apiKey: stored.apiKey };
-  } else if (stored?.apiKeyEnvVar && !entry.apiKeyEnvVar) {
+  } else if (
+    stored?.apiKeyEnvVar &&
+    !entry.apiKeyEnvVar &&
+    // A shared OPENAI_* name moved to an endpoint the shared key may not
+    // reach: carried over, the resolver would honour it as an explicit
+    // choice and send the cloud key there (in clear for http://).
+    !(networkKeyEnvVar !== undefined && isSharedCompatKeyVar(stored.apiKeyEnvVar))
+  ) {
     // Still a variable: the key stays in .env, under the name the
     // operator gave it.
     entry = { ...entry, apiKeyEnvVar: stored.apiKeyEnvVar };
