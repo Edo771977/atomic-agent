@@ -61,8 +61,13 @@ it("preserves external and sibling file URLs", () => {
   const text = "file:///backup/home/u/project/a.js file:///home/u/project-sibling/a.js file:/home/u/project-sibling/a.js file:backup/home/u/project/a.js";
   expect(rebaseVerifyWorkspaceValue(text, "/home/u/project", "/private/checked", "linux")).toBe(text);
 });
-it("refuses malformed file URI plans before execution", () => {
-  expect(() => rebaseVerifyWorkspaceValue("file:///%GG/project/a.js", "/home/u/project", "/private/checked", "linux")).toThrow(/unsupported absolute project reference/);
+it.each([
+  ["linux", "/home/u/project", "file:///home/u/project/%GG/a.js"],
+  ["darwin", "/home/u/my project", "file:/home/u/my%20project/%GG/a.js"],
+  ["win32", "C:\\source", "file:C:/sour%63e/%GG/a.js"],
+  ["win32", "\\\\server\\share\\project", "file://server/share/project/%GG/a.js"],
+] as const)("refuses malformed file URI plans with a recognizable %s source prefix", (platform, root, uri) => {
+  expect(() => rebaseVerifyWorkspaceValue(uri, root, "/private/checked", platform)).toThrow(/unsupported absolute project reference/);
 });
 it("preserves an external literal file URI with WHATWG scheme whitespace", () => {
   const uri = "fi\nle:/backup/home/u/project/a.js";
@@ -71,4 +76,10 @@ it("preserves an external literal file URI with WHATWG scheme whitespace", () =>
 it("preserves benign multiline code and file labels", () => {
   const code = "console.log('file: ready');\nconsole.log('file:');\nprocess.exit(0);";
   expect(rebaseVerifyWorkspaceValue(code, source, execution)).toBe(code);
+});
+it.each(["linux", "darwin", "win32"] as const)("preserves percent-bearing file labels on %s", platform => {
+  const code = "console.log('file: 100% ready');\nconsole.log('file: ready');";
+  expect(rebaseVerifyWorkspaceValue(code, "/source", "/execution", platform)).toBe(code);
+  const external = "file:///backup/%GG/a.js";
+  expect(rebaseVerifyWorkspaceValue(external, "/source", "/execution", platform)).toBe(external);
 });

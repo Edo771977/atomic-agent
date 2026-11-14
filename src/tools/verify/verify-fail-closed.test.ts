@@ -30,6 +30,12 @@ afterEach(async () => {
 });
 
 describe("verify refuses to execute without a private workspace", () => {
+  it("executes benign logging with a percent-bearing file label", async () => {
+    const result = await runVerify({ kind: "command", cmd: process.execPath,
+      args: ["-e", "console.log('file: 100% ready')"], network: true }, { workingDir: dir });
+    expect(result.ok).toBe(true);
+    expect(result).toMatchObject({ stdoutTail: "file: 100% ready\n" });
+  });
   it.each(["canonical", "single-slash", "no-slash", "scheme-newline"] as const)("refuses a %s source file URL instead of passing a check that reads outside its execution copy", async spelling => {
     const execution = join(dir, "execution"); await mkdir(execution);
     await writeFile(join(execution, "original.txt"), "execution-copy");

@@ -28,6 +28,10 @@ export function rebaseVerifyWorkspaceValue<T>(value: T, from: string, to: string
       return fold(platform === "darwin" ? resolved.normalize("NFC") : resolved);
     };
     const root = identity(from);
+    const namesSource = (path: string): boolean => {
+      const normalized = identity(path);
+      return normalized === root || normalized.startsWith(`${root}/`);
+    };
     const tokens = [...text.matchAll(/[^\s"'`()=;,\[\]]+/g)].map(match => match[0]);
     tokens.push(...[...text.matchAll(/["'`]([^"'`]+)["'`]/g)].map(match => match[1]!));
     // A whole argv value may contain literal controls that WHATWG removes
@@ -41,7 +45,21 @@ export function rebaseVerifyWorkspaceValue<T>(value: T, from: string, to: string
         // normalization, instead of enumerating file scheme spellings.
         try { token = fileURLToPath(fileUri, { windows: platform === "win32" }); }
         catch (error) {
-          if (error instanceof URIError) throw new Error("verification check plan has an unsupported absolute project reference");
+          if (error instanceof URIError) {
+            // An invalid percent escape in a later component must not hide
+            // a recognizable source-root prefix. A logging label or an
+            // unrelated malformed URL is not evidence of that reference.
+            const prefix: string[] = [];
+            for (const component of fileUri.pathname.split("/")) {
+              try { decodeURIComponent(component); } catch { break; }
+              prefix.push(component);
+            }
+            const prefixUri = new URL(fileUri);
+            prefixUri.pathname = prefix.join("/") || "/";
+            let nativePrefix: string | undefined;
+            try { nativePrefix = fileURLToPath(prefixUri, { windows: platform === "win32" }); } catch { /* No native source prefix. */ }
+            if (nativePrefix !== undefined && namesSource(nativePrefix)) throw new Error("verification check plan has an unsupported absolute project reference");
+          }
           // Non-native file URLs and labels (e.g. `file:`) cannot name a
           // native source file; do not reject benign logging text.
           continue;
@@ -49,8 +67,7 @@ export function rebaseVerifyWorkspaceValue<T>(value: T, from: string, to: string
       }
       token = token.replace(/^(?:~|\$HOME|\$\{HOME\}|%USERPROFILE%|\$env:USERPROFILE)(?=[\/\\]|$)/i, home);
       if (!paths.isAbsolute(token)) continue;
-      const normalized = identity(token);
-      if (normalized === root || normalized.startsWith(`${root}/`)) throw new Error("verification check plan has an unsupported absolute project reference");
+      if (namesSource(token)) throw new Error("verification check plan has an unsupported absolute project reference");
     }
     return text as T;
   }
