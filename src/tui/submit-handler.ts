@@ -573,7 +573,12 @@ function runFusionRunAction(
     return;
   }
   if (!canTypeMessage(state)) return;
-  const text = callbacks.prepareFusionResume?.(sessionId, request.runId) ?? null;
+  const offer = callbacks.prepareFusionResume?.(sessionId, request.runId) ?? null;
+  if (offer !== null && typeof offer === "object") {
+    dispatch({ type: "system_message", text: offer.alreadyQueued });
+    return;
+  }
+  const text = offer;
   if (text === null) {
     dispatch({
       type: "system_message",
@@ -606,10 +611,15 @@ function runResumeInterruptedTurn(
 ): void {
   const sessionId = state.session.sessionId;
   if (!canTypeMessage(state)) return;
-  const text =
+  const offer =
     sessionId === null
       ? null
       : (callbacks.prepareInterruptedTurnResume?.(sessionId) ?? null);
+  if (offer !== null && typeof offer === "object") {
+    dispatch({ type: "system_message", text: offer.alreadyQueued });
+    return;
+  }
+  const text = offer;
   if (text === null) {
     dispatch({ type: "system_message", text: NOTHING_TO_RESUME });
     return;

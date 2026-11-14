@@ -608,17 +608,19 @@ export interface TuiAppCallbacks {
   /**
    * `/fusion resume [id]`: the message that makes the orchestrator
    * continue an unfinished run of `sessionId`, sent as the person's
-   * turn; `null` when there is no such run.
+   * turn; `null` when there is no such run; `alreadyQueued` (a line to
+   * show) when a resume of that run is queued and has not started.
    */
-  prepareFusionResume?(sessionId: string, runId: string | undefined): string | null;
+  prepareFusionResume?(sessionId: string, runId: string | undefined): string | { alreadyQueued: string } | null;
   /** `/fusion report [flags]`: the outcome report's text (or a usage line). */
   renderFusionReport?(args: readonly string[]): string;
   /**
    * `/resume` (ATO-448): the message that continues `sessionId`'s last
    * turn when a restart cut it off, sent as the person's turn; `null`
-   * when there is none. Taking it records the turn as resumed.
+   * when there is none; `alreadyQueued` when its resume (or its Fusion
+   * run's) is queued already. Taking it records the turn as resumed.
    */
-  prepareInterruptedTurnResume?(sessionId: string): string | null;
+  prepareInterruptedTurnResume?(sessionId: string): string | { alreadyQueued: string } | null;
   /** Providers tab / LLM panel: select an exact chat model for a provider. */
   onProvidersSelectChatModel?(providerId: string, modelId: string): void;
   /**

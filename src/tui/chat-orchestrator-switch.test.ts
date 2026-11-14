@@ -605,7 +605,7 @@ describe("ChatOrchestrator offers a reply a restart cut off (ATO-448)", () => {
   it("shows the one-line notice when the opened session's last turn was interrupted", () => {
     const pending = vi.fn((id: string) => (id === "s-b" ? cutOff : null));
     const { orchestrator, actions } = makeHarness({
-      interruptedTurns: { pending, resumeMessage: () => null, release: () => {} },
+      interruptedTurns: { pending, resumeMessage: () => null, resume: () => null, fusionResume: () => null, release: () => {} },
     });
     orchestrator.switchSession("s-b");
     expect(warnTexts(actionsAfterLastSwitch(actions))).toContain(
@@ -616,7 +616,7 @@ describe("ChatOrchestrator offers a reply a restart cut off (ATO-448)", () => {
 
   it("shows nothing when the last turn was not interrupted", () => {
     const { orchestrator, actions } = makeHarness({
-      interruptedTurns: { pending: () => null, resumeMessage: () => null, release: () => {} },
+      interruptedTurns: { pending: () => null, resumeMessage: () => null, resume: () => null, fusionResume: () => null, release: () => {} },
     });
     orchestrator.switchSession("s-a");
     expect(warnTexts(actionsAfterLastSwitch(actions))).not.toContain(
@@ -626,17 +626,19 @@ describe("ChatOrchestrator offers a reply a restart cut off (ATO-448)", () => {
 
   it("never acts on it: opening the session starts no turn", () => {
     const resumeMessage = vi.fn(() => "continue");
+    const resume = vi.fn(() => ({ text: "continue" }));
     const { orchestrator, turns } = makeHarness({
-      interruptedTurns: { pending: () => cutOff, resumeMessage, release: () => {} },
+      interruptedTurns: { pending: () => cutOff, resumeMessage, resume, fusionResume: () => null, release: () => {} },
     });
     orchestrator.switchSession("s-b");
     expect(turns).toHaveLength(0);
     expect(resumeMessage).not.toHaveBeenCalled();
+    expect(resume).not.toHaveBeenCalled();
   });
 
   it("leaves a cut-off fusion run to its own offer", () => {
     const { orchestrator, actions } = makeHarness({
-      interruptedTurns: { pending: () => cutOff, resumeMessage: () => null, release: () => {} },
+      interruptedTurns: { pending: () => cutOff, resumeMessage: () => null, resume: () => null, fusionResume: () => null, release: () => {} },
       fusionRuns: {
         listResumable: () => [
           { runId: "r1", sessionId: "s-b", updatedAt: 1, summary: "fusion run r1: 2 of 3 tasks done" },

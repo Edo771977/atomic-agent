@@ -92,6 +92,24 @@ describe("/resume", () => {
     expect(systemTexts(dispatched)).toContain(NOTHING_TO_RESUME);
   });
 
+  it("says a resume is already queued rather than queueing a second one", () => {
+    const onMessageSubmitted = vi.fn();
+    const dispatched: Array<{ type: string; text?: string }> = [];
+    const dispatch = ((a: { type: string }) => dispatched.push(a)) as never;
+    const cbs = callbacks({
+      onMessageSubmitted,
+      prepareInterruptedTurnResume: () => ({ alreadyQueued: "a resume of fusion run r1 is already queued" }),
+      prepareFusionResume: () => ({ alreadyQueued: "a resume of fusion run r1 is already queued" }),
+    });
+    handleEditorSubmit("/resume", idleState(), dispatch, cbs);
+    handleEditorSubmit("/fusion resume", idleState(), dispatch, cbs);
+    expect(onMessageSubmitted).not.toHaveBeenCalled();
+    expect(systemTexts(dispatched)).toEqual([
+      "a resume of fusion run r1 is already queued",
+      "a resume of fusion run r1 is already queued",
+    ]);
+  });
+
   it("says there is nothing to resume without a session or a runtime that offers it", () => {
     const onMessageSubmitted = vi.fn();
     const dispatched: Array<{ type: string; text?: string }> = [];

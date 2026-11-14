@@ -699,8 +699,15 @@ export async function tuiCommand(args: string[]): Promise<number> {
                 ].join("\n"),
           );
         },
-        prepareFusionResume: (sessionId, runId) =>
-          runtime.fusionRuns?.resumeMessage(sessionId, runId) ?? null,
+        // One queued mark with `/resume` (a cut-off Fusion turn resumes
+        // the same run): a run is never queued twice.
+        prepareFusionResume: (sessionId, runId) => {
+          const turns = runtime.interruptedTurns;
+          const offer = turns === undefined
+            ? runtime.fusionRuns?.resumeMessage(sessionId, runId) ?? null
+            : turns.fusionResume(sessionId, runId);
+          return offer === null || typeof offer === "string" || "alreadyQueued" in offer ? offer : offer.text;
+        },
         // `/fusion report`: the same text as `atomic-agent fusion report`.
         renderFusionReport: (args) => {
           const parsed = parseReportArgs(args);
@@ -717,8 +724,10 @@ export async function tuiCommand(args: string[]): Promise<number> {
           }
         },
         // `/resume` (ATO-448): a chat turn a restart cut off.
-        prepareInterruptedTurnResume: (sessionId) =>
-          runtime.interruptedTurns?.resumeMessage(sessionId) ?? null,
+        prepareInterruptedTurnResume: (sessionId) => {
+          const offer = runtime.interruptedTurns?.resume(sessionId) ?? null;
+          return offer === null || "alreadyQueued" in offer ? offer : offer.text;
+        },
         onProvidersSelectChatModel: (providerId, modelId) =>
           void orchestrator.providers.selectChatModel(providerId, modelId),
         onProvidersChatModelPickerRequested: (providerId) =>

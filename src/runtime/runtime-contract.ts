@@ -269,7 +269,9 @@ export interface AgentRuntime {
    * `resumeMessage` returns the message that continues it (a note
    * telling the model to check before repeating side effects, then the
    * request; for a cut-off Fusion orchestrator turn with a resumable run,
-   * that run's `fusionRuns.resumeMessage` instead) and marks it "resume queued", so it is offered once; the
+   * that run's `fusionRuns.resumeMessage` instead) and marks it "resume queued", so it is offered once
+   * (`resume` / `fusionResume` share that mark per run, so `/resume` and
+   * `/fusion resume` never queue one run twice); the
    * marker is replaced when the continuing turn starts. `release` gives
    * it back when the caller drops that exact message before it runs (a cleared
    * queue, a stop, a switch). The caller sends the message through
