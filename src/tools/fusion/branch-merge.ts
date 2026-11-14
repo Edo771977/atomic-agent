@@ -34,7 +34,7 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
-import { dirname, isAbsolute, join, normalize, relative, sep } from "node:path";
+import { dirname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
 import { runCommand } from "../../sandbox/command-runner.js";
 import { buildCommandEnv } from "../../sandbox/command-env.js";
 import {
@@ -428,7 +428,10 @@ export function rebaseScope(
   for (const entry of scope) {
     const root = [...roots]
       .sort((a, b) => b.length - a.length)
-      .find((r) => entry === r || entry.startsWith(`${r}${sep}`));
+      .find((r) => {
+        const rel = relative(resolve(r), resolve(entry));
+        return rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+      });
     const mapped = root === undefined ? entry : join(dir, relative(root, entry));
     if (!out.includes(mapped)) out.push(mapped);
   }

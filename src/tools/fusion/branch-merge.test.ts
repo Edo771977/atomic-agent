@@ -362,6 +362,18 @@ describe("inputReplacement / applyMergeOutcome", () => {
 });
 
 describe("rebaseTask / rebaseScope", () => {
+  it("rebases native scope aliases and keeps sibling scopes outside the workspace", () => {
+    const root = join(process.cwd(), "review-project");
+    const workspace = join(process.cwd(), "private-task");
+    const sibling = `${root}-backup`;
+    const alias = process.platform === "win32"
+      ? `${root.toUpperCase().replaceAll("\\", "/")}/src`
+      : join(root, "nested", "..", "src");
+    expect(rebaseScope([alias, sibling, join(root, "..hidden")], [root], workspace)).toEqual([
+      join(workspace, "src"), sibling, join(workspace, "..hidden"), workspace,
+    ]);
+  });
+
   it("points paths into the folder at the workspace, under either spelling", () => {
     const roots = ["/var/p", "/private/var/p"];
     const t = rebaseTask(
