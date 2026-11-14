@@ -43,11 +43,13 @@ vi.mock("../core/core-embedding.js", async (importOriginal) => {
 });
 import { coreEmbeddingRecordPath, CORE_VERSION, readCoreEmbeddingRecord, writeCoreJson } from "../core/core-state.js";
 
+import { USER_CONFIG_VERSION } from "../../config/config-schema.js";
 import {
   resolveEmbeddingPidFilePath,
   resolveLogFilePath,
   resolveModelFilePath,
   resolvePidFilePath,
+  resolvePromptCacheDir,
   resolveServerBinPath,
   resolveThroughputFilePath,
 } from "../backend-paths.js";
@@ -1263,6 +1265,41 @@ describe("managed launch requires an api key (#582)", () => {
       expect(args.join(" ")).not.toContain(key);
     } finally {
       rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it("a launch with the prompt cache suspended (fit-test) keeps the user's saves and adds no save path", async () => {
+    const dataDir = mkdtempSync(`${tmpdir()}/atomic-daemon-suspend-`);
+    const stateDir = mkdtempSync(`${tmpdir()}/atomic-daemon-suspend-state-`);
+    const savedStateDir = process.env.ATOMIC_AGENT_STATE_DIR;
+    try {
+      process.env.ATOMIC_AGENT_STATE_DIR = stateDir;
+      writeFileSync(
+        join(stateDir, "config.json"),
+        JSON.stringify({ version: USER_CONFIG_VERSION, localModels: { managed: { promptDiskCache: true } } }),
+      );
+      resetConfigCache();
+      stageBackend(dataDir);
+      // The user's own conversation, saved by the stop before the fit-test.
+      const cacheDir = resolvePromptCacheDir(dataDir);
+      mkdirSync(cacheDir, { recursive: true });
+      const save = join(cacheDir, "slot-1-0.bin");
+      writeFileSync(save, "kv");
+      writeFileSync(`${save}.json`, JSON.stringify({ fingerprint: "the-user-model", tokens: 4096, savedAt: 1 }));
+      stubServer([]);
+      spawnMock.mockReturnValue(fakeChild(4261));
+      await startDaemon({ dataDir, modelId: "qwen-3.5-4b", port: 19092, device: "cpu", promptCache: "suspend" });
+      expect(spawned(0).args).not.toContain("--slot-save-path");
+      expect(existsSync(save)).toBe(true);
+      expect(existsSync(`${save}.json`)).toBe(true);
+      // Nothing for the stop to save: the test model's caches never reach the folder.
+      expect(readLaunchRecord(dataDir, 4261)?.promptCacheFingerprint ?? null).toBeNull();
+    } finally {
+      if (savedStateDir === undefined) delete process.env.ATOMIC_AGENT_STATE_DIR;
+      else process.env.ATOMIC_AGENT_STATE_DIR = savedStateDir;
+      resetConfigCache();
+      rmSync(dataDir, { recursive: true, force: true });
+      rmSync(stateDir, { recursive: true, force: true });
     }
   });
 });
