@@ -19,7 +19,13 @@ export type ResolvedModel = {
   supportsPromptCache: boolean;
   reasoningFormat: UserModelConfigEntry["reasoningFormat"];
   pricing?: UserModelConfigEntry["pricing"];
-  source: "user" | "catalog" | "live" | "default";
+  /**
+   * Where the row came from. `snapshot` is the bundled models.dev
+   * snapshot (ATO-647): its prices are a frozen community list, used to
+   * estimate spend but never to refuse a request ahead of sending it
+   * (`verifiedAdmissionPricing`), and its context window is display-only.
+   */
+  source: "user" | "catalog" | "snapshot" | "live" | "default";
 };
 
 export type ModelCatalogEntry = Omit<ResolvedModel, "source"> & {

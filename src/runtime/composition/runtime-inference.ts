@@ -21,7 +21,7 @@ import {
 } from "../../session/daily-spend.js";
 import { DailySpendLimitError } from "../../llm/reliability/spend-limit-error.js";
 import { isLocalServerUrl } from "../../llm/provider/openai/local-server-url.js";
-import { linkSpendBilling } from "../link-spend-billing.js";
+import { linkSpendBilling, verifiedAdmissionPricing } from "../link-spend-billing.js";
 import { resolveModelPricingFor } from "../resolve-model-pricing.js";
 import { createRequestBudgetScope } from "../request-budget.js";
 import { createDailySpendBudget } from "../daily-spend-budget.js";
@@ -359,7 +359,7 @@ export function connectRuntimeFallback(
   const spendBilling = (providerId: string): { local: boolean; plan: boolean } => {
     const entry = resolveLlmConfig(getConfig()).providers.find((p) => p.id === providerId);
     const billing = linkSpendBilling(entry, entry === undefined ? undefined
-      : resolveModelPricing(entry.defaultChatModel ?? entry.model ?? null, providerId)?.pricing);
+      : verifiedAdmissionPricing(resolveModelPricing(entry.defaultChatModel ?? entry.model ?? null, providerId)));
     return { local: billing === "local", plan: billing === "plan" };
   };
   // ATO-649: today's total is a second ledger of the per-send request

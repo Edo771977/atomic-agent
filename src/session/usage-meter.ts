@@ -60,7 +60,7 @@ export interface SessionUsageState {
  * a price the operator configured (`userModels[].pricing`), the bundled
  * catalog, the provider's live model list. Nothing else is guessed.
  */
-export type CostSource = "provider" | "user" | "catalog" | "live";
+export type CostSource = "provider" | "user" | "catalog" | "snapshot" | "live";
 
 export interface LimitReading extends RateLimitWindow {
   /** The provider link (account) the reading came from. */
@@ -126,7 +126,7 @@ export function priceCompletion(
   return {
     kind: "priced",
     usd: estimateUsageCostUsd(usage, pricing),
-    source: source === "user" ? "user" : source === "live" ? "live" : "catalog",
+    source: source === "user" ? "user" : source === "live" ? "live" : source === "snapshot" ? "snapshot" : "catalog",
   };
 }
 
@@ -463,6 +463,8 @@ function sourceLabel(source: CostSource): string {
       return "your configured prices";
     case "catalog":
       return "the built-in price list";
+    case "snapshot":
+      return "the bundled models.dev price snapshot (an estimate)";
     case "live":
       return "the provider's live price list";
   }

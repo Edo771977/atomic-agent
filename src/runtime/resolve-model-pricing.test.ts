@@ -180,7 +180,7 @@ describe("resolveModelPricingFor — models.dev snapshot", () => {
 
   it("prices a preset model nobody priced by hand", () => {
     const model = resolveModelPricingFor(resolved, "kimi-k3.1-pro");
-    expect(model?.source).toBe("catalog");
+    expect(model?.source).toBe("snapshot");
     expect(model?.pricing).toEqual({ input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2 });
     expect(model?.contextWindow).toBe(1_048_576);
   });
