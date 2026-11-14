@@ -11,7 +11,18 @@ const HERE = fileURLToPath(new URL(".", import.meta.url));
 export const REPO_ROOT = resolve(HERE, "..", "..");
 export const CLI_BIN = resolve(REPO_ROOT, "dist", "cli", "index.js");
 export const VITEST_CONFIG = resolve(REPO_ROOT, "eval-agents", "vitest.config.ts");
-export const VITEST_ENTRY = fileURLToPath(import.meta.resolve("vitest/vitest.mjs"));
+
+/**
+ * The installed Vitest entry, resolved on use so that orchestrators and
+ * helpers that never launch Vitest still load when it is not installed.
+ */
+export function resolveVitestEntry() {
+  try {
+    return fileURLToPath(import.meta.resolve("vitest/vitest.mjs"));
+  } catch {
+    throw new Error("vitest is not installed (cannot resolve vitest/vitest.mjs); run `npm ci` first");
+  }
+}
 export const ENV_FILE = resolve(REPO_ROOT, "eval-agents", ".env");
 
 export function makeLog(tag) {
@@ -147,9 +158,17 @@ export function teardownDaemons(log, startedByUs) {
 }
 
 export function runVitest({ extraEnv = {}, forwarded = [], signal,
-  entryPath = VITEST_ENTRY, cwd = REPO_ROOT,
-  requireCampaign = entryPath === VITEST_ENTRY, killTimeoutMs = 10_000 } = {}) {
+  entryPath, cwd = REPO_ROOT,
+  requireCampaign = entryPath === undefined, killTimeoutMs = 10_000 } = {}) {
   if (signal?.aborted) return Promise.resolve(signalExitCode(signal.reason?.signal));
+  if (entryPath === undefined) {
+    try {
+      entryPath = resolveVitestEntry();
+    } catch (error) {
+      console.error(`[eval-agents] could not launch vitest: ${error.message}`);
+      return Promise.resolve(1);
+    }
+  }
   const env = { ...process.env, ...extraEnv };
   let campaignPath;
   if (requireCampaign) {

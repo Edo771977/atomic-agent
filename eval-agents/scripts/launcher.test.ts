@@ -1,8 +1,8 @@
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterAll, describe, expect, it } from "vitest";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
@@ -159,4 +159,28 @@ describe.skipIf(process.platform === "win32")("eval launcher repeated signals", 
       }
     });
   }
+});
+
+describe("eval launcher without an installed Vitest", () => {
+  it("still imports the shared helpers and fails runVitest with a clear diagnostic", () => {
+    // A copy outside the repository cannot resolve the vitest package.
+    const isolated = mkdtempSync(join(tmpdir(), "eval-lib-no-vitest-"));
+    try {
+      mkdirSync(join(isolated, "eval-agents", "scripts"), { recursive: true });
+      const lib = join(isolated, "eval-agents", "scripts", "_lib.mjs");
+      copyFileSync(join(root, "eval-agents/scripts/_lib.mjs"), lib);
+      const script = `const lib = await import(${JSON.stringify(pathToFileURL(lib).href)});
+        lib.makeLog("probe")("imported");
+        process.exitCode = await lib.runVitest();`;
+      const result = spawnSync(process.execPath, ["--input-type=module", "-e", script],
+        { cwd: isolated, encoding: "utf8", timeout: 10_000 });
+      const diagnostic = `${result.stdout}\n${result.stderr}`;
+      expect(result.stderr, diagnostic).toContain("[eval-agents:probe] imported");
+      expect(result.status, diagnostic).toBe(1);
+      expect(result.stderr).toContain("vitest is not installed");
+      expect(result.stderr).not.toContain("ERR_MODULE_NOT_FOUND");
+    } finally {
+      rmSync(isolated, { recursive: true, force: true });
+    }
+  });
 });
