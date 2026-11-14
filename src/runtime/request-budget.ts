@@ -116,6 +116,49 @@ export const SOFT_OUTPUT_RESERVE_TOKENS = 8192;
  */
 export type RequestBudgetMode = "hard" | "soft" | "meter" | "unbilled";
 
+/** Input estimate: serialized body bytes per token, plus a fixed framing allowance. */
+const BODY_BYTES_PER_TOKEN = 3;
+const FRAMING_TOKENS = 1024;
+/** Smallest output a clamped ceiling or shrunk soft bound may leave. */
+const MIN_OUTPUT_TOKENS = 1024;
+
+type Hold = ReturnType<FusionTurnBudget["reserveRequest"]>;
+
+function isCapRefusal(error: unknown): boolean {
+  return error instanceof Error && error.message.startsWith("turn budget cannot cover this request");
+}
+
+/**
+ * Reserves `upperUsd(output)` for the largest output in
+ * [min(MIN_OUTPUT_TOKENS, output), output] that the remaining allowance
+ * covers. Reservation is synchronous, so the search cannot race another
+ * request. Refuses with the full bound's error when even the smallest
+ * output does not fit.
+ */
+function reserveFitting(budget: FusionTurnBudget, sessionId: string, output: number, upperUsd: (output: number) => number): { hold: Hold; output: number } {
+  const attempt = (tokens: number): Hold | undefined => {
+    try { return budget.reserveRequest(sessionId, upperUsd(tokens)); } catch (error) {
+      if (isCapRefusal(error)) return undefined;
+      throw error;
+    }
+  };
+  const full = attempt(output);
+  if (full !== undefined) return { hold: full, output };
+  const floor = Math.min(MIN_OUTPUT_TOKENS, output);
+  const smallest = floor < output ? attempt(floor) : undefined;
+  if (smallest === undefined) return { hold: budget.reserveRequest(sessionId, upperUsd(output)), output };
+  smallest.release();
+  let fits = floor;
+  let misses = output;
+  while (misses - fits > 1) {
+    const middle = Math.floor((fits + misses) / 2);
+    const probe = attempt(middle);
+    if (probe === undefined) misses = middle;
+    else { probe.release(); fits = middle; }
+  }
+  return { hold: budget.reserveRequest(sessionId, upperUsd(fits)), output: fits };
+}
+
 export interface RequestBudgetScope extends CompletionRequestBudget {
   signal?: AbortSignal;
   /** Enforcement of the USD cap; `undefined` without one. `hard` may become `soft` at the first send. */
@@ -192,6 +235,7 @@ export function createRequestBudgetScope(
       const explicitCaps = outputCap === undefined ? wireCaps : [outputCap, ...wireCaps];
       const soft = explicitCaps.length === 0;
       let ceiling: number;
+      let fields: readonly ("max_tokens" | "max_completion_tokens")[] = [];
       if (soft) {
         // No explicit ceiling: assume a bounded reply, leave the body alone
         // and settle on real usage afterwards.
@@ -214,17 +258,20 @@ export function createRequestBudgetScope(
         // field the wire model's profile expects: OpenAI reasoning models
         // reject `max_tokens`.
         const present = (["max_tokens", "max_completion_tokens"] as const).filter(field => body[field] !== undefined);
-        const fields = present.length > 0 ? present : [typeof body.model === "string" ? modelParamProfile(body.model).capField : "max_tokens"];
+        fields = present.length > 0 ? present : [typeof body.model === "string" ? modelParamProfile(body.model).capField : "max_tokens"];
         for (const field of fields) body[field] = ceiling;
       }
-      // Every tokenizer emits at most one token per UTF-8 byte of text, so
-      // the serialized body bounds the prompt; JSON keys/escaping and a fixed
-      // framing allowance deliberately overestimate the server's template.
+      // A planning estimate, not a hard bound: about one token per three
+      // UTF-8 bytes of the serialized body (JSON keys and escaping included)
+      // plus a framing allowance. Settlement charges real usage, so an
+      // underestimate costs at most one request's difference. Multi-byte
+      // scripts stay sane: a 3-byte CJK character counts as one token.
       // The context window is not a floor for ordinary bodies: it would
       // reserve a full window for every short request and starve parallel
       // workers. It is the floor when the provider adds input of its own
       // (web search results, server tools) that the body cannot bound.
-      const bodyTokens = Buffer.byteLength(JSON.stringify(body), "utf8") + 1024;
+      const serialized = JSON.stringify(body);
+      const bodyTokens = Math.ceil(Buffer.byteLength(serialized, "utf8") / BODY_BYTES_PER_TOKEN) + FRAMING_TOKENS;
       let inputTokens = bodyTokens;
       if (addsProviderSideInput(body)) {
         if (model?.source === "default" || !Number.isFinite(model?.contextWindow) || model!.contextWindow <= 0) {
@@ -236,16 +283,27 @@ export function createRequestBudgetScope(
       // The bound can cross a long-context threshold the real prompt does
       // not: reserving the higher tier then only overestimates.
       const long = pricing!.longContext !== undefined && inputTokens > pricing!.longContext.thresholdTokens ? longContextRates(pricing!) : undefined;
-      const inputRates = [pricing!.input, pricing!.cacheWrite ?? pricing!.input, pricing!.cacheRead ?? pricing!.input];
+      // Input is priced at the input rate; the cache-write premium applies
+      // only when the body places explicit `cache_control` breakpoints.
+      // Settlement prices the reported cache reads/writes.
+      const cacheBreakpoints = serialized.includes('"cache_control"');
+      const inputRates = [pricing!.input];
+      if (cacheBreakpoints) inputRates.push(pricing!.cacheWrite ?? pricing!.input);
       // Missing long cache rates are derived exactly as settlement derives them.
-      if (long !== undefined) inputRates.push(long.input, long.cacheWrite, long.cacheRead);
+      if (long !== undefined) inputRates.push(long.input, ...(cacheBreakpoints ? [long.cacheWrite] : []));
       const inputRate = Math.max(...inputRates);
       const outputRate = long === undefined ? pricing!.output : Math.max(pricing!.output, long.output);
       const copies = [body.n, body.best_of].filter(value => value !== undefined);
       if (!copies.every(value => typeof value === "number" && Number.isInteger(value) && value > 0)) throw new Error("turn budget cannot verify the request's completion count");
       const outputCopies = Math.max(1, ...(copies as number[]));
-      const upperUsd = ((inputTokens * inputRate + ceiling * outputRate) * outputCopies * multiplier) / 1_000_000;
-      held = budget.reserveRequest(sessionId, upperUsd);
+      const upperUsd = (output: number) => ((inputTokens * inputRate + output * outputRate) * outputCopies * multiplier) / 1_000_000;
+      const fitting = reserveFitting(budget, sessionId, ceiling, upperUsd);
+      held = fitting.hold;
+      if (fitting.output < ceiling) {
+        // Clamp a written ceiling to what the allowance covers; a soft
+        // bound only assumes the smaller reply.
+        for (const field of fields) body[field] = fitting.output;
+      }
       tierMultiplier = multiplier;
     },
     onResponse(status) {
