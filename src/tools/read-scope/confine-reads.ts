@@ -267,7 +267,10 @@ export function confineReads(
           const cwd = name === VERIFY_TOOL && typeof call.cwd === "string" ? resolve(ctx.workingDir, call.cwd) : ctx.workingDir;
           if (name === VERIFY_TOOL && !isInside(resolve(ctx.workingDir), cwd)) return compressToolResult({ tool: name, status: "error", output: "verify.run: cwd must stay inside the working directory" });
           const commandContext = cwd === ctx.workingDir ? ctx : { ...ctx, workingDir: cwd, readRoots: [ctx.workingDir, ...(ctx.readRoots ?? [])] };
-          const refusal = await checkCommand(name, call, commandContext);
+          // cwd was consumed into this context. Keeping the relative field
+          // would make the shared scanners resolve it a second time.
+          const checkedCall = name === VERIFY_TOOL ? { ...call, cwd: undefined } : call;
+          const refusal = await checkCommand(name, checkedCall, commandContext);
           if (refusal !== null) return refusal;
         }
         return inner.run(args, ctx);
