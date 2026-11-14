@@ -40,7 +40,8 @@ export function loadGaiaRows(opts: LoadGaiaOptions = {}): GaiaRow[] {
   if (level !== null) {
     rows = rows.filter((row) => Number(row.Level) === level);
   }
-  if (opts.taskIds && opts.taskIds.length > 0) {
+  // null/undefined means no task-id filter; an empty list selects no rows.
+  if (opts.taskIds) {
     const allow = new Set(opts.taskIds);
     rows = rows.filter((row) => allow.has(row.task_id));
   }
