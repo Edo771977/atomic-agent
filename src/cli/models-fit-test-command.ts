@@ -35,6 +35,7 @@ import {
   clearFitRestoreMarker,
   createFitModelSwitcher,
   fitRestoreMarkerLive,
+  fitRunDeadlineMs,
   markFitRestoreSwapped,
   readFitModelSnapshot,
   readFitRestoreMarker,
@@ -238,7 +239,10 @@ export async function runModelsFitTest(args: string[]): Promise<number> {
   // A process killed with no chance to run a handler (the desktop's
   // Cancel on Windows is TerminateProcess) leaves this record behind; the
   // next `models` command or TUI start puts the models back from it.
-  writeFitRestoreMarker(cfg.paths.localModelsDataDir, snapshot, { stateDir: cfg.paths.stateDir });
+  writeFitRestoreMarker(cfg.paths.localModelsDataDir, snapshot, {
+    stateDir: cfg.paths.stateDir,
+    maxRunMs: fitRunDeadlineMs(parsed.modelIds.length, set.tasks.length, parsed.timeoutMs),
+  });
   // A failed restore must not hide the finished report: it is reported,
   // the record stays for the next `models` command to retry, and the
   // command exits 1 after printing the run.

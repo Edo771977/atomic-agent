@@ -101,7 +101,7 @@ vi.mock("../fit-test/index.js", async (importOriginal) => {
 
 import { runModelsFitTest } from "./models-fit-test-command.js";
 import { modelsCommand } from "./models-command.js";
-import { releaseSuspendedChatBeforeTui } from "./models-fit-test-restore.js";
+import { fitRestoreMarkerLive, processStartToken, releaseSuspendedChatBeforeTui } from "./models-fit-test-restore.js";
 
 let stateDir: string;
 let tasksPath: string;
@@ -414,5 +414,39 @@ describe("recovering a fit-test killed before it swapped the model", () => {
     expect(callsOf("stop")).toEqual([]);
     expect(callsOf("start")).toEqual([]);
     expect(existsSync(markerFile())).toBe(false);
+  });
+});
+
+describe("a restore record whose pid the OS handed to another process", () => {
+  const base = { previous: "qwen-3.5-4b", chatRunning: true, embeddingRunning: false, swapped: true };
+
+  it("records this process's start and a deadline from the run's own length", async () => {
+    let seen: Record<string, unknown> | null = null;
+    fake.duringTask = () => {
+      seen = JSON.parse(readFileSync(markerFile(), "utf8")) as Record<string, unknown>;
+    };
+    expect(await runModelsFitTest(fitArgs("--timeout", "60"))).toBe(0);
+    const marker = seen as unknown as { processStart: string | null; deadline: number; startedAt: number };
+    if (process.platform === "linux" || process.platform === "darwin") expect(marker.processStart).toBe(processStartToken(process.pid));
+    // Two models, one task of 60 s: well under the old 24 h.
+    expect(marker.deadline - marker.startedAt).toBeLessThan(3 * 60 * 60 * 1000);
+    expect(marker.deadline - marker.startedAt).toBeGreaterThan(2 * 60 * 1000);
+  });
+
+  it.runIf(process.platform === "linux" || process.platform === "darwin")(
+    "a live pid that started at another time is not the run",
+    () => {
+      const now = Date.now();
+      expect(fitRestoreMarkerLive({ ...base, pid: process.ppid, startedAt: now, deadline: now + 60_000, processStart: "not-its-start" })).toBe(false);
+      expect(
+        fitRestoreMarkerLive({ ...base, pid: process.ppid, startedAt: now, deadline: now + 60_000, processStart: processStartToken(process.ppid) }),
+      ).toBe(true);
+    },
+  );
+
+  it("without a start time, a live pid past the run's deadline is not the run (Windows)", () => {
+    const now = Date.now();
+    expect(fitRestoreMarkerLive({ ...base, pid: process.ppid, startedAt: now - 7_200_000, deadline: now - 1, processStart: null }, now)).toBe(false);
+    expect(fitRestoreMarkerLive({ ...base, pid: process.ppid, startedAt: now - 1000, deadline: now + 60_000, processStart: null }, now)).toBe(true);
   });
 });

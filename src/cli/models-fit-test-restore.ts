@@ -14,6 +14,7 @@
  * TUI start (`recoverInterruptedFitTest`) puts the models back from it
  * and removes it.
  */
+import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { getConfig, resetConfigCache } from "../config/index.js";
@@ -160,12 +161,51 @@ export function createFitModelSwitcher(
 }
 
 const MARKER_FILE = "fit-test-restore.json";
-/** A record older than this is a pid the OS has had time to hand to someone else. */
-const MARKER_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+/** A record without a deadline (an older run's) is not live past this. */
+const LEGACY_MARKER_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+/** Budget per model load in {@link fitRunDeadlineMs}: a cold start of a big model. */
+const LOAD_BUDGET_MS = 20 * 60 * 1000;
+/** Budget per judge call (`fit-judge.ts` times out at 60 s). */
+const JUDGE_BUDGET_MS = 60 * 1000;
+const DEADLINE_MARGIN_MS = 30 * 60 * 1000;
+
+/** The longest a run of `models` x `tasks` with this per-task timeout can take, with margin. */
+export function fitRunDeadlineMs(models: number, tasks: number, timeoutMs: number): number {
+  return models * (LOAD_BUDGET_MS + tasks * (timeoutMs + JUDGE_BUDGET_MS)) + DEADLINE_MARGIN_MS;
+}
+
+/**
+ * When `pid` started, as an opaque token, or `null` where it cannot be
+ * read: Linux `/proc/<pid>/stat` (start time in ticks since boot), macOS
+ * `ps -o lstart=`. Windows has none without a slow WMI query; there the
+ * record's deadline alone tells a reused pid apart.
+ */
+export function processStartToken(pid: number, platform: NodeJS.Platform = process.platform): string | null {
+  try {
+    if (platform === "linux") {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      // Fields after the parenthesised command name; starttime is field 22.
+      const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+      return fields[19] ?? null;
+    }
+    if (platform === "darwin") {
+      const out = execFileSync("/bin/ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", timeout: 2000 }).trim();
+      return out === "" ? null : out;
+    }
+  } catch {
+    /* gone, or not readable */
+  }
+  return null;
+}
 
 export interface FitRestoreMarker extends FitModelSnapshot {
   pid: number;
   startedAt: number;
+  /** When the run's process started ({@link processStartToken}); `null` where unreadable. */
+  processStart?: string | null;
+  /** Past this (epoch ms) the run is over, whatever process holds its pid now. */
+  deadline?: number;
   /** The state dir whose config `previous` is (absent: the reader's own). */
   stateDir?: string;
   /**
@@ -184,9 +224,18 @@ export function fitRestoreMarkerPath(dataDir: string): string {
 export function writeFitRestoreMarker(
   dataDir: string,
   snapshot: FitModelSnapshot,
-  opts: { stateDir: string; pid?: number },
+  opts: { stateDir: string; maxRunMs: number; pid?: number },
 ): void {
-  const marker: FitRestoreMarker = { pid: opts.pid ?? process.pid, startedAt: Date.now(), stateDir: opts.stateDir, ...snapshot };
+  const pid = opts.pid ?? process.pid;
+  const startedAt = Date.now();
+  const marker: FitRestoreMarker = {
+    pid,
+    startedAt,
+    processStart: processStartToken(pid),
+    deadline: startedAt + opts.maxRunMs,
+    stateDir: opts.stateDir,
+    ...snapshot,
+  };
   mkdirSync(dataDir, { recursive: true });
   writeFileSync(fitRestoreMarkerPath(dataDir), `${JSON.stringify(marker)}\n`, { encoding: "utf8", mode: 0o600 });
 }
@@ -220,7 +269,9 @@ export function readFitRestoreMarker(dataDir: string): FitRestoreMarker | null {
     typeof m.chatRunning !== "boolean" ||
     typeof m.embeddingRunning !== "boolean" ||
     !(m.stateDir === undefined || typeof m.stateDir === "string") ||
-    !(m.swapped === undefined || typeof m.swapped === "boolean")
+    !(m.swapped === undefined || typeof m.swapped === "boolean") ||
+    !(m.processStart === undefined || m.processStart === null || typeof m.processStart === "string") ||
+    !(m.deadline === undefined || typeof m.deadline === "number")
   ) {
     return null;
   }
@@ -238,9 +289,20 @@ function pidAlive(pid: number): boolean {
   }
 }
 
-/** Whether the record belongs to a fit-test that is still running. */
+/**
+ * Whether the record belongs to a fit-test that is still running: its pid
+ * is alive and, where the start time can be read, started when the run's
+ * did (a reused pid did not); where it cannot (Windows), the run's
+ * deadline has not passed.
+ */
 export function fitRestoreMarkerLive(marker: FitRestoreMarker, now = Date.now()): boolean {
-  return now - marker.startedAt < MARKER_MAX_AGE_MS && pidAlive(marker.pid);
+  if (!pidAlive(marker.pid)) return false;
+  if (marker.pid === process.pid) return true;
+  if (typeof marker.processStart === "string") {
+    const current = processStartToken(marker.pid);
+    if (current !== null) return current === marker.processStart;
+  }
+  return now < (marker.deadline ?? marker.startedAt + LEGACY_MARKER_MAX_AGE_MS);
 }
 
 /**
