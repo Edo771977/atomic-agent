@@ -30,7 +30,7 @@ Owner: src/tools/browser/
 
 ## Page text is outside data
 
-The page in `### world` and the summaries of `browser.navigate`, `browser.read_aria` and `browser.tabs` (page titles) are framed as external content in a nonce-fenced block, like a fetched page (ATO-1378, `../untrusted-text.ts`). The framing lowers the odds that a page steers the model; the approval gates above are what stop an action.
+The page in `### world` and the summaries of `browser.navigate`, `browser.search`, `browser.read_aria` and `browser.tabs` (page titles) are framed as external content in a nonce-fenced block, like a fetched page (ATO-1378, `../untrusted-text.ts`). The framing lowers the odds that a page steers the model; the approval gates above are what stop an action.
 
 ## Screenshots
 
