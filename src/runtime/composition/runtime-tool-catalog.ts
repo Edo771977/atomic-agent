@@ -65,7 +65,8 @@ const SECRET_HEADER = /authorization|api[-_]?key|token|secret|password|cookie|au
 /**
  * The exact secrets masked in tool output (ATO-1077): the agent's `.env`
  * (loaded into `process.env`) and the credentials stored in the config
- * file: provider keys and secret headers, the local server's key,
+ * file: provider keys and secret headers, explicitly configured key-env
+ * references (including ordinary names), the local server's key,
  * webhook secrets, and MCP servers' secret env values and headers. Read
  * per call, so a key added through `/providers` mid-session is covered.
  */
