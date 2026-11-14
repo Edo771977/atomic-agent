@@ -121,7 +121,7 @@ describe("os.screen.capture of one window (ATO-532)", () => {
     expect(String(prompts[0]!.preview)).toContain('Notes — "Groceries"');
     expect(geometry.get("s1")).toEqual({ originX: 100, originY: 50, scale: 2, imageWidth: 1280, imageHeight: 800 });
     // The desktop finds the picture by this line (chat-files.js cfShotPath).
-    expect(result.summary).toContain(`saved ${path} (`);
+    expect(result.summary.split(/\r?\n/).filter((line) => line.startsWith(`saved ${path} (`))).toHaveLength(1);
     expect(result.summary).toContain("reply.attachments");
     expect(result.details).toMatchObject({ path, window: { app: "Notes", title: "Groceries" } });
   });
