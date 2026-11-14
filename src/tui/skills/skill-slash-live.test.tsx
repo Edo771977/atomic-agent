@@ -86,7 +86,7 @@ it.each(["keyboard", "mouse"])("discovers and invokes a cloud project skill befo
     await vi.waitFor(() => expect(f.frame()).toContain("Explore project requirements"));
     const catalog = f.actions.filter(a => a.type === "skills_refreshed").at(-1);
     expect(catalog?.rows.filter(r => r.name === "openspec-explore")).toHaveLength(1);
-    expect(catalog?.rows.find(r => r.name === "openspec-explore")?.sourcePath).toContain(".agents/skills");
+    expect(catalog?.rows.find(r => r.name === "openspec-explore")?.sourcePath).toContain(join(".agents", "skills"));
     if (input === "keyboard") {
       f.app.stdin.write("\t");
       await vi.waitFor(() => expect(f.frame()).not.toContain("Explore project requirements"));

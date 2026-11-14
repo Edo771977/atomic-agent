@@ -1,3 +1,4 @@
+import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -8,8 +9,8 @@ import {
 } from "./overnight-args.js";
 
 const env = {
-  cwd: "/home/me/code",
-  isDirectory: (path: string) => path.startsWith("/home/me"),
+  cwd: resolve("/home/me/code"),
+  isDirectory: (path: string) => [resolve("/home/me/code"), resolve("/home/me/code/app")].includes(path),
 };
 
 function parseOk(argv: string[]): OvernightArgs {
@@ -24,7 +25,7 @@ describe("parseOvernightArgs", () => {
       task: "tidy the repo",
       budgetUsd: null,
       durationMs: 8 * 3_600_000,
-      dir: "/home/me/code",
+      dir: env.cwd,
       notify: null,
       detach: false,
       noApproval: false,
@@ -51,7 +52,7 @@ describe("parseOvernightArgs", () => {
       task: "migrate the tests",
       budgetUsd: 5,
       durationMs: 5_400_000,
-      dir: "/home/me/code/app",
+      dir: join(env.cwd, "app"),
       notify: "telegram",
       detach: true,
       noApproval: true,
@@ -68,13 +69,16 @@ describe("parseOvernightArgs", () => {
     [["x", "--hours", "0.01"], /--hours expects/],
     [["x", "--hours", "8h"], /--hours expects/],
     [["x", "--hours", "500"], /--hours expects/],
-    [["x", "--dir", "/etc"], /not a directory: \/etc/],
+    [["x", "--dir", "/etc"], /not a directory:/],
     [["x", "--notify", "email"], /only "telegram"/],
     [["x", "--frobnicate"], /unknown option: --frobnicate/],
   ])("refuses %j", (argv, error) => {
     const parsed = parseOvernightArgs(argv, env);
     expect(parsed.ok).toBe(false);
-    if (!parsed.ok) expect(parsed.error).toMatch(error);
+    if (!parsed.ok) {
+      expect(parsed.error).toMatch(error);
+      if (argv.includes("--dir")) expect(parsed.error).toContain(resolve("/etc"));
+    }
   });
 });
 
@@ -90,7 +94,7 @@ describe("detachedChildArgs", () => {
       "--hours",
       "3",
       "--dir",
-      "/home/me/code/app",
+      join(env.cwd, "app"),
       OVERNIGHT_TASK_ID_FLAG,
       "t-123",
     ]);
