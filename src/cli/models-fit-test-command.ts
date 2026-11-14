@@ -236,10 +236,22 @@ export async function runModelsFitTest(args: string[]): Promise<number> {
   // Cancel on Windows is TerminateProcess) leaves this record behind; the
   // next `models` command or TUI start puts the models back from it.
   writeFitRestoreMarker(cfg.paths.stateDir, snapshot);
+  // A failed restore must not hide the finished report: it is reported,
+  // the record stays for the next `models` command to retry, and the
+  // command exits 1 after printing the run.
+  const restoreState = { failed: false };
   const outcome = await runRestoringOnStop(
     (signal) => runFitTest(set, parsed.modelIds, depsFor(signal), { gpuBudgetGb }),
     async (stopped) => {
-      await switcher.restore(stopped);
+      try {
+        await switcher.restore(stopped);
+      } catch (err) {
+        restoreState.failed = true;
+        process.stderr.write(
+          `putting your model back failed: ${err instanceof Error ? err.message : String(err)}; the next \`atomic-agent models\` command tries again\n`,
+        );
+        return;
+      }
       clearFitRestoreMarker(cfg.paths.stateDir);
     },
   );
@@ -248,5 +260,5 @@ export async function runModelsFitTest(args: string[]): Promise<number> {
   const body = `${JSON.stringify(run, null, 2)}\n`;
   if (parsed.outPath !== null) writeFileSync(parsed.outPath, body, { encoding: "utf8", mode: 0o600 });
   process.stdout.write(parsed.json ? body : formatFitTable(run));
-  return 0;
+  return restoreState.failed ? 1 : 0;
 }

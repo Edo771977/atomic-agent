@@ -23,6 +23,8 @@ const fake = vi.hoisted(() => ({
   embWanted: true,
   calls: [] as Array<[string, Record<string, unknown> | string | null]>,
   duringTask: null as null | (() => void),
+  /** `models use <id>` of this id throws (a restore that fails). */
+  useThrowsFor: null as string | null,
 }));
 
 vi.mock("./models-handlers.js", async (importOriginal) => {
@@ -39,6 +41,7 @@ vi.mock("./models-handlers.js", async (importOriginal) => {
     }),
     runLocalModelsUse: vi.fn(async (id: string) => {
       fake.calls.push(["use", id]);
+      if (fake.useThrowsFor === id) throw new Error("config is read-only");
       process.stdout.write(`mode: managed\nactive model: ${id}\n`);
       return 0;
     }),
@@ -131,7 +134,7 @@ beforeEach(() => {
       ],
     }),
   );
-  Object.assign(fake, { chat: true, emb: false, embWanted: true, calls: [], duringTask: null });
+  Object.assign(fake, { chat: true, emb: false, embWanted: true, calls: [], duringTask: null, useThrowsFor: null });
   stdout = "";
   stderr = "";
   vi.spyOn(process.stdout, "write").mockImplementation((chunk: string | Uint8Array) => {
@@ -287,6 +290,17 @@ describe("models fit-test beside another client of the local model", () => {
     expect(await runModelsFitTest(fitArgs())).toBe(1);
     expect(stderr).toMatch(/another models fit-test is running/);
     expect(fake.calls).toEqual([]);
+    expect(existsSync(join(stateDir, "fit-test-restore.json"))).toBe(true);
+  });
+});
+
+describe("models fit-test when putting the user's model back fails", () => {
+  it("still prints the finished report, reports the failure and keeps the record for the next command", async () => {
+    fake.useThrowsFor = "qwen-3.5-4b";
+    expect(await runModelsFitTest(fitArgs("--json"))).toBe(1);
+    const run = JSON.parse(stdout) as { kind: string };
+    expect(run.kind).toBe("atomic-agent.fit-test-run");
+    expect(stderr).toMatch(/putting your model back failed: config is read-only/);
     expect(existsSync(join(stateDir, "fit-test-restore.json"))).toBe(true);
   });
 });
