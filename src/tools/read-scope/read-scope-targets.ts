@@ -68,11 +68,22 @@ export function invalidLocalFileUrlReason(url: string): string | null {
   return local !== null && "error" in local ? local.error : null;
 }
 
-const browserUrlArg: ReadTargetsOf = (args) => {
-  const url = nonEmpty(args.url);
-  const file = url === undefined ? null : localFileOfUrl(url);
-  return file === null ? [] : [file];
-};
+/** URL reads share argument selection between validation and path extraction. */
+const URL_READ_TARGETS: ReadonlyMap<string, (args: Record<string, unknown>) => string | undefined> = new Map([
+  ["browser.navigate", (args) => nonEmpty(args.url)],
+  ["browser.tabs", (args) => args.action === "new" ? nonEmpty(args.url) : undefined],
+]);
+
+/** Invalid local URLs must not become an empty, implicitly allowed target set. */
+export function invalidReadUrlTarget(
+  tool: string,
+  args: Record<string, unknown>,
+): { url: string; why: string } | null {
+  const url = URL_READ_TARGETS.get(tool)?.(args);
+  if (url === undefined) return null;
+  const why = invalidLocalFileUrlReason(url);
+  return why === null ? null : { url, why };
+}
 
 function gitRepoArg(pathKey?: "path" | "paths"): ReadTargetsOf {
   return (args) => {
@@ -172,11 +183,11 @@ export const READ_TOOL_TARGETS: ReadonlyMap<string, ReadTargetsOf> = new Map<
   ["os.git.diff", gitRepoArg("paths")],
   // A file:// page (or its view-source:) reads that file into the
   // browser, and the page text comes back to the model.
-  ["browser.navigate", browserUrlArg],
-  [
-    "browser.tabs",
-    (args) => (args.action === "new" ? browserUrlArg(args) : []),
-  ],
+  ...Array.from(URL_READ_TARGETS, ([name, urlOf]): [string, ReadTargetsOf] => [name, (args) => {
+    const url = urlOf(args);
+    const file = url === undefined ? null : localFileOfUrl(url);
+    return file === null ? [] : [file];
+  }]),
   [
     // A syntax check reads every file it is handed.
     "verify.syntax",

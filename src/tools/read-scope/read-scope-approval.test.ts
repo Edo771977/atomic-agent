@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, parse, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 
 import {
   ApprovalGate,
@@ -17,6 +18,93 @@ import { widenedReadRoot } from "./read-scope-approval.js";
 import { READ_REFUSAL_REASON, WORKER_READ_REFUSAL_REASON } from "./read-scope.js";
 
 const WORKER = `${FUSION_WORKER_ID_PREFIX}1`;
+
+describe("local URL validation at read dispatch", () => {
+  let work: string;
+  let registry: ToolRegistry;
+  let gate: ApprovalGate;
+  let innerCalls: number;
+  let prompts: number;
+
+  const ctx = (sessionId: string): ToolContext => ({
+    sessionId, workingDir: work, stepIndex: 0, signal: new AbortController().signal,
+  });
+  const install = (readScope?: ReadScope) => confineReads(registry, {
+    grantedDirs: () => [],
+    ...(readScope === undefined ? {} : { readScope: () => readScope }),
+    approvals: { approvals: gate, approvalRequired: true },
+    stateSecrets: { stateDir: join(work, "state"), files: [join(work, "state", "config.json")] },
+  });
+
+  beforeEach(() => {
+    work = mkdtempSync(join(tmpdir(), "read-url-dispatch-"));
+    innerCalls = 0;
+    prompts = 0;
+    gate = new ApprovalGate({
+      level: 3,
+      emit: request => {
+        prompts += 1;
+        queueMicrotask(() => gate.resolve({ approvalId: request.approvalId, approved: false }));
+      },
+    });
+    registry = new ToolRegistry();
+    for (const name of ["browser.navigate", "browser.tabs"]) registry.register({
+      name, description: name, readonly: true,
+      run: async () => {
+        innerCalls += 1;
+        return compressToolResult({ tool: name, status: "ok", output: "inner body ran", details: {} });
+      },
+    });
+  });
+
+  afterEach(() => rmSync(work, { recursive: true, force: true }));
+
+  for (const sessionId of ["ordinary", WORKER]) {
+    for (const scope of ["unrestricted", "working-dir"] as const) {
+      for (const name of ["browser.navigate", "browser.tabs"]) {
+        it(`refuses invalid local URLs before ${name} for ${sessionId} under ${scope}`, async () => {
+          install(scope);
+          for (const url of [
+            "file:///bad%00name.html", "file:///bad%ZZname.html", "file:///bad%2Fname.html",
+            "view-\tsource:view-source:file:///bad%00name.html",
+            process.platform === "win32" ? "file:///srv/outside.html" : "file://server/share/outside.html",
+          ]) {
+            const result = await registry.invoke(name, { url, ...(name === "browser.tabs" ? { action: "new" } : {}) }, ctx(sessionId));
+            expect(result.status).toBe("error");
+            expect(result.details.reason).toBe("local_file_refused");
+            expect(innerCalls).toBe(0);
+            expect(prompts).toBe(0);
+          }
+        });
+      }
+    }
+  }
+
+  it("preserves valid native, network and non-file targets and ignores unused tab URLs", async () => {
+    install("unrestricted");
+    const urls = [pathToFileURL(join(work, "page.html")).href, "https://example.com", "about:blank", "data:text/plain,hello"];
+    if (process.platform === "win32") urls.push("file://server/share/page.html");
+    for (const url of urls) {
+      for (const name of ["browser.navigate", "browser.tabs"]) {
+        const before = innerCalls;
+        expect((await registry.invoke(name, { url, ...(name === "browser.tabs" ? { action: "new" } : {}) }, ctx("ordinary"))).status).toBe("ok");
+        expect(innerCalls).toBe(before + 1);
+      }
+    }
+    expect((await registry.invoke("browser.tabs", { action: "list", url: "file:///bad%00name" }, ctx(WORKER))).status).toBe("ok");
+    expect(prompts).toBe(0);
+  });
+
+  it("preserves confinement for a valid native file outside the scope", async () => {
+    install("working-dir");
+    const url = pathToFileURL(join(parse(work).root, "dispatch-outside-scratch", "page.html")).href;
+    const result = await registry.invoke("browser.navigate", { url }, ctx("ordinary"));
+    expect(result.status).toBe("error");
+    expect(result.details.reason).toBe(READ_REFUSAL_REASON);
+    expect(prompts).toBe(1);
+    expect(innerCalls).toBe(0);
+  });
+});
 
 describe("a read outside the scope asks through the ladder", () => {
   let work: string;
