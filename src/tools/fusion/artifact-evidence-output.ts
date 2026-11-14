@@ -18,7 +18,12 @@ const record = (v: unknown): v is Record<string, unknown> => v !== null && typeo
 const safeText = (value: string, known: readonly KnownSecret[]): boolean => maskSecrets(value, known) === value;
 const safeName = (value: unknown, known: readonly KnownSecret[]): value is string => typeof value === "string" && /^[a-zA-Z0-9_.-]{1,80}$/.test(value) && safeText(value, known);
 const safePath = (value: string | null, known: readonly KnownSecret[]): value is string => value !== null && value.length <= 256 && !posix.isAbsolute(value) &&
-  !win32.isAbsolute(value) && !/[\p{Cc}\p{Cf}]/u.test(value) && !value.split(/[\\/]/).includes("..") && safeText(value, known);
+  !win32.isAbsolute(value) && !/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(value) && !value.split(/[\\/]/).includes("..") && safeText(value, known);
+
+/** Keep every structured string on one visual line, including future fields. */
+function evidenceJson(value: object): string {
+  return JSON.stringify(value).replace(/[<>\u2028\u2029]/g, char => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`);
+}
 
 export interface ArtifactEvidenceOutputOptions { knownSecrets?: readonly KnownSecret[] }
 
@@ -136,7 +141,7 @@ export function projectFusionArtifactEvidence(result: CompressedToolResult, maxC
   if (rows.length > SCAN_ROWS) taskCounts.unknown = (taskCounts.unknown ?? 0) + rows.length - SCAN_ROWS;
   const outcome = { status: result.status, ...(rows.length === 0 ? {} : { tasks: taskCounts }), ...(receipt === undefined ? {} : { candidateDisposition: receipt.disposition, checkStatus: receipt.checkStatus,
     ...(receipt.reason === undefined ? {} : { candidateReason: receipt.reason }) }) };
-  const minimal = JSON.stringify({ version: 1, tasks: [], outcome, omitted });
+  const minimal = evidenceJson({ version: 1, tasks: [], outcome, omitted });
   // Leave room for the outcome and readable prose on small local contexts.
   // Tiny caps may spend more than 40% on the minimal whole runtime document.
   const budget = Math.min(ARTIFACT_EVIDENCE_OUTPUT_MAX_CHARS, Math.max(2, cap - PREFIX.length), Math.max(minimal.length, Math.floor(cap * 0.4) - PREFIX.length));
@@ -145,12 +150,12 @@ export function projectFusionArtifactEvidence(result: CompressedToolResult, maxC
   };
   let privacyOmitted = false;
   const serialize = () => {
-    const json = JSON.stringify(value).replace(/</g, "\\u003c").replace(/>/g, "\\u003e");
+    const json = evidenceJson(value);
     if (safeText(json, known)) return json;
     // Fixed schema bytes can themselves coincide with a configured value.
     // Never mask across JSON syntax or publish a partially redacted identity.
     privacyOmitted = true;
-    const minimal = JSON.stringify({ version: 1, tasks: [], omitted: Math.max(1, value.omitted) });
+    const minimal = evidenceJson({ version: 1, tasks: [], omitted: Math.max(1, value.omitted) });
     return safeText(minimal, known) ? minimal : "{}";
   };
   // Remove whole fields/entries, never slice JSON. Candidate acceptance takes
