@@ -1,9 +1,9 @@
-import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { runIsolatedWave } from "./branch-merge.js";
-import { createBranchSet, defaultGitExec, touchedPaths } from "./branch-workspace.js";
+import { createBranchSet, defaultGitExec, removeWorkspaceTree, touchedPaths } from "./branch-workspace.js";
 import type { DelegateTask } from "./delegate-args.js";
 import type { WorkerTaskResult } from "./worker-result.js";
 import { runWorkerTasks, type WorkerRunnerDeps } from "./worker-runner.js";
@@ -525,5 +525,43 @@ describe("declared-file status in a fresh private workspace", () => {
     });
     expect(result.status).toBe("ok");
     expect(result.notes ?? []).not.toContain("core.js unchanged by this task");
+  });
+});
+
+describe("removing a workspace tree with read-only directories", () => {
+  it("unlocks directories (never through links) and retries once when removal is refused", async () => {
+    const root = await mkdtemp(join(tmpdir(), "atag-rm-"));
+    const outside = await mkdtemp(join(tmpdir(), "atag-rm-outside-"));
+    try {
+      const tree = join(root, "ws");
+      await mkdir(join(tree, "locked", "inner"), { recursive: true });
+      await writeFile(join(tree, "locked", "inner", "f.txt"), "x");
+      await symlink(outside, join(tree, "locked", "link"), "dir");
+      await chmod(join(tree, "locked", "inner"), 0o500);
+      await chmod(join(tree, "locked"), 0o500);
+      await chmod(outside, 0o500);
+      // Root ignores directory modes, so the refusal a non-root user gets
+      // is simulated: refused while any directory in the tree lacks owner write.
+      let calls = 0;
+      const remove = async (target: string): Promise<void> => {
+        calls++;
+        for (const dir of [join(target, "locked"), join(target, "locked", "inner")]) {
+          if (((await stat(dir)).mode & 0o200) === 0) throw Object.assign(new Error("EACCES: permission denied, rmdir"), { code: "EACCES" });
+        }
+        await rm(target, { recursive: true, force: true });
+      };
+      await removeWorkspaceTree(tree, remove);
+      expect(calls).toBe(2);
+      await expect(lstat(tree)).rejects.toThrow();
+      expect((await stat(outside)).mode & 0o777).toBe(0o500);
+    } finally {
+      await chmod(outside, 0o700).catch(() => undefined);
+      await rm(root, { recursive: true, force: true });
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("rethrows a refusal other than a permission error", async () => {
+    await expect(removeWorkspaceTree("/nowhere", async () => { throw Object.assign(new Error("EBUSY"), { code: "EBUSY" }); })).rejects.toThrow("EBUSY");
   });
 });

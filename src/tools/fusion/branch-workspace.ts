@@ -140,6 +140,36 @@ async function forgetRemovedWorktrees(git: GitExec, top: string, removed: readon
 }
 
 /**
+ * `rm -r` of a workspace tree. Workspace directories carry the original's
+ * modes, so a read-only directory in the project is read-only here too
+ * and, for a non-root user, refuses deleting its entries. On EACCES/EPERM
+ * every directory in the tree (links never followed) gets owner rwx and
+ * the removal is retried once. `remove` is a test seam.
+ */
+export async function removeWorkspaceTree(
+  path: string,
+  remove: (target: string) => Promise<void> = (target) => rm(target, { recursive: true, force: true }),
+): Promise<void> {
+  try {
+    await remove(path);
+    return;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException | undefined)?.code;
+    if (code !== "EACCES" && code !== "EPERM") throw err;
+  }
+  const unlock = async (dir: string): Promise<void> => {
+    const info = await lstat(dir).catch(() => undefined);
+    if (!info?.isDirectory()) return;
+    await chmod(dir, (info.mode & 0o777) | 0o700).catch(() => undefined);
+    for (const entry of await readdir(dir, { withFileTypes: true }).catch(() => [])) {
+      if (entry.isDirectory()) await unlock(join(dir, entry.name));
+    }
+  };
+  await unlock(path);
+  await remove(path);
+}
+
+/**
  * Remove what a fusion run that died (a crash, a kill, a throw nobody
  * cleaned up after) left behind: its run roots under `tmpRoot` whose
  * owner process is gone, and the git worktrees `repoTop` still records
@@ -158,7 +188,7 @@ export async function sweepStaleBranchSets(
       const root = join(tmpRoot, entry.name);
       if (await staleRoot(root)) stale.push(await realpath(root).catch(() => root));
     }
-    for (const root of stale) await rm(root, { recursive: true, force: true }).catch(() => undefined);
+    for (const root of stale) await removeWorkspaceTree(root).catch(() => undefined);
     if (repoTop !== undefined) await forgetRemovedWorktrees(git, repoTop, stale);
   } catch {
     // Housekeeping; never a reason to fail a fan-out.
@@ -902,7 +932,7 @@ export async function createBranchSet(
   ).catch(() => undefined);
   let snapshot: GitSnapshot | null;
   try { snapshot = await gitSnapshot(real, git); }
-  catch (err) { await rm(runRoot, { recursive: true, force: true }); throw err; }
+  catch (err) { await removeWorkspaceTree(runRoot); throw err; }
   await sweepStaleBranchSets(dirname(runRoot), snapshot?.top, git);
   const roots: string[] = [];
   const workspaceRoots = new Map<string, string>();
@@ -923,13 +953,13 @@ export async function createBranchSet(
           roots.push(root);
           continue;
         }
-        await rm(root, { recursive: true, force: true }).catch(() => undefined);
+        await removeWorkspaceTree(root).catch(() => undefined);
         removed.push(root);
       }
       if (snapshot !== null) await forgetRemovedWorktrees(cleanupGit, snapshot.top, removed);
       return;
     }
-    await rm(runRoot, { recursive: true, force: true }).catch(() => undefined);
+    await removeWorkspaceTree(runRoot).catch(() => undefined);
     if (snapshot !== null) await forgetRemovedWorktrees(cleanupGit, snapshot.top, [runRoot]);
   };
   const limit = options.maxCopyBytes ?? VERIFY_COPY_MAX_BYTES;
