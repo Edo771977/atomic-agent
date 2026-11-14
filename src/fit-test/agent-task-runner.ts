@@ -12,7 +12,10 @@
  *   tasks and skills never reach the user's own state, and both temp
  *   dirs are removed afterwards;
  * - the task set already left out tasks that sent things outside
- *   (`outbound-calls.ts`).
+ *   (`outbound-calls.ts`);
+ * - the child's environment drops every credential-looking variable
+ *   (`buildCommandEnv`, as for the agent's shell commands): only the
+ *   loaded model's key is passed on.
  */
 import { spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -20,6 +23,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { USER_CONFIG_VERSION } from "../config/config-schema.js";
 import { isSeaBuild, selfInvocation } from "../runtime/self-invocation.js";
+import { buildCommandEnv } from "../sandbox/command-env.js";
 import { killProcessTree } from "../sandbox/kill-process-tree.js";
 import type { FitTask } from "./fit-task.js";
 import type { AgentTaskOutcome } from "./fit-test-types.js";
@@ -102,7 +106,10 @@ export function createAgentTaskRunner(options: AgentTaskRunnerOptions): (task: F
       const self = selfInvocation({ execPath: process.execPath, argv: process.argv, execArgv: process.execArgv, isSea: isSeaBuild() });
       const maxSteps = task.maxSteps ?? options.defaultMaxSteps ?? 15;
       const args = [...self.args, "run", "--cwd", workDir, "--max-steps", String(maxSteps)];
-      const env: NodeJS.ProcessEnv = { ...process.env, ATOMIC_AGENT_STATE_DIR: stateDir, FORCE_COLOR: "0", NO_COLOR: "1" };
+      // The replay must not carry the user's credentials (GitHub, Composio,
+      // providers, mail): the child only talks to the loaded model, whose
+      // key is the one passed back in below.
+      const env: NodeJS.ProcessEnv = { ...buildCommandEnv(process.env), ATOMIC_AGENT_STATE_DIR: stateDir, FORCE_COLOR: "0", NO_COLOR: "1" };
       if (options.modelApiKey) env.ATOMIC_AGENT_LLAMA_API_KEY = options.modelApiKey;
       else delete env.ATOMIC_AGENT_LLAMA_API_KEY;
       const started = Date.now();
