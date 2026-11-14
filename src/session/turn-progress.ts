@@ -52,6 +52,12 @@ export interface TurnResumeOptions {
   readonly taskMaxDurationMs?: number;
   readonly providerId?: string;
   readonly interactive?: boolean;
+  /**
+   * Who started the turn (`TurnOrigin`: `tui`, `telegram`, `scheduler`,
+   * ...), so a restart's `/resume` is offered only for the operator's own
+   * turns. Absent on markers written before it was recorded.
+   */
+  readonly origin?: string;
 }
 
 /** The stored form of a marker. */
@@ -93,6 +99,7 @@ function parseOptions(raw: unknown): TurnResumeOptions {
       ? { providerId: o.providerId }
       : {}),
     ...(o.interactive === true ? { interactive: true } : {}),
+    ...(typeof o.origin === "string" && /^[a-z]{1,32}$/.test(o.origin) ? { origin: o.origin } : {}),
   };
 }
 

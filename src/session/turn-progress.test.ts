@@ -50,6 +50,8 @@ describe("turn progress markers", () => {
   it("round-trips and drops what does not parse", () => {
     const marker = progress({ stepsDone: 3, lastStepIndex: 2, resumes: 1 });
     expect(parseTurnProgress(serializeTurnProgress(marker))).toEqual(marker);
+    const fromChannel = progress({ options: { origin: "telegram" } });
+    expect(parseTurnProgress(serializeTurnProgress(fromChannel))).toEqual(fromChannel);
     expect(parseTurnProgress(null)).toBeNull();
     expect(parseTurnProgress("not json")).toBeNull();
     expect(parseTurnProgress(JSON.stringify({ stepsDone: 1 }))).toBeNull();

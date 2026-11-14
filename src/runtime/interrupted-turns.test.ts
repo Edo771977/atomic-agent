@@ -173,6 +173,35 @@ describe("createInterruptedTurns", () => {
       expect(turns.resumeMessage("fz")).toBeNull();
     });
 
+    it("shares one queued mark between /resume and /fusion resume of the same run", () => {
+      cutOffByRestart("fz");
+      const fusion = fusionRunsOf([{ runId: "run-7", updatedAt: 1_500 }]);
+      const turns = createInterruptedTurns(store, fusion.api);
+      expect(turns.fusionResume("fz")).toEqual({ text: "resume fusion run run-7" });
+      // /resume of the cut-off turn would queue the same run a second time.
+      expect(turns.resume("fz")).toEqual({ alreadyQueued: expect.stringContaining("run-7") });
+      expect(turns.resumeMessage("fz")).toBeNull();
+      expect(turns.fusionResume("fz", "run-7")).toEqual({ alreadyQueued: expect.stringContaining("already queued") });
+
+      const other = createInterruptedTurns(store, fusion.api);
+      expect(other.resume("fz")).toEqual({ text: "resume fusion run run-7" });
+      expect(other.fusionResume("fz", "run-7")).toEqual({ alreadyQueued: expect.stringContaining("run-7") });
+      // Dropped before it ran: both paths offer it again.
+      other.release("fz", ["resume fusion run run-7"]);
+      expect(other.fusionResume("fz", "run-7")).toEqual({ text: "resume fusion run run-7" });
+    });
+
+    it("forgets the mark once the run was worked on again", () => {
+      cutOffByRestart("fz");
+      const runs = [{ runId: "run-7", updatedAt: 1_500 }];
+      const fusion = fusionRunsOf(runs);
+      const turns = createInterruptedTurns(store, fusion.api);
+      expect(turns.fusionResume("fz")).toEqual({ text: "resume fusion run run-7" });
+      // The resumed run wrote its checkpoint, then was stopped again.
+      runs[0]!.updatedAt = 9_000;
+      expect(turns.fusionResume("fz")).toEqual({ text: "resume fusion run run-7" });
+    });
+
     it("re-sends the request when the session's resumable run predates the cut-off turn", () => {
       cutOffByRestart("fz");
       const fusion = fusionRunsOf([{ runId: "old", updatedAt: 500 }]);

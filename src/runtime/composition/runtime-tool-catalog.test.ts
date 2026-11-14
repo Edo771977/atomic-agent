@@ -506,3 +506,30 @@ describe("runtimeKnownSecrets (ATO-1077)", () => {
     ]);
   });
 });
+
+describe("fusion escalation pricing from the models.dev snapshot", () => {
+  it("prices a snapshot-only model for estimates but gives it no admission pricing", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "catalog-snapshot-"));
+    try {
+      const config = getConfig(); const toolRegistry = new ToolRegistry();
+      const approvals = new ApprovalGate({ emit: () => {}, level: 5 });
+      const builder = vi.spyOn(fusionTools, "buildFusionDelegateTool");
+      config.llm = { providers: [{ id: "anthropic", kind: "openai-compatible", baseUrl: "https://api.anthropic.com", defaultChatModel: "claude-haiku-4-5" }],
+        activeTextProvider: "anthropic", activeEmbeddingProvider: "anthropic", toolTransport: "auto" };
+      registerRuntimeFusionAndReadScope({ config, toolRegistry, approvals, dangerous: { approvals, approvalRequired: false }, declaredInputs: new osTools.DeclaredInputsRegistry(),
+        resolveOriginalRequest: () => undefined, runTurn: async () => externalOperation(), createEphemeralSession: () => createEmptySessionState({ id: "worker", workingDir: directory }),
+        prepareLocalLink: async () => {}, emitAgentLoopEventFor: () => {}, resolveCurrentRunMode: () => resolveRunMode(resolveLlmConfig(config)),
+        providerRegistry: { getProvider: () => undefined }, llama: { measuredTokensPerSecond: () => null, fetchSlots: async () => ({ slots: [] }), probeHealth: async () => "answered" as const },
+        slotManager: { poolSize: () => 2 }, workingDir: directory, logger });
+      const wired = builder.mock.calls.at(-1)?.[0];
+      if (!wired) throw new Error("fusion seam missing");
+      expect(wired.resolveWorkerPricing?.("anthropic", "claude-haiku-4-5")).toMatchObject({ input: 1, output: 5 });
+      expect(wired.resolveWorkerAdmissionPricing?.("anthropic", "claude-haiku-4-5")).toBeUndefined();
+      config.llm.providers[0]!.userModels = [{ id: "claude-haiku-4-5", kind: "chat", pricing: { input: 2, output: 6 } }] as never;
+      expect(wired.resolveWorkerAdmissionPricing?.("anthropic", "claude-haiku-4-5")).toMatchObject({ input: 2, output: 6 });
+    } finally {
+      vi.restoreAllMocks();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+});

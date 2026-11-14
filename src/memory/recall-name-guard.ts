@@ -147,6 +147,10 @@ export function createRecallNameGuard(args: {
     },
     noteUserMessage(text) {
       if (text.trim().length === 0) return;
+      // Recall runs every step with the same turn message: noting it again
+      // would evict older messages from the cap and re-run failed checks
+      // each step. A message identical to the last one noted adds nothing.
+      if (noted[noted.length - 1] === text) return;
       noted.push(text);
       if (noted.length > MAX_NOTED_MESSAGES) noted.shift();
       for (const [key, verdict] of verdicts) {

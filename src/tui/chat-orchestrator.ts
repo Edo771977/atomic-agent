@@ -94,7 +94,6 @@ import {
 import { turnsToMessages } from "./chat/turns-to-messages.js";
 import { formatSessionFusionNotice } from "./fusion-resume-notice.js";
 import { INTERRUPTED_TURN_NOTICE } from "./interrupted-turn-notice.js";
-import { isInterruptedTurnResumeMessage } from "../session/interrupted-chat-turn.js";
 import { createHeapGuard } from "../runtime/heap-guard.js";
 import type { SessionPickerEntry, TuiState } from "./tui-state.js";
 
@@ -1519,12 +1518,12 @@ export class ChatOrchestrator {
 
   /**
    * A `/resume` message (ATO-448) dropped before its turn started: the
-   * cut-off turn is offered again instead of being lost.
+   * cut-off turn is offered again instead of being lost. The runtime
+   * matches the exact text it handed out, so a Fusion run's resume
+   * (which carries no interrupted-turn note) is released too.
    */
   private releaseDroppedResumes(sessionId: string, dropped: readonly string[]): void {
-    if (dropped.some(isInterruptedTurnResumeMessage)) {
-      this.runtime.interruptedTurns?.release(sessionId);
-    }
+    if (dropped.length > 0) this.runtime.interruptedTurns?.release(sessionId, dropped);
   }
 
   /**
