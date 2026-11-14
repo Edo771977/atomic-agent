@@ -270,3 +270,14 @@ it.each(["persistent", "restored"] as const)("rejects protected check input writ
   expect(result.details.candidateIntegration).toMatchObject({ status: "rejected", acceptanceReceipt: { disposition: "rejected", checkScope: "declared", inputs: { declared: 1, verified: 0 } } });
   expect(await readFile(join(f.root, "api.json"), "utf8")).toBe('{"name":"before"}'); expect(await readFile(join(f.root, "check.mjs"), "utf8")).toBe(original);
 });
+
+it.each([true, false])("masks configured known secrets before bounding public artifact output (candidate=%s)", async candidate => {
+  const secret = "configuredOpaqueValueWithoutVendorShape0123456789";
+  const f = await fixture({ knownSecrets: () => [{ label: "configured-test", value: secret }] }, candidate);
+  f.deps.runChecks = async specs => ({ ok: true, results: specs.map(() => ({ ok: true })) });
+  f.deps.runTurn = async session => { await writeFile(join(session.workingDir, "api.json"), "candidate"); return { session, reason: "reply", stepCount: 1 }; };
+  const result = await buildFusionDelegateTool(f.deps).run({ tasks: [{ id: "api", title: `title ${secret}`, instructions: "work", files: ["api.json"] }], contract }, f.ctx);
+  expect(result.summary).not.toContain(secret.slice(0, 12)); expect(result.fullOutput).not.toContain(secret.slice(0, 12));
+  expect(result.summary.length).toBeLessThanOrEqual(f.deps.outputCharCap); expect((result.fullOutput ?? "").length).toBeLessThanOrEqual(f.deps.outputCharCap);
+  expect(result.summary.startsWith("artifact-evidence: ")).toBe(true);
+});

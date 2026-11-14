@@ -12,6 +12,7 @@ import type { CompressedToolResult } from "../../compressor/result-compressor.js
 import type { ResolvedRunMode } from "../../llm/run-mode/index.js";
 import type { SlotManager } from "../../llm/slot-manager.js";
 import type { StructuredLogger } from "../../tracing/index.js";
+import type { KnownSecret } from "../../error-reporting/secret-detector.js";
 import { isFusionWorkerSessionId } from "../../session/fusion-worker-session.js";
 import {
   DEFAULT_FUSION_CLOUD_WORKERS,
@@ -2394,7 +2395,8 @@ export function buildFusionDelegateTool(
           },
           { maxSummaryLength: deps.outputCharCap + 400, maxTailLines: 2000 },
         );
-        return candidateReport === undefined ? projectFusionArtifactEvidence(result, deps.outputCharCap) : candidateToolResult(result, candidateReport, candidate!.dir, candidateOriginalDir, deps.outputCharCap);
+        const outputKnownSecrets = deps.knownSecrets?.();
+        return candidateReport === undefined ? projectFusionArtifactEvidence(result, deps.outputCharCap, { knownSecrets: outputKnownSecrets }) : candidateToolResult(result, candidateReport, candidate!.dir, candidateOriginalDir, deps.outputCharCap, outputKnownSecrets);
       } finally {
         if (budgetTimer !== undefined) clearTimeout(budgetTimer);
         // Kept workspaces (a judged-red task's, for its retry) are removed
@@ -2409,7 +2411,7 @@ export function buildFusionDelegateTool(
         try { recordCandidateInterruption?.(report); } catch (recordError) {
           deps.logger.warn("fusion: interrupted candidate outcomes were not recorded", { reason: recordError instanceof Error ? recordError.message : String(recordError) });
         }
-        return candidateToolResult(error("candidate fan-out interrupted", { reason: "candidate-interrupted" }), report, candidate.dir, candidateOriginalDir, deps.outputCharCap);
+        return candidateToolResult(error("candidate fan-out interrupted", { reason: "candidate-interrupted" }), report, candidate.dir, candidateOriginalDir, deps.outputCharCap, deps.knownSecrets?.());
       } finally {
         await candidate?.cleanup();
       }
@@ -2425,13 +2427,13 @@ function rebaseCandidateValue<T>(value: T, roots: readonly string[], to: string)
   return value;
 }
 
-function candidateToolResult(result: CompressedToolResult, report: CandidateIntegrationReport, candidateDir: string, originalDir: string, cap: number): CompressedToolResult {
+function candidateToolResult(result: CompressedToolResult, report: CandidateIntegrationReport, candidateDir: string, originalDir: string, cap: number, knownSecrets?: readonly KnownSecret[]): CompressedToolResult {
   const note = report.status === "promoted" ? "Candidate promoted after final integration checks." : `Candidate rejected; file promotion did not complete. ${report.reason ?? ""}`;
   const recovery = (report.patch === undefined ? "" : ` Changes retained at ${report.patch.path}${report.patch.filesDir === undefined ? "" : ` and ${report.patch.filesDir}`}.`) + (report.retainedWorkspace === undefined ? "" : ` Recovery workspace retained at ${report.retainedWorkspace}; remove it manually after recovery.`) + (report.heldArtifactsDir === undefined ? "" : ` Held task artifacts: ${report.heldArtifactsDir}.`) + (report.rollbackConflicts === undefined ? "" : ` Rollback left these concurrently changed or unwritable paths for review: ${report.rollbackConflicts.join(", ")}.`) + (report.ignoredChanges === undefined ? "" : ` Ignored or disposable paths kept private to the candidate, never promoted: ${report.ignoredChanges.join(", ")}.`);
   const details = rebaseCandidateValue(result.details, [candidateDir, candidateDir.replace(/\\/g, "/")], originalDir);
   delete details.runId;
   const checkedRecovery = report.retainedCheckedWorkspace === undefined ? "" : ` Checked recovery workspace retained at ${report.retainedCheckedWorkspace}; remove it manually after recovery.`;
-  return projectFusionArtifactEvidence(compressToolResult({ tool: result.tool, status: report.status === "rejected" ? "error" : result.status, output: `${note}${recovery}${checkedRecovery} Candidate mode is non-resumable.\n\n${rebaseText(result.fullOutput ?? result.summary, [candidateDir, candidateDir.replace(/\\/g, "/")], originalDir)}`, details: { ...details, candidateIntegration: report } }, { maxSummaryLength: cap + 800, maxTailLines: 2000 }), cap);
+  return projectFusionArtifactEvidence(compressToolResult({ tool: result.tool, status: report.status === "rejected" ? "error" : result.status, output: `${note}${recovery}${checkedRecovery} Candidate mode is non-resumable.\n\n${rebaseText(result.fullOutput ?? result.summary, [candidateDir, candidateDir.replace(/\\/g, "/")], originalDir)}`, details: { ...details, candidateIntegration: report } }, { maxSummaryLength: cap + 800, maxTailLines: 2000 }), cap, { knownSecrets });
 }
 
 /**
