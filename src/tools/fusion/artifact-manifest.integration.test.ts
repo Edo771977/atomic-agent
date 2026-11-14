@@ -82,7 +82,7 @@ describe("artifact evidence through Fusion results and checkpoints", () => {
   it("stores candidate binding in v1 but never carries promoted proof into freshly observed resume evidence", async () => {
     writeFileSync(join(dir, "artifact.txt"), "original");
     const raw = await collectArtifactManifest({ workingDir: dir, roots: [dir], artifacts: [{ path: "artifact.txt", change: "new", source: "snapshot" }], coverage: "snapshot", signal: new AbortController().signal });
-    const manifest = attachCandidateArtifactReceipt(raw, { version: 1, id: "a".repeat(24), disposition: "promoted", checkScope: "declared", checkStatus: "passed", checkedPayloadDigest: "b".repeat(64), checkPlanDigest: "c".repeat(64) });
+    const manifest = attachCandidateArtifactReceipt(raw, { version: 1, id: "a".repeat(24), disposition: "promoted", checkScope: "declared", checkStatus: "passed", checkedPayloadDigest: "b".repeat(64), checkPlanDigest: "c".repeat(64), checks: { total: 1, passed: 1, failed: 0 }, inputs: { declared: 0, verified: 0 } });
     const store = new FusionRunStore({ dir: join(dir, "checkpoints") });
     const tasks = [{ id: "core", title: "Core", instructions: "write artifact.txt" }];
     const run = store.start({ sessionId: "s-parent", workingDir: dir, args: { tasks }, tasks, waveCount: 1 });

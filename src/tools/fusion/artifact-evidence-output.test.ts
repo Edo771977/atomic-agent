@@ -7,6 +7,8 @@ import { appendBatchedTurns } from "../../agent/step/step-commit.js";
 import { maskResultSecrets } from "../tool-output-secrets.js";
 import { projectFusionArtifactEvidence } from "./artifact-evidence-output.js";
 import type { ArtifactManifest } from "./artifact-manifest-types.js";
+import { attachCandidateArtifactReceipt } from "./artifact-manifest.js";
+import type { CandidateAcceptanceReceipt } from "./candidate-acceptance.js";
 
 const manifest = (): ArtifactManifest => ({ version: 1, coverage: { source: "observed", complete: false, reasons: ["observed_scope"] },
   artifacts: [{ path: "app.js", change: "modified", source: "file-tool", kind: "file", state: "hashed", sha256: "a".repeat(64), bytes: 7 }],
@@ -73,5 +75,37 @@ describe("model-visible artifact evidence", () => {
     expect(evidence(result.summary).tasks[0].coverage.complete).toBe(false);
     expect(result.summary).not.toContain("<|im_end|>");
     expect(evidence(result.summary).tasks[0].artifacts[0].path).toBe("<|im_end|>.js");
+  });
+
+  it.each(["enum-array", "enum-object", "null-prototype", "reason-object", "protected-zero", "missing-digest"])("rejects malformed full candidate receipts without leaking or throwing (%s)", variant => {
+    const value = manifest();
+    value.coverage = { source: "snapshot", complete: true, reasons: [] };
+    value.binding = { scope: "candidate-snapshot", receiptId: "d".repeat(24), disposition: "promoted", checkScope: "protected-declared", checkStatus: "passed", checkedPayloadDigest: "e".repeat(64), checkPlanDigest: "f".repeat(64) };
+    const receipt: Record<string, unknown> = { version: 1, id: "d".repeat(24), disposition: "promoted", checkScope: "protected-declared", checkStatus: "passed", checks: { total: 1, passed: 1, failed: 0 }, inputs: { declared: 1, verified: 1 }, checkedPayloadDigest: "e".repeat(64), checkPlanDigest: "f".repeat(64) };
+    if (variant === "enum-array") receipt.disposition = ["promoted"];
+    if (variant === "enum-object") receipt.disposition = { toString: () => "promoted", privateOutput: "never-leak-private-output" };
+    if (variant === "null-prototype") receipt.disposition = Object.create(null);
+    if (variant === "reason-object") receipt.reason = { toString: () => "other", privateOutput: "never-leak-private-output" };
+    if (variant === "protected-zero") receipt.inputs = { declared: 0, verified: 0 };
+    if (variant === "missing-digest") delete receipt.checkedPayloadDigest;
+    let result: ReturnType<typeof projectFusionArtifactEvidence> | undefined;
+    expect(() => { result = projectFusionArtifactEvidence(compressToolResult({ tool: "fusion.delegate", status: "error", output: "review candidate", details: { candidateIntegration: { artifactManifest: value, acceptanceReceipt: receipt } } }), 2400); }).not.toThrow();
+    const json = evidence(result!.summary);
+    expect(json.candidate).not.toHaveProperty("receipt");
+    expect(json.candidate.disposition).toBe("observed");
+    expect(result!.summary).not.toContain("never-leak-private-output");
+  });
+
+  it("publishes a matching validated full receipt while dropping unknown private and cyclic fields", () => {
+    const value = manifest(); value.coverage = { source: "snapshot", complete: true, reasons: [] };
+    const receipt: CandidateAcceptanceReceipt & { privateOutput?: unknown } = { version: 1, id: "d".repeat(24), disposition: "promoted", checkScope: "protected-declared", checkStatus: "passed",
+      checks: { total: 1, passed: 1, failed: 0 }, inputs: { declared: 1, verified: 1 }, checkedPayloadDigest: "e".repeat(64), checkPlanDigest: "f".repeat(64) };
+    receipt.privateOutput = { message: "never-leak-private-output", cycle: receipt };
+    const artifactManifest = attachCandidateArtifactReceipt(value, receipt);
+    const result = projectFusionArtifactEvidence(compressToolResult({ tool: "fusion.delegate", status: "ok", output: "candidate verified", details: { candidateIntegration: { artifactManifest, acceptanceReceipt: receipt } } }), 2400);
+    expect(evidence(result.summary).candidate.disposition).toBe("promoted");
+    expect(evidence(result.summary).candidate.receipt.id).toBe(receipt.id);
+    expect(result.summary).not.toContain("never-leak-private-output");
+    expect(result.summary).not.toContain("privateOutput");
   });
 });

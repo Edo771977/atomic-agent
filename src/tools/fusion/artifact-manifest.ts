@@ -4,6 +4,7 @@ import { lstat, open, readlink, realpath } from "node:fs/promises";
 import { basename, dirname, isAbsolute, posix, relative, resolve, sep, win32 } from "node:path";
 import { isInside } from "../../approval/fanout-scope.js";
 import type { CandidateAcceptanceReceipt } from "./candidate-acceptance.js";
+import { parseCandidateAcceptanceReceipt } from "./candidate-receipt.js";
 import type {
   ArtifactManifest, ArtifactManifestEntry, ArtifactManifestReason,
   ArtifactManifestBinding, CollectArtifactManifestInput,
@@ -221,17 +222,20 @@ function parseBinding(value: unknown, source: unknown): ArtifactManifestBinding 
     ...(value.checkPlanDigest === undefined ? {} : { checkPlanDigest: value.checkPlanDigest }) };
 }
 
-/** Structural subset of the neutral candidate receipt; no outcome or candidate dependency. */
-export type CandidateArtifactReceipt = Pick<CandidateAcceptanceReceipt,
-  "version" | "id" | "disposition" | "checkScope" | "checkStatus" | "checkedPayloadDigest" | "checkPlanDigest">;
+/** Full runtime input: count and protected-input invariants are validated before narrowing. */
+export type CandidateArtifactReceipt = CandidateAcceptanceReceipt;
 
 /** Only final authoritative candidate inventory may carry final delivery proof. */
 export function attachCandidateArtifactReceipt(manifest: ArtifactManifest, receipt: CandidateArtifactReceipt): ArtifactManifest {
   const clean = parseArtifactManifest(manifest) ?? incompleteArtifactManifest();
-  if (clean.coverage.source !== "snapshot" || receipt.version !== 1) return clean;
-  const binding = parseBinding({ scope: "candidate-snapshot", receiptId: receipt.id, disposition: receipt.disposition,
-    checkScope: receipt.checkScope, checkStatus: receipt.checkStatus, checkedPayloadDigest: receipt.checkedPayloadDigest, checkPlanDigest: receipt.checkPlanDigest }, "snapshot");
-  return binding === undefined ? clean : boundArtifactManifest({ ...clean, binding });
+  if (clean.coverage.source !== "snapshot") return clean;
+  // A stored narrow binding cannot stand in for a valid full runtime receipt.
+  const { binding: _prior, ...unbound } = clean;
+  const full = parseCandidateAcceptanceReceipt(receipt);
+  if (full === undefined) return unbound;
+  const binding = parseBinding({ scope: "candidate-snapshot", receiptId: full.id, disposition: full.disposition,
+    checkScope: full.checkScope, checkStatus: full.checkStatus, checkedPayloadDigest: full.checkedPayloadDigest, checkPlanDigest: full.checkPlanDigest }, "snapshot");
+  return binding === undefined ? unbound : boundArtifactManifest({ ...unbound, binding });
 }
 
 /** Strict, whitelist-only v1 persistence boundary; extra contents/args/output fields are never copied. */

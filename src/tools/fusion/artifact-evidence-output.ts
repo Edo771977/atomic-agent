@@ -3,6 +3,8 @@ import type { CompressedToolResult } from "../../compressor/result-compressor.js
 import { knownSecretsFromEnv, maskSecrets } from "../../error-reporting/secret-detector.js";
 import { parseArtifactManifest } from "./artifact-manifest.js";
 import type { ArtifactManifest } from "./artifact-manifest-types.js";
+import type { CandidateAcceptanceReceipt } from "./candidate-acceptance.js";
+import { parseCandidateAcceptanceReceipt } from "./candidate-receipt.js";
 
 export const ARTIFACT_EVIDENCE_OUTPUT_MAX_CHARS = 4_000;
 const PREFIX = "artifact-evidence: ";
@@ -13,28 +15,13 @@ const safeName = (value: unknown): value is string => typeof value === "string" 
 const safePath = (value: string | null): value is string => value !== null && value.length <= 256 && !posix.isAbsolute(value) &&
   !win32.isAbsolute(value) && !/[\u0000-\u001f\u007f]/.test(value) && !value.split(/[\\/]/).includes("..") && maskSecrets(value, knownSecretsFromEnv()) === value;
 
-function projectReceipt(value: unknown): Record<string, unknown> | undefined {
-  const count = (v: unknown): v is number => typeof v === "number" && Number.isSafeInteger(v) && v >= 0 && v <= 100_000;
-  const digest = (v: unknown): v is string => typeof v === "string" && /^[a-f0-9]{64}$/.test(v);
-  if (!record(value) || value.version !== 1 || typeof value.id !== "string" || !/^[a-f0-9]{24}$/.test(value.id) ||
-      !["promoted", "rejected", "unchanged"].includes(String(value.disposition)) || !["declared", "protected-declared"].includes(String(value.checkScope)) ||
-      !["passed", "failed", "unverified"].includes(String(value.checkStatus)) || !record(value.checks) || !record(value.inputs) ||
-      !count(value.checks.total) || !count(value.checks.passed) || !count(value.checks.failed) || value.checks.passed + value.checks.failed > value.checks.total ||
-      !count(value.inputs.declared) || !count(value.inputs.verified) || value.inputs.verified > value.inputs.declared ||
-      (value.checkedPayloadDigest !== undefined && !digest(value.checkedPayloadDigest)) || (value.checkPlanDigest !== undefined && !digest(value.checkPlanDigest)) ||
-      (value.disposition !== "rejected" && (value.checkStatus !== "passed" || value.checks.total === 0 || value.checks.passed !== value.checks.total || value.checks.failed !== 0 ||
-        !digest(value.checkedPayloadDigest) || !digest(value.checkPlanDigest)))) return undefined;
-  const reasons = ["checks-failed", "checks-unverified", "check-inputs-changed", "payload-changed", "provides-unverified", "task-not-ok", "original-changed", "delivery-failed", "interrupted", "other"];
-  return { version: 1, id: value.id, disposition: value.disposition, checkScope: value.checkScope, checkStatus: value.checkStatus,
-    checks: { total: value.checks.total, passed: value.checks.passed, failed: value.checks.failed }, inputs: { declared: value.inputs.declared, verified: value.inputs.verified },
-    ...(value.checkedPayloadDigest === undefined ? {} : { checkedPayloadDigest: value.checkedPayloadDigest }),
-    ...(value.checkPlanDigest === undefined ? {} : { checkPlanDigest: value.checkPlanDigest }), ...(reasons.includes(String(value.reason)) ? { reason: value.reason } : {}) };
-}
-
-function projectManifest(manifest: ArtifactManifest, candidate: boolean): Record<string, unknown> {
+function projectManifest(manifest: ArtifactManifest, candidate: boolean, receipt?: CandidateAcceptanceReceipt): Record<string, unknown> {
   // Task inventories precede final acceptance. Even a saved binding cannot
   // turn one into the candidate's final delivery proof.
-  const binding = candidate && manifest.coverage.source === "snapshot" ? manifest.binding : undefined;
+  const view = manifest.binding;
+  const binding = candidate && manifest.coverage.source === "snapshot" && view?.scope === "candidate-snapshot" && receipt !== undefined &&
+    view.receiptId === receipt.id && view.disposition === receipt.disposition && view.checkScope === receipt.checkScope && view.checkStatus === receipt.checkStatus &&
+    view.checkedPayloadDigest === receipt.checkedPayloadDigest && view.checkPlanDigest === receipt.checkPlanDigest ? view : undefined;
   const artifacts = manifest.artifacts.filter(e => safePath(e.path)).slice(0, FACTS).map(e => ({ path: e.path, kind: e.kind, state: e.state,
     ...(e.sha256 === undefined ? {} : { sha256: e.sha256 }), ...(e.bytes === undefined ? {} : { bytes: e.bytes }) }));
   const checks = manifest.checks.slice(0, FACTS).map(c => ({ id: c.id, source: c.source, status: c.status }));
@@ -70,10 +57,10 @@ export function projectFusionArtifactEvidence(result: CompressedToolResult, maxC
   omitted += Math.max(0, rows.length - TASKS);
   const report = record(result.details.candidateIntegration) ? result.details.candidateIntegration : undefined;
   const manifest = report?.artifactManifest === undefined ? undefined : parseArtifactManifest(report.artifactManifest);
-  const receipt = projectReceipt(report?.acceptanceReceipt);
+  const receipt = parseCandidateAcceptanceReceipt(report?.acceptanceReceipt);
   if (report?.acceptanceReceipt !== undefined && receipt === undefined) omitted += 1;
   const candidate = manifest === undefined && receipt === undefined ? undefined : {
-    ...(manifest === undefined ? {} : projectManifest(manifest, true)), ...(receipt === undefined ? {} : { receipt }),
+    ...(manifest === undefined ? {} : projectManifest(manifest, true, receipt)), ...(receipt === undefined ? {} : { receipt }),
   };
   const candidateOmitted = candidate === undefined ? undefined : (candidate as Record<string, unknown>).omitted;
   if (typeof candidateOmitted === "number") omitted += candidateOmitted;
