@@ -208,14 +208,14 @@ describe("os.shell.run says when it ran with no arguments (F40)", () => {
   it("notes a bare invocation when args is absent", async () => {
     // The live case was `python3` with its script under an unknown key:
     // exit 0, nothing done, and nothing in the output said so.
-    const result = await tool().run({ cmd: "echo" }, makeCtx());
+    const result = await tool().run({ cmd: process.execPath }, makeCtx());
     expect(result.status).toBe("ok");
-    expect(result.summary).toContain("$ echo (ran with no arguments)\nexit: 0");
+    expect(result.summary).toContain(`$ ${process.execPath} (ran with no arguments)\nexit: 0`);
   });
 
   it("notes a bare invocation when args is empty", async () => {
-    const result = await tool().run({ cmd: "echo", args: [] }, makeCtx());
-    expect(result.summary).toContain("$ echo (ran with no arguments)");
+    const result = await tool().run({ cmd: process.execPath, args: [] }, makeCtx());
+    expect(result.summary).toContain(`$ ${process.execPath} (ran with no arguments)`);
   });
 
   it("stays silent when arguments were passed", async () => {

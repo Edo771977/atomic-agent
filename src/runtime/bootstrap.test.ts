@@ -609,7 +609,7 @@ describe("createAgentRuntime", () => {
       // 2. A different shell binary now runs silently under the grant.
       const second = await runtime.toolRegistry.invoke(
         "os.shell.run",
-        { cmd: "ls", args: [workingDir] },
+        { cmd: "node", args: ["-e", "0"] },
         ctx,
       );
       expect(second.status).toBe("ok");
@@ -684,11 +684,11 @@ describe("createAgentRuntime", () => {
       // 3. A different binary is not covered by the git shape; it asks.
       await runtime.toolRegistry.invoke(
         "os.shell.run",
-        { cmd: "ls", args: [workingDir] },
+        { cmd: "node", args: ["-e", "0"] },
         ctx,
       );
       expect(prompts).toHaveLength(2);
-      expect(prompts[1]?.commandShape).toBe("ls");
+      expect(prompts[1]?.commandShape).toBe("node");
     } finally {
       await runtime.shutdown();
     }

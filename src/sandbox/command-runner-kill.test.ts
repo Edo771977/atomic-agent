@@ -86,7 +86,13 @@ describe("runCommand stopping a child", () => {
 
     expect(killSpy).toHaveBeenCalledTimes(1);
     expect(killSpy).toHaveBeenCalledWith({ force: true });
-    expect(result.signal).toBe("SIGKILL");
+    if (process.platform === "win32") {
+      // taskkill terminates the process without a POSIX signal status.
+      expect(result.signal).toBeNull();
+      expect(result.exitCode).toBe(1);
+    } else {
+      expect(result.signal).toBe("SIGKILL");
+    }
     expect(result.timedOut).toBe(false);
   });
 
@@ -99,7 +105,13 @@ describe("runCommand stopping a child", () => {
 
     expect(killSpy).toHaveBeenCalledWith({ force: true });
     expect(result.timedOut).toBe(true);
-    expect(result.signal).toBe("SIGKILL");
+    if (process.platform === "win32") {
+      // taskkill terminates the process without a POSIX signal status.
+      expect(result.signal).toBeNull();
+      expect(result.exitCode).toBe(1);
+    } else {
+      expect(result.signal).toBe("SIGKILL");
+    }
   });
 
   it("does not reach for it when the command ends on its own", async () => {
