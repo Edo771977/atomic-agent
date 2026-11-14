@@ -11,6 +11,7 @@ import {
 } from "../../config/llm-provider-commands.js";
 import { findProviderPreset } from "./provider-presets.js";
 import {
+  isSharedCompatKeyVar,
   networkComputerKeyEnvVar,
   wizardKeyIsOptional,
 } from "./providers-wizard-target.js";
@@ -107,7 +108,9 @@ export function saveProviderWizardToConfig(
   // (a server on another computer on this network, or plain http:// to a
   // host that is not this machine) cannot use a key saved there: the
   // resolver refuses it, and saving it would overwrite the operator's
-  // cloud key. A key typed for it lives under a variable of its own.
+  // cloud key. A key typed for it lives under a variable of its own: the
+  // entry's stored variable, unless that is a shared OPENAI_* name (an
+  // entry moved from the cloud), whose cloud key it would overwrite.
   // The entry as written in config.json, moved to its new address. Never
   // `existing` for keys: getConfig() has already filled its apiKey from
   // the environment, and copying that wrote a shared cloud key into
@@ -120,7 +123,9 @@ export function saveProviderWizardToConfig(
     !preset &&
     entry.kind === "openai-compatible" &&
     !maySendSharedOpenAiKey(entry.baseUrl)
-      ? (stored?.apiKeyEnvVar ?? networkComputerKeyEnvVar(entry.id))
+      ? (stored?.apiKeyEnvVar !== undefined && !isSharedCompatKeyVar(stored.apiKeyEnvVar)
+          ? stored.apiKeyEnvVar
+          : networkComputerKeyEnvVar(entry.id))
       : undefined;
   if (wizard.apiKeyBuffer.trim().length > 0) {
     // Validate the value that is actually persisted: the dotenv writer
