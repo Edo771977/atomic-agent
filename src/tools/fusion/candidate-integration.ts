@@ -572,6 +572,9 @@ export async function createCandidateIntegration(
             };
           },
         };
+        // Source observations do not establish that the actual execution-copy
+        // observations completed; an abort before completion remains unknown.
+        if (inputIntegrity !== undefined) verifiedInputs = 0;
         const checked = await runContractChecks(rebaseChecked(checks), runner, { workingDir: checkedDir, signal: input.signal, ...(inputIntegrity === undefined ? {} : { inputIntegrity }) });
         receiptEvidence = { findings: [], checks: checked.outcomes, ...(checked.checksSkipped === undefined ? {} : { checksSkipped: checked.checksSkipped }) };
         input.signal.throwIfAborted();

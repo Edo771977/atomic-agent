@@ -111,6 +111,19 @@ it("refuses a custom runner that cannot attest each actual protected-input execu
   } finally { await candidate.cleanup(); }
 });
 
+it("leaves actual protected-input integrity unknown when cancellation prevents its completion", async () => {
+  const root = await project(); await writeFile(join(root, "check.mjs"), "test");
+  const candidate = await createCandidateIntegration(root, { checkInputs: ["check.mjs"] });
+  const controller = new AbortController();
+  try {
+    await writeFile(join(candidate.dir, "a.txt"), "candidate");
+    const runner = Object.assign(async () => { controller.abort(); return { ok: false, results: [{ ok: false }] }; }, { supportsInputIntegrity: true as const });
+    const report = await candidate.finish({ rows, contract: { ...contract, checkInputs: ["check.mjs"] }, signal: controller.signal, runChecks: runner });
+    expect(report.status).toBe("rejected");
+    expect(report.acceptanceReceipt).toMatchObject({ checkScope: "declared", inputs: { declared: 1, verified: 0 }, reason: "interrupted" });
+  } finally { await candidate.cleanup(); }
+});
+
 it("rejects mutation of otherwise unchanged project code during final checks", async () => {
   const root = await project(); await writeFile(join(root, "unchanged.js"), "before");
   const candidate = await createCandidateIntegration(root);

@@ -233,4 +233,19 @@ describe("verify refuses to execute without a private workspace", () => {
     expect(result.summary.split("\n")[0]).toBe("verify.run command: FAILED");
     expect(result.summary).toContain("built");
   });
+
+  it("keeps cancelled executor evidence when the protected-input completion observation also aborts", async () => {
+    const controller = new AbortController();
+    const complete = vi.fn(async () => { controller.signal.throwIfAborted(); });
+    vi.spyOn(commands, "runCommandKind").mockImplementation(async () => {
+      controller.abort();
+      return { commandLine: "node protected-build.js", exitCode: 0, signal: null, timedOut: false, aborted: false, stdout: "protected build\n", stderr: "", stdoutTail: "protected build\n", stderrTail: "", durationMs: 5 };
+    });
+    const result = await runVerify({ kind: "command", cmd: "node", args: ["protected-build.js"], checks: ["exit 0"] }, {
+      workingDir: dir, config, signal: controller.signal, inputIntegrity: { begin: async () => complete },
+    });
+    expect(complete).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({ ok: false, errorCode: "cancelled", aborted: true, isolated: true, commandLine: "node protected-build.js", exitCode: 0, stdoutTail: "protected build\n", timedOut: false });
+    expect(result.checks).toEqual([expect.objectContaining({ check: "exit 0", ok: false })]);
+  });
 });
