@@ -40,8 +40,9 @@ export function catalogForProvider(
  * Moonshot, Mistral, xAI, and the `gemini` kind), or `undefined`.
  *
  * A third source after `userModels` and {@link catalogForProvider}, read
- * one model at a time by pricing and context-window sizing
- * (`resolveModelPricingFor`). It is kept out of `catalogForProvider` on
+ * one model at a time by pricing (`resolveModelPricingFor`, source
+ * `snapshot`: spend estimates and display, never admission pricing or
+ * prompt sizing). It is kept out of `catalogForProvider` on
  * purpose: that map also answers vision, strict-tool and model-search
  * questions, and models.dev rows carry limits and prices only (ATO-647).
  * Refreshed by `npm run models:snapshot`.

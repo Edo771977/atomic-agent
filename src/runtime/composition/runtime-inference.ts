@@ -188,6 +188,13 @@ export function createRuntimeModelContext(
    * defend. The same reasoning keeps the TUI gauge from drawing itself
    * against that number.
    *
+   * `source === "snapshot"` (the bundled models.dev list, ATO-647) is
+   * unknown here too: it reports up to 1M tokens for models the server
+   * may cap lower, and sizing prompts from it would raise every prompt's
+   * spend and invite a 400 where the fixed fallback held. The window
+   * stays for display; a `userModels` window the operator configured
+   * still sizes prompts.
+   *
    * Resolved per step rather than captured once, so switching model
    * mid-session is picked up by the next prompt.
    */
@@ -270,7 +277,7 @@ export function createRuntimeModelContext(
     const observed = observedContextWindows.get(activeModelKey(providerId));
     const model = resolveModelPricing(resolveActiveModelName(providerId), providerId);
     const catalogued =
-      !model || model.source === "default" || model.contextWindow <= 0
+      !model || model.source === "default" || model.source === "snapshot" || model.contextWindow <= 0
         ? null
         : model.contextWindow;
     if (observed === undefined) return catalogued;

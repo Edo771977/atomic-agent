@@ -15,7 +15,10 @@ type Snapshot = Readonly<Record<string, Readonly<Record<string, ModelsDevRow>>>>
  * is the resolver's own default (`supportsVision: false`, `"parallel"`
  * tools, no prompt cache flag, no reasoning format): the entry feeds
  * pricing and window sizing, not vision or tool routing, which keep
- * their own hand-verified sources.
+ * their own hand-verified sources. The runtime resolves the entry with
+ * source `snapshot`: its prices estimate spend but never admit or refuse
+ * a request, and its context window is display-only (prompt sizing does
+ * not read it).
  *
  * The row is keyed by the id the caller asked for, so a hit through
  * the `models/` prefix or a case-insensitive match still reports the
