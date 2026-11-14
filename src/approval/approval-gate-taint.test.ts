@@ -147,12 +147,34 @@ describe("ApprovalGate review after outside content (ATO-618)", () => {
   });
 
   it("refuses for a session under a refuse policy instead of parking a prompt", async () => {
-    const { gate, emitted, review } = setup({ answer: { risk: "low", reason: "x" } });
+    const { gate, emitted, review } = setup({ answer: { risk: "medium", reason: "x" } });
     gate.setSessionPolicy("s1", { onPrompt: "refuse", reason: "no surface" });
     gate.noteUntrustedContent("s1", "a web page");
     await expect(gate.request(curl)).resolves.toMatchObject({ approved: false, automatic: true, reason: "no surface" });
-    expect(review).not.toHaveBeenCalled();
+    expect(review).toHaveBeenCalledOnce();
     expect(emitted).toHaveLength(0);
+  });
+
+  it("lets the reviewer settle a held GET on a refuse-policy session (a worker after search results)", async () => {
+    const { gate, emitted, review } = setup({ answer: { risk: "low", reason: "docs lookup" } });
+    gate.setSessionPolicy("w1", { onPrompt: "refuse", reason: "refused-by-worker-policy" });
+    gate.noteUntrustedContent("w1", "web search results");
+    expect(gate.holdsForOutsideContent("w1", "http")).toBe(true);
+    await expect(
+      gate.request({ sessionId: "w1", tool: "os.web.fetch", category: "http", reason: "GET https://docs.example/x", preview: "p" }),
+    ).resolves.toMatchObject({ approved: true, reason: TAINT_REVIEW_LOW_REASON });
+    expect(review).toHaveBeenCalledOnce();
+    expect(emitted).toHaveLength(0);
+  });
+
+  it("still refuses on a refuse-policy session when the reviewer is off", async () => {
+    const { gate, review } = setup({ answer: { risk: "low", reason: "x" }, reviewerOn: false });
+    gate.setSessionPolicy("w1", { onPrompt: "refuse", reason: "refused-by-worker-policy" });
+    gate.noteUntrustedContent("w1", "web search results");
+    await expect(
+      gate.request({ sessionId: "w1", tool: "os.web.fetch", category: "http", reason: "GET https://docs.example/x" }),
+    ).resolves.toMatchObject({ approved: false, reason: "refused-by-worker-policy" });
+    expect(review).not.toHaveBeenCalled();
   });
 
   it("holds a fan-out after outside content instead of letting level 4 run it", async () => {

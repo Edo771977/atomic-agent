@@ -777,7 +777,9 @@ export class ApprovalGate {
    * category is one it may settle) is asked whether the action serves the
    * user's request; `low` runs it, anything else and every failure puts it
    * to the person, skipping the level and grants. A session under a refuse
-   * policy gets its refusal, as for any prompt.
+   * policy (a Fusion worker) is reviewed too: the request is one its level
+   * or grant would have run anyway, so a `low` restores that and nothing
+   * more; any other answer, or no reviewer, gets the policy's refusal.
    */
   private async requestAfterTaint(
     request: ApprovalRequest,
@@ -790,8 +792,7 @@ export class ApprovalGate {
     if (
       reviewer !== undefined &&
       reviewer.enabled?.() !== false &&
-      isRiskReviewEligible(request.category) &&
-      !this.policiesBySession.has(request.sessionId)
+      isRiskReviewEligible(request.category)
     ) {
       consulted = true;
       verdict = await runRiskReview(
