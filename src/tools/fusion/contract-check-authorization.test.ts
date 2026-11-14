@@ -140,7 +140,7 @@ describe("contract command read boundaries", () => {
   });
   it("does not let a caller-supplied approval flag or outside cwd bypass policy", async () => {
     const { hold, runner } = setup();
-    await expect(run(hold, [{ kind: "command", cmd: "node", args: ["test.js"], cwd: resolve(cwd, "..", "outside"), approvalRequired: false }])).rejects.toThrow(/cwd/);
+    await expect(run(hold, [{ kind: "command", cmd: "node", args: ["test.js"], cwd: resolve(cwd, "..", "outside"), approvalRequired: false }])).rejects.toThrow(/cwd|unsupported verification executor field/);
     expect(runner).not.toHaveBeenCalled();
   });
 });
@@ -148,7 +148,7 @@ describe("contract command read boundaries", () => {
 describe("trusted custom check compatibility", () => {
   it("refuses an undisclosed executor in production even when a worker sends approvalRequired false", async () => {
     const { hold, runner, requests } = setup();
-    await expect(run(hold, [{ kind: "command", file: "fixture.txt", approvalRequired: false }])).rejects.toThrow(/no disclosed command/);
+    await expect(run(hold, [{ kind: "command", file: "fixture.txt", approvalRequired: false }])).rejects.toThrow(/no disclosed command|unsupported verification executor field/);
     expect(requests).toEqual([]); expect(runner).not.toHaveBeenCalled();
   });
   it("preserves non-process custom specs for an explicitly trusted embedder", async () => {
@@ -161,5 +161,30 @@ describe("trusted custom check compatibility", () => {
     const { hold, runner, requests } = setup();
     await expect(run(hold, [{ kind: "command", cmd: "node", args: ["fixture.mjs", "long-fixture-secret-value"], env: { API_TOKEN: "long-fixture-secret-value" } }])).rejects.toThrow(/credentials/);
     expect(requests).toEqual([]); expect(runner).not.toHaveBeenCalled();
+  });
+});
+
+describe("verification executor schema identity", () => {
+  it.each([
+    { kind: "command", cmd: "node", args: ["safe.js"], command: "rm -rf ~" },
+    { kind: "command", type: "page", cmd: "node", args: ["safe.js"], path: "state.json" },
+    { kind: "service", start: { cmd: "node", command: "rm -rf ~", args: ["safe.js"] }, ready: { port: 3000 } },
+    { kind: "service", cmd: "rm -rf ~", start: { cmd: "node", args: ["safe.js"] }, ready: { port: 3000 } },
+    { kind: "command", cmd: "node", args: ["safe.js"], customExecutor: "rm -rf ~" },
+  ])("refuses ambiguous or undisclosed executable fields before any prompt or runner ($kind)", async spec => {
+    const { hold, runner, requests } = setup();
+    await expect(run(hold, [spec])).rejects.toThrow(/ambiguous|conflict|unsupported|undisclosed/i);
+    expect(requests).toEqual([]); expect(runner).not.toHaveBeenCalled();
+  });
+  it("authorizes the same sole legacy alias snapshot that an alias-aware custom runner receives", async () => {
+    const spec = { type: "command", command: "node", args: ["safe.js"] };
+    let selected = "";
+    const gate: ApprovalGate = new ApprovalGate({ level: 1, emit: request => {
+      spec.command = "rm -rf ~";
+      queueMicrotask(() => gate.resolve({ approvalId: request.approvalId, approved: true }));
+    } });
+    const runner: ContractCheckRunner = async specs => { selected = String(specs[0]?.command ?? specs[0]?.cmd); return { ok: true, results: [{ ok: true }] }; };
+    const hold = createContractCheckHold({ runner, approvals: gate, approvalRequired: true, sessionId: "parent", workingDir: cwd, tool: "fusion.delegate", checks: [], signal });
+    await run(hold, [spec]); expect(selected).toBe("node");
   });
 });

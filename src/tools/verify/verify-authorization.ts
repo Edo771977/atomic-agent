@@ -40,6 +40,29 @@ export function resolveVerifyCwd(root: string, cwd: string | undefined): string 
   return target;
 }
 
+const VERIFICATION_FIELDS = new Set([
+  "kind", "type", "cmd", "command", "args", "start", "cwd", "env", "timeoutMs", "network",
+  "ready", "requests", "path", "url", "script", "seconds", "probes", "checks", "task",
+]);
+
+/** Reject alternative executor meanings before interpreting or describing any plan. */
+function assertDeclaredVerificationSchema(spec: Record<string, unknown>, approvalRequired: boolean): void {
+  const present = (object: Record<string, unknown>, key: string): boolean => object[key] !== undefined && object[key] !== null;
+  if (present(spec, "cmd") && present(spec, "command")) throw new Error("ambiguous verification command: cmd and command cannot both be present");
+  if (present(spec, "kind") && present(spec, "type")) throw new Error("ambiguous verification kind: kind and type cannot both be present");
+  const kind = spec.kind ?? spec.type;
+  const start = typeof spec.start === "object" && spec.start !== null && !Array.isArray(spec.start) ? spec.start as Record<string, unknown> : undefined;
+  if (start !== undefined && present(start, "cmd") && present(start, "command")) throw new Error("ambiguous verification start: cmd and command cannot both be present");
+  if (approvalRequired) {
+    const unsupported = Object.keys(spec).find(key => !VERIFICATION_FIELDS.has(key));
+    if (unsupported !== undefined) throw new Error(`unsupported verification executor field: ${unsupported}`);
+    if (start !== undefined && Object.keys(start).some(key => key !== "cmd" && key !== "args")) throw new Error("unsupported verification start executor field");
+  }
+  const nonempty = (value: unknown): boolean => typeof value === "string" && value.length > 0 || Array.isArray(value) && value.length > 0;
+  if ((kind === "service" || kind === "page") && [spec.cmd, spec.command, spec.args].some(nonempty)) throw new Error("conflicting verification executors: a service or page must use start, not a command");
+  if (kind === "command" && start !== undefined && [start.cmd, start.command, start.args].some(nonempty)) throw new Error("conflicting verification executors: a command must not also declare start");
+}
+
 /**
  * A check is a verify.run call, including when fusion owns it. This deliberately
  * preserves verify.run tool rules; shell deny/ask command-prefix rules cross
@@ -56,6 +79,7 @@ export async function authorizeVerifyBatch(
   const serialized = JSON.stringify(specs);
   if (Buffer.byteLength(serialized) > MAX_AUTHORIZATION_BYTES) throw new Error("verification authorization plan exceeds the size limit");
   const snapshot = JSON.parse(serialized) as Record<string, unknown>[];
+  for (const spec of snapshot) assertDeclaredVerificationSchema(spec, options.approvalRequired);
   const project = ctx.ruleWorkdir ?? ctx.workingDir;
   const known = [...knownSecretsFromEnv(), ...(options.knownSecrets ?? [])];
   const plans = snapshot.flatMap(spec => {
