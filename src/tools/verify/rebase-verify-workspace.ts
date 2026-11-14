@@ -3,6 +3,7 @@ import { posix, win32 } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const unsupported = (): never => { throw new Error("verification check plan has an unsupported absolute project reference"); };
+const pathListNames = new Set(["PATH", "PYTHONPATH", "NODE_PATH", "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"]);
 
 /**
  * Rebase finite, explicit literals, not evaluated shell/program expressions.
@@ -29,6 +30,8 @@ export function rebaseVerifyWorkspaceValue<T>(value: T, from: string, to: string
   // Return undefined only when this is not an absolute/home path literal.
   const native = (text: string, allowRewrite = true): string | undefined => {
     const expanded = expandHome(text);
+    const unescaped = expanded.replace(/\\\//g, "/");
+    if (platform !== "win32" && unescaped !== expanded && paths.isAbsolute(unescaped) && namesSource(unescaped)) unsupported();
     if (!paths.isAbsolute(expanded)) return undefined;
     if (!namesSource(expanded)) return text;
     const comparable = spelling(text);
@@ -81,7 +84,7 @@ export function rebaseVerifyWorkspaceValue<T>(value: T, from: string, to: string
     }
     if (suffix === undefined) unsupported();
     const target = pathToFileURL(to, { windows: platform === "win32" });
-    target.pathname = target.pathname.replace(/\/$/, "") + suffix;
+    target.pathname = target.pathname.replace(/\/$/, "").replace(/'/g, "%27") + suffix;
     target.search = url.search; target.hash = url.hash;
     return target.href;
   };
@@ -89,11 +92,34 @@ export function rebaseVerifyWorkspaceValue<T>(value: T, from: string, to: string
   const literal = (text: string): string | undefined => uri(text) ?? native(text);
   const delimiter = (char: string): boolean => /[\s"'`()=;,:<>|&@+]/.test(char);
   const quote = (char: string): boolean => char === '"' || char === "'" || char === "`";
+  const quoteEnd = (text: string, start: number): number => {
+    for (let end = start + 1; end < text.length; end++) {
+      if (text[end] !== text[start]) continue;
+      let escapes = 0;
+      for (let previous = end - 1; previous > start && text[previous] === "\\"; previous--) escapes++;
+      if (escapes % 2 === 0) return end;
+    }
+    return text.length;
+  };
+  const pathList = (text: string): string => {
+    let result = "", start = 0;
+    for (let index = 0; index <= text.length; index++) {
+      // A named PATH-like value is a list even when its first relative entry
+      // looks like a URL scheme. URI arguments and other env values use uri().
+      const char = text[index];
+      if (index !== text.length && char !== ":" && char !== ";") continue;
+      if (char === ":" && index === start + 1 && drive(text.slice(start))) continue;
+      if (char === ":" && index === start + 4 && /^\$env:USERPROFILE(?=[\/\\]|$)/i.test(text.slice(start))) continue;
+      const entry = text.slice(start, index);
+      result += (native(entry) ?? entry) + (char ?? ""); start = index + 1;
+    }
+    return result;
+  };
 
   const scan = (text: string, wholeLiteral: boolean): string => {
     // Whole argv/quoted path literals retain their spaces. Path lists and
     // command bodies still need token scanning; a drive's ':' is not a list.
-    const wholeUri = uri(text);
+    const wholeUri = wholeLiteral || !/[|&<>]/.test(text) ? uri(text) : undefined;
     if (wholeUri !== undefined) return wholeUri;
     if (wholeLiteral && !/[;|<>]/.test(text) && !text.slice(drive(text) ? 2 : 0).includes(":")) {
       const whole = native(text);
@@ -102,14 +128,25 @@ export function rebaseVerifyWorkspaceValue<T>(value: T, from: string, to: string
     let result = "";
     for (let index = 0; index < text.length;) {
       const char = text[index]!;
-      if (quote(char)) {
-        let end = index + 1;
-        for (; end < text.length; end++) {
-          if (text[end] !== char) continue;
-          let escapes = 0;
-          for (let previous = end - 1; previous > index && text[previous] === "\\"; previous--) escapes++;
-          if (escapes % 2 === 0) break;
+      const assignment = /^([a-z_][a-z\d_]*)=/i.exec(text.slice(index));
+      if (assignment !== null && pathListNames.has(assignment[1]!.toUpperCase())) {
+        const prefix = assignment[0], start = index + prefix.length;
+        if (quote(text[start] ?? "")) {
+          const end = quoteEnd(text, start), body = text.slice(start + 1, end);
+          if (end === text.length) {
+            if (pathList(body) !== body) unsupported();
+            result += prefix + text.slice(start); break;
+          }
+          result += prefix + text[start] + pathList(body) + text[start]; index = end + 1;
+        } else {
+          let end = start;
+          while (end < text.length && !/[\s;<>|&]/.test(text[end]!)) end++;
+          result += prefix + pathList(text.slice(start, end)); index = end;
         }
+        continue;
+      }
+      if (quote(char)) {
+        const end = quoteEnd(text, index);
         if (end === text.length) {
           // An unterminated quote is not safe to reinterpret as a literal.
           const remainder = text.slice(index + 1);
@@ -127,7 +164,7 @@ export function rebaseVerifyWorkspaceValue<T>(value: T, from: string, to: string
       const scheme = /^[a-z][a-z\d+.-]*:/i.test(tail) && !drive(tail);
       let end = index;
       if (scheme) {
-        while (end < text.length && !/[\s"'`()]/.test(text[end]!)) end++;
+        while (end < text.length && !/[\s"'`()<>|&]/.test(text[end]!)) end++;
         result += uri(text.slice(index, end)) ?? text.slice(index, end);
       } else {
         // A literal root may itself contain spaces/braces/brackets. Consume
@@ -136,6 +173,8 @@ export function rebaseVerifyWorkspaceValue<T>(value: T, from: string, to: string
         const pathStart = index + attached.length;
         const rootCandidate = spelling(text.slice(pathStart, pathStart + source.length));
         if (fold(rootCandidate) === fold(source)) end = pathStart + source.length;
+        const homePrefix = /^(?:~|\$HOME|\$\{HOME\}|%USERPROFILE%|\$env:USERPROFILE)(?=[\/\\]|$)/i.exec(text.slice(pathStart));
+        if (homePrefix !== null) end = Math.max(end, pathStart + homePrefix[0].length);
         while (end < text.length) {
           const next = text[end]!;
           if (delimiter(next)) {
@@ -157,10 +196,10 @@ export function rebaseVerifyWorkspaceValue<T>(value: T, from: string, to: string
     return result;
   };
 
-  const visit = (item: unknown, command = false): unknown => {
-    if (typeof item === "string") return scan(item, !command);
+  const visit = (item: unknown, command = false, environment = false, list = false): unknown => {
+    if (typeof item === "string") return list ? pathList(item) : scan(item, !command);
     if (Array.isArray(item)) return item.map(child => visit(child));
-    if (item !== null && typeof item === "object") return Object.fromEntries(Object.entries(item).map(([key, child]) => [key, visit(child, key === "cmd" || key === "command")]));
+    if (item !== null && typeof item === "object") return Object.fromEntries(Object.entries(item).map(([key, child]) => [key, visit(child, key === "cmd" || key === "command", key === "env", environment && pathListNames.has(key.toUpperCase()))]));
     return item;
   };
   return visit(value) as T;

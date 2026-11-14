@@ -61,3 +61,52 @@ it("preserves ordinary commands, percent labels and unrelated filesystem referen
 it("applies the same finite literal rules to nested command arguments and environments", () => {
   expect(rebase({ cmd: "tool", args: ["-I/project/include"], env: { PYTHONPATH: "/external:/project/lib" } }, "/project", "/checked", "linux")).toEqual({ cmd: "tool", args: ["-I/checked/include"], env: { PYTHONPATH: "/external:/checked/lib" } });
 });
+
+it("uses path-list context for relative first entries instead of treating them as URL schemes", () => {
+  expect(rebase({ env: { PATH: "bin:/project/bin", PYTHONPATH: "relative:/project/lib" } }, "/project", "/checked", "linux")).toEqual({ env: { PATH: "bin:/checked/bin", PYTHONPATH: "relative:/checked/lib" } });
+  expect(rebase({ cmd: "PATH=bin:/project/bin tool" }, "/project", "/checked", "linux")).toEqual({ cmd: "PATH=bin:/checked/bin tool" });
+  expect(rebase({ cmd: 'PYTHONPATH="relative:/project space/lib" tool' }, "/project space", "/checked space", "linux")).toEqual({ cmd: 'PYTHONPATH="relative:/checked space/lib" tool' });
+});
+
+it("preserves actual URLs and complete sibling names inside known path-list values", () => {
+  const value = { env: { PATH: "https://localhost:3000/?next=/project", PYTHONPATH: "/external:/project space", NODE_PATH: "file:///external/a.mjs?next=/project" } };
+  expect(rebase(value, "/project", "/checked", "linux")).toEqual(value);
+  expect(rebase("custom:/project/a.txt", "/project", "/checked", "linux")).toBe("custom:/project/a.txt");
+});
+
+it("refuses a recognizable PowerShell home source alias before splitting its namespace colon", () => {
+  const root = String.raw`C:\Users\u\project`;
+  expect(() => rebase({ cmd: String.raw`type $env:USERPROFILE\project\a.txt` }, root, String.raw`D:\checked`, "win32", String.raw`C:\Users\u`)).toThrow(/unsupported absolute project reference/);
+  expect(rebase({ cmd: String.raw`type $env:USERPROFILE\external\a.txt` }, root, String.raw`D:\checked`, "win32", String.raw`C:\Users\u`)).toEqual({ cmd: String.raw`type $env:USERPROFILE\external\a.txt` });
+});
+
+it.each(["curl http://localhost:3000|cat</project/a.txt", "curl http://localhost:3000&&cat</project/a.txt", "echo file:///external/a|cat</project/a.txt"])("ends an unquoted command URL at a shell operator: %s", cmd => {
+  expect(rebase({ cmd }, "/project", "/checked", "linux")).toEqual({ cmd: cmd.replace("</project/", "</checked/") });
+});
+
+it("keeps URL operators as data in argv, env and quoted URL literals", () => {
+  const url = "http://localhost:3000/?a=1&path=/project/a.txt";
+  const value = { cmd: `echo '${url}'`, args: [url], env: { LINK: url, PATH: url } };
+  expect(rebase(value, "/project", "/checked", "linux")).toEqual(value);
+});
+
+it("uses known assignment/environment context for quoted and semicolon path lists", () => {
+  expect(rebase({ cmd: 'PATH="/external:/project/bin" tool; PYTHONPATH="/external:/project/lib" python check.py' }, "/project", "/checked", "linux")).toEqual({ cmd: 'PATH="/external:/checked/bin" tool; PYTHONPATH="/external:/checked/lib" python check.py' });
+  expect(rebase({ env: { PATH: String.raw`relative;C:\project\bin;D:\external`, PYTHONPATH: String.raw`relative;C:\project\lib` } }, String.raw`C:\project`, String.raw`E:\checked`, "win32")).toEqual({ env: { PATH: String.raw`relative;E:\checked\bin;D:\external`, PYTHONPATH: String.raw`relative;E:\checked\lib` } });
+  expect(rebase('tool "/project/x:y;z"', "/project", "/checked", "linux")).toBe('tool "/checked/x:y;z"');
+});
+
+it("refuses recognizable POSIX escaped-separator source aliases without evaluating a shell", () => {
+  expect(() => rebase(String.raw`tool /project\/a.txt`, "/project", "/checked", "linux")).toThrow(/unsupported absolute project reference/);
+  expect(rebase(String.raw`tool /external\/a.txt`, "/project", "/checked", "linux")).toBe(String.raw`tool /external\/a.txt`);
+});
+
+it("lets named path-list semantics take precedence over URL-looking first entries", () => {
+  expect(rebase({ env: { PATH: "http://external:/project/bin" } }, "/project", "/checked", "linux")).toEqual({ env: { PATH: "http://external:/checked/bin" } });
+  expect(rebase({ cmd: 'PATH="https://external:/project/bin" tool' }, "/project", "/checked", "linux")).toEqual({ cmd: 'PATH="https://external:/checked/bin" tool' });
+  expect(rebase({ env: { PATH: String.raw`http://external;C:\project\bin` } }, String.raw`C:\project`, String.raw`E:\checked`, "win32")).toEqual({ env: { PATH: String.raw`http://external;E:\checked\bin` } });
+});
+
+it("retains named list context in a PowerShell environment assignment", () => {
+  expect(rebase({ cmd: String.raw`$env:NODE_PATH='C:\external;C:\project\lib'; & node check.cjs` }, String.raw`C:\project`, String.raw`E:\checked`, "win32")).toEqual({ cmd: String.raw`$env:NODE_PATH='C:\external;E:\checked\lib'; & node check.cjs` });
+});

@@ -76,6 +76,11 @@ it("compares file URL identity with native platform case rules", () => {
 it("constructs UNC destination file URLs and preserves encoded suffixes", () => {
   expect(rebaseVerifyWorkspaceValue("file://server/share/project/a%20b.mjs?q=1#part", String.raw`\\server\share\project`, String.raw`\\target\private share\checked`, "win32")).toBe("file://target/private%20share/checked/a%20b.mjs?q=1#part");
 });
+it("encodes apostrophes introduced by a destination URL prefix so single-quoted import code stays valid", () => {
+  const code = rebaseVerifyWorkspaceValue("import('file:///project/a%27b.mjs?keep=%27#same')", "/project", "/tmp/O'Neil/checked", "linux");
+  expect(code).toBe("import('file:///tmp/O%27Neil/checked/a%27b.mjs?keep=%27#same')");
+  expect(() => new Function(code)).not.toThrow();
+});
 it("preserves external and sibling file URLs", () => {
   const text = "file:///backup/home/u/project/a.js file:///home/u/project-sibling/a.js file:/home/u/project-sibling/a.js file:backup/home/u/project/a.js";
   expect(rebaseVerifyWorkspaceValue(text, "/home/u/project", "/private/checked", "linux")).toBe(text);

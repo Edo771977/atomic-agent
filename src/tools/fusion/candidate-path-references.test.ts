@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -30,6 +30,24 @@ it("rejects a candidate when an attached redirection must read changed execution
     expect(executions[0]?.commandLine).not.toContain(join(root, "a.txt"));
     expect(executions[0]?.exitCode).toBe(1);
     expect(executions[0]?.stdoutTail).not.toContain("hello");
+    expect(report.status).toBe("rejected");
+    expect(await readFile(join(root, "a.txt"), "utf8")).toBe("hello\n");
+  } finally { await candidate.cleanup(); }
+});
+
+it("does not let an unquoted external file URL hide a later shell pipeline source reference", async () => {
+  const root = await mkdtemp(join(tmpdir(), "atag-uri-pipeline-")); roots.push(root);
+  await writeFile(join(root, "a.txt"), "hello\n");
+  const candidate = await createCandidateIntegration(root, { git: async () => null, maxCopyBytes: 1024 * 1024 });
+  try {
+    await writeFile(join(candidate.dir, "a.txt"), "changed\n");
+    const cmd = `echo file:///external/a|${process.platform === "win32" ? "findstr" : "grep"}<${join(root, "a.txt")} ${process.platform === "win32" ? "/c:hello" : "-x hello"}`;
+    const executions: VerifyRunResult[] = [];
+    const runner: ContractCheckRunner = async (specs, ctx) => { const result = await runChecks(specs, ctx); executions.push(...result.results); return result; };
+    const report = await candidate.finish({ rows, signal: new AbortController().signal, contract: { checks: [{ kind: "command", cmd, checks: ["exit 0"] }] }, runChecks: runner });
+    expect(executions).toHaveLength(1); expect(executions[0]?.error).toBeUndefined();
+    expect(executions[0]?.commandLine).not.toContain(join(root, "a.txt"));
+    expect(executions[0]?.exitCode).toBe(1);
     expect(report.status).toBe("rejected");
     expect(await readFile(join(root, "a.txt"), "utf8")).toBe("hello\n");
   } finally { await candidate.cleanup(); }
@@ -71,5 +89,30 @@ it("checks candidate module bytes through a rebased file URL in the actual execu
     expect(executions[0]?.stdoutTail?.trim()).toBe(`candidate ${pathToFileURL(join(executionRoots[0]!, "module.mjs")).href}`);
     expect(report.status).toBe("promoted");
     expect(await readFile(join(root, "module.mjs"), "utf8")).toContain('"candidate"');
+  } finally { await candidate.cleanup(); }
+});
+
+it.runIf(process.platform === "win32")("checks a protected PowerShell path-list import from the execution copy", async () => {
+  const root = await mkdtemp(join(tmpdir(), "atag-protected-list-")); roots.push(root);
+  await mkdir(join(root, "lib"));
+  await writeFile(join(root, "lib", "literal-check.js"), 'module.exports="hello";');
+  const check = 'console.log(require("literal-check"));';
+  await writeFile(join(root, "check.cjs"), check);
+  const candidate = await createCandidateIntegration(root, { git: async () => null, maxCopyBytes: 1024 * 1024, checkInputs: ["check.cjs"] });
+  try {
+    await writeFile(join(candidate.dir, "lib", "literal-check.js"), 'module.exports="changed";');
+    const cmd = `powershell.exe -NoProfile -NonInteractive -Command "$env:NODE_PATH='C:\\external;${join(root, "lib")}'; & '${process.execPath}' check.cjs"`;
+    const executions: VerifyRunResult[] = [];
+    const runner: ContractCheckRunner = Object.assign(async (specs: readonly Record<string, unknown>[], ctx: Parameters<ContractCheckRunner>[1]) => {
+      const result = await runChecks(specs, ctx); executions.push(...result.results); return result;
+    }, { supportsInputIntegrity: true as const });
+    const report = await candidate.finish({ rows, signal: new AbortController().signal, contract: { checkInputs: ["check.cjs"], checks: [{ kind: "command", cmd, checks: ["exit 0", 'stdout contains "hello"'] }] }, runChecks: runner });
+    expect(executions).toHaveLength(1); expect(executions[0]?.error).toBeUndefined();
+    expect(executions[0]?.commandLine).not.toContain(join(root, "lib"));
+    expect(executions[0]?.stdoutTail?.trim()).toBe("changed");
+    expect(report.status).toBe("rejected");
+    expect(report.acceptanceReceipt?.checkScope).toBe("protected-declared");
+    expect(await readFile(join(root, "lib", "literal-check.js"), "utf8")).toContain('"hello"');
+    expect(await readFile(join(root, "check.cjs"), "utf8")).toBe(check);
   } finally { await candidate.cleanup(); }
 });
