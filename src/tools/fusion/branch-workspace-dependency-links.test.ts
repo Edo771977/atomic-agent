@@ -218,3 +218,29 @@ it("refuses a folder-copy candidate whose dependency link points into the reposi
   );
   expect(await readFile(join(top, "packages", "lib", "index.js"), "utf8")).toBe("original lib\n");
 });
+
+it("recreates a relative dependency link leaving the project as its absolute original target", async () => {
+  const holder = await realpath(await mkdtemp(join(tmpdir(), "atag-dep-holder-"))); roots.push(holder);
+  const root = join(holder, "proj");
+  await mkdir(join(root, "node_modules"), { recursive: true });
+  await mkdir(join(holder, "shared-lib"));
+  await writeFile(join(holder, "shared-lib", "index.js"), "lib");
+  await writeFile(join(root, "input.txt"), "original input\n");
+  await symlink(join("..", "..", "shared-lib"), join(root, "node_modules", "lib"), "dir");
+  await symlink(join("..", "own"), join(root, "node_modules", "alias"), "dir");
+  await mkdir(join(root, "node_modules", "own"));
+  for (const make of [
+    async () => { const c = await createCandidateIntegration(root, { git: async () => null }); return { dir: c.dir, done: () => c.cleanup() }; },
+    // The original cannot be linked, so the base copies node_modules and the task links to that copy.
+    async () => { links.deny = (target, type) => type === "dir" || inside(target, root) ? "EPERM" : undefined; const s = await createBranchSet(root, ["a"], { git: async () => null }); return { dir: s!.workspaces.get("a")!.dir, done: () => s!.cleanup() }; },
+  ]) {
+    const made = await make();
+    try {
+      const nm = join(made.dir, "node_modules");
+      expect(await readlink(join(nm, "lib"))).toBe(join(holder, "shared-lib"));
+      expect(await readFile(join(nm, "lib", "index.js"), "utf8")).toBe("lib");
+      // A relative link that stays inside is kept relative.
+      expect(await readlink(join(nm, "alias"))).toBe(join("..", "own"));
+    } finally { await made.done(); links.deny = () => undefined; }
+  }
+});

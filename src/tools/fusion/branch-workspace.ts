@@ -561,17 +561,25 @@ async function privateDependencyTarget(target: string, workspaceDir: string, bud
  * workspace instead, so a write through it stays private; in a worktree
  * the same holds for a target elsewhere in the repository (a monorepo's
  * sibling package), and in a folder copy such a target refuses setup
- * (`privateDependencyTarget`). Relative targets already resolve inside
- * the copy, and targets outside the repository (or, without one, the
- * original) are kept. Where the host denies symlinks, a directory target
+ * (`privateDependencyTarget`). A relative target under a dependency
+ * directory is kept when it resolves inside the source tree (from the
+ * source link's own folder); one leaving it becomes its absolute
+ * original target, then follows the same rules. Targets outside the
+ * repository (or, without one, the original) are kept. Where the host denies symlinks, a directory target
  * under a dependency directory becomes a junction to the same resolved
  * path; otherwise the copy fails, naming the link (it is never expanded
  * into a copy).
  */
 async function recreateLink(from: string, to: string, budget: PrivateCopyBudget, rel: string): Promise<void> {
   let target = await readlink(from);
-  const origin = budget.privateDependenciesFrom;
-  if (origin !== undefined && isAbsolute(target) && underSharedDependencyDirectory(rel) && to.endsWith(`${sep}${rel}`)) {
+  const dependency = rel.length > 0 && underSharedDependencyDirectory(rel) && from.endsWith(`${sep}${rel}`) && to.endsWith(`${sep}${rel}`);
+  if (dependency && !isAbsolute(target)) {
+    // Resolved where the source link lives: one leaving the source tree
+    // would dangle (or hit an unrelated folder) next to the copy.
+    const resolved = resolve(dirname(from), target);
+    if (await insideRoot(resolved, from.slice(0, from.length - rel.length - 1)) === undefined) target = resolved;
+  }
+  if (dependency && budget.privateDependenciesFrom !== undefined && isAbsolute(target)) {
     target = await privateDependencyTarget(target, to.slice(0, to.length - rel.length - 1), budget, rel);
   }
   let denied: unknown;
