@@ -8,6 +8,7 @@ import { modelParamProfile } from "../llm/provider/openai/model-params.js";
 import { formatUsd, type FusionTurnBudget } from "../tools/fusion/turn-budget.js";
 import { DailySpendLimitError } from "../llm/reliability/spend-limit-error.js";
 import type { DailySpendBudget, DailySpendHold } from "./daily-spend-budget.js";
+import { linkSpendBilling, verifiablePricing, type ModelPricing } from "./link-spend-billing.js";
 
 // Explicit rejections before generation. 529 is Anthropic's overload answer
 // returned instead of generating. 503 stays charged like 500/502/504:
@@ -35,7 +36,6 @@ function addsProviderSideInput(body: Record<string, unknown>): boolean {
   return tools.some(tool => typeof tool !== "object" || tool === null || (tool as { type?: unknown }).type !== "function");
 }
 
-type ModelPricing = NonNullable<ResolvedModel["pricing"]>;
 
 /**
  * Tiers the configured base rates bound from above, lower-cased: the
@@ -54,20 +54,6 @@ function configuredTierMultiplier(tier: string, pricing: ModelPricing): number |
     if (name.toLowerCase() === wanted) return multiplier;
   }
   return undefined;
-}
-
-function validRate(rate: unknown): boolean {
-  return typeof rate === "number" && Number.isFinite(rate) && rate >= 0;
-}
-
-/** Every rate the reservation or settlement may read is finite and >= 0. */
-function verifiablePricing(pricing: ModelPricing | undefined): pricing is ModelPricing {
-  if (pricing === undefined) return false;
-  if (![pricing.input, pricing.output, pricing.cacheWrite ?? 0, pricing.cacheRead ?? 0].every(validRate)) return false;
-  const long = pricing.longContext;
-  if (long !== undefined && !(typeof long.thresholdTokens === "number" && long.thresholdTokens > 0 && [long.input, long.output, long.cacheWrite ?? 0, long.cacheRead ?? 0].every(validRate))) return false;
-  const tiers = pricing.serviceTierMultipliers;
-  return tiers === undefined || Object.values(tiers).every(validRate);
 }
 
 /**
@@ -186,7 +172,12 @@ export interface RequestBudgetScope extends CompletionRequestBudget {
    */
   hint?: string;
   hintKey?: string;
-  finish(result?: CompletionResult): void;
+  /**
+   * Settle the scope. `streamed.outputBytes` is the reply text a stream
+   * delivered before it ended without a result (a cancel): the day's
+   * ledger prices it on top of the input bound.
+   */
+  finish(result?: CompletionResult, streamed?: { outputBytes: number }): void;
 }
 
 /**
@@ -209,9 +200,9 @@ export function createRequestBudgetScope(
 ): RequestBudgetScope | undefined {
   const sessionId = request.budgetOwnerSessionId ?? request.sessionId;
   const limits = budget === undefined || sessionId === undefined ? undefined : budget.requestLimits(sessionId);
-  // A loopback/private URL can be a forwarding gateway to a paid service.
-  // Only an explicit runner/plan kind is free without configured zero rates.
-  const unbilled = entry?.kind === "subscription-cli" || entry?.kind === "llama-server";
+  // An explicit runner or plan, or an unpriced loopback/LAN server; a
+  // priced one may be a forwarding gateway to a paid service and is billed.
+  const unbilled = linkSpendBilling(entry, model?.pricing) !== "billed";
   // Unbilled links are not spend: the day never sees them.
   const day = unbilled ? undefined : daily;
   if (limits === undefined && day === undefined) return undefined;
@@ -245,6 +236,9 @@ export function createRequestBudgetScope(
   // No context-window fallback: providers reject a window-sized output
   // limit, and reserving one would hold dollars per request.
   const outputCap = caps.length > 0 ? Math.min(...caps) : undefined;
+  // The cap the provider writes itself: what this call asked for, else
+  // the turn's ceiling, else the entry's (`openai-build-body.ts`).
+  const providerCap = caps.length > 0 ? caps[0] : undefined;
   const timeLeft = limits === undefined ? undefined : budget!.requestTimeLeftMs(sessionId!);
   if (timeLeft !== undefined && timeLeft <= 0) throw new Error("the turn time cap has been reached before this request");
   // A metered day holds nothing; the zero hold still refuses once today's
@@ -263,6 +257,11 @@ export function createRequestBudgetScope(
   let done = false;
   // Multiplier of the most recent physical send; settlement prices usage with it.
   let tierMultiplier = 1;
+  // The latest priced send's input bound and per-output-token rate (USD),
+  // and its whole hold: what an abandoned send is charged on the day.
+  let sendInputUsd = 0;
+  let sendOutputUsdPerToken = 0;
+  let sendHoldUsd = 0;
   const hintKey = `${sessionId ?? ""}:${provider.id}`;
   const reserveBoth = (usd: number): SendHolds => {
     const turn = turnPriced ? budget!.reserveRequest(sessionId!, usd) : undefined;
@@ -287,7 +286,15 @@ export function createRequestBudgetScope(
       if (dayPriced) { dayHeld?.settle(); dayHeld = undefined; }
       if (request.signal?.aborted) throw request.signal.reason;
       const wireCaps = [body.max_tokens, body.max_completion_tokens].filter((value): value is number => typeof value === "number" && Number.isFinite(value) && value > 0);
-      const explicitCaps = outputCap === undefined ? wireCaps : [outputCap, ...wireCaps];
+      // A turn cap enforces the tightest configured ceiling over any body
+      // override. A daily limit alone bounds the reply the provider will
+      // actually send: the body's cap (after extraBody and model params),
+      // else the provider's own rule. Taking the minimum there would cut
+      // a truncation step-up (16000 asked, entry 4096) or an extraBody
+      // cap down although the day has room for it.
+      const explicitCaps = turnPriced
+        ? (outputCap === undefined ? wireCaps : [outputCap, ...wireCaps])
+        : wireCaps.length > 0 ? wireCaps : providerCap === undefined ? [] : [providerCap];
       const soft = explicitCaps.length === 0;
       let ceiling: number;
       let fields: readonly ("max_tokens" | "max_completion_tokens")[] = [];
@@ -356,34 +363,44 @@ export function createRequestBudgetScope(
       if (!copies.every(value => typeof value === "number" && Number.isInteger(value) && value > 0)) throw new Error(`${label} cannot verify the request's completion count`);
       const outputCopies = Math.max(1, ...(copies as number[]));
       const upperUsd = (output: number) => ((inputTokens * inputRate + output * outputRate) * outputCopies * multiplier) / 1_000_000;
+      const dayLeft = dayPriced ? day!.remainingUsd() : null;
       const fitting = reserveFitting(reserveBoth, ceiling, upperUsd);
+      sendInputUsd = upperUsd(0);
+      sendOutputUsdPerToken = upperUsd(1) - sendInputUsd;
+      sendHoldUsd = upperUsd(fitting.output);
       if (turnPriced) held = fitting.holds.turn;
       if (dayPriced) dayHeld = fitting.holds.daily;
       if (fitting.output < ceiling) {
         // Clamp a written ceiling to what the allowance covers; a soft
         // bound only assumes the smaller reply.
         for (const field of fields) body[field] = fitting.output;
+        if (fields.length > 0) {
+          hint = dayLeft !== null && upperUsd(ceiling) > dayLeft
+            ? `daily spend limit: reply capped at ${fitting.output} tokens (from ${ceiling}) to fit the remaining daily allowance (${formatUsd(dayLeft)} left)`
+            : `turn budget: reply capped at ${fitting.output} tokens (from ${ceiling}) to fit the remaining ${capText} turn allowance`;
+          scope.hint = hint;
+          scope.hintKey = hintKey;
+        }
       }
       tierMultiplier = multiplier;
     },
     onResponse(status) {
       // 408, other 5xx and network deaths remain ambiguous and retain their bound.
       if (RELEASED_STATUSES.has(status)) {
-        held?.release();
-        held = undefined;
-        // A metered day's zero hold stays: its reply may still come.
+        // A metered hold (turn or day) is the scope's zero hold, not this
+        // send's: it stays so a retried reply is still settled against it.
+        if (turnPriced) { held?.release(); held = undefined; }
         if (dayPriced) { dayHeld?.release(); dayHeld = undefined; }
       }
     },
     onSendFailed(error) {
       const code = readErrnoCode(error);
       if (code !== undefined && UNSENT_ERRNOS.has(code)) {
-        held?.release();
-        held = undefined;
+        if (turnPriced) { held?.release(); held = undefined; }
         if (dayPriced) { dayHeld?.release(); dayHeld = undefined; }
       }
     },
-    finish(result) {
+    finish(result, streamed) {
       // Reported cost has already won above; only the estimate takes the
       // tier, the one the response says served the request when it names
       // one (an `auto` request can be served at a project's priority tier).
@@ -404,10 +421,25 @@ export function createRequestBudgetScope(
       // A metered request holds nothing, so a missing estimate charges zero.
       held?.settle(usage === undefined ? (turnPriced ? undefined : 0) : settledUsd);
       held = undefined;
+      // A send abandoned after it left (a cancel or the turn deadline,
+      // or a reply with no usage block): the provider may bill the prompt
+      // and whatever it generated, but charging the whole output ceiling
+      // would put money never spent on today's total, and each Esc would
+      // eat into the day. The day counts it as a priced call at the input
+      // bound plus the output known to have arrived (streamed or returned
+      // text, at the bound's bytes-per-token), never more than the hold.
+      // The turn ledger keeps its conservative whole-hold charge.
+      const abandonedUsd = (outputBytes: number): number =>
+        Math.min(sendHoldUsd, sendInputUsd + Math.ceil(outputBytes / BODY_BYTES_PER_TOKEN) * sendOutputUsdPerToken);
+      const returnedBytes = (reply: CompletionResult): number =>
+        Buffer.byteLength(reply.content ?? "", "utf8") + Buffer.byteLength(reply.reasoningContent ?? "", "utf8") +
+        (reply.toolCalls === undefined ? 0 : Buffer.byteLength(JSON.stringify(reply.toolCalls), "utf8"));
       if (day !== undefined) {
         if (dayHeld !== undefined) {
           // No reply on a metered day: nothing is known to have been billed.
           if (usage === undefined && !dayPriced) dayHeld.release();
+          else if (dayPriced && usage === undefined && signal.aborted) dayHeld.settle(abandonedUsd(streamed?.outputBytes ?? 0));
+          else if (dayPriced && usage?.incomplete === true && reportedCostUsd(usage) === undefined) dayHeld.settle(abandonedUsd(returnedBytes(result!)));
           else dayHeld.settle(settledUsd);
         } else if (usage !== undefined) {
           // A reply whose send took no hold (released on a rejection the

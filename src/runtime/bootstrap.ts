@@ -466,7 +466,7 @@ export async function createAgentRuntime(
     });
   }
 
-  const { prepareLocalLink, llmComplete, llmCompleteStream } = connectRuntimeFallback(options, {
+  const { prepareLocalLink, llmComplete, llmCompleteStream, dailySpendLimit } = connectRuntimeFallback(options, {
     fallbackChain, resolveActiveLlmSlice, localBackend: connectedLocal.localBackend, profileManager,
     costAccumulator, turnUsageMeter, sessionUsage, dailySpend, resolveModelPricing, resolveCatalogContextWindow,
     turnBudget: fusionTurnBudget,
@@ -819,7 +819,7 @@ export async function createAgentRuntime(
   const { executeTurn, steer, runTurn, controlGoal } = createRuntimeTurnService(config, {
     sessions: { sessionStore, turnContext, turnRequests, turnPreviousReplies },
     execution: { loop, turnController, steeringInbox, shellJobs, slotManager, llmComplete },
-    inference: { providerRegistry, resolveActiveLlmSlice, resolveCurrentRunMode, resolveRouteVision, resolveActiveModelName, fallbackChain },
+    inference: { providerRegistry, resolveActiveLlmSlice, resolveCurrentRunMode, resolveRouteVision, resolveActiveModelName, fallbackChain, dailyLimitRefuses: dailySpendLimit.refuses },
     traces, telemetry: { observability, analyticsStateStore, turnUsageMeter, sessionUsage },
     state: turnState, lifecycle, logger,
   });
@@ -837,6 +837,7 @@ export async function createAgentRuntime(
     turnBudget: fusionTurnBudget,
     sessionUsage,
     costAccumulator,
+    dailySpendLimit,
     liveWorkers: fusionLiveWorkers,
     runCheckpoints: fusionRuns,
     outcomeLog: fusionOutcomes.outcomeLog,

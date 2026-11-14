@@ -5,6 +5,7 @@ import {
   estimateMessageTokens,
   extractRouteFeatures,
   routeTurn,
+  ROUTER_MATCH_MAX_CHARS,
   type RouteTurnInput,
 } from "./route-turn.js";
 
@@ -149,6 +150,12 @@ describe("routeTurn: rule matching", () => {
     expect(routeTurn(input(router, "please REFACTOR this"))).toMatchObject({ rule: "words" });
     expect(routeTurn(input(router, "Translate this to French"))).toMatchObject({ rule: "regex" });
     expect(routeTurn(input(router, "do not translate"))).toMatchObject({ routed: false });
+  });
+
+  it("tests a matches rule against the message's first 32 KiB only", () => {
+    const router = on([{ name: "tail", when: { matches: "needle$" }, provider: "groq" }]);
+    expect(routeTurn(input(router, "x".repeat(100) + "needle"))).toMatchObject({ rule: "tail" });
+    expect(routeTurn(input(router, "x".repeat(ROUTER_MATCH_MAX_CHARS) + "needle"))).toMatchObject({ routed: false });
   });
 
   it("matches the working folder and the folders inside it, with ~ expanded", () => {

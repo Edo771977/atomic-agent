@@ -70,4 +70,13 @@ describe("routeTurnProvider (ATO-483)", () => {
     const config = configWith({ enabled: true, rules: [{ provider: "groq" }] });
     expect(run(config, { runMode: { stored: "cloud", effective: "cloud" } }).providerId).toBe("groq");
   });
+
+  it("passes over a rule whose target the daily limit refuses, so a free primary keeps the turn", () => {
+    // With onDailyLimit "stop" a refused routed head would end the turn even
+    // though the configured primary (free) could answer it.
+    const config = configWith({ enabled: true, rules: [{ provider: "groq" }, { provider: "openrouter" }] });
+    const refuses = (id: string) => id === "groq";
+    expect(run(config, { dailyLimitRefuses: refuses }).providerId).toBeUndefined();
+    expect(run(config, { dailyLimitRefuses: () => false }).providerId).toBe("groq");
+  });
 });

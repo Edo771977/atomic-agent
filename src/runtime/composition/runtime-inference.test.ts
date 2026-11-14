@@ -457,6 +457,53 @@ describe("runtime provider/context/fallback/reload phases", () => {
       expect(fixture.dailySpend.today().usd).toBeCloseTo(0.00002, 9);
     });
 
+    // Ollama / LM Studio on this machine with no price: not spend.
+    function cloudOnLocalhost(): void {
+      const llm = config.llm!;
+      config.llm = {
+        ...llm,
+        providers: llm.providers.map((p) => (p.id === "cloud" ? { ...p, baseUrl: "http://localhost:11434/v1" } : p)),
+      };
+    }
+
+    it("leaves an unpriced localhost link out of today's total", async () => {
+      const fixture = withDailySpend();
+      cloudOnLocalhost();
+      const cloud = providers.providerRegistry.getProvider("cloud");
+      if (!cloud) throw new Error("cloud fixture missing");
+      vi.spyOn(cloud, "complete").mockResolvedValue(completion("cloud-model"));
+      const wired = connectRuntimeFallback({}, fixture.deps);
+      await wired.llmComplete({ ...params, providerId: "cloud" });
+      expect(fixture.dailySpend.today()).toMatchObject({ usd: 0, pricedCalls: 0, unpricedCalls: 0 });
+      expect(wired.dailySpendLimit.refuses("cloud")).toBe(false);
+    });
+
+    it("onDailyLimit \"local\" lands a refused paid link on an unpriced localhost link", async () => {
+      const fixture = withDailySpend(1, "local");
+      cloudOnLocalhost();
+      fixture.dailySpend.record({ kind: "priced", usd: 1.2, source: "provider" });
+      const fallbackChain = new ProviderFallbackChain({
+        resolve: () => ({ chain: ["served", "cloud"], timing: DEFAULT_FALLBACK_TIMING }),
+      });
+      const cloud = providers.providerRegistry.getProvider("cloud");
+      const served = providers.providerRegistry.getProvider("served");
+      if (!cloud || !served) throw new Error("provider fixtures missing");
+      const servedCall = vi.spyOn(served, "complete").mockResolvedValue(completion());
+      vi.spyOn(cloud, "complete").mockResolvedValue({ ...completion("cloud-model"), content: "ollama answer" });
+      const wired = connectRuntimeFallback({}, { ...fixture.deps, fallbackChain });
+      await expect(wired.llmComplete(params)).resolves.toMatchObject({ content: "ollama answer" });
+      expect(servedCall).not.toHaveBeenCalled();
+    });
+
+    it("tells the model router which links today's ceiling refuses", () => {
+      const fixture = withDailySpend(1);
+      const wired = connectRuntimeFallback({}, fixture.deps);
+      expect(wired.dailySpendLimit.refuses("cloud")).toBe(false);
+      fixture.dailySpend.record({ kind: "priced", usd: 1.2, source: "provider" });
+      expect(wired.dailySpendLimit.refuses("cloud")).toBe(true);
+      expect(wired.dailySpendLimit.refuses("local")).toBe(false);
+    });
+
     it("lets paid links through below the limit and with no limit set", async () => {
       for (const limit of [5, undefined]) {
         const fixture = withDailySpend(limit);

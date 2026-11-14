@@ -21,6 +21,7 @@ import {
 } from "../../session/daily-spend.js";
 import { DailySpendLimitError } from "../../llm/reliability/spend-limit-error.js";
 import { isLocalServerUrl } from "../../llm/provider/openai/local-server-url.js";
+import { linkSpendBilling } from "../link-spend-billing.js";
 import { resolveModelPricingFor } from "../resolve-model-pricing.js";
 import { createRequestBudgetScope } from "../request-budget.js";
 import { createDailySpendBudget } from "../daily-spend-budget.js";
@@ -352,13 +353,14 @@ export function connectRuntimeFallback(
     };
   };
   // How a link bills for the day total and the daily ceiling: the same
-  // rule as the turn budget (`request-budget.ts`). A loopback or private
-  // URL can be a forwarding gateway to a paid service (LiteLLM, a team
-  // proxy on the LAN or a Tailscale address), so only the explicit
-  // runner and plan kinds are free; any other link is counted and capped.
+  // rule as the turn budget (`link-spend-billing.ts`). An unpriced
+  // loopback/LAN server (Ollama, LM Studio) is free; a priced one may be
+  // a forwarding gateway to a paid service and is counted and capped.
   const spendBilling = (providerId: string): { local: boolean; plan: boolean } => {
     const entry = resolveLlmConfig(getConfig()).providers.find((p) => p.id === providerId);
-    return { local: entry?.kind === "llama-server", plan: entry?.kind === "subscription-cli" };
+    const billing = linkSpendBilling(entry, entry === undefined ? undefined
+      : resolveModelPricing(entry.defaultChatModel ?? entry.model ?? null, providerId)?.pricing);
+    return { local: billing === "local", plan: billing === "plan" };
   };
   // ATO-649: today's total is a second ledger of the per-send request
   // budget (`request-budget.ts`), next to the turn budget: each send holds
@@ -378,22 +380,25 @@ export function connectRuntimeFallback(
   // past the link (to the local model when it is in the chain) and
   // announces the switch. Local and plan links are never refused: they
   // are not spend. Read live, so a raised limit applies at once.
-  const enforceDailySpendLimit = (providerId: string): void => {
-    if (!dailySpend) return;
+  const dailyLimitRefusal = (providerId: string): DailySpendLimitError | null => {
+    if (!dailySpend) return null;
     const costTracking = getConfig().llm?.costTracking;
     const limitUsd = effectiveDailyLimitUsd(costTracking?.dailyLimitUsd);
-    if (limitUsd === null) return;
+    if (limitUsd === null) return null;
     const billing = spendBilling(providerId);
-    if (billing.local || billing.plan) return;
+    if (billing.local || billing.plan) return null;
     const today = dailySpend.today();
-    if (isOverDailyLimit(today, limitUsd)) {
-      throw new DailySpendLimitError({
-        spentUsd: today.usd,
-        limitUsd,
-        providerId,
-        onLimit: costTracking?.onDailyLimit === "local" ? "local" : "stop",
-      });
-    }
+    if (!isOverDailyLimit(today, limitUsd)) return null;
+    return new DailySpendLimitError({
+      spentUsd: today.usd,
+      limitUsd,
+      providerId,
+      onLimit: costTracking?.onDailyLimit === "local" ? "local" : "stop",
+    });
+  };
+  const enforceDailySpendLimit = (providerId: string): void => {
+    const refusal = dailyLimitRefusal(providerId);
+    if (refusal !== null) throw refusal;
   };
   // Fold one completion into its session's spend and the account's
   // limit readings (ATO-569). A local link is never priced; a cloud call
@@ -588,6 +593,17 @@ export function connectRuntimeFallback(
     prepareLocalLink,
     llmComplete,
     llmCompleteStream,
+    /**
+     * Today's ceiling for callers outside the fallback seam (ATO-649):
+     * `refuses` for the model router, which passes over a refused target;
+     * `enforce` and the daily ledger (`budget`) for Fusion's escalation
+     * and judge calls, which go straight to their provider.
+     */
+    dailySpendLimit: {
+      refuses: (providerId: string): boolean => dailyLimitRefusal(providerId) !== null,
+      enforce: enforceDailySpendLimit,
+      budget: dailyBudget,
+    },
   };
 }
 

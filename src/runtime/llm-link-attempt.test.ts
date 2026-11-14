@@ -184,3 +184,46 @@ describe("a thinking profile's lifted reply cap (ATO-1031)", () => {
     expect(requests[0]).not.toHaveProperty("maxTokens");
   });
 });
+
+describe("llm-link-attempt — the request budget's view of an abandoned stream", () => {
+  it("tells the scope how much reply text arrived before the stream ended without a result", async () => {
+    const base = fakeProvider("native_tools", "native_tools", async () => fakeAnswer("native_tools"));
+    const provider: LlmProvider = {
+      ...base,
+      async *completeStream() {
+        yield { delta: "héllo", reasoningDelta: "ab", done: false };
+        throw new DOMException("cancelled", "AbortError");
+      },
+    } as LlmProvider;
+    const finished: unknown[][] = [];
+    const scope = { softBound: false, beforeSend() {}, onResponse() {}, finish: (...args: unknown[]) => { finished.push(args); } };
+    const deps = { resolveSlice: () => ({ provider, transport: "native_tools" as const }), requestBudget: () => scope };
+    const { primed } = await openStreamOnLink(deps, params, "native_tools");
+    await expect((async () => { for (;;) if ((await primed.rest.next()).done) break; })()).rejects.toThrow("cancelled");
+    expect(finished).toEqual([[undefined, { outputBytes: Buffer.byteLength("héllo") + 2 }]]);
+  });
+});
+
+describe("llm-link-attempt — closing a budgeted stream early", () => {
+  it("closes the provider's stream when the consumer stops", async () => {
+    const base = fakeProvider("native_tools", "native_tools", async () => fakeAnswer("native_tools"));
+    let closed = false;
+    const provider: LlmProvider = {
+      ...base,
+      async *completeStream() {
+        try {
+          yield { delta: "a", reasoningDelta: "", done: false };
+          yield { delta: "b", reasoningDelta: "", done: false };
+          return fakeAnswer("native_tools");
+        } finally { closed = true; }
+      },
+    } as LlmProvider;
+    const finished: unknown[][] = [];
+    const scope = { softBound: false, beforeSend() {}, onResponse() {}, finish: (...args: unknown[]) => { finished.push(args); } };
+    const deps = { resolveSlice: () => ({ provider, transport: "native_tools" as const }), requestBudget: () => scope };
+    const { primed } = await openStreamOnLink(deps, params, "native_tools");
+    await primed.rest.return(undefined as never);
+    expect(closed).toBe(true);
+    expect(finished).toEqual([[undefined, { outputBytes: 1 }]]);
+  });
+});
