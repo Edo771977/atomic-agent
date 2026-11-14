@@ -535,6 +535,50 @@ describe("request budget scope", () => {
         .toThrow(DailySpendLimitError);
     });
 
+    describe("a daily limit alone bounds the reply the provider will actually send", () => {
+      const capped = { ...entry, maxOutputTokens: 4096 } as LlmProviderConfigEntry;
+      it("leaves a request's larger cap (a truncation step-up) on the wire", () => {
+        const { daily } = day(100);
+        const s = createRequestBudgetScope(undefined, { prompt: "hi", maxTokens: 16_000 } as CompletionRequest, provider, capped, model, daily)!;
+        const sent = { ...body(), max_tokens: 16_000 };
+        s.beforeSend(sent);
+        expect(sent.max_tokens).toBe(16_000);
+        expect(s.hint).toBeUndefined();
+        s.finish({ usage } as never);
+      });
+
+      it("leaves an extraBody cap above the request's on the wire", () => {
+        const { daily } = day(100);
+        const s = createRequestBudgetScope(undefined, request(), provider, entry, model, daily)!;
+        const sent = { ...body(), max_tokens: 32_000 };
+        s.beforeSend(sent);
+        expect(sent.max_tokens).toBe(32_000);
+        s.finish({ usage } as never);
+      });
+
+      it("clamps only to fit the remaining allowance, and says so", () => {
+        const { store, daily } = day(0.02);
+        store.add(0.001);
+        const s = createRequestBudgetScope(undefined, request(), provider, entry, model, daily)!;
+        const sent: Record<string, unknown> = { ...body(), max_tokens: 4096 };
+        s.beforeSend(sent);
+        expect(sent.max_tokens as number).toBeLessThan(4096);
+        expect(s.hint).toMatch(/daily spend limit: .*capped at \d+ tokens.*\$0\.02 left/);
+        s.finish({ usage } as never);
+      });
+
+      it("words a send that does not fit as a possible overrun, not a reached limit", () => {
+        const { store, daily } = day(0.01);
+        store.add(0.008);
+        const s = createRequestBudgetScope(undefined, request(), provider, entry, model, daily)!;
+        let error: unknown;
+        try { s.beforeSend({ ...body(), max_tokens: 4096 }); } catch (caught) { error = caught; }
+        expect(error).toBeInstanceOf(DailySpendLimitError);
+        expect((error as Error).message).toMatch(/could exceed the remaining daily allowance \(\$0\.00 left of \$0\.01\)/);
+        expect((error as Error).message).not.toMatch(/limit reached/);
+      });
+    });
+
     describe("an abandoned send counts its input bound and streamed output, not its whole hold", () => {
       const bodyTokens = (sent: object) => Math.ceil(Buffer.byteLength(JSON.stringify(sent), "utf8") / 3) + 1024;
       function aborted(streamedBytes?: number) {

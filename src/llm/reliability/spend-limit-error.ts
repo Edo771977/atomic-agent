@@ -23,21 +23,45 @@ export class DailySpendLimitError extends Error {
   readonly limitUsd: number;
   readonly providerId: string;
   readonly onLimit: DailySpendLimitAction;
+  /**
+   * `true` when today's total is still under the ceiling but this send's
+   * upper bound does not fit what is left (the request budget's hold):
+   * the sentence then says the request could exceed the allowance, not
+   * that the limit is reached.
+   */
+  readonly wouldExceed: boolean;
 
   constructor(params: {
     spentUsd: number;
     limitUsd: number;
     providerId: string;
     onLimit?: DailySpendLimitAction;
+    wouldExceed?: boolean;
   }) {
     const onLimit = params.onLimit ?? "stop";
-    super(dailySpendLimitSentence(params.spentUsd, params.limitUsd, onLimit));
+    const wouldExceed = params.wouldExceed === true && params.spentUsd < params.limitUsd;
+    super(wouldExceed
+      ? dailySpendOverrunSentence(params.spentUsd, params.limitUsd, onLimit)
+      : dailySpendLimitSentence(params.spentUsd, params.limitUsd, onLimit));
     this.name = "DailySpendLimitError";
     this.spentUsd = params.spentUsd;
     this.limitUsd = params.limitUsd;
     this.providerId = params.providerId;
     this.onLimit = onLimit;
+    this.wouldExceed = wouldExceed;
   }
+}
+
+/** The chat sentence for a send whose upper bound does not fit what is left today. */
+export function dailySpendOverrunSentence(
+  spentUsd: number,
+  limitUsd: number,
+  onLimit: DailySpendLimitAction,
+): string {
+  const head = `This request could exceed the remaining daily allowance (${usd(Math.max(0, limitUsd - spentUsd))} left of ${usd(limitUsd)}).`;
+  return onLimit === "local"
+    ? head
+    : `${head} Raise llm.costTracking.dailyLimitUsd, lower the provider's maxOutputTokens, or set llm.costTracking.onDailyLimit to "local" to use your local model.`;
 }
 
 /**

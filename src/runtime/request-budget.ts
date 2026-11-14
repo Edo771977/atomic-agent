@@ -250,6 +250,9 @@ export function createRequestBudgetScope(
   // No context-window fallback: providers reject a window-sized output
   // limit, and reserving one would hold dollars per request.
   const outputCap = caps.length > 0 ? Math.min(...caps) : undefined;
+  // The cap the provider writes itself: what this call asked for, else
+  // the turn's ceiling, else the entry's (`openai-build-body.ts`).
+  const providerCap = caps.length > 0 ? caps[0] : undefined;
   const timeLeft = limits === undefined ? undefined : budget!.requestTimeLeftMs(sessionId!);
   if (timeLeft !== undefined && timeLeft <= 0) throw new Error("the turn time cap has been reached before this request");
   // A metered day holds nothing; the zero hold still refuses once today's
@@ -297,7 +300,15 @@ export function createRequestBudgetScope(
       if (dayPriced) { dayHeld?.settle(); dayHeld = undefined; }
       if (request.signal?.aborted) throw request.signal.reason;
       const wireCaps = [body.max_tokens, body.max_completion_tokens].filter((value): value is number => typeof value === "number" && Number.isFinite(value) && value > 0);
-      const explicitCaps = outputCap === undefined ? wireCaps : [outputCap, ...wireCaps];
+      // A turn cap enforces the tightest configured ceiling over any body
+      // override. A daily limit alone bounds the reply the provider will
+      // actually send: the body's cap (after extraBody and model params),
+      // else the provider's own rule. Taking the minimum there would cut
+      // a truncation step-up (16000 asked, entry 4096) or an extraBody
+      // cap down although the day has room for it.
+      const explicitCaps = turnPriced
+        ? (outputCap === undefined ? wireCaps : [outputCap, ...wireCaps])
+        : wireCaps.length > 0 ? wireCaps : providerCap === undefined ? [] : [providerCap];
       const soft = explicitCaps.length === 0;
       let ceiling: number;
       let fields: readonly ("max_tokens" | "max_completion_tokens")[] = [];
@@ -366,6 +377,7 @@ export function createRequestBudgetScope(
       if (!copies.every(value => typeof value === "number" && Number.isInteger(value) && value > 0)) throw new Error(`${label} cannot verify the request's completion count`);
       const outputCopies = Math.max(1, ...(copies as number[]));
       const upperUsd = (output: number) => ((inputTokens * inputRate + output * outputRate) * outputCopies * multiplier) / 1_000_000;
+      const dayLeft = dayPriced ? day!.remainingUsd() : null;
       const fitting = reserveFitting(reserveBoth, ceiling, upperUsd);
       sendInputUsd = upperUsd(0);
       sendOutputUsdPerToken = upperUsd(1) - sendInputUsd;
@@ -376,6 +388,13 @@ export function createRequestBudgetScope(
         // Clamp a written ceiling to what the allowance covers; a soft
         // bound only assumes the smaller reply.
         for (const field of fields) body[field] = fitting.output;
+        if (fields.length > 0) {
+          hint = dayLeft !== null && upperUsd(ceiling) > dayLeft
+            ? `daily spend limit: reply capped at ${fitting.output} tokens (from ${ceiling}) to fit the remaining daily allowance (${formatUsd(dayLeft)} left)`
+            : `turn budget: reply capped at ${fitting.output} tokens (from ${ceiling}) to fit the remaining ${capText} turn allowance`;
+          scope.hint = hint;
+          scope.hintKey = hintKey;
+        }
       }
       tierMultiplier = multiplier;
     },

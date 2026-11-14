@@ -34,6 +34,8 @@ export interface DailySpendBudget {
   reserve(providerId: string, upperUsd: number): DailySpendHold;
   /** Count a completion seen without a hold: `usd` when known, else unpriced. */
   charge(usd: number | undefined): void;
+  /** What is left today after the persisted total and this process's holds; `null` without a ceiling. */
+  remainingUsd(): number | null;
 }
 
 export function createDailySpendBudget(
@@ -61,6 +63,8 @@ export function createDailySpendBudget(
             limitUsd,
             providerId,
             onLimit: settings?.onDailyLimit === "local" ? "local" : "stop",
+            // Under the ceiling, the send's bound is what does not fit.
+            wouldExceed: upperUsd > 0,
           });
         }
       }
@@ -81,5 +85,9 @@ export function createDailySpendBudget(
       };
     },
     charge,
+    remainingUsd() {
+      const limitUsd = effectiveDailyLimitUsd(costTracking()?.dailyLimitUsd);
+      return limitUsd === null ? null : Math.max(0, limitUsd - store.today().usd - heldUsd);
+    },
   };
 }
