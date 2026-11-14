@@ -91,6 +91,8 @@ export interface RuntimeTurnDependencies {
     resolveRouteVision: RuntimeProviders["resolveRouteVision"];
     resolveActiveModelName: RuntimeProviders["resolveActiveModelName"];
     fallbackChain: Pick<ProviderFallbackChain, "standingOverrideFor" | "setTurnPrimary">;
+    /** True when today's spend ceiling refuses a paid link now (ATO-649); the router passes over it. */
+    dailyLimitRefuses?: (providerId: string) => boolean;
   };
   traces: Pick<RuntimeTraces, "ensureRecorder" | "pinSession" | "readContextUsage" | "clearContextUsage" | "releaseSession">;
   telemetry: {
@@ -111,7 +113,7 @@ export function createRuntimeTurnService(
 ) {
   const { sessionStore, turnContext, turnRequests, turnPreviousReplies } = deps.sessions;
   const { loop, turnController, steeringInbox, shellJobs, slotManager, llmComplete } = deps.execution;
-  const { providerRegistry, resolveActiveLlmSlice, resolveCurrentRunMode, resolveRouteVision, resolveActiveModelName, fallbackChain } = deps.inference;
+  const { providerRegistry, resolveActiveLlmSlice, resolveCurrentRunMode, resolveRouteVision, resolveActiveModelName, fallbackChain, dailyLimitRefuses } = deps.inference;
   const { traces, lifecycle, logger } = deps;
   const { ensureRecorder } = traces;
   const { observability, analyticsStateStore, turnUsageMeter, sessionUsage } = deps.telemetry;
@@ -434,6 +436,7 @@ export function createRuntimeTurnService(
       isRegistered: (id) => providerRegistry.getProvider(id) !== undefined,
       logger,
       sessionId: session.id,
+      ...(dailyLimitRefuses === undefined ? {} : { dailyLimitRefuses }),
     });
     if (runOptions.providerId === undefined) {
       fallbackChain.setTurnPrimary(session.id, routedProviderId ?? null);

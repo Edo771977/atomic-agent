@@ -457,6 +457,15 @@ describe("runtime provider/context/fallback/reload phases", () => {
       expect(fixture.dailySpend.today().usd).toBeCloseTo(0.00002, 9);
     });
 
+    it("tells the model router which links today's ceiling refuses", () => {
+      const fixture = withDailySpend(1);
+      const wired = connectRuntimeFallback({}, fixture.deps);
+      expect(wired.dailySpendLimit.refuses("cloud")).toBe(false);
+      fixture.dailySpend.record({ kind: "priced", usd: 1.2, source: "provider" });
+      expect(wired.dailySpendLimit.refuses("cloud")).toBe(true);
+      expect(wired.dailySpendLimit.refuses("local")).toBe(false);
+    });
+
     it("lets paid links through below the limit and with no limit set", async () => {
       for (const limit of [5, undefined]) {
         const fixture = withDailySpend(limit);

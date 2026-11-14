@@ -378,22 +378,25 @@ export function connectRuntimeFallback(
   // past the link (to the local model when it is in the chain) and
   // announces the switch. Local and plan links are never refused: they
   // are not spend. Read live, so a raised limit applies at once.
-  const enforceDailySpendLimit = (providerId: string): void => {
-    if (!dailySpend) return;
+  const dailyLimitRefusal = (providerId: string): DailySpendLimitError | null => {
+    if (!dailySpend) return null;
     const costTracking = getConfig().llm?.costTracking;
     const limitUsd = effectiveDailyLimitUsd(costTracking?.dailyLimitUsd);
-    if (limitUsd === null) return;
+    if (limitUsd === null) return null;
     const billing = spendBilling(providerId);
-    if (billing.local || billing.plan) return;
+    if (billing.local || billing.plan) return null;
     const today = dailySpend.today();
-    if (isOverDailyLimit(today, limitUsd)) {
-      throw new DailySpendLimitError({
-        spentUsd: today.usd,
-        limitUsd,
-        providerId,
-        onLimit: costTracking?.onDailyLimit === "local" ? "local" : "stop",
-      });
-    }
+    if (!isOverDailyLimit(today, limitUsd)) return null;
+    return new DailySpendLimitError({
+      spentUsd: today.usd,
+      limitUsd,
+      providerId,
+      onLimit: costTracking?.onDailyLimit === "local" ? "local" : "stop",
+    });
+  };
+  const enforceDailySpendLimit = (providerId: string): void => {
+    const refusal = dailyLimitRefusal(providerId);
+    if (refusal !== null) throw refusal;
   };
   // Fold one completion into its session's spend and the account's
   // limit readings (ATO-569). A local link is never priced; a cloud call
@@ -588,6 +591,13 @@ export function connectRuntimeFallback(
     prepareLocalLink,
     llmComplete,
     llmCompleteStream,
+    /**
+     * Today's ceiling for callers outside the fallback seam (ATO-649):
+     * `refuses` for the model router, which passes over a refused target.
+     */
+    dailySpendLimit: {
+      refuses: (providerId: string): boolean => dailyLimitRefusal(providerId) !== null,
+    },
   };
 }
 

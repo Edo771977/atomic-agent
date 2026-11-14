@@ -25,6 +25,14 @@ export function routeTurnProvider(params: {
   isRegistered: (providerId: string) => boolean;
   logger: Pick<StructuredLogger, "info">;
   sessionId: string;
+  /**
+   * True when today's spend ceiling would refuse a paid link now
+   * (ATO-649). Such a target is passed over like an unconfigured one: a
+   * routed head becomes the turn's primary, so with `onDailyLimit:
+   * "stop"` its refusal would end the turn even when the configured
+   * primary is free (llama-server, a subscription CLI) and could answer.
+   */
+  dailyLimitRefuses?: (providerId: string) => boolean;
 }): string | undefined {
   const router = params.config.llm?.router;
   if (!router?.enabled) return undefined;
@@ -42,7 +50,7 @@ export function routeTurnProvider(params: {
       ? { pinnedProviderId: params.pinnedProviderId }
       : {}),
     providers: resolved.providers
-      .filter((p) => params.isRegistered(p.id))
+      .filter((p) => params.isRegistered(p.id) && params.dailyLimitRefuses?.(p.id) !== true)
       .map((p) => ({
         id: p.id,
         ...(p.supportsTools !== undefined ? { supportsTools: p.supportsTools } : {}),
