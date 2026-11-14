@@ -54,6 +54,10 @@ export interface RuntimeToolsConfig {
     /** Registers `os.screen.{capture,point}` (macOS only). Mirrors `UserToolsConfig.screen.point`. */
     point: boolean;
   };
+  verify: {
+    /** Byte ceiling for `verify.run`'s workspace copy. Mirrors `UserToolsConfig.verify`. */
+    maxCopyBytes: number;
+  };
 }
 
 export interface UserToolsConfig {
@@ -112,7 +116,19 @@ export interface UserToolsConfig {
      */
     point: boolean;
   };
+  verify: {
+    /**
+     * Largest tree, in bytes, `verify.run` copies into its throwaway
+     * workspace off macOS (the linked build/dependency directories do
+     * not count). A bigger tree is refused, never run in place. Default
+     * 2 GiB. A positive integer.
+     */
+    maxCopyBytes: number;
+  };
 }
+
+/** `tools.verify.maxCopyBytes` default; `verify-workspace-copy.ts` keeps the same value. */
+export const DEFAULT_VERIFY_MAX_COPY_BYTES = 2 * 1024 * 1024 * 1024;
 
 export function createToolsDefaults(): UserToolsConfig {
   return {
@@ -137,18 +153,21 @@ export function createToolsDefaults(): UserToolsConfig {
     // type anywhere is not a default.
     // Pointing only draws, so it is on; clicking and typing stay off.
     screen: { enabled: false, point: true },
+    verify: { maxCopyBytes: DEFAULT_VERIFY_MAX_COPY_BYTES },
   };
 }
 
 /**
  * `raw` is the `tools.shell` block (the historical signature);
- * `rawScreen` the `tools.screen` block. A file without either takes the
- * defaults — `tools.screen` is unversioned and additive.
+ * `rawScreen` the `tools.screen` block, `rawVerify` the `tools.verify`
+ * block. A file without them takes the defaults — both are unversioned
+ * and additive.
  */
 export function parseToolsConfig(
   raw: Record<string, unknown>,
   readDefaults: () => UserToolsConfig,
   rawScreen: Record<string, unknown> = {},
+  rawVerify: Record<string, unknown> = {},
 ): UserToolsConfig {
   return {
     shell: {
@@ -185,6 +204,12 @@ export function parseToolsConfig(
       point: parseBool(
         rawScreen.point ?? readDefaults().screen.point,
         "tools.screen.point",
+      ),
+    },
+    verify: {
+      maxCopyBytes: parsePositiveInt(
+        rawVerify.maxCopyBytes ?? readDefaults().verify.maxCopyBytes,
+        "tools.verify.maxCopyBytes",
       ),
     },
   };

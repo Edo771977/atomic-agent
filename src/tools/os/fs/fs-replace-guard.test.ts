@@ -387,6 +387,7 @@ describe("replace guard (F36)", () => {
           tools: {
             shell: { defaultTimeoutMs: 600_000, jobMaxMs: 3_600_000, maxJobs: 3, envPassthrough: [] },
             screen: { enabled: false, point: true },
+            verify: { maxCopyBytes: 2 * 1024 * 1024 * 1024 },
           },
           http: {
             enabled: true,

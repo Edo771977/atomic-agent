@@ -1,6 +1,6 @@
 import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
@@ -76,8 +76,47 @@ describe("createVerifyWorkspace", () => {
     expect(ws).toMatchObject({ isolated: false, method: "unavailable" });
     expect(ws.dir).not.toBe(work);
     expect(ws.error).toContain("copy limit");
+    // The refusal says how to get past it.
+    expect(ws.error).toContain("tools.verify.maxCopyBytes");
     await ws.cleanup();
     expect(await readdir(work)).toContain("index.html");
+  });
+
+  it("falls back to a junction on Windows when a directory symlink is refused (EPERM)", async () => {
+    const calls: { target: string; path: string; type: string | undefined }[] = [];
+    const ws = await createVerifyWorkspace(work, {
+      platform: "win32",
+      tmpRoot,
+      symlink: async (target, path, type) => {
+        calls.push({ target, path, type });
+        if (type !== "junction") throw Object.assign(new Error("EPERM: operation not permitted, symlink"), { code: "EPERM" });
+        // Stand-in for the junction: a real directory link on this host.
+        await symlink(target, path, "dir");
+      },
+    });
+    try {
+      expect(ws).toMatchObject({ isolated: true, method: "copy" });
+      const junctions = calls.filter((c) => c.type === "junction").map((c) => c.path).sort();
+      expect(junctions).toEqual([join(ws.dir, ".git"), join(ws.dir, "node_modules")].sort());
+      for (const c of calls.filter((c) => c.type === "junction")) expect(isAbsolute(c.target)).toBe(true);
+      expect(await readFile(join(ws.dir, "node_modules", "dep", "index.js"), "utf8")).toBe("module.exports = 1;");
+      // A refused file symlink inside the tree becomes a copy of its target.
+      expect((await lstat(join(ws.dir, "link.js"))).isFile()).toBe(true);
+      expect(await readFile(join(ws.dir, "link.js"), "utf8")).toBe("var a = 1;");
+    } finally {
+      await ws.cleanup();
+    }
+  });
+
+  it("reports an actionable error when neither a symlink nor a junction can be made", async () => {
+    const eperm = async (): Promise<void> => {
+      throw Object.assign(new Error("EPERM: operation not permitted, symlink"), { code: "EPERM" });
+    };
+    const ws = await createVerifyWorkspace(work, { platform: "win32", tmpRoot, symlink: eperm });
+    expect(ws).toMatchObject({ isolated: false, method: "unavailable" });
+    expect(ws.error).toMatch(/Developer Mode/);
+    expect(ws.error).toMatch(/supports (symbolic )?links/);
+    expect(await readdir(tmpRoot)).toEqual([]);
   });
 
   it("uses clonefile on macOS and falls back to the copy when the clone fails", async () => {
