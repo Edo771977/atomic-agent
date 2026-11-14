@@ -10,7 +10,7 @@ import { VERIFY_COPY_EXCLUDED, VERIFY_COPY_MAX_BYTES } from "../verify/verify-wo
 import { createBranchSet, planBranchSetCopy, defaultGitExec, BRANCH_MERGE_DIR, ensureMergeDir, type BranchCopyPlan, type BranchSet, type BranchWorkspace, type CreateBranchSetOptions, type GitExec } from "./branch-workspace.js";
 import { workspaceChanges, writeTaskPatch, type SavedTaskPatch } from "./branch-diff.js";
 import { resolveContractInputs } from "./contract-inputs.js";
-import { inspectContractProvides, runContractChecks, type ContractCheckRunner, type ContractReport } from "./contract-checks.js";
+import { CONTRACT_CHECKS_HELD, inspectContractProvides, runContractChecks, type ContractCheckRunner, type ContractReport } from "./contract-checks.js";
 import type { DelegateContract } from "./contract.js";
 import type { DelegateTask } from "./delegate-args.js";
 import type { WorkerTaskResult } from "./worker-result.js";
@@ -288,6 +288,13 @@ export interface CandidateFinishInput {
   tasks?: readonly DelegateTask[];
   contract?: DelegateContract;
   runChecks?: ContractCheckRunner;
+  /**
+   * Asked once the candidate could otherwise be checked, before any check
+   * runs: `undefined` to run them, or why they are held (the delegate's
+   * hold after outside content, `contract-check-hold.ts`). Held, the
+   * candidate is rejected as unverified, its patch kept.
+   */
+  holdChecks?: (signal: AbortSignal) => Promise<string | undefined>;
   signal: AbortSignal;
 }
 export interface CandidateIntegration {
@@ -359,7 +366,8 @@ export async function createCandidateIntegration(
   let checkedPayloadDigest: string | undefined;
   let checkPlanDigest: string | undefined;
   const receiptId = randomBytes(12).toString("hex");
-  const rejectionReason = (reason: string): CandidateRejectionReason => /cancel|abort|interrupt/i.test(reason) ? "interrupted"
+  const rejectionReason = (reason: string): CandidateRejectionReason => reason.startsWith(`candidate not promoted: ${CONTRACT_CHECKS_HELD}`) ? "checks-unverified"
+    : /cancel|abort|interrupt/i.test(reason) ? "interrupted"
     : /check input/i.test(reason) ? "check-inputs-changed" : /candidate changed|checked source changed|payload/i.test(reason) ? "payload-changed"
     : /every task/i.test(reason) ? "task-not-ok" : /integration checks failed/i.test(reason) ? receiptEvidence?.checks.some(check => !check.ok) ? "checks-failed" : "checks-unverified"
     : /check|runner/i.test(reason) ? "checks-unverified" : /provides/i.test(reason) ? "provides-unverified"
@@ -564,6 +572,9 @@ export async function createCandidateIntegration(
           verifiedInputs = 0;
           return await rejectFinal("candidate not promoted: check input integrity cannot be attested by this custom check runner");
         }
+        const held = await input.holdChecks?.(input.signal);
+        input.signal.throwIfAborted();
+        if (held !== undefined) return await rejectFinal(`candidate not promoted: ${held}`);
         await verifyProtectedInputs(workspace.dir, input.signal);
         // One private final source supplies every check and every delivered byte.
         // Its actual copies spend the original candidate's remaining budget.

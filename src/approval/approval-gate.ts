@@ -513,6 +513,15 @@ export class ApprovalGate {
     return this.taintSourcesOf(sessionId).length > 0;
   }
 
+  /**
+   * The outside sources `sessionId` (and, for a worker, its orchestrator)
+   * read this turn, for a caller that names them on its own request
+   * (a Fusion delegate's held contract checks). Empty when clean.
+   */
+  outsideContentSources(sessionId: string): readonly string[] {
+    return this.taintSourcesOf(sessionId);
+  }
+
   /** Forget the outside content of `sessionId`'s last turn; called when a turn starts. */
   clearUntrustedContent(sessionId: string): void {
     this.taint.clear(sessionId);

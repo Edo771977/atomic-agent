@@ -30,6 +30,7 @@ import {
 import {
   applyCheckOutcomes,
   applyContractFindings,
+  CONTRACT_CHECKS_HELD,
   inspectContractProvides,
   renderContractLine,
   runContractChecks,
@@ -151,6 +152,7 @@ import { projectFusionArtifactEvidence } from "./artifact-evidence-output.js";
 import { readFusionWorkerMeta } from "../../session/fusion-worker-session.js";
 import { createTaskPermitPool, type TaskPermit } from "./task-permits.js";
 import { VERIFY_COPY_MAX_BYTES } from "../verify/verify-workspace-copy.js";
+import { createContractCheckHold } from "./contract-check-hold.js";
 
 export const FUSION_DELEGATE_TOOL = "fusion.delegate";
 
@@ -1117,6 +1119,21 @@ export function buildFusionDelegateTool(
       const runSignal = capped
         ? AbortSignal.any([ctx.signal, budgetAbort.signal])
         : ctx.signal;
+      // The contract's checks run what the workers wrote: after outside
+      // content (`agent.taintReview`) they wait on one more yes, asked
+      // once for the call, whichever batch comes first (ATO-618).
+      const checkHold = createContractCheckHold({
+        runner: deps.runChecks,
+        approvals: deps.approvals,
+        approvalRequired: deps.approvalRequired,
+        sessionId: ctx.sessionId,
+        // The operator's project, not a candidate copy: rules and the prompt name it.
+        workingDir: candidateOriginalDir,
+        tool: FUSION_DELEGATE_TOOL,
+        checks: parsed.contract?.checks ?? [],
+        signal: runSignal,
+      });
+      const heldRunChecks = checkHold.runner;
       // Escalation and judge calls name the delegating session, so they
       // count in its spend readout like the workers' own calls (ATO-1388).
       const sideComplete: FusionDelegateDeps["escalationComplete"] =
@@ -1129,6 +1146,7 @@ export function buildFusionDelegateTool(
       const executionIdentities = new Map<string, string | undefined>();
       const workerDeps: FusionDelegateDeps = {
         ...deps,
+        ...(heldRunChecks === undefined ? {} : { runChecks: heldRunChecks }),
         ...(deps.knownSecrets === undefined ? {} : { knownSecrets: () => collectKnownSecrets() ?? [] }),
         ...(candidate === undefined ? {} : { ruleWorkdir: candidateOriginalDir }),
         ...(deps.resolveRoutingIdentity === undefined ? {} : { runTurn: (session, message, options) => {
@@ -1396,7 +1414,7 @@ export function buildFusionDelegateTool(
             contract: parsed.contract,
             tasks: parsed.tasks,
             concurrent: tasks.map((t) => t.id),
-            runChecks: deps.runChecks,
+            runChecks: heldRunChecks,
             ...(deps.knownSecrets === undefined
               ? {}
               : { knownSecrets: collectKnownSecrets() }),
@@ -1644,7 +1662,7 @@ export function buildFusionDelegateTool(
                 );
                 const checks = await runContractChecks(
                   childContract.checks ?? [],
-                  deps.runChecks,
+                  heldRunChecks,
                   {
                     workingDir: ctx.workingDir,
                     signal: runSignal,
@@ -1796,7 +1814,7 @@ export function buildFusionDelegateTool(
                 check.task === id && (rechecking || !gateState.checkOutcomes.has(index) || stale.has(index))
                   ? [{ check, index }] : [],
               );
-              const checks = await runContractChecks(own.map((c) => c.check), deps.runChecks, {
+              const checks = await runContractChecks(own.map((c) => c.check), heldRunChecks, {
                 workingDir: ctx.workingDir, signal: runSignal,
                 ...(deps.knownSecrets === undefined ? {} : { knownSecrets: collectKnownSecrets() }),
               });
@@ -2001,7 +2019,7 @@ export function buildFusionDelegateTool(
           );
           const checks = await runContractChecks(
             pending.map((p) => p.check),
-            deps.runChecks,
+            heldRunChecks,
             {
               workingDir: ctx.workingDir,
               signal: runSignal,
@@ -2022,6 +2040,17 @@ export function buildFusionDelegateTool(
                 })
               : [],
           );
+          // Held after outside content: each row whose own checks were
+          // among them says so, its status kept but its acceptance unverified.
+          if (checks.checksSkipped?.includes(CONTRACT_CHECKS_HELD) === true) {
+            const heldTasks = new Set(pending.flatMap((p) => (typeof p.check.task === "string" ? [p.check.task] : [])));
+            const note = `${CONTRACT_CHECKS_HELD} (acceptance unverified)`;
+            out = out.map((r) =>
+              heldTasks.has(r.id) && !(r.notes ?? []).includes(note)
+                ? { ...r, notes: [...(r.notes ?? []), note] }
+                : r,
+            );
+          }
           const byIndex = new Map(gateState.checkOutcomes);
           if (ran) {
             pending.forEach((p, i) => {
@@ -2368,7 +2397,7 @@ export function buildFusionDelegateTool(
         // reading only the status merged nothing as if it were something.
         // Workers that were never served or timed out before a single step
         // count as nothing delivered too (ATO-234).
-        const candidateReport = candidate === undefined ? undefined : await candidate.finish({ rows: results, tasks: parsed.tasks, ...(parsed.contract === undefined ? {} : { contract: parsed.contract }), ...(deps.runChecks === undefined ? {} : { runChecks: deps.runChecks }), signal: runSignal });
+        const candidateReport = candidate === undefined ? undefined : await candidate.finish({ rows: results, tasks: parsed.tasks, ...(parsed.contract === undefined ? {} : { contract: parsed.contract }), ...(deps.runChecks === undefined ? {} : { runChecks: deps.runChecks, holdChecks: (signal) => checkHold.decide(signal) }), signal: runSignal });
         completedCandidateReport = candidateReport;
         terminalTaskCount = results.length;
         const outcome = delegateOutcome(results);
