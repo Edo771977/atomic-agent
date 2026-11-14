@@ -22,9 +22,10 @@
  * a directory link becomes a junction to the matching directory in the
  * copy when its target is inside the tree (writes stay in the copy), or
  * to the real target when it points outside (writes reach that target,
- * as with an excluded directory); a file link becomes a copy of the
- * target. With neither available the workspace is unavailable and says
- * how to fix it.
+ * as with an excluded directory); a file link inside the tree becomes a
+ * copy of its target, counted against the copy limit, and one pointing
+ * outside the tree makes the workspace unavailable. With neither
+ * available the workspace is unavailable and says how to fix it.
  */
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -87,6 +88,12 @@ export type SymlinkFn = (target: string, path: string, type?: "dir" | "file" | "
 export interface CopyTreeOptions {
   platform?: NodeJS.Platform;
   symlink?: SymlinkFn;
+  /** Bytes the copy may write (files and refused-link targets); unlimited when omitted. */
+  maxBytes?: number;
+}
+
+function copyLimitError(limit: number): Error {
+  return new Error(`workspace exceeds the ${limit}-byte copy limit (${[...VERIFY_COPY_EXCLUDED].join(", ")} not counted); raise \`tools.verify.maxCopyBytes\` in the config, or move large generated files into one of those directories`);
 }
 
 const LINK_REFUSED = new Set(["EPERM", "EACCES"]);
@@ -171,6 +178,7 @@ export async function copyTreeWithExclusions(src: string, dest: string, options:
     link: options.symlink ?? symlink,
     srcRoot: resolve(src),
     destRoot: resolve(dest),
+    budget: { limit: options.maxBytes ?? Number.POSITIVE_INFINITY, used: 0 },
   };
   await copyDirectory(src, dest, context);
 }
@@ -180,6 +188,13 @@ interface CopyContext {
   readonly link: SymlinkFn;
   readonly srcRoot: string;
   readonly destRoot: string;
+  readonly budget: { readonly limit: number; used: number };
+}
+
+/** Charge `bytes` against the copy limit before writing them. */
+function charge(context: CopyContext, bytes: number): void {
+  context.budget.used += bytes;
+  if (context.budget.used > context.budget.limit) throw copyLimitError(context.budget.limit);
 }
 
 /** `absolute` relative to `root` when it lies inside it, else `undefined`. */
@@ -196,7 +211,9 @@ function insideTree(root: string, absolute: string): string | undefined {
  * the copy when the target is inside the tree (so writes stay in the
  * copy), to the real target otherwise (like an excluded directory,
  * writes through it reach that target). A file inside the tree becomes
- * a copy of its target.
+ * a copy of its target, charged against the copy limit (the measurement
+ * skips links); a file outside the tree is refused rather than copied
+ * out of a place the workspace does not own.
  */
 async function recreateRefusedLink(from: string, to: string, target: string, context: CopyContext, cause: unknown): Promise<void> {
   const { platform, link } = context;
@@ -206,10 +223,17 @@ async function recreateRefusedLink(from: string, to: string, target: string, con
   if (info?.isDirectory()) {
     await linkDirectory(rel === undefined ? absolute : join(context.destRoot, rel), to, platform, link);
   } else if (info?.isFile()) {
+    if (rel === undefined) throw outsideFileLinkError(to, target, platform, cause);
+    charge(context, info.size);
     await copyFile(absolute, to);
   } else {
     throw linkUnavailableError(to, platform, cause);
   }
+}
+
+function outsideFileLinkError(path: string, target: string, platform: NodeJS.Platform, cause: unknown): Error {
+  const reason = cause instanceof Error ? cause.message : String(cause);
+  return new Error(`cannot recreate the file symlink ${path} -> ${target} in the verification copy (${reason}): its target is outside the workspace and is not copied; ${platform === "win32" ? "enable Windows Developer Mode (or grant the symlink privilege)" : "work on a filesystem that supports symbolic links"}, or replace the link with the file itself`);
 }
 
 async function copyDirectory(src: string, dest: string, context: CopyContext): Promise<void> {
@@ -234,8 +258,10 @@ async function copyDirectory(src: string, dest: string, context: CopyContext): P
         await copyDirectory(from, to, context);
       }
     } else if (entry.isFile()) {
+      const info = await lstat(from);
+      charge(context, info.size);
       await copyFile(from, to);
-      const mode = (await lstat(from)).mode & 0o777;
+      const mode = info.mode & 0o777;
       if (mode & 0o111) await chmod(to, mode);
     }
     // Sockets, FIFOs, devices: not part of a deliverable, skipped.
@@ -268,10 +294,10 @@ export async function createVerifyWorkspace(
   }
   const limit = options.maxBytes ?? VERIFY_COPY_MAX_BYTES;
   if ((await measureTree(workingDir, limit)) > limit) {
-    return { dir: dest, isolated: false, method: "unavailable", error: `workspace exceeds the ${limit}-byte copy limit (${[...VERIFY_COPY_EXCLUDED].join(", ")} not counted); raise \`tools.verify.maxCopyBytes\` in the config, or move large generated files into one of those directories`, cleanup };
+    return { dir: dest, isolated: false, method: "unavailable", error: copyLimitError(limit).message, cleanup };
   }
   try {
-    await copyTreeWithExclusions(workingDir, dest, { platform, ...(options.symlink === undefined ? {} : { symlink: options.symlink }) });
+    await copyTreeWithExclusions(workingDir, dest, { platform, maxBytes: limit, ...(options.symlink === undefined ? {} : { symlink: options.symlink }) });
   } catch (err) {
     await cleanup();
     const reason = err instanceof Error ? err.message : String(err);

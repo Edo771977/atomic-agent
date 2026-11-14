@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   createVerifyWorkspace,
   measureTree,
+  type SymlinkFn,
   VERIFY_COPY_EXCLUDED,
 } from "./verify-workspace-copy.js";
 
@@ -131,6 +132,35 @@ describe("createVerifyWorkspace", () => {
     } finally {
       await ws.cleanup();
     }
+  });
+
+  const refuseFileSymlinks: SymlinkFn = async (target, path, type) => {
+    if (type !== "junction") throw Object.assign(new Error("EPERM: operation not permitted, symlink"), { code: "EPERM" });
+    await symlink(target, path, "dir");
+  };
+
+  it("charges a refused file link's copied target against the copy limit", async () => {
+    await writeFile(join(work, "big.bin"), "b".repeat(100));
+    await symlink("big.bin", join(work, "big-link.bin"));
+    // The measured tree (41 + 100 bytes) fits; the copied link target does not.
+    const limit = 13 + 10 + 18 + 100;
+    expect(await measureTree(work, limit)).toBe(limit);
+    const ws = await createVerifyWorkspace(work, { platform: "win32", tmpRoot, maxBytes: limit, symlink: refuseFileSymlinks });
+    expect(ws).toMatchObject({ isolated: false, method: "unavailable" });
+    expect(ws.error).toContain("copy limit");
+    expect(ws.error).toContain("tools.verify.maxCopyBytes");
+    expect(await readdir(tmpRoot)).toEqual([]);
+  });
+
+  it("refuses a refused file link whose target is outside the workspace", async () => {
+    await writeFile(join(root, "outside.txt"), "secret");
+    await symlink("../outside.txt", join(work, "out-link.txt"));
+    const ws = await createVerifyWorkspace(work, { platform: "win32", tmpRoot, symlink: refuseFileSymlinks });
+    expect(ws).toMatchObject({ isolated: false, method: "unavailable" });
+    expect(ws.error).toContain("out-link.txt");
+    expect(ws.error).toMatch(/outside the workspace/);
+    expect(ws.error).toMatch(/Developer Mode/);
+    expect(await readdir(tmpRoot)).toEqual([]);
   });
 
   it("reports an actionable error when neither a symlink nor a junction can be made", async () => {
