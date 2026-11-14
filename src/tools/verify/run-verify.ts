@@ -28,7 +28,13 @@ export interface VerifyRunResult {
   /** A run that could not happen (no browser, bad cwd, spawn failure). */
   readonly error?: string;
   /** Setup/cancellation failures are distinct from a check that actually ran. */
-  readonly errorCode?: "workspace-unavailable" | "cancelled" | "workspace-cleanup-failed";
+  readonly errorCode?: "workspace-unavailable" | "cancelled";
+  /**
+   * The throwaway copy could not be removed afterwards (a file still
+   * busy on Windows, say). A warning only: the run's own outcome — pass
+   * or fail — stands.
+   */
+  readonly cleanupWarning?: string;
   readonly commandLine?: string;
   readonly exitCode?: number | null;
   readonly timedOut?: boolean;
@@ -206,13 +212,13 @@ export async function runVerify(
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
     result = failed(error, ctx.signal?.aborted ? "cancelled" : workspace === undefined ? "workspace-unavailable" : undefined, workspace?.isolated ?? false);
-  } finally {
-    try {
-      await workspace?.cleanup();
-    } catch (err) {
-      const error = err instanceof Error ? err.message : String(err);
-      result = failed(`could not clean up verification workspace: ${error}`, "workspace-cleanup-failed", workspace?.isolated ?? false);
-    }
+  }
+  try {
+    await workspace?.cleanup();
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    const warned = { ...result, cleanupWarning: `could not remove the verification copy ${workspace?.dir ?? ""}: ${error}` };
+    result = { ...warned, summary: renderVerifyRunSummary(warned) };
   }
   return result;
 }

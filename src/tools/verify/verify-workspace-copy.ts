@@ -67,7 +67,16 @@ export interface CreateWorkspaceOptions {
   clone?: (src: string, dest: string) => Promise<boolean>;
   /** Test seam: `fs.promises.symlink` (to simulate a refused link). */
   symlink?: SymlinkFn;
+  /** Test seam: `fs.promises.rm` for cleanup. */
+  remove?: (path: string, options: { recursive: true; force: true; maxRetries: number; retryDelay: number }) => Promise<void>;
 }
+
+/**
+ * Cleanup retries: on Windows a just-exited process, an antivirus scan or
+ * an indexer can hold a file for a moment (EBUSY/EPERM/ENOTEMPTY); Node's
+ * `rm` retries those with a linear backoff.
+ */
+const CLEANUP_RM_OPTIONS = { recursive: true, force: true, maxRetries: 5, retryDelay: 100 } as const;
 
 export type SymlinkFn = (target: string, path: string, type?: "dir" | "file" | "junction") => Promise<void>;
 
@@ -197,9 +206,10 @@ export async function createVerifyWorkspace(
     options.tmpRoot ?? tmpdir(),
     `atag-verify-${randomBytes(4).toString("hex")}`,
   );
+  const remove = options.remove ?? rm;
   const cleanup = async (): Promise<void> => {
     try {
-      await rm(dest, { recursive: true, force: true });
+      await remove(dest, CLEANUP_RM_OPTIONS);
     } catch (err) {
       // A bad temp root can be a file: no destination was created there.
       if ((err as NodeJS.ErrnoException).code !== "ENOTDIR") throw err;
