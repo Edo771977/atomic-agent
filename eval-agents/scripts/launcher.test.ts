@@ -79,3 +79,48 @@ describe("eval launcher actual Node children", () => {
     expect(() => process.kill(child.pid, 0)).toThrow();
   });
 });
+
+// A zombie awaiting reaping by the container init is already dead.
+function processAlive(pid: number): boolean {
+  try { process.kill(pid, 0); } catch { return false; }
+  try { return readFileSync(`/proc/${pid}/stat`, "utf8").replace(/^.*\)\s+/, "")[0] !== "Z"; } catch { return true; }
+}
+
+describe.skipIf(process.platform === "win32")("eval launcher process tree", () => {
+  it("terminates grandchildren of the cancelled test child, not only its main process", () => {
+    const result = launch("tree", { LAUNCHER_MODE: "tree" });
+    const child = JSON.parse(readFileSync(result.output, "utf8")) as { pid: number; grandchildPid: number };
+    try {
+      expect(result.status, result.diagnostic).toBe(130);
+      expect(processAlive(child.pid)).toBe(false);
+      expect(processAlive(child.grandchildPid)).toBe(false);
+    } finally {
+      try { process.kill(child.grandchildPid, "SIGKILL"); } catch { /* already gone */ }
+    }
+  });
+
+  it("escalates to SIGKILL when the tree ignores the termination signal", () => {
+    const started = Date.now();
+    const result = launch("stubborn", { LAUNCHER_MODE: "stubborn", LAUNCHER_KILL_TIMEOUT_MS: "500" });
+    const child = JSON.parse(readFileSync(result.output, "utf8")) as { pid: number; grandchildPid: number };
+    try {
+      expect(result.status, result.diagnostic).toBe(130);
+      expect(Date.now() - started).toBeLessThan(8000);
+      expect(processAlive(child.pid)).toBe(false);
+      expect(processAlive(child.grandchildPid)).toBe(false);
+    } finally {
+      for (const pid of [child.pid, child.grandchildPid]) try { process.kill(pid, "SIGKILL"); } catch { /* gone */ }
+    }
+  });
+
+  it("does not leave the test child's process group running after a normal exit", () => {
+    const result = launch("leak", { LAUNCHER_MODE: "leak", LAUNCHER_KILL_TIMEOUT_MS: "500" });
+    const child = JSON.parse(readFileSync(result.output, "utf8")) as { pid: number; grandchildPid: number };
+    try {
+      expect(result.status, result.diagnostic).toBe(0);
+      expect(processAlive(child.grandchildPid)).toBe(false);
+    } finally {
+      try { process.kill(child.grandchildPid, "SIGKILL"); } catch { /* already gone */ }
+    }
+  });
+});

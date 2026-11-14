@@ -1,7 +1,7 @@
 // Shared daemon-lifecycle + vitest helpers for eval-agents orchestrators.
 
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -148,8 +148,8 @@ export function teardownDaemons(log, startedByUs) {
 
 export function runVitest({ extraEnv = {}, forwarded = [], signal,
   entryPath = VITEST_ENTRY, cwd = REPO_ROOT,
-  requireCampaign = entryPath === VITEST_ENTRY } = {}) {
-  if (signal?.aborted) return Promise.resolve(130);
+  requireCampaign = entryPath === VITEST_ENTRY, killTimeoutMs = 10_000 } = {}) {
+  if (signal?.aborted) return Promise.resolve(signalExitCode(signal.reason?.signal));
   const env = { ...process.env, ...extraEnv };
   let campaignPath;
   if (requireCampaign) {
@@ -163,28 +163,41 @@ export function runVitest({ extraEnv = {}, forwarded = [], signal,
     writeFileSync(campaignPath, `${JSON.stringify({ selected: null, executed: 0, status: "pending" })}\n`);
   }
   return new Promise((resolveExit) => {
+    // POSIX: the child leads its own process group so cancellation reaches
+    // Vitest's forked workers and the agents they started, not just Vitest's
+    // main process. stdin is not inherited: a background process group must
+    // not read the terminal.
     const child = spawn(
       process.execPath,
       [entryPath, "run", "--config", VITEST_CONFIG, ...forwarded],
       {
         cwd,
         env,
-        stdio: "inherit",
+        stdio: ["ignore", "inherit", "inherit"],
         windowsHide: true,
-        signal,
+        detached: process.platform !== "win32",
       },
     );
     let launchFailed = false;
-    let interrupted = false;
-    const forward = (name) => {
-      interrupted = true;
-      child.kill(name);
+    let interruptedBy = null;
+    let killTimer;
+    const tree = { child };
+    activeTrees.add(tree);
+    const interrupt = (name) => {
+      if (interruptedBy) return;
+      interruptedBy = name;
+      signalTree(child, name);
+      // Escalate if the tree has not exited in time; close still awaits it.
+      killTimer = setTimeout(() => signalTree(child, "SIGKILL"), killTimeoutMs);
+      killTimer.unref?.();
     };
-    const onInt = () => forward("SIGINT");
-    const onTerm = () => forward("SIGTERM");
-    // Orchestrators pass the signal from installSignalHandlers. Standalone
-    // callers still forward process signals, without exiting before close.
-    if (!signal) {
+    const onAbort = () => interrupt(signal.reason?.signal ?? "SIGTERM");
+    // Standalone callers forward process signals, without exiting before
+    // close; a second signal kills the tree and exits immediately.
+    const onInt = () => (interruptedBy ? forceExit("SIGINT") : interrupt("SIGINT"));
+    const onTerm = () => (interruptedBy ? forceExit("SIGTERM") : interrupt("SIGTERM"));
+    if (signal) signal.addEventListener("abort", onAbort, { once: true });
+    else {
       process.prependListener("SIGINT", onInt);
       process.prependListener("SIGTERM", onTerm);
     }
@@ -192,12 +205,18 @@ export function runVitest({ extraEnv = {}, forwarded = [], signal,
       launchFailed = true;
       if (!signal?.aborted) console.error(`[eval-agents] could not launch vitest: ${error.message}`);
     });
-    // close follows both failed spawns and cancellation; wait until the child
-    // and its inherited streams have closed before the caller tears down.
-    child.once("close", (code) => {
+    // close follows both failed spawns and cancellation; wait until the child,
+    // the rest of its process tree and its inherited streams have gone before
+    // the caller tears down.
+    child.once("close", async (code) => {
+      signal?.removeEventListener("abort", onAbort);
       process.removeListener("SIGINT", onInt);
       process.removeListener("SIGTERM", onTerm);
-      let exitCode = signal?.aborted || interrupted ? 130 : launchFailed ? 1 : code ?? 1;
+      await reapTree(child, killTimeoutMs);
+      clearTimeout(killTimer);
+      activeTrees.delete(tree);
+      let exitCode = signal?.aborted ? signalExitCode(signal.reason?.signal)
+        : interruptedBy ? signalExitCode(interruptedBy) : launchFailed ? 1 : code ?? 1;
       if (exitCode === 0 && campaignPath) {
         try {
           const campaign = JSON.parse(readFileSync(campaignPath, "utf8"));
@@ -210,6 +229,71 @@ export function runVitest({ extraEnv = {}, forwarded = [], signal,
       resolveExit(exitCode);
     });
   });
+}
+
+/** Conventional shell exit status for a cancellation signal. */
+export function signalExitCode(name) {
+  return name === "SIGTERM" ? 143 : 130;
+}
+
+// Test-child process trees still running; a second signal kills them all.
+const activeTrees = new Set();
+
+function forceExit(name) {
+  for (const { child } of activeTrees) signalTree(child, "SIGKILL");
+  process.exit(signalExitCode(name));
+}
+
+function signalTree(child, name) {
+  if (!child.pid) return;
+  if (process.platform === "win32") {
+    // taskkill /T walks the tree from the live root; /F forces it.
+    spawnSync("taskkill", ["/pid", String(child.pid), "/T", ...(name === "SIGKILL" ? ["/F"] : [])],
+      { stdio: "ignore", windowsHide: true });
+    return;
+  }
+  try {
+    process.kill(-child.pid, name);
+  } catch {
+    // group already gone
+  }
+}
+
+function groupAlive(pgid) {
+  try {
+    process.kill(-pgid, 0);
+  } catch (error) {
+    return error.code === "EPERM";
+  }
+  if (process.platform !== "linux") return true;
+  // Zombies awaiting reaping by init still count for kill(); they are dead.
+  try {
+    for (const entry of readdirSync("/proc")) {
+      if (!/^\d+$/.test(entry)) continue;
+      let stat;
+      try { stat = readFileSync(`/proc/${entry}/stat`, "utf8"); } catch { continue; }
+      const [state, , pgrp] = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+      if (Number(pgrp) === pgid && state !== "Z") return true;
+    }
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+async function reapTree(child, timeoutMs) {
+  if (!child.pid || process.platform === "win32") return;
+  if (!groupAlive(child.pid)) return;
+  // The main process exited but workers or agents remain: stop them too.
+  signalTree(child, "SIGTERM");
+  for (const [sig, budget] of [["SIGKILL", timeoutMs], [null, 2000]]) {
+    const deadline = Date.now() + budget;
+    while (Date.now() < deadline) {
+      if (!groupAlive(child.pid)) return;
+      await delay(50);
+    }
+    if (sig) signalTree(child, sig);
+  }
 }
 
 export function installSignalHandlers(log) {

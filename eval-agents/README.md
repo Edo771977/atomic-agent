@@ -93,7 +93,13 @@ absolute path to the child and completion validator.
 Orchestrators launch the installed Vitest JavaScript entry with the current
 Node executable, including on Windows; forwarded arguments stay separate
 argv entries. Spawn errors fail the run, and cancellation waits for the
-test child to close before returning.
+test child to close before returning. On POSIX the test child leads its own
+process group (stdin is not inherited): cancellation signals the whole group,
+so Vitest's forked workers and the agents they started stop too, and the
+launcher waits until the group is gone, escalating to SIGKILL after a timeout
+(10 s by default). A group left behind after a normal exit is stopped the
+same way. On Windows cancellation runs `taskkill /T`, then `/T /F` after the
+timeout; it reaches descendants only while the Vitest process is alive.
 Installed SIGINT/SIGTERM handlers request cancellation through the signal
 passed by smoke/level1; they do not exit or stop daemons inline. The caller
 awaits child close, then its managed-daemon teardown, before exiting 130.
