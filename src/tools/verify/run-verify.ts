@@ -35,6 +35,11 @@ export interface VerifyRunResult {
    * or fail — stands.
    */
   readonly cleanupWarning?: string;
+  /**
+   * The call was cancelled while the executor ran. Its fields (command
+   * line, exit code, output) are kept as evidence; the run never passes.
+   */
+  readonly aborted?: boolean;
   readonly commandLine?: string;
   readonly exitCode?: number | null;
   readonly timedOut?: boolean;
@@ -207,7 +212,13 @@ export async function runVerify(
       result = await runInWorkspace(args, workspace.dir, true, ctx, started);
       // Executors may settle normally after an abort (a page can skip
       // remaining script steps). Such an incomplete run cannot pass.
-      if (ctx.signal?.aborted) result = failed("verification cancelled during execution", "cancelled", true);
+      // Keep what it did report: the command line, exit code and output
+      // are evidence of what ran before the cancellation landed.
+      if (ctx.signal?.aborted) {
+        const { ok: _ok, summary: _summary, checks: _checks, durationMs: _durationMs, ...fields } = result;
+        const error = `verification cancelled during execution${fields.error === undefined ? "" : ` (${fields.error})`}`;
+        result = finish({ ...fields, error, errorCode: "cancelled", aborted: true }, { kind: args.kind }, args.checks, false, started);
+      }
     }
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);

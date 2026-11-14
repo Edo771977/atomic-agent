@@ -219,4 +219,18 @@ describe("verify refuses to execute without a private workspace", () => {
     expect(result).toMatchObject({ ok: false, errorCode: "cancelled" });
     expect(result.error).toContain("cancelled");
   });
+
+  it("keeps the executor's fields when a run that completed is cancelled, and never passes", async () => {
+    const controller = new AbortController();
+    vi.spyOn(commands, "runCommandKind").mockImplementation(async () => {
+      controller.abort();
+      return { commandLine: "node build.js", exitCode: 0, signal: null, timedOut: false, aborted: false, stdout: "built\n", stderr: "", stdoutTail: "built\n", stderrTail: "", durationMs: 5 };
+    });
+    const result = await runVerify({ kind: "command", cmd: "node", args: ["build.js"], checks: ["exit 0"] }, { workingDir: dir, config, signal: controller.signal });
+    expect(result).toMatchObject({ ok: false, errorCode: "cancelled", aborted: true, isolated: true, commandLine: "node build.js", exitCode: 0, stdoutTail: "built\n", timedOut: false });
+    expect(result.error).toContain("cancelled during execution");
+    expect(result.checks).toEqual([expect.objectContaining({ check: "exit 0", ok: false })]);
+    expect(result.summary.split("\n")[0]).toBe("verify.run command: FAILED");
+    expect(result.summary).toContain("built");
+  });
 });
