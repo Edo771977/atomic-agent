@@ -331,7 +331,7 @@ export async function createCandidateIntegration(
   const receiptId = randomBytes(12).toString("hex");
   const rejectionReason = (reason: string): CandidateRejectionReason => /cancel|abort|interrupt/i.test(reason) ? "interrupted"
     : /check input/i.test(reason) ? "check-inputs-changed" : /candidate changed|checked source changed|payload/i.test(reason) ? "payload-changed"
-    : /every task/i.test(reason) ? "task-not-ok" : /integration checks failed/i.test(reason) ? "checks-failed"
+    : /every task/i.test(reason) ? "task-not-ok" : /integration checks failed/i.test(reason) ? receiptEvidence?.checks.some(check => !check.ok) ? "checks-failed" : "checks-unverified"
     : /check|runner/i.test(reason) ? "checks-unverified" : /provides/i.test(reason) ? "provides-unverified"
     : /original project changed/i.test(reason) ? "original-changed" : /delivery|rollback/i.test(reason) ? "delivery-failed" : "other";
   const receipt = (disposition: CandidateAcceptanceReceipt["disposition"], reason?: string): CandidateAcceptanceReceipt => {

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { createReadStream } from "node:fs";
-import { lstat } from "node:fs/promises";
+import { constants, createReadStream, type Stats } from "node:fs";
+import { lstat, open } from "node:fs/promises";
 import { dirname, join, relative, sep } from "node:path";
 import { isInside } from "../../approval/fanout-scope.js";
 import { resolveUserPath } from "../os/expand-home.js";
@@ -28,6 +28,8 @@ export function readCheckInputs(value: unknown, problems: string[]): string[] | 
 }
 
 interface Stamp { sha256: string; mode: number }
+const sameFile = (a: Stats, b: Stats): boolean => a.dev === b.dev && a.ino === b.ino && a.size === b.size &&
+  a.mode === b.mode && a.mtimeMs === b.mtimeMs && a.ctimeMs === b.ctimeMs;
 export interface CheckInputSnapshot {
   readonly paths: readonly string[];
   /** Verify every declared file against the pre-worker original bytes, type and mode. */
@@ -58,15 +60,22 @@ export async function freezeCheckInputs(root: string, declarations: readonly str
       const absolute = join(dir, path), before = await lstat(absolute);
       if (!before.isFile() || before.isSymbolicLink()) throw new Error("check input must be a regular file, never a symlink");
       if (before.size > MAX_FILE_BYTES || before.size > left) throw new Error("check input byte limit exceeded");
-      const hash = createHash("sha256"); let bytes = 0;
-      for await (const chunk of createReadStream(absolute, { signal: stop, highWaterMark: 64 * 1024 })) {
-        bytes += (chunk as Buffer).length; left -= (chunk as Buffer).length;
-        if (bytes > MAX_FILE_BYTES || left < 0) throw new Error("check input byte limit exceeded");
-        hash.update(chunk);
+      const handle = await open(absolute, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+      try {
+        if (!sameFile(before, await handle.stat())) throw new Error("check input identity changed before read");
+        const hash = createHash("sha256"); let bytes = 0;
+        // Pin the verified descriptor: do not reopen the pathname after its lstat.
+        for await (const chunk of createReadStream(absolute, { fd: handle.fd, autoClose: false, signal: stop, highWaterMark: 64 * 1024 })) {
+          bytes += (chunk as Buffer).length; left -= (chunk as Buffer).length;
+          if (bytes > MAX_FILE_BYTES || left < 0) throw new Error("check input byte limit exceeded");
+          hash.update(chunk);
+        }
+        const after = await lstat(absolute);
+        if (bytes !== before.size || !sameFile(before, after) || !sameFile(before, await handle.stat())) throw new Error("check input changed during read");
+        entries.set(path, { sha256: hash.digest("hex"), mode: after.mode & 0o777 });
+      } finally {
+        await handle.close();
       }
-      const after = await lstat(absolute);
-      if (!after.isFile() || before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size || before.mode !== after.mode || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs) throw new Error("check input changed during read");
-      entries.set(path, { sha256: hash.digest("hex"), mode: after.mode & 0o777 });
     }
     return entries;
   };
