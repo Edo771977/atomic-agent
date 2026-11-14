@@ -103,6 +103,8 @@ export interface ContractRequire {
 export type ContractCheck = { task?: string } & Record<string, unknown>;
 
 export interface DelegateContract {
+  /** Candidate mode: exact existing files frozen before workers and kept byte/type/mode-identical for final checks. */
+  checkInputs?: string[];
   /** The operator's own files: edited in place by any worker, replaced by none (`contract-inputs.ts`). */
   inputs?: string[];
   /** Path → task id. Nobody else writes there. */
@@ -250,6 +252,7 @@ export function renderContractBlock(contract: DelegateContract): string {
   const lines = [
     `CONTRACT — the interface between the parts of this fan-out. Every worker sees this same block. Produce exactly what it says you provide, under exactly these names, and reach the other parts only through what they provide.`,
     ...renderContractInputs(contract.inputs),
+    ...(contract.checkInputs?.length ? ["CHECK INPUTS (candidate mode: immutable declared check files; do not edit, remove or replace):", ...contract.checkInputs.map(path => `- ${path}`)] : []),
   ];
   const owners = Object.entries(contract.owners ?? {});
   if (owners.length > 0) {
